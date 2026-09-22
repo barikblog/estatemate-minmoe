@@ -53,6 +53,6 @@
   "vars": {
     "APP_NAME": "EstateMate",
     "ALLOWED_ORIGINS": "",
-    "HIKVISION_MODE": "http-listener-events-only"
+    "HIKVISION_MODE": "per-device"
   }
 }

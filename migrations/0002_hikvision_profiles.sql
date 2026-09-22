@@ -11,3 +11,5 @@ ALTER TABLE access_events ADD COLUMN profile_key TEXT NOT NULL DEFAULT 'generic_
 CREATE INDEX idx_devices_profile_status ON hikvision_devices(profile_key, status);
 CREATE INDEX idx_events_employee_time ON access_events(employee_no, device_timestamp DESC);
 CREATE INDEX idx_events_credential_time ON access_events(credential_type, device_timestamp DESC);
+
+UPDATE settings SET value = 'per_device', updated_at = datetime('now') WHERE key = 'hikvision_control_mode';
