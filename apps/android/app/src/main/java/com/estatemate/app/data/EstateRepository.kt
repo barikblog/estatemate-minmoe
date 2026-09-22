@@ -1,0 +1,42 @@
+package com.estatemate.app.data
+
+import com.estatemate.app.data.local.AccessEventDao
+import com.estatemate.app.data.local.CachedAccessEvent
+import com.estatemate.app.data.remote.DashboardResponse
+import com.estatemate.app.data.remote.EstateMateApi
+import com.estatemate.app.data.remote.LoginRequest
+import com.estatemate.app.data.remote.UserDto
+import kotlinx.coroutines.flow.Flow
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class EstateRepository @Inject constructor(
+    private val api: EstateMateApi,
+    private val authStore: AuthStore,
+    private val eventDao: AccessEventDao,
+) {
+    val recentEvents: Flow<List<CachedAccessEvent>> = eventDao.observeRecent()
+
+    suspend fun login(email: String, password: String): UserDto =
+        api.login(LoginRequest(email.trim(), password)).also { authStore.token = it.token }.user
+
+    suspend fun restore(): UserDto? = if (authStore.token == null) null else runCatching { api.me().user }.getOrElse {
+        authStore.token = null
+        null
+    }
+
+    suspend fun dashboard(): DashboardResponse = api.dashboard()
+
+    suspend fun refreshEvents() {
+        val events = api.accessEvents().items.map {
+            CachedAccessEvent(it.id, it.personName, it.cardUid, it.deviceName, it.result, it.deviceTimestamp)
+        }
+        eventDao.replace(events)
+    }
+
+    suspend fun logout() {
+        authStore.token = null
+        eventDao.clear()
+    }
+}

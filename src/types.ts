@@ -1,0 +1,62 @@
+export type Role = 'admin' | 'resident' | 'security' | 'cashier';
+
+export interface Env {
+  DB: D1Database;
+  FILES: R2Bucket;
+  ACCESS_EVENTS: Queue<NormalizedAccessEvent>;
+  LIVE_FEED: DurableObjectNamespace;
+  ASSETS: Fetcher;
+  APP_NAME: string;
+  ALLOWED_ORIGINS: string;
+  HIKVISION_MODE: string;
+  JWT_SECRET: string;
+  BOOTSTRAP_TOKEN: string;
+  DEVICE_INGEST_PEPPER: string;
+  GEMINI_API_KEY?: string;
+  GITHUB_TOKEN?: string;
+  GITHUB_OWNER?: string;
+  GITHUB_REPO?: string;
+}
+
+export interface AuthUser {
+  id: string;
+  name: string;
+  email: string;
+  role: Role;
+  property_id: string | null;
+}
+
+export interface JwtClaims {
+  sub: string;
+  role: Role;
+  name: string;
+  iat: number;
+  exp: number;
+}
+
+export interface DeviceIdentity {
+  id: string;
+  name: string;
+  username: string;
+  direction: 'entry' | 'exit' | 'both';
+  accessPointId: string | null;
+}
+
+export interface NormalizedAccessEvent {
+  id: string;
+  vendorEventId: string;
+  deviceId: string;
+  accessPointId: string | null;
+  cardUid: string | null;
+  personName: string | null;
+  direction: 'entry' | 'exit';
+  result: 'granted' | 'denied' | 'unknown';
+  eventType: string;
+  deviceTimestamp: string;
+  rawSummary: string;
+}
+
+export interface AppVariables {
+  user: AuthUser;
+  device: DeviceIdentity;
+}
