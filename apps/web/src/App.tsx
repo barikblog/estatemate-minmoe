@@ -288,12 +288,13 @@ function AccessEvents({ user }: { user: User }) {
   }, [user.role]);
   return <PagePanel title="Gate activity" subtitle="Granted and denied access across every configured point" action={user.role !== 'resident' ? <span className={`connection ${connection}`}><span className="pulse-dot" /> {connection}</span> : null}>
     {live.length > 0 && <section className="live-strip"><p className="eyebrow">JUST RECEIVED</p>{live.map((event, index) => <div className="live-event" key={`${String(event.vendorEventId)}-${index}`}><span className={`result-dot ${event.result}`} /><strong>{String(event.personName ?? event.cardUid ?? 'Unknown credential')}</strong><span>{String(event.result)}</span><small>{readableDate(event.deviceTimestamp)}</small></div>)}</section>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['result','Result'],['person_name','Person'],['card_uid','Card'],['device_name','Device'],['access_point_name','Access point'],['direction','Direction'],['device_timestamp','Time','date']]} /></ListState>
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['result','Result'],['person_name','Person'],['employee_no','Employee no.'],['credential_type','Method'],['card_uid','Card'],['device_name','Device'],['access_point_name','Access point'],['door_no','Door'],['direction','Direction'],['device_timestamp','Time','date']]} /></ListState>
   </PagePanel>;
 }
 
 function Devices({ user }: { user: User }) {
   const list = useList('/api/access/devices');
+  const profiles = useAsync<{ items: Row[] }>(() => api('/api/access/profiles'), []);
   const [show, setShow] = useState(false);
   const [credentials, setCredentials] = useState<Row | null>(null);
   const [error, setError] = useState('');
@@ -305,9 +306,20 @@ function Devices({ user }: { user: User }) {
   return <PagePanel title="MinMoe devices" subtitle="Internet-connected terminal health and event ingestion" action={user.role === 'admin' ? <button className="primary" onClick={() => setShow(!show)}>Register device</button> : null}>
     <Notice tone="warning"><strong>No-PC mode:</strong> HTTP Listening sends events to EstateMate, but it does not provide a return command channel. Do not expose the terminal’s ISAPI port to the public Internet.</Notice>
     {error && <Notice tone="error">{error}</Notice>}
-    {credentials && <section className="credential-box"><p className="eyebrow">COPY NOW — SHOWN ONCE</p><h3>HTTP Listening endpoint</h3><code>{String(credentials.endpoint)}</code><p>Username: <code>{String(credentials.username)}</code></p><p>Secret: <code>{String(credentials.secret)}</code></p><button className="secondary" onClick={() => navigator.clipboard.writeText(String(credentials.endpoint))}>Copy endpoint</button></section>}
-    {show && <FormCard title="Register MinMoe terminal" onSubmit={submit}><label>Display name<input name="name" placeholder="Gate 1 terminal" required /></label><label>Gate name<input name="gateName" placeholder="Main gate" required /></label><label>Direction<select name="direction"><option value="entry">Entry</option><option value="exit">Exit</option><option value="both">Both</option></select></label><label>Model<input name="model" placeholder="DS-K1T…" /></label><label>Firmware<input name="firmware" /></label><label>Serial number<input name="serialNumber" /></label><button className="primary">Register</button></FormCard>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Device'],['model','Model'],['firmware','Firmware'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['last_seen_at','Last event','date'],['pending_operations','Pending actions']]} /></ListState>
+    {credentials && <section className="credential-box"><p className="eyebrow">COPY NOW — SHOWN ONCE</p><h3>Device event endpoint</h3><code>{String(credentials.endpoint)}</code><p>Profile: <code>{String((credentials.profile as Row | undefined)?.label ?? '')}</code></p><p>Connection: <code>{String(credentials.connectionPattern)}</code></p><p>Username: <code>{String(credentials.username)}</code></p><p>Secret: <code>{String(credentials.secret)}</code></p><button className="secondary" onClick={() => navigator.clipboard.writeText(String(credentials.endpoint))}>Copy endpoint</button></section>}
+    {show && <FormCard title="Register Hikvision access device" onSubmit={submit}>
+      <label>Display name<input name="name" placeholder="Gate 1 terminal" required /></label>
+      <label>Gate name<input name="gateName" placeholder="Main gate" required /></label>
+      <label>Direction<select name="direction"><option value="entry">Entry</option><option value="exit">Exit</option><option value="both">Both</option></select></label>
+      <label>Model<input name="model" placeholder="DS-K1T341CMFW" /></label>
+      <label>Firmware<input name="firmware" placeholder="Full version and build" /></label>
+      <label>Serial number<input name="serialNumber" /></label>
+      <label>Series profile<select name="profileKey"><option value="auto">Auto-detect from model</option>{profiles.data?.items.map((profile) => <option key={String(profile.key)} value={String(profile.key)}>{String(profile.label)}</option>)}</select></label>
+      <label>Connection pattern<select name="connectionPattern"><option value="direct_http_listener">Direct HTTP Listening</option><option value="hikvision_cloud_openapi">Hikvision cloud/OpenAPI</option><option value="offsite_isup_gateway">Off-site ISUP gateway</option><option value="manual_sync">Manual synchronization</option></select></label>
+      <label>Listener format<select name="listenerFormat"><option value="auto">Auto-detect</option><option value="json">JSON</option><option value="xml">XML</option><option value="multipart">Multipart</option></select></label>
+      <button className="primary">Register</button>
+    </FormCard>}
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Device'],['model','Model'],['profile_key','Series profile'],['connection_pattern','Connection'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['last_seen_at','Last event','date'],['pending_operations','Pending actions']]} /></ListState>
   </PagePanel>;
 }
 

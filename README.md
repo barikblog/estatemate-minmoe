@@ -50,6 +50,31 @@ Cloud-to-terminal card action
       Future verified mode: Hikvision cloud/OpenAPI or off-site ISUP command bridge
 ```
 
+## Supported Hikvision series profiles
+
+Device registration now offers profile auto-detection plus an explicit override for ambiguous regional models:
+
+| Profile | Typical model pattern | Device pattern |
+|---|---|---|
+| MinMoe Value | `DS-K1T3xx` — K1T320/321/331/341/342/343/344 | Standalone terminal |
+| MinMoe Pro | `DS-K1T67x` | Standalone terminal |
+| MinMoe Ultra | `DS-K1T68x`, explicitly selected Ultra K1T67x | Standalone terminal |
+| MinMoe turnstile module | K560/K567 and configured modules | Embedded/turnstile |
+| K1T5xx | `DS-K1T5xx` | Access terminal |
+| K1A | `DS-K1Axxx` | Attendance/access terminal |
+| DS-K2600 | K2601/K2602/K2604 | Multi-door controller |
+| DS-K2700/K2800 | K27xx/K28xx | Multi-door controller |
+| Generic ISAPI | Unknown/unlisted models | Conservative fallback |
+
+Each profile carries model patterns, event-field aliases, grant/deny mappings, credential types, expected event formats, and permitted connection patterns. The selectable connection patterns are:
+
+- **Direct HTTP Listening:** outbound event upload, no assumed return command channel.
+- **Hikvision cloud/OpenAPI:** pending adapter; enable only with approved API documentation and credentials.
+- **Off-site ISUP gateway:** bidirectional option hosted away from the estate, not on-site.
+- **Manual synchronization:** event/audit platform with operator-applied hardware changes.
+
+The generic parser retains unknown values rather than inventing a grant result. Add firmware-specific evidence in `docs/device-profiles/` before marking a combination production-supported.
+
 ## Monorepo layout
 
 ```text

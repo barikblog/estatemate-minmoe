@@ -8,6 +8,8 @@ const device: DeviceIdentity = {
   username: 'gate1',
   direction: 'entry',
   accessPointId: 'point-1',
+  profileKey: 'minmoe_value_3xx',
+  connectionPattern: 'direct_http_listener',
 };
 
 describe('Hikvision event parser', () => {

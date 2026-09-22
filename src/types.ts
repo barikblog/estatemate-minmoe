@@ -40,6 +40,8 @@ export interface DeviceIdentity {
   username: string;
   direction: 'entry' | 'exit' | 'both';
   accessPointId: string | null;
+  profileKey: string;
+  connectionPattern: string;
 }
 
 export interface NormalizedAccessEvent {
@@ -48,11 +50,15 @@ export interface NormalizedAccessEvent {
   deviceId: string;
   accessPointId: string | null;
   cardUid: string | null;
+  employeeNo: string | null;
   personName: string | null;
+  credentialType: string | null;
+  doorNo: string | null;
   direction: 'entry' | 'exit';
   result: 'granted' | 'denied' | 'unknown';
   eventType: string;
   deviceTimestamp: string;
+  profileKey: string;
   rawSummary: string;
 }
 

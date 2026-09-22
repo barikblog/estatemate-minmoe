@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import type { Context, MiddlewareHandler } from 'hono';
 import { AccessLiveFeed } from './live-feed';
 import { extractEventDocuments, normalizeHikvisionDocument } from './hikvision';
+import { HIKVISION_PROFILES, isConnectionSupported, resolveHikvisionProfile } from './hikvision-profiles';
 import {
   bearerToken,
   cookieValue,
@@ -448,6 +449,21 @@ app.get('/api/access/events/stream', requireRoles('admin', 'security'), async (c
   return c.env.LIVE_FEED.get(id).fetch(c.req.raw);
 });
 
+app.get('/api/access/profiles', requireRoles('admin', 'security'), (c) => c.json({
+  items: HIKVISION_PROFILES.map((profile) => ({
+    key: profile.key,
+    label: profile.label,
+    family: profile.family,
+    description: profile.description,
+    modelPatterns: profile.modelPatterns,
+    devicePattern: profile.devicePattern,
+    authenticationMethods: profile.authenticationMethods,
+    supportedConnections: profile.supportedConnections,
+    defaultConnection: profile.defaultConnection,
+    httpListener: profile.httpListener,
+  })),
+}));
+
 app.get('/api/access/devices', requireRoles('admin', 'security'), async (c) => {
   const devices = await c.env.DB.prepare(
     `SELECT d.*, ap.id AS access_point_id, ap.name AS access_point_name,
@@ -458,8 +474,26 @@ app.get('/api/access/devices', requireRoles('admin', 'security'), async (c) => {
 });
 
 app.post('/api/access/devices', requireRoles('admin'), async (c) => {
-  const body = await c.req.json<{ name?: string; serialNumber?: string; model?: string; firmware?: string; gateName?: string; direction?: 'entry'|'exit'|'both' }>();
+  const body = await c.req.json<{
+    name?: string;
+    serialNumber?: string;
+    model?: string;
+    firmware?: string;
+    gateName?: string;
+    direction?: 'entry'|'exit'|'both';
+    profileKey?: string;
+    connectionPattern?: string;
+    listenerFormat?: 'auto'|'json'|'xml'|'multipart';
+  }>();
   if (!body.name?.trim() || !body.gateName?.trim() || !body.direction) return jsonError(c, 400, 'name, gateName and direction are required');
+  const profile = resolveHikvisionProfile(body.model, body.profileKey ?? 'auto');
+  const connectionPattern = body.connectionPattern ?? profile.defaultConnection;
+  if (!isConnectionSupported(profile, connectionPattern)) {
+    return jsonError(c, 400, `${profile.label} does not offer ${connectionPattern} as a supported connection option`);
+  }
+  const listenerFormat = body.listenerFormat ?? 'auto';
+  if (!['auto','json','xml','multipart'].includes(listenerFormat)) return jsonError(c, 400, 'Invalid listenerFormat');
+  const legacyMode = connectionPattern === 'direct_http_listener' ? 'http_listener' : connectionPattern === 'offsite_isup_gateway' ? 'isup_bridge' : 'manual';
   const id = crypto.randomUUID();
   const pointId = crypto.randomUUID();
   const credentialId = crypto.randomUUID();
@@ -467,13 +501,33 @@ app.post('/api/access/devices', requireRoles('admin'), async (c) => {
   const secret = randomToken(32);
   const keyHash = await sha256(`${secret}:${c.env.DEVICE_INGEST_PEPPER}`);
   await c.env.DB.batch([
-    c.env.DB.prepare(`INSERT INTO hikvision_devices(id,name,serial_number,model,firmware,gate_name,direction) VALUES (?,?,?,?,?,?,?)`).bind(id, body.name.trim(), body.serialNumber?.trim() ?? null, body.model?.trim() ?? null, body.firmware?.trim() ?? null, body.gateName.trim(), body.direction),
+    c.env.DB.prepare(
+      `INSERT INTO hikvision_devices(id,name,serial_number,model,firmware,gate_name,direction,integration_mode,profile_key,connection_pattern,listener_format)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    ).bind(
+      id, body.name.trim(), body.serialNumber?.trim() ?? null, body.model?.trim() ?? null,
+      body.firmware?.trim() ?? null, body.gateName.trim(), body.direction, legacyMode,
+      profile.key, connectionPattern, listenerFormat,
+    ),
     c.env.DB.prepare(`INSERT INTO access_points(id,name,gate_name,direction,device_id) VALUES (?,?,?,?,?)`).bind(pointId, `${body.gateName.trim()} ${body.direction === 'both' ? 'Entry' : body.direction}`, body.gateName.trim(), body.direction === 'exit' ? 'exit' : 'entry', id),
     c.env.DB.prepare(`INSERT INTO device_credentials(id,device_id,username,api_key_hash) VALUES (?,?,?,?)`).bind(credentialId, id, username, keyHash),
   ]);
   const endpoint = `${new URL(c.req.url).origin}/api/hikvision/v1/events/${id}?key=${encodeURIComponent(secret)}`;
-  await audit(c, 'create', 'hikvision_device', id, { model: body.model, firmware: body.firmware });
-  return c.json({ id, username, secret, endpoint, warning: 'The secret is shown once. Prefer HTTPS and Basic authentication when the exact firmware supports it.' }, 201);
+  await audit(c, 'create', 'hikvision_device', id, { model: body.model, firmware: body.firmware, profileKey: profile.key, connectionPattern });
+  const warning = connectionPattern === 'direct_http_listener'
+    ? 'The secret is shown once. Direct HTTP Listening uploads events only; card commands still need a verified return channel.'
+    : connectionPattern === 'manual_sync'
+      ? 'No automatic device transport is enabled. Use the hardware action queue and acknowledge each applied change.'
+      : 'Complete the selected gateway/cloud integration before marking hardware operations as applied.';
+  return c.json({
+    id,
+    username,
+    secret,
+    endpoint,
+    profile: { key: profile.key, label: profile.label, httpListener: profile.httpListener },
+    connectionPattern,
+    warning,
+  }, 201);
 });
 
 app.get('/api/access/operations', requireRoles('admin'), async (c) => {
@@ -538,11 +592,16 @@ async function createDeviceOperations(
   operation: 'upsert_card'|'enable_card'|'disable_card'|'delete_card',
   payload: unknown,
 ): Promise<void> {
-  const devices = await env.DB.prepare(`SELECT id FROM hikvision_devices WHERE status != 'disabled'`).all<{ id: string }>();
+  const devices = await env.DB.prepare(`SELECT id,connection_pattern FROM hikvision_devices WHERE status != 'disabled'`).all<{ id: string; connection_pattern: string }>();
   if (!devices.results.length) return;
-  await env.DB.batch(devices.results.map((device) => env.DB.prepare(
-    `INSERT INTO device_operations(id,device_id,card_id,operation,payload_json,status) VALUES (?,?,?,?,?,'manual_action_required')`,
-  ).bind(crypto.randomUUID(), device.id, cardId, operation, JSON.stringify(payload))));
+  await env.DB.batch(devices.results.map((device) => {
+    const status = ['hikvision_cloud_openapi','offsite_isup_gateway'].includes(device.connection_pattern)
+      ? 'pending'
+      : 'manual_action_required';
+    return env.DB.prepare(
+      `INSERT INTO device_operations(id,device_id,card_id,operation,payload_json,status) VALUES (?,?,?,?,?,?)`,
+    ).bind(crypto.randomUUID(), device.id, cardId, operation, JSON.stringify(payload), status);
+  }));
 }
 
 async function authenticateDevice(request: Request, env: Env, deviceId: string): Promise<DeviceIdentity | null> {
@@ -559,7 +618,7 @@ async function authenticateDevice(request: Request, env: Env, deviceId: string):
   }
   if (!secret) return null;
   const credential = await env.DB.prepare(
-    `SELECT dc.username,dc.api_key_hash,d.id,d.name,d.direction,ap.id AS access_point_id
+    `SELECT dc.username,dc.api_key_hash,d.id,d.name,d.direction,d.profile_key,d.connection_pattern,ap.id AS access_point_id
      FROM device_credentials dc JOIN hikvision_devices d ON d.id=dc.device_id
      LEFT JOIN access_points ap ON ap.device_id=d.id AND ap.enabled=1
      WHERE d.id=? AND dc.revoked_at IS NULL AND (? IS NULL OR dc.username=?) LIMIT 1`,
@@ -572,6 +631,8 @@ async function authenticateDevice(request: Request, env: Env, deviceId: string):
     username: credential.username!,
     direction: credential.direction as 'entry'|'exit'|'both',
     accessPointId: credential.access_point_id ?? null,
+    profileKey: credential.profile_key ?? 'generic_isapi',
+    connectionPattern: credential.connection_pattern ?? 'direct_http_listener',
   };
 }
 
@@ -601,13 +662,14 @@ async function handleDeviceEvent(request: Request, env: Env, deviceId: string): 
 async function consumeAccessEvents(batch: MessageBatch<NormalizedAccessEvent>, env: Env): Promise<void> {
   const statements = batch.messages.map(({ body: event }) => env.DB.prepare(
     `INSERT OR IGNORE INTO access_events(
-      id,vendor_event_id,device_id,access_point_id,card_id,resident_id,card_uid,person_name,direction,result,event_type,device_timestamp,raw_summary
+      id,vendor_event_id,device_id,access_point_id,card_id,resident_id,card_uid,employee_no,person_name,credential_type,door_no,direction,result,event_type,device_timestamp,profile_key,raw_summary
      ) VALUES (?,?,?,?,
        (SELECT id FROM access_cards WHERE card_uid=? LIMIT 1),
-       (SELECT resident_id FROM access_cards WHERE card_uid=? LIMIT 1),?,?,?,?,?,?,?)`,
+       (SELECT resident_id FROM access_cards WHERE card_uid=? LIMIT 1),?,?,?,?,?,?,?,?,?,?,?)`,
   ).bind(
-    event.id,event.vendorEventId,event.deviceId,event.accessPointId,event.cardUid,event.cardUid,event.cardUid,event.personName,
-    event.direction,event.result,event.eventType,event.deviceTimestamp,event.rawSummary,
+    event.id,event.vendorEventId,event.deviceId,event.accessPointId,event.cardUid,event.cardUid,
+    event.cardUid,event.employeeNo,event.personName,event.credentialType,event.doorNo,event.direction,event.result,
+    event.eventType,event.deviceTimestamp,event.profileKey,event.rawSummary,
   ));
   if (statements.length) await env.DB.batch(statements);
   const live = env.LIVE_FEED.get(env.LIVE_FEED.idFromName('global'));

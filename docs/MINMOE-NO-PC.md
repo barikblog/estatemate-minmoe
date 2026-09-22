@@ -47,6 +47,21 @@ Do not expose the terminal’s web/ISAPI/server ports to the Internet. Risks inc
 
 This repository’s safe default. It has no extra infrastructure and keeps events live, but physical card changes are not immediate.
 
+## Multiple series and installation patterns
+
+EstateMate does not treat every Hikvision access product as one MinMoe model. The device registry supports separate profiles for Value K1T3xx, Pro K1T67x, Ultra K1T68x/selected K1T67x, turnstile modules, K1T5xx access terminals, K1A attendance terminals, K2600 controllers, K2700/K2800 controllers, and a generic ISAPI fallback.
+
+Profiles affect field aliases, event result mapping, credential-type inference, door/channel handling, and allowed transport choices. They do not override the need to test the exact suffix, region, hardware revision, and firmware. A model prefix is a starting point—not proof that HTTPS listening or remote commands are supported.
+
+Supported deployment patterns:
+
+1. Standalone terminal with direct HTTP Listening.
+2. Entry and exit terminals as separate devices/access points.
+3. One terminal configured for both directions when its event contains reliable direction data.
+4. Face module attached to a turnstile, with explicit lane/channel mapping.
+5. Multi-door K2600/K2700/K2800 controller, with one access-point row per door/reader direction.
+6. Multiple mixed series in one estate; every device keeps its own profile and transport.
+
 ## Required model-validation test
 
 For each terminal model/firmware:
