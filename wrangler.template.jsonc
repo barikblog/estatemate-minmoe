@@ -19,12 +19,6 @@
       "migrations_dir": "migrations"
     }
   ],
-  "r2_buckets": [
-    {
-      "binding": "FILES",
-      "bucket_name": "estatemate-private"
-    }
-  ],
   "queues": {
     "producers": [
       { "binding": "ACCESS_EVENTS", "queue": "estatemate-access-events" }
@@ -53,6 +47,7 @@
   "vars": {
     "APP_NAME": "EstateMate",
     "ALLOWED_ORIGINS": "",
-    "HIKVISION_MODE": "per-device"
+    "HIKVISION_MODE": "per-device",
+    "FILE_STORAGE_MODE": "github-private-configurable"
   }
 }

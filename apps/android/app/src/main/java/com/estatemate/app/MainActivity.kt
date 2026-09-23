@@ -62,6 +62,9 @@ import androidx.lifecycle.viewModelScope
 import com.estatemate.app.data.EstateRepository
 import com.estatemate.app.data.local.CachedAccessEvent
 import com.estatemate.app.data.remote.DashboardResponse
+import com.estatemate.app.data.remote.OwnershipRequestBody
+import com.estatemate.app.data.remote.OwnershipRequestDto
+import com.estatemate.app.data.remote.PropertyDto
 import com.estatemate.app.data.remote.UserDto
 import dagger.hilt.android.AndroidEntryPoint
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -104,8 +107,18 @@ data class AppState(
     val checkingSession: Boolean = true,
     val user: UserDto? = null,
     val dashboard: DashboardResponse? = null,
+    val properties: List<PropertyDto> = emptyList(),
+    val availableProperties: List<PropertyDto> = emptyList(),
+    val ownershipRequests: List<OwnershipRequestDto> = emptyList(),
     val busy: Boolean = false,
     val error: String? = null,
+)
+
+private data class RefreshPayload(
+    val dashboard: DashboardResponse,
+    val properties: List<PropertyDto>,
+    val availableProperties: List<PropertyDto>,
+    val ownershipRequests: List<OwnershipRequestDto>,
 )
 
 @HiltViewModel
@@ -131,12 +144,37 @@ class MainViewModel @Inject constructor(private val repository: EstateRepository
 
     fun refresh() = viewModelScope.launch {
         _state.value = _state.value.copy(busy = true, error = null)
+        val role = _state.value.user?.role
         runCatching {
             val dashboard = repository.dashboard()
+            val properties = repository.properties()
+            val available = if (role == "resident") repository.availableProperties() else emptyList()
+            val requests = if (role == "resident" || role == "admin") repository.ownershipRequests() else emptyList()
             repository.refreshEvents()
-            dashboard
-        }.onSuccess { dashboard -> _state.value = _state.value.copy(dashboard = dashboard, busy = false) }
-            .onFailure { error -> _state.value = _state.value.copy(busy = false, error = error.message ?: "Unable to refresh") }
+            RefreshPayload(dashboard, properties, available, requests)
+        }.onSuccess { payload ->
+            _state.value = _state.value.copy(
+                dashboard = payload.dashboard,
+                properties = payload.properties,
+                availableProperties = payload.availableProperties,
+                ownershipRequests = payload.ownershipRequests,
+                busy = false,
+            )
+        }.onFailure { error -> _state.value = _state.value.copy(busy = false, error = error.message ?: "Unable to refresh") }
+    }
+
+    fun requestOwnership(request: OwnershipRequestBody) = viewModelScope.launch {
+        _state.value = _state.value.copy(busy = true, error = null)
+        runCatching { repository.requestOwnership(request) }
+            .onSuccess { refresh() }
+            .onFailure { error -> _state.value = _state.value.copy(busy = false, error = error.message ?: "Ownership request failed") }
+    }
+
+    fun reviewOwnership(id: String, approved: Boolean) = viewModelScope.launch {
+        _state.value = _state.value.copy(busy = true, error = null)
+        runCatching { repository.reviewOwnership(id, approved) }
+            .onSuccess { refresh() }
+            .onFailure { error -> _state.value = _state.value.copy(busy = false, error = error.message ?: "Ownership review failed") }
     }
 
     fun logout() = viewModelScope.launch {
@@ -152,7 +190,7 @@ fun EstateMateApp(viewModel: MainViewModel = hiltViewModel()) {
     when {
         state.checkingSession -> FullScreenLoading()
         state.user == null -> LoginScreen(state.busy, state.error, viewModel::login)
-        else -> HomeScreen(state, events, viewModel::refresh, viewModel::logout)
+        else -> HomeScreen(state, events, viewModel::refresh, viewModel::requestOwnership, viewModel::reviewOwnership, viewModel::logout)
     }
 }
 
@@ -196,11 +234,18 @@ private fun LoginScreen(busy: Boolean, error: String?, onLogin: (String, String)
     }
 }
 
-private enum class HomeTab(val label: String) { Overview("Overview"), Activity("Gate activity"), Account("Account") }
+private enum class HomeTab(val label: String) { Overview("Overview"), Properties("Properties"), Activity("Gate activity"), Account("Account") }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun HomeScreen(state: AppState, events: List<CachedAccessEvent>, refresh: () -> Unit, logout: () -> Unit) {
+private fun HomeScreen(
+    state: AppState,
+    events: List<CachedAccessEvent>,
+    refresh: () -> Unit,
+    requestOwnership: (OwnershipRequestBody) -> Unit,
+    reviewOwnership: (String, Boolean) -> Unit,
+    logout: () -> Unit,
+) {
     var tab by remember { mutableStateOf(HomeTab.Overview) }
     Scaffold(
         containerColor = EstateBackground,
@@ -230,6 +275,7 @@ private fun HomeScreen(state: AppState, events: List<CachedAccessEvent>, refresh
         Box(Modifier.fillMaxSize().padding(padding)) {
             when (tab) {
                 HomeTab.Overview -> Overview(state)
+                HomeTab.Properties -> Properties(state, requestOwnership, reviewOwnership)
                 HomeTab.Activity -> Activity(events)
                 HomeTab.Account -> Account(state.user!!, logout)
             }
@@ -274,6 +320,78 @@ private fun MetricCard(label: String, value: Int, detail: String) {
         Row(Modifier.fillMaxWidth().padding(20.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) { Text(label, color = Color(0xFF68748A), fontWeight = FontWeight.SemiBold); Text(detail, color = Color(0xFF98A2B2), fontSize = 11.sp) }
             Text(value.toString(), color = EstateNavy, fontSize = 30.sp, fontWeight = FontWeight.ExtraBold)
+        }
+    }
+}
+
+@Composable
+private fun Properties(
+    state: AppState,
+    requestOwnership: (OwnershipRequestBody) -> Unit,
+    reviewOwnership: (String, Boolean) -> Unit,
+) {
+    val resident = state.user?.role == "resident"
+    var unitNumber by remember { mutableStateOf("") }
+    var street by remember { mutableStateOf("") }
+    var address by remember { mutableStateOf("") }
+    var note by remember { mutableStateOf("") }
+    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(18.dp), verticalArrangement = Arrangement.spacedBy(11.dp)) {
+        item { Text(if (resident) "My properties" else "Estate properties", fontSize = 24.sp, fontWeight = FontWeight.ExtraBold, color = EstateNavy) }
+        if (state.error != null) item { Text(state.error, color = MaterialTheme.colorScheme.error, fontSize = 13.sp) }
+        if (state.properties.isEmpty()) item { Text("No approved properties yet.", color = Color(0xFF68748A)) }
+        items(state.properties, key = { "property-${it.id}" }) { property ->
+            Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(14.dp)) {
+                Column(Modifier.fillMaxWidth().padding(17.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(property.unitNumber, fontSize = 19.sp, fontWeight = FontWeight.ExtraBold, color = EstateNavy)
+                    Text(listOfNotNull(property.street, property.address).joinToString(" · "), color = Color(0xFF68748A), fontSize = 12.sp)
+                    if (!resident && property.ownerName != null) Text("Owner: ${property.ownerName}", color = EstateBlue, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                }
+            }
+        }
+        if (resident) {
+            item { Text("Request an existing unowned property", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = EstateNavy, modifier = Modifier.padding(top = 10.dp)) }
+            if (state.availableProperties.isEmpty()) item { Text("No unowned properties are currently available. You can propose one below.", color = Color(0xFF68748A), fontSize = 12.sp) }
+            items(state.availableProperties, key = { "available-${it.id}" }) { property ->
+                Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(13.dp)) {
+                    Row(Modifier.fillMaxWidth().padding(15.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Column(Modifier.weight(1f)) { Text(property.unitNumber, fontWeight = FontWeight.Bold); Text(property.street.orEmpty(), color = Color(0xFF68748A), fontSize = 11.sp) }
+                        Button(onClick = { requestOwnership(OwnershipRequestBody(propertyId = property.id)) }, enabled = !state.busy) { Text("Request") }
+                    }
+                }
+            }
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(14.dp)) {
+                    Column(Modifier.fillMaxWidth().padding(17.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text("Propose a new property", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = EstateNavy)
+                        OutlinedTextField(unitNumber, { unitNumber = it }, label = { Text("Unit number") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                        OutlinedTextField(street, { street = it }, label = { Text("Street") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                        OutlinedTextField(address, { address = it }, label = { Text("Address") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                        OutlinedTextField(note, { note = it }, label = { Text("Note to administrator") }, modifier = Modifier.fillMaxWidth())
+                        Button(
+                            onClick = { requestOwnership(OwnershipRequestBody(proposedUnitNumber = unitNumber, proposedStreet = street, proposedAddress = address, requestNote = if (note.isBlank()) null else note)) },
+                            enabled = !state.busy && unitNumber.isNotBlank() && street.isNotBlank() && address.isNotBlank(),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("Submit for approval") }
+                    }
+                }
+            }
+        }
+        if (state.ownershipRequests.isNotEmpty()) {
+            item { Text(if (resident) "My request history" else "Ownership approvals", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = EstateNavy, modifier = Modifier.padding(top = 10.dp)) }
+            items(state.ownershipRequests, key = { "request-${it.id}" }) { request ->
+                Card(colors = CardDefaults.cardColors(containerColor = if (request.status == "pending") Color(0xFFFFFBF2) else Color.White), shape = RoundedCornerShape(13.dp)) {
+                    Column(Modifier.fillMaxWidth().padding(15.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(request.unitNumber ?: "Proposed property", fontWeight = FontWeight.Bold)
+                        Text(listOfNotNull(request.street, request.address).joinToString(" · "), color = Color(0xFF68748A), fontSize = 11.sp)
+                        Text(request.status.replaceFirstChar(Char::uppercase), color = if (request.status == "approved") Color(0xFF137444) else EstateBlue, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                        if (request.reviewNote != null) Text(request.reviewNote, color = Color(0xFF68748A), fontSize = 11.sp)
+                        if (!resident && request.status == "pending") Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { reviewOwnership(request.id, true) }, enabled = !state.busy) { Text("Approve") }
+                            Button(onClick = { reviewOwnership(request.id, false) }, enabled = !state.busy, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) { Text("Reject") }
+                        }
+                    }
+                }
+            }
         }
     }
 }

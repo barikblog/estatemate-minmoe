@@ -2,7 +2,6 @@ export type Role = 'admin' | 'resident' | 'security' | 'cashier';
 
 export interface Env {
   DB: D1Database;
-  FILES?: R2Bucket;
   ACCESS_EVENTS: Queue<NormalizedAccessEvent>;
   LIVE_FEED: DurableObjectNamespace;
   ASSETS: Fetcher;
@@ -13,10 +12,8 @@ export interface Env {
   JWT_SECRET: string;
   BOOTSTRAP_TOKEN: string;
   DEVICE_INGEST_PEPPER: string;
+  STORAGE_ENCRYPTION_KEY?: string;
   GEMINI_API_KEY?: string;
-  GITHUB_TOKEN?: string;
-  GITHUB_OWNER?: string;
-  GITHUB_REPO?: string;
 }
 
 export interface AuthUser {

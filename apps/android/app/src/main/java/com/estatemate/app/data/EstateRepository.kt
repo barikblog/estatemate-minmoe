@@ -5,6 +5,10 @@ import com.estatemate.app.data.local.CachedAccessEvent
 import com.estatemate.app.data.remote.DashboardResponse
 import com.estatemate.app.data.remote.EstateMateApi
 import com.estatemate.app.data.remote.LoginRequest
+import com.estatemate.app.data.remote.OwnershipRequestBody
+import com.estatemate.app.data.remote.OwnershipRequestDto
+import com.estatemate.app.data.remote.OwnershipReviewBody
+import com.estatemate.app.data.remote.PropertyDto
 import com.estatemate.app.data.remote.UserDto
 import kotlinx.coroutines.flow.Flow
 import javax.inject.Inject
@@ -27,6 +31,11 @@ class EstateRepository @Inject constructor(
     }
 
     suspend fun dashboard(): DashboardResponse = api.dashboard()
+    suspend fun properties(): List<PropertyDto> = api.properties().items
+    suspend fun availableProperties(): List<PropertyDto> = api.availableProperties().items
+    suspend fun ownershipRequests(): List<OwnershipRequestDto> = api.ownershipRequests().items
+    suspend fun requestOwnership(request: OwnershipRequestBody) = api.requestOwnership(request)
+    suspend fun reviewOwnership(id: String, approved: Boolean) = api.reviewOwnership(id, OwnershipReviewBody(if (approved) "approved" else "rejected"))
 
     suspend fun refreshEvents() {
         val events = api.accessEvents().items.map {

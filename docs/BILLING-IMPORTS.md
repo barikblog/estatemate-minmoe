@@ -2,7 +2,7 @@
 
 ## Property street data
 
-Every new property requires a `street`. Street-targeted billing creates one bill for every active resident whose assigned property is on any selected street. A resident without an assigned property is not billed by a street batch.
+Every new property requires a `street`. Street-targeted billing creates one bill for every property on a selected street that has an active, administrator-approved resident owner. A resident who owns several properties receives one property-linked bill for each qualifying property.
 
 The batch record stores the selected streets, amount, bill type, due date, description, creator, creation time, and number of generated bills.
 
@@ -18,7 +18,7 @@ Columns:
 |---|---:|---|
 | `external_reference` | Recommended | Unique ID from the old system; payment imports can refer to it. |
 | `unit_number` | Conditional | Required when `resident_email` is empty. |
-| `resident_email` | Conditional | Required when `unit_number` is empty; takes matching priority when both are supplied. |
+| `resident_email` | Conditional | Required when `unit_number` is empty. If this resident owns multiple properties, `unit_number` is also required to remove ambiguity. When both are supplied, they must identify the same approved ownership. |
 | `amount` | Yes | Major units, e.g. `25000.00` NGN. |
 | `currency` | No | Defaults to `NGN`. |
 | `due_date` | Yes | ISO date such as `2026-12-31`. |
@@ -46,6 +46,6 @@ Approved imported payments immediately recalculate the linked bill status.
 
 ## Error handling
 
-Imports are row-tolerant: valid rows are saved while invalid rows are returned with their CSV row numbers. Every upload writes an `import_jobs` audit record with total, successful, and failed counts plus up to 100 error descriptions.
+Imports are row-tolerant: valid rows are saved while invalid rows are returned with their CSV row numbers. Every upload writes an `import_jobs` audit record with total, successful, and failed counts plus up to 100 error descriptions. The original CSV is archived in the administrator-configured private GitHub repository and can be retrieved with **Download source** in import history. An import is rejected before financial rows are processed if private storage is unavailable.
 
 Duplicate external references or receipt numbers are rejected instead of overwriting existing financial records. There is no one-click rollback because later transactions may depend on imported bills. Correct errors in a new import or use audited adjustments rather than deleting financial history.

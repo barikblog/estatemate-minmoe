@@ -8,7 +8,7 @@ interface NavItem { id: Section; label: string; roles?: User['role'][] }
 const navItems: NavItem[] = [
   { id: 'dashboard', label: 'Overview' },
   { id: 'residents', label: 'People', roles: ['admin', 'cashier', 'security'] },
-  { id: 'properties', label: 'Properties', roles: ['admin', 'cashier', 'security'] },
+  { id: 'properties', label: 'Properties', roles: ['admin', 'cashier', 'security', 'resident'] },
   { id: 'bills', label: 'Bills & payments', roles: ['admin', 'cashier', 'resident'] },
   { id: 'visitors', label: 'Visitors' },
   { id: 'maintenance', label: 'Maintenance', roles: ['admin', 'resident'] },
@@ -192,7 +192,7 @@ function People({ user }: { user: User }) {
   const [showForm, setShowForm] = useState(false);
   return <PagePanel title="People" subtitle="Resident and staff accounts" action={user.role === 'admin' ? <button className="primary" onClick={() => setShowForm(!showForm)}>Add person</button> : null}>
     {showForm && <CreateUser onDone={() => { setShowForm(false); list.reload(); }} />}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Name'],['role','Role'],['email','Email'],['phone','Phone'],['unit_number','Unit'],['status','Status']]} /></ListState>
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Name'],['role','Role'],['email','Email'],['phone','Phone'],['unit_numbers','Properties'],['property_count','Property count'],['status','Status']]} /></ListState>
   </PagePanel>;
 }
 
@@ -212,15 +212,98 @@ function CreateUser({ onDone }: { onDone: () => void }) {
 }
 
 function Properties({ user }: { user: User }) {
-  const list = useList('/api/properties?limit=50');
-  const [show, setShow] = useState(false);
-  async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); const values = Object.fromEntries(new FormData(event.currentTarget));
-    await api('/api/properties', { method: 'POST', body: JSON.stringify(values) }); setShow(false); list.reload();
+  const list = useList('/api/properties?limit=100');
+  const requests = useAsync<ListResponse<Row>>(
+    () => user.role === 'resident' || user.role === 'admin' ? api('/api/property-ownership-requests?limit=100') : Promise.resolve({ items: [], page: 1, limit: 100 }),
+    [user.role],
+  );
+  const available = useAsync<{ items: Row[] }>(
+    () => user.role === 'resident' || user.role === 'admin' ? api('/api/properties/available') : Promise.resolve({ items: [] }),
+    [user.role],
+  );
+  const [showAdd, setShowAdd] = useState(false);
+  const [showRequest, setShowRequest] = useState(false);
+  const [showAssign, setShowAssign] = useState(false);
+  const [requestMode, setRequestMode] = useState<'existing'|'propose'>('existing');
+  const [assignPropertyId, setAssignPropertyId] = useState('');
+  const [message, setMessage] = useState('');
+
+  function refresh() { list.reload(); requests.reload(); available.reload(); }
+
+  async function addProperty(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setMessage(''); const values = Object.fromEntries(new FormData(event.currentTarget));
+    try { await api('/api/properties', { method: 'POST', body: JSON.stringify(values) }); setShowAdd(false); setMessage('Property created.'); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not create property'); }
   }
-  return <PagePanel title="Properties" subtitle="Units, addresses and assignments" action={user.role === 'admin' ? <button className="primary" onClick={() => setShow(!show)}>Add property</button> : null}>
-    {show && <FormCard title="New property" onSubmit={submit}><label>Unit number<input name="unitNumber" required /></label><label>Street<input name="street" placeholder="Example: Unity Street" required /></label><label>Address<input name="address" required /></label><button className="primary">Save property</button></FormCard>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['unit_number','Unit'],['street','Street'],['address','Address'],['owner_name','Owner'],['created_at','Created','date']]} /></ListState>
+
+  async function requestProperty(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setMessage(''); const form = new FormData(event.currentTarget);
+    const body = requestMode === 'existing'
+      ? { propertyId: form.get('propertyId'), requestNote: form.get('requestNote') }
+      : { proposedUnitNumber: form.get('proposedUnitNumber'), proposedStreet: form.get('proposedStreet'), proposedAddress: form.get('proposedAddress'), requestNote: form.get('requestNote') };
+    try { await api('/api/property-ownership-requests', { method: 'POST', body: JSON.stringify(body) }); setShowRequest(false); setMessage('Ownership request submitted for administrator approval.'); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not submit ownership request'); }
+  }
+
+  async function assignOwner(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setMessage(''); const values = Object.fromEntries(new FormData(event.currentTarget));
+    try { await api('/api/property-ownerships', { method: 'POST', body: JSON.stringify(values) }); setShowAssign(false); setAssignPropertyId(''); setMessage('Property owner assigned.'); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not assign property owner'); }
+  }
+
+  async function reviewRequest(id: unknown, status: 'approved'|'rejected') {
+    const reviewNote = prompt(status === 'approved' ? 'Optional approval note' : 'Reason for rejection') ?? '';
+    try { await api(`/api/property-ownership-requests/${id}`, { method: 'PATCH', body: JSON.stringify({ status, reviewNote }) }); setMessage(`Ownership request ${status}.`); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not review ownership request'); }
+  }
+
+  async function revokeOwner(row: Row) {
+    if (!confirm(`Remove ${String(row.owner_name)} as owner of ${String(row.unit_number)}? Existing bills remain linked.`)) return;
+    try { await api(`/api/property-ownerships/${row.ownership_id}`, { method: 'DELETE' }); setMessage('Property ownership removed.'); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not remove owner'); }
+  }
+
+  async function editProperty(row: Row) {
+    const unitNumber = prompt('Unit number', String(row.unit_number ?? ''));
+    if (!unitNumber) return;
+    const street = prompt('Street', String(row.street ?? ''));
+    if (!street) return;
+    const address = prompt('Address', String(row.address ?? ''));
+    if (!address) return;
+    try { await api(`/api/properties/${row.id}`, { method: 'PATCH', body: JSON.stringify({ unitNumber, street, address }) }); setMessage('Property details updated.'); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not update property'); }
+  }
+
+  const actions = user.role === 'admin' ? (row: Row) => <div className="row-actions">
+    <button className="text" onClick={() => editProperty(row)}>Edit</button>
+    {row.ownership_id
+      ? <button className="text danger" onClick={() => revokeOwner(row)}>Remove owner</button>
+      : <button className="text" onClick={() => { setAssignPropertyId(String(row.id)); setShowAssign(true); }}>Assign owner</button>}
+  </div> : undefined;
+  const pending = requests.data?.items.filter((request) => request.status === 'pending') ?? [];
+
+  return <PagePanel
+    title={user.role === 'resident' ? 'My properties' : 'Properties'}
+    subtitle={user.role === 'resident' ? 'Every property you own and requests awaiting administrator approval' : 'Units, streets, single-owner assignments and approval requests'}
+    action={<div className="row-actions">
+      {user.role === 'resident' && <button className="primary" onClick={() => setShowRequest(!showRequest)}>Request another property</button>}
+      {user.role === 'admin' && <><button className="secondary" onClick={() => setShowAssign(!showAssign)}>Assign owner</button><button className="primary" onClick={() => setShowAdd(!showAdd)}>Add property</button></>}
+    </div>}
+  >
+    {message && <Notice tone={message.includes('Could not') || message.includes('already') ? 'error' : 'success'}>{message}</Notice>}
+    {showAdd && <FormCard title="New property" onSubmit={addProperty}><label>Unit number<input name="unitNumber" required /></label><label>Street<input name="street" placeholder="Example: Unity Street" required /></label><label>Address<input name="address" required /></label><button className="primary">Save property</button></FormCard>}
+    {showAssign && <FormCard title="Assign an unowned property" onSubmit={assignOwner}>
+      <label>Property<select name="propertyId" value={assignPropertyId} onChange={(event) => setAssignPropertyId(event.target.value)} required><option value="">Select property</option>{available.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}</option>)}</select></label>
+      <label>Resident email<input name="residentEmail" type="email" required /></label><button className="primary">Assign owner</button>
+    </FormCard>}
+    {showRequest && <FormCard title="Request another property" onSubmit={requestProperty}>
+      <label>Request type<select value={requestMode} onChange={(event) => setRequestMode(event.target.value as 'existing'|'propose')}><option value="existing">Existing unowned property</option><option value="propose">Propose a new property</option></select></label>
+      {requestMode === 'existing' ? <label>Available property<select name="propertyId" required><option value="">Select property</option>{available.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}, {String(property.address)}</option>)}</select></label> : <><label>Unit number<input name="proposedUnitNumber" required /></label><label>Street<input name="proposedStreet" required /></label><label>Address<input name="proposedAddress" required /></label></>}
+      <label className="span-2">Note to administrator<textarea name="requestNote" rows={3} placeholder="Explain the ownership request" /></label><button className="primary">Submit for approval</button>
+    </FormCard>}
+    {user.role === 'admin' && pending.length > 0 && <section className="approval-queue"><h3>Ownership approvals</h3><DataTable rows={pending} columns={[['resident_name','Resident'],['resident_email','Email'],['unit_number','Unit'],['street','Street'],['request_note','Request note'],['created_at','Requested','date'],['status','Status']]} action={(row) => <div className="row-actions"><button className="text" onClick={() => reviewRequest(row.id, 'approved')}>Approve</button><button className="text danger" onClick={() => reviewRequest(row.id, 'rejected')}>Reject</button></div>} /></section>}
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={user.role === 'resident' ? [['unit_number','Unit'],['street','Street'],['address','Address'],['approved_at','Approved','date']] : [['unit_number','Unit'],['street','Street'],['address','Address'],['owner_name','Owner'],['owner_email','Owner email'],['created_at','Created','date']]} action={actions} /></ListState>
+    {(user.role === 'resident' || user.role === 'admin') && requests.data && requests.data.items.length > 0 && <section className="request-history"><h3>{user.role === 'resident' ? 'My ownership requests' : 'Request history'}</h3><DataTable rows={requests.data.items} columns={[['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['status','Status'],['review_note','Review note'],['created_at','Requested','date']]} /></section>}
   </PagePanel>;
 }
 
@@ -264,7 +347,7 @@ function Bills({ user }: { user: User }) {
       <CsvImporter kind="payments" title="Import resident payments" onDone={() => { list.reload(); imports.reload(); }} />
     </section>}
     <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['bill_type','Type'],['batch_name','Batch'],['external_reference','External ref.'],['amount_minor','Amount','money'],['paid_minor','Paid','money'],['due_date','Due'],['status','Status']]} /></ListState>
-    {staff && imports.data && imports.data.items.length > 0 && <section className="import-history"><h3>Recent imports</h3><DataTable rows={imports.data.items} columns={[['kind','Type'],['filename','File'],['status','Status'],['total_rows','Rows'],['successful_rows','Imported'],['error_rows','Errors'],['created_at','Uploaded','date']]} /></section>}
+    {staff && imports.data && imports.data.items.length > 0 && <section className="import-history"><h3>Recent imports</h3><DataTable rows={imports.data.items} columns={[['kind','Type'],['filename','File'],['status','Status'],['total_rows','Rows'],['successful_rows','Imported'],['error_rows','Errors'],['created_at','Uploaded','date']]} action={(row) => row.storage_key ? <a className="text" href={`/api/files/${encodeURIComponent(String(row.storage_key))}`}>Download source</a> : null} /></section>}
   </PagePanel>;
 }
 
@@ -295,6 +378,7 @@ function CsvImporter({ kind, title, onDone }: { kind: 'bills'|'payments'; title:
 
 function Visitors({ user }: { user: User }) {
   const list = useList('/api/visitors?limit=50');
+  const properties = useList('/api/properties?limit=100');
   const [show, setShow] = useState(false);
   const [result, setResult] = useState('');
   async function create(event: FormEvent<HTMLFormElement>) {
@@ -309,22 +393,23 @@ function Visitors({ user }: { user: User }) {
   }
   return <PagePanel title="Visitors" subtitle="Issue passes and manage arrivals" action={(user.role === 'resident' || user.role === 'admin') ? <button className="primary" onClick={() => setShow(!show)}>New pass</button> : null}>
     {result && <Notice tone={result.includes('created') || result.includes('checked') ? 'success' : 'error'}>{result}</Notice>}
-    {show && <FormCard title="Create visitor pass" onSubmit={create}><label>Visitor name<input name="visitorName" required /></label><label>Phone<input name="visitorPhone" /></label>{user.role === 'admin' && <label>Resident ID<input name="residentId" required /></label>}<label>Valid from<input name="validFrom" type="datetime-local" required /></label><label>Valid until<input name="validUntil" type="datetime-local" required /></label><button className="primary">Issue pass</button></FormCard>}
+    {show && <FormCard title="Create visitor pass" onSubmit={create}><label>Visitor name<input name="visitorName" required /></label><label>Phone<input name="visitorPhone" /></label>{user.role === 'admin' && <label>Resident ID<input name="residentId" required /></label>}{user.role === 'resident' ? <label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}</option>)}</select></label> : <label>Property ID<input name="propertyId" required /></label>}<label>Valid from<input name="validFrom" type="datetime-local" required /></label><label>Valid until<input name="validUntil" type="datetime-local" required /></label><button className="primary">Issue pass</button></FormCard>}
     {(user.role === 'security' || user.role === 'admin') && <FormCard title="Gate check" onSubmit={check}><label>Six-digit PIN<input name="pin" inputMode="numeric" pattern="[0-9]{6}" required /></label><label>Action<select name="action"><option value="in">Check in</option><option value="out">Check out</option></select></label><button className="primary">Verify pass</button></FormCard>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['visitor_name','Visitor'],['resident_name','Resident'],['unit_number','Unit'],['pin','PIN'],['status','Status'],['valid_until','Valid until','date']]} /></ListState>
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['visitor_name','Visitor'],['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['pin','PIN'],['status','Status'],['valid_until','Valid until','date']]} /></ListState>
   </PagePanel>;
 }
 
 function Maintenance({ user }: { user: User }) {
   const list = useList('/api/maintenance?limit=50');
+  const properties = useList('/api/properties?limit=100');
   const [show, setShow] = useState(false);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const values = Object.fromEntries(new FormData(event.currentTarget));
     await api('/api/maintenance', { method: 'POST', body: JSON.stringify(values) }); setShow(false); list.reload();
   }
   return <PagePanel title="Maintenance" subtitle="Requests and work status" action={<button className="primary" onClick={() => setShow(!show)}>New request</button>}>
-    {show && <FormCard title="Report a maintenance issue" onSubmit={submit}><label className="span-2">Description<textarea name="description" rows={4} required /></label>{user.role === 'admin' && <label>Resident ID<input name="residentId" required /></label>}<button className="primary">Submit request</button></FormCard>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['resident_name','Resident'],['description','Description'],['status','Status'],['ai_urgency','Urgency'],['created_at','Reported','date']]} /></ListState>
+    {show && <FormCard title="Report a maintenance issue" onSubmit={submit}><label className="span-2">Description<textarea name="description" rows={4} required /></label>{user.role === 'admin' && <label>Resident ID<input name="residentId" required /></label>}{user.role === 'resident' ? <label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}</option>)}</select></label> : <label>Property ID<input name="propertyId" required /></label>}<button className="primary">Submit request</button></FormCard>}
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['description','Description'],['status','Status'],['ai_urgency','Urgency'],['created_at','Reported','date']]} /></ListState>
   </PagePanel>;
 }
 
@@ -447,12 +532,23 @@ function Operations() {
 
 function Settings() {
   const list = useList('/api/settings');
+  const storage = useAsync<Row>(() => api('/api/storage-settings'), []);
   const [message, setMessage] = useState('');
   const [passwordMessage, setPasswordMessage] = useState('');
+  const [storageMessage, setStorageMessage] = useState('');
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = new FormData(event.currentTarget); const value = String(form.get('value') ?? '');
     try { await api('/api/settings/facility_fee_grace_period_days', { method: 'PUT', body: JSON.stringify({ value }) }); setMessage('Grace period updated.'); list.reload(); }
     catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Failed'); }
+  }
+  async function saveStorage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setStorageMessage(''); const storageForm = event.currentTarget; const form = new FormData(storageForm);
+    const body = {
+      enabled: form.get('enabled') === 'on', owner: form.get('owner'), repository: form.get('repository'),
+      branch: form.get('branch'), basePath: form.get('basePath'), accessToken: form.get('accessToken') || undefined,
+    };
+    try { await api('/api/storage-settings', { method: 'PUT', body: JSON.stringify(body) }); setStorageMessage('Private GitHub storage verified and updated.'); storage.reload(); (storageForm.elements.namedItem('accessToken') as HTMLInputElement).value = ''; }
+    catch (reason) { setStorageMessage(reason instanceof Error ? reason.message : 'Storage update failed'); }
   }
   async function changePassword(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -466,9 +562,20 @@ function Settings() {
       setPasswordMessage('Password changed successfully.');
     } catch (reason) { setPasswordMessage(reason instanceof Error ? reason.message : 'Password change failed'); }
   }
-  return <PagePanel title="Settings" subtitle="Estate-wide operational rules">
+  return <PagePanel title="Settings" subtitle="Estate-wide operational rules and private storage">
     {message && <Notice tone={message.includes('updated') ? 'success' : 'error'}>{message}</Notice>}
     <FormCard title="Facility-fee enforcement" onSubmit={submit}><label>Grace period (days)<input name="value" type="number" min="0" max="365" defaultValue={String(list.data?.items.find((item) => item.key === 'facility_fee_grace_period_days')?.value ?? '7')} required /></label><button className="primary">Save rule</button></FormCard>
+    {storageMessage && <Notice tone={storageMessage.includes('updated') ? 'success' : 'error'}>{storageMessage}</Notice>}
+    <Notice tone="warning"><strong>Private repository required.</strong> EstateMate encrypts the GitHub token before saving it and never displays it again. Use a fine-grained token limited to this repository’s Contents permission.</Notice>
+    {storage.data && <FormCard title="Private GitHub upload storage" onSubmit={saveStorage}>
+      <label className="check"><input name="enabled" type="checkbox" defaultChecked={Boolean(storage.data.enabled)} /> Enable uploads</label>
+      <label>GitHub owner<input name="owner" defaultValue={String(storage.data.owner || 'Barikblog')} required /></label>
+      <label>Private repository<input name="repository" defaultValue={String(storage.data.repository || 'estatemate-private-storage')} required /></label>
+      <label>Branch<input name="branch" defaultValue={String(storage.data.branch || 'main')} required /></label>
+      <label>Base folder<input name="basePath" defaultValue={String(storage.data.basePath || 'uploads')} required /></label>
+      <label>Fine-grained access token<input name="accessToken" type="password" autoComplete="new-password" placeholder={storage.data.tokenConfigured ? 'Configured — leave blank to keep it' : 'Required to enable storage'} /></label>
+      <button className="primary">Verify and save storage</button>
+    </FormCard>}
     {passwordMessage && <Notice tone={passwordMessage.includes('successfully') ? 'success' : 'error'}>{passwordMessage}</Notice>}
     <FormCard title="Change my password" onSubmit={changePassword}><label>Current password<input name="currentPassword" type="password" autoComplete="current-password" required /></label><label>New password<input name="newPassword" type="password" minLength={12} autoComplete="new-password" required /></label><label>Confirm new password<input name="confirmPassword" type="password" minLength={12} autoComplete="new-password" required /></label><button className="primary">Change password</button></FormCard>
     <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['key','Setting'],['value','Value'],['updated_at','Updated','date']]} /></ListState>

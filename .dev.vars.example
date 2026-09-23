@@ -1,7 +1,5 @@
 JWT_SECRET=replace-with-at-least-32-random-bytes
 BOOTSTRAP_TOKEN=one-time-random-bootstrap-token
 DEVICE_INGEST_PEPPER=replace-with-another-random-secret
+STORAGE_ENCRYPTION_KEY=replace-with-a-different-32-byte-random-secret
 GEMINI_API_KEY=
-GITHUB_TOKEN=
-GITHUB_OWNER=
-GITHUB_REPO=

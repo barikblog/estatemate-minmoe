@@ -36,6 +36,6 @@
     "APP_NAME": "EstateMate",
     "ALLOWED_ORIGINS": "",
     "HIKVISION_MODE": "per-device",
-    "FILE_STORAGE_MODE": "disabled-no-paid-services"
+    "FILE_STORAGE_MODE": "github-private-configurable"
   }
 }

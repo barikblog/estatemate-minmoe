@@ -5,6 +5,13 @@ import { AccessLiveFeed } from './live-feed';
 import { extractEventDocuments, normalizeHikvisionDocument } from './hikvision';
 import { HIKVISION_PROFILES, isConnectionSupported, resolveHikvisionProfile } from './hikvision-profiles';
 import {
+  MAX_GITHUB_FILE_SIZE,
+  downloadFromPrivateGitHub,
+  publicStorageSettings,
+  saveStorageSettings,
+  uploadToPrivateGitHub,
+} from './github-storage';
+import {
   bearerToken,
   cookieValue,
   hashPassword,
@@ -52,7 +59,7 @@ app.use('/api/*', async (c, next) => {
       headers: {
         'Access-Control-Allow-Origin': origin,
         'Access-Control-Allow-Credentials': 'true',
-        'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-Bootstrap-Token',
+        'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-Bootstrap-Token, X-Filename, X-File-Category',
         'Access-Control-Allow-Methods': 'GET,POST,PATCH,PUT,DELETE,OPTIONS',
         'Access-Control-Max-Age': '86400',
       },
@@ -97,12 +104,17 @@ async function audit(c: AppContext, action: string, entityType: string, entityId
 
 app.get('/api/health', async (c) => {
   const db = await c.env.DB.prepare('SELECT 1 AS ok').first<{ ok: number }>();
+  let fileStorage = c.env.FILE_STORAGE_MODE ?? 'disabled';
+  try {
+    const storage = await publicStorageSettings(c.env.DB);
+    if (storage.enabled) fileStorage = 'github-private';
+  } catch { /* A migration may still be running during a deployment health check. */ }
   return c.json({
     ok: db?.ok === 1,
     app: c.env.APP_NAME,
     time: new Date().toISOString(),
     hikvisionMode: c.env.HIKVISION_MODE,
-    fileStorage: c.env.FILES ? 'r2' : (c.env.FILE_STORAGE_MODE ?? 'disabled'),
+    fileStorage,
   });
 });
 
@@ -189,28 +201,185 @@ app.get('/api/dashboard', async (c) => {
   });
 });
 
-app.get('/api/properties', requireRoles('admin', 'cashier', 'security'), async (c) => {
+app.get('/api/properties', async (c) => {
+  const user = c.get('user');
   const { limit, offset, page: pageNumber } = page(c);
   const search = `%${c.req.query('search')?.trim() ?? ''}%`;
+  const residentId = user.role === 'resident' ? user.id : null;
   const result = await c.env.DB.prepare(
-    `SELECT p.*, u.name AS owner_name FROM properties p LEFT JOIN users u ON u.id = p.owner_id
-     WHERE p.unit_number LIKE ? OR p.address LIKE ? OR p.street LIKE ? ORDER BY p.street,p.unit_number LIMIT ? OFFSET ?`,
-  ).bind(search, search, search, limit, offset).all();
+    `SELECT p.*,po.id AS ownership_id,po.approved_at,u.id AS owner_id,u.name AS owner_name,u.email AS owner_email
+     FROM properties p
+     LEFT JOIN property_ownerships po ON po.property_id=p.id AND po.status='active'
+     LEFT JOIN users u ON u.id=po.resident_id
+     WHERE (? IS NULL OR po.resident_id=?) AND (p.unit_number LIKE ? OR p.address LIKE ? OR p.street LIKE ?)
+     ORDER BY p.street,p.unit_number LIMIT ? OFFSET ?`,
+  ).bind(residentId, residentId, search, search, search, limit, offset).all();
   return c.json({ items: result.results, page: pageNumber, limit });
+});
+
+app.get('/api/properties/available', requireRoles('resident', 'admin'), async (c) => {
+  const search = `%${c.req.query('search')?.trim() ?? ''}%`;
+  const result = await c.env.DB.prepare(
+    `SELECT p.id,p.unit_number,p.street,p.address FROM properties p
+     WHERE NOT EXISTS (SELECT 1 FROM property_ownerships po WHERE po.property_id=p.id AND po.status='active')
+       AND (p.unit_number LIKE ? OR p.address LIKE ? OR p.street LIKE ?)
+     ORDER BY p.street,p.unit_number LIMIT 100`,
+  ).bind(search, search, search).all();
+  return c.json({ items: result.results });
 });
 
 app.post('/api/properties', requireRoles('admin'), async (c) => {
   const body = await c.req.json<{ unitNumber?: string; address?: string; street?: string }>();
   if (!body.unitNumber?.trim() || !body.address?.trim() || !body.street?.trim()) return jsonError(c, 400, 'unitNumber, address and street are required');
   const id = crypto.randomUUID();
-  await c.env.DB.prepare(`INSERT INTO properties(id, unit_number, address, street) VALUES (?, ?, ?, ?)`).bind(id, body.unitNumber.trim(), body.address.trim(), body.street.trim()).run();
+  await c.env.DB.prepare(`INSERT INTO properties(id,unit_number,address,street) VALUES (?,?,?,?)`).bind(id, body.unitNumber.trim(), body.address.trim(), body.street.trim()).run();
   await audit(c, 'create', 'property', id, body);
   return c.json({ id }, 201);
 });
 
+app.patch('/api/properties/:id', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<{ unitNumber?: string; address?: string; street?: string }>();
+  if (!body.unitNumber?.trim() || !body.address?.trim() || !body.street?.trim()) return jsonError(c, 400, 'unitNumber, address and street are required');
+  const result = await c.env.DB.prepare(
+    `UPDATE properties SET unit_number=?,address=?,street=? WHERE id=?`,
+  ).bind(body.unitNumber.trim(), body.address.trim(), body.street.trim(), c.req.param('id')).run();
+  if (!result.meta.changes) return jsonError(c, 404, 'Property not found');
+  await audit(c, 'update', 'property', c.req.param('id'), body);
+  return c.json({ ok: true });
+});
+
+app.get('/api/property-ownership-requests', requireRoles('resident', 'admin'), async (c) => {
+  const user = c.get('user');
+  const { limit, offset, page: pageNumber } = page(c);
+  const residentId = user.role === 'resident' ? user.id : null;
+  const status = c.req.query('status') ?? null;
+  const result = await c.env.DB.prepare(
+    `SELECT r.*,u.name AS resident_name,u.email AS resident_email,
+       COALESCE(p.unit_number,r.proposed_unit_number) AS unit_number,
+       COALESCE(p.street,r.proposed_street) AS street,
+       COALESCE(p.address,r.proposed_address) AS address,
+       reviewer.name AS reviewed_by_name
+     FROM property_ownership_requests r
+     JOIN users u ON u.id=r.requester_id
+     LEFT JOIN properties p ON p.id=r.property_id
+     LEFT JOIN users reviewer ON reviewer.id=r.reviewed_by
+     WHERE (? IS NULL OR r.requester_id=?) AND (? IS NULL OR r.status=?)
+     ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT ? OFFSET ?`,
+  ).bind(residentId, residentId, status, status, limit, offset).all();
+  return c.json({ items: result.results, page: pageNumber, limit });
+});
+
+app.post('/api/property-ownership-requests', requireRoles('resident'), async (c) => {
+  const body = await c.req.json<{
+    propertyId?: string;
+    proposedUnitNumber?: string;
+    proposedStreet?: string;
+    proposedAddress?: string;
+    requestNote?: string;
+  }>();
+  const proposing = !body.propertyId;
+  if (proposing && (!body.proposedUnitNumber?.trim() || !body.proposedStreet?.trim() || !body.proposedAddress?.trim())) {
+    return jsonError(c, 400, 'Select an existing property or provide proposedUnitNumber, proposedStreet and proposedAddress');
+  }
+  if (body.propertyId) {
+    const available = await c.env.DB.prepare(
+      `SELECT p.id FROM properties p WHERE p.id=? AND NOT EXISTS (SELECT 1 FROM property_ownerships po WHERE po.property_id=p.id AND po.status='active')`,
+    ).bind(body.propertyId).first();
+    if (!available) return jsonError(c, 409, 'That property is already owned or no longer available');
+  }
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare(
+    `INSERT INTO property_ownership_requests(id,requester_id,property_id,proposed_unit_number,proposed_street,proposed_address,request_note)
+     VALUES (?,?,?,?,?,?,?)`,
+  ).bind(
+    id,c.get('user').id,body.propertyId ?? null,body.proposedUnitNumber?.trim() ?? null,
+    body.proposedStreet?.trim() ?? null,body.proposedAddress?.trim() ?? null,body.requestNote?.trim() ?? null,
+  ).run();
+  await audit(c, 'request', 'property_ownership', id, { propertyId: body.propertyId, proposedUnitNumber: body.proposedUnitNumber });
+  return c.json({ id, status: 'pending' }, 201);
+});
+
+app.post('/api/property-ownerships', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<{ propertyId?: string; residentId?: string; residentEmail?: string }>();
+  if (!body.propertyId || (!body.residentId && !body.residentEmail?.trim())) return jsonError(c, 400, 'propertyId and residentId or residentEmail are required');
+  const resident = await c.env.DB.prepare(
+    `SELECT id FROM users WHERE role='resident' AND status='active' AND (id=? OR lower(email)=lower(?)) LIMIT 1`,
+  ).bind(body.residentId ?? '', body.residentEmail?.trim() ?? '').first<{ id: string }>();
+  if (!resident) return jsonError(c, 404, 'Active resident not found');
+  const property = await c.env.DB.prepare(
+    `SELECT p.id FROM properties p WHERE p.id=? AND NOT EXISTS (SELECT 1 FROM property_ownerships po WHERE po.property_id=p.id AND po.status='active')`,
+  ).bind(body.propertyId).first();
+  if (!property) return jsonError(c, 409, 'Property is already owned or was not found');
+  const id = crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`INSERT INTO property_ownerships(id,property_id,resident_id,status,approved_by) VALUES (?,?,?,'active',?)`).bind(id, body.propertyId, resident.id, c.get('user').id),
+    c.env.DB.prepare(`UPDATE users SET property_id=COALESCE(property_id,?),updated_at=datetime('now') WHERE id=?`).bind(body.propertyId, resident.id),
+  ]);
+  await audit(c, 'assign', 'property_ownership', id, { propertyId: body.propertyId, residentId: resident.id });
+  return c.json({ id }, 201);
+});
+
+app.patch('/api/property-ownership-requests/:id', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<{ status?: 'approved'|'rejected'; reviewNote?: string }>();
+  if (!body.status || !['approved','rejected'].includes(body.status)) return jsonError(c, 400, 'status must be approved or rejected');
+  const request = await c.env.DB.prepare(
+    `SELECT * FROM property_ownership_requests WHERE id=? AND status='pending'`,
+  ).bind(c.req.param('id')).first<Record<string, string | null>>();
+  if (!request) return jsonError(c, 404, 'Pending ownership request not found');
+  if (body.status === 'rejected') {
+    await c.env.DB.prepare(
+      `UPDATE property_ownership_requests SET status='rejected',reviewed_by=?,reviewed_at=datetime('now'),review_note=?,updated_at=datetime('now') WHERE id=?`,
+    ).bind(c.get('user').id, body.reviewNote?.trim() ?? null, c.req.param('id')).run();
+    await audit(c, 'reject', 'property_ownership_request', c.req.param('id'), { reviewNote: body.reviewNote });
+    return c.json({ ok: true, status: 'rejected' });
+  }
+
+  let propertyId = request.property_id;
+  const statements: D1PreparedStatement[] = [];
+  if (propertyId) {
+    const available = await c.env.DB.prepare(
+      `SELECT p.id FROM properties p WHERE p.id=? AND NOT EXISTS (SELECT 1 FROM property_ownerships po WHERE po.property_id=p.id AND po.status='active')`,
+    ).bind(propertyId).first();
+    if (!available) return jsonError(c, 409, 'The requested property is no longer available');
+  } else {
+    propertyId = crypto.randomUUID();
+    statements.push(c.env.DB.prepare(
+      `INSERT INTO properties(id,unit_number,address,street) VALUES (?,?,?,?)`,
+    ).bind(propertyId, request.proposed_unit_number, request.proposed_address, request.proposed_street));
+  }
+  const ownershipId = crypto.randomUUID();
+  statements.push(
+    c.env.DB.prepare(`INSERT INTO property_ownerships(id,property_id,resident_id,status,approved_by) VALUES (?,?,?,'active',?)`).bind(ownershipId, propertyId, request.requester_id, c.get('user').id),
+    c.env.DB.prepare(`UPDATE users SET property_id=COALESCE(property_id,?),updated_at=datetime('now') WHERE id=?`).bind(propertyId, request.requester_id),
+    c.env.DB.prepare(
+      `UPDATE property_ownership_requests SET status='approved',reviewed_by=?,reviewed_at=datetime('now'),review_note=?,resulting_property_id=?,updated_at=datetime('now') WHERE id=?`,
+    ).bind(c.get('user').id, body.reviewNote?.trim() ?? null, propertyId, c.req.param('id')),
+  );
+  await c.env.DB.batch(statements);
+  await audit(c, 'approve', 'property_ownership_request', c.req.param('id'), { propertyId, ownershipId });
+  return c.json({ ok: true, status: 'approved', propertyId, ownershipId });
+});
+
+app.delete('/api/property-ownerships/:id', requireRoles('admin'), async (c) => {
+  const ownership = await c.env.DB.prepare(
+    `SELECT id,property_id,resident_id FROM property_ownerships WHERE id=? AND status='active'`,
+  ).bind(c.req.param('id')).first<{ id: string; property_id: string; resident_id: string }>();
+  if (!ownership) return jsonError(c, 404, 'Active property ownership not found');
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE property_ownerships SET status='revoked',revoked_by=?,revoked_at=datetime('now'),revocation_reason=? WHERE id=?`,
+    ).bind(c.get('user').id, c.req.query('reason')?.slice(0, 300) ?? 'Administrator action', ownership.id),
+    c.env.DB.prepare(
+      `UPDATE users SET property_id=(SELECT property_id FROM property_ownerships WHERE resident_id=? AND status='active' AND id!=? ORDER BY approved_at LIMIT 1),updated_at=datetime('now') WHERE id=?`,
+    ).bind(ownership.resident_id, ownership.id, ownership.resident_id),
+  ]);
+  await audit(c, 'revoke', 'property_ownership', ownership.id, ownership);
+  return c.json({ ok: true });
+});
+
 app.get('/api/streets', requireRoles('admin', 'cashier'), async (c) => {
   const result = await c.env.DB.prepare(
-    `SELECT street, COUNT(*) AS property_count FROM properties WHERE street IS NOT NULL AND trim(street) != '' GROUP BY street ORDER BY street`,
+    `SELECT street,COUNT(*) AS property_count FROM properties WHERE street IS NOT NULL AND trim(street) != '' GROUP BY street ORDER BY street`,
   ).all();
   return c.json({ items: result.results });
 });
@@ -240,7 +409,9 @@ app.post('/api/bills/batch', requireRoles('admin', 'cashier'), async (c) => {
   const inserted = await c.env.DB.prepare(
     `INSERT INTO bills(id,property_id,resident_id,amount_minor,due_date,bill_type,description,batch_id)
      SELECT lower(hex(randomblob(16))),p.id,u.id,?,?,?,?,?
-     FROM users u JOIN properties p ON p.id=u.property_id
+     FROM properties p
+     JOIN property_ownerships po ON po.property_id=p.id AND po.status='active'
+     JOIN users u ON u.id=po.resident_id
      WHERE u.role='resident' AND u.status='active' AND p.street IN (${placeholders})`,
   ).bind(amountMinor, body.dueDate, body.billType.trim(), body.description?.trim() ?? null, batchId, ...streets).run();
   const count = inserted.meta.changes ?? 0;
@@ -254,10 +425,14 @@ app.get('/api/users', requireRoles('admin', 'cashier', 'security'), async (c) =>
   const role = c.req.query('role');
   const search = `%${c.req.query('search')?.trim() ?? ''}%`;
   const result = await c.env.DB.prepare(
-    `SELECT u.id, u.name, u.email, u.phone, u.role, u.status, u.property_id, p.unit_number, u.created_at
-     FROM users u LEFT JOIN properties p ON p.id = u.property_id
-     WHERE (? IS NULL OR u.role = ?) AND (u.name LIKE ? OR u.email LIKE ? OR u.phone LIKE ?)
-     ORDER BY u.created_at DESC LIMIT ? OFFSET ?`,
+    `SELECT u.id,u.name,u.email,u.phone,u.role,u.status,u.property_id,u.created_at,
+       GROUP_CONCAT(CASE WHEN po.status='active' THEN p.unit_number END, ', ') AS unit_numbers,
+       COUNT(CASE WHEN po.status='active' THEN 1 END) AS property_count
+     FROM users u
+     LEFT JOIN property_ownerships po ON po.resident_id=u.id AND po.status='active'
+     LEFT JOIN properties p ON p.id=po.property_id
+     WHERE (? IS NULL OR u.role=?) AND (u.name LIKE ? OR u.email LIKE ? OR u.phone LIKE ?)
+     GROUP BY u.id ORDER BY u.created_at DESC LIMIT ? OFFSET ?`,
   ).bind(role ?? null, role ?? null, search, search, search, limit, offset).all();
   return c.json({ items: result.results, page: pageNumber, limit });
 });
@@ -265,13 +440,28 @@ app.get('/api/users', requireRoles('admin', 'cashier', 'security'), async (c) =>
 app.post('/api/users', requireRoles('admin'), async (c) => {
   const body = await c.req.json<{ name?: string; email?: string; phone?: string; password?: string; role?: Role; propertyId?: string }>();
   if (!body.name?.trim() || !body.email?.trim() || !body.password || !body.role) return jsonError(c, 400, 'name, email, password and role are required');
-  if (!['admin', 'resident', 'security', 'cashier'].includes(body.role)) return jsonError(c, 400, 'Invalid role');
+  if (!['admin','resident','security','cashier'].includes(body.role)) return jsonError(c, 400, 'Invalid role');
+  if (body.propertyId && body.role !== 'resident') return jsonError(c, 400, 'Only resident accounts can own a property');
+  if (body.propertyId) {
+    const available = await c.env.DB.prepare(
+      `SELECT p.id FROM properties p WHERE p.id=? AND NOT EXISTS (SELECT 1 FROM property_ownerships po WHERE po.property_id=p.id AND po.status='active')`,
+    ).bind(body.propertyId).first();
+    if (!available) return jsonError(c, 409, 'Selected property is already owned or was not found');
+  }
   const id = crypto.randomUUID();
-  await c.env.DB.prepare(
-    `INSERT INTO users(id, name, email, phone, password_hash, role, property_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).bind(id, body.name.trim(), body.email.trim().toLowerCase(), body.phone?.trim() ?? null, await hashPassword(body.password), body.role, body.propertyId ?? null).run();
-  await audit(c, 'create', 'user', id, { role: body.role, email: body.email });
-  return c.json({ id }, 201);
+  const statements = [c.env.DB.prepare(
+    `INSERT INTO users(id,name,email,phone,password_hash,role,property_id) VALUES (?,?,?,?,?,?,?)`,
+  ).bind(id, body.name.trim(), body.email.trim().toLowerCase(), body.phone?.trim() ?? null, await hashPassword(body.password), body.role, body.propertyId ?? null)];
+  let ownershipId: string | null = null;
+  if (body.propertyId) {
+    ownershipId = crypto.randomUUID();
+    statements.push(c.env.DB.prepare(
+      `INSERT INTO property_ownerships(id,property_id,resident_id,status,approved_by) VALUES (?,?,?,'active',?)`,
+    ).bind(ownershipId, body.propertyId, id, c.get('user').id));
+  }
+  await c.env.DB.batch(statements);
+  await audit(c, 'create', 'user', id, { role: body.role, email: body.email, ownershipId });
+  return c.json({ id, ownershipId }, 201);
 });
 
 app.get('/api/bills', async (c) => {
@@ -351,17 +541,37 @@ app.post('/api/imports/bills', requireRoles('admin', 'cashier'), async (c) => {
     requireHeaders(table, ['amount','due_date','bill_type']);
   } catch (error) { return jsonError(c, 400, error instanceof Error ? error.message : 'Invalid CSV'); }
   const jobId = crypto.randomUUID();
+  const filename = (c.req.header('X-Filename') ?? 'bills.csv').slice(0, 200);
+  let archive: { key: string };
+  try {
+    const bytes = new TextEncoder().encode(text);
+    archive = await uploadToPrivateGitHub(c.env, {
+      body: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer,
+      originalName: filename,
+      contentType: 'text/csv',
+      uploadedBy: c.get('user').id,
+      category: 'billing-imports',
+      linkedEntityType: 'import_job',
+      linkedEntityId: jobId,
+    });
+  } catch (error) { return jsonError(c, 503, error instanceof Error ? error.message : 'Private GitHub storage is unavailable'); }
   const errors: Array<{ row: number; error: string }> = [];
   let successful = 0;
   for (const [index, row] of table.rows.entries()) {
     try {
       if (!row.resident_email && !row.unit_number) throw new Error('resident_email or unit_number is required');
-      const target = await c.env.DB.prepare(
-        `SELECT u.id AS resident_id,p.id AS property_id FROM users u JOIN properties p ON p.id=u.property_id
-         WHERE u.role='resident' AND u.status='active' AND ((? != '' AND lower(u.email)=lower(?)) OR (? != '' AND p.unit_number=?))
-         ORDER BY CASE WHEN ? != '' AND lower(u.email)=lower(?) THEN 0 ELSE 1 END LIMIT 1`,
-      ).bind(row.resident_email ?? '', row.resident_email ?? '', row.unit_number ?? '', row.unit_number ?? '', row.resident_email ?? '', row.resident_email ?? '').first<{ resident_id: string; property_id: string }>();
-      if (!target) throw new Error('No active resident/property match');
+      const matches = await c.env.DB.prepare(
+        `SELECT u.id AS resident_id,p.id AS property_id
+         FROM property_ownerships po
+         JOIN users u ON u.id=po.resident_id
+         JOIN properties p ON p.id=po.property_id
+         WHERE po.status='active' AND u.role='resident' AND u.status='active'
+           AND (?='' OR lower(u.email)=lower(?)) AND (?='' OR p.unit_number=?)
+         LIMIT 2`,
+      ).bind(row.resident_email ?? '', row.resident_email ?? '', row.unit_number ?? '', row.unit_number ?? '').all<{ resident_id: string; property_id: string }>();
+      if (!matches.results.length) throw new Error('No active resident/property ownership match');
+      if (matches.results.length > 1) throw new Error('Resident owns multiple properties; provide unit_number to identify the bill property');
+      const target = matches.results[0]!;
       const status = row.status || 'unpaid';
       if (!['unpaid','partial','paid','void'].includes(status)) throw new Error(`Invalid status: ${status}`);
       const amountMinor = moneyToMinor(row.amount!);
@@ -376,8 +586,7 @@ app.post('/api/imports/bills', requireRoles('admin', 'cashier'), async (c) => {
       errors.push({ row: index + 2, error: error instanceof Error ? error.message : String(error) });
     }
   }
-  const filename = (c.req.header('X-Filename') ?? 'bills.csv').slice(0, 200);
-  await saveImportJob(c.env.DB, jobId, 'bills', filename, table.rows.length, successful, errors, c.get('user').id);
+  await saveImportJob(c.env.DB, jobId, 'bills', filename, table.rows.length, successful, errors, c.get('user').id, archive.key);
   await audit(c, 'import', 'bills', jobId, { total: table.rows.length, successful, errors: errors.length });
   return c.json({ id: jobId, totalRows: table.rows.length, successfulRows: successful, errorRows: errors.length, errors: errors.slice(0, 100) }, errors.length ? 207 : 201);
 });
@@ -393,6 +602,20 @@ app.post('/api/imports/payments', requireRoles('admin', 'cashier'), async (c) =>
     requireHeaders(table, ['bill_reference','amount','payment_method','receipt_number']);
   } catch (error) { return jsonError(c, 400, error instanceof Error ? error.message : 'Invalid CSV'); }
   const jobId = crypto.randomUUID();
+  const filename = (c.req.header('X-Filename') ?? 'payments.csv').slice(0, 200);
+  let archive: { key: string };
+  try {
+    const bytes = new TextEncoder().encode(text);
+    archive = await uploadToPrivateGitHub(c.env, {
+      body: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer,
+      originalName: filename,
+      contentType: 'text/csv',
+      uploadedBy: c.get('user').id,
+      category: 'billing-imports',
+      linkedEntityType: 'import_job',
+      linkedEntityId: jobId,
+    });
+  } catch (error) { return jsonError(c, 503, error instanceof Error ? error.message : 'Private GitHub storage is unavailable'); }
   const errors: Array<{ row: number; error: string }> = [];
   let successful = 0;
   for (const [index, row] of table.rows.entries()) {
@@ -416,8 +639,7 @@ app.post('/api/imports/payments', requireRoles('admin', 'cashier'), async (c) =>
       errors.push({ row: index + 2, error: error instanceof Error ? error.message : String(error) });
     }
   }
-  const filename = (c.req.header('X-Filename') ?? 'payments.csv').slice(0, 200);
-  await saveImportJob(c.env.DB, jobId, 'payments', filename, table.rows.length, successful, errors, c.get('user').id);
+  await saveImportJob(c.env.DB, jobId, 'payments', filename, table.rows.length, successful, errors, c.get('user').id, archive.key);
   await audit(c, 'import', 'payments', jobId, { total: table.rows.length, successful, errors: errors.length });
   return c.json({ id: jobId, totalRows: table.rows.length, successfulRows: successful, errorRows: errors.length, errors: errors.slice(0, 100) }, errors.length ? 207 : 201);
 });
@@ -427,26 +649,32 @@ app.get('/api/visitors', async (c) => {
   const { limit, offset, page: pageNumber } = page(c);
   const residentId = user.role === 'resident' ? user.id : null;
   const result = await c.env.DB.prepare(
-    `SELECT v.*, u.name AS resident_name, p.unit_number FROM visitor_requests v
-     JOIN users u ON u.id=v.resident_id LEFT JOIN properties p ON p.id=u.property_id
+    `SELECT v.*,u.name AS resident_name,p.unit_number,p.street FROM visitor_requests v
+     JOIN users u ON u.id=v.resident_id LEFT JOIN properties p ON p.id=COALESCE(v.property_id,u.property_id)
      WHERE (? IS NULL OR v.resident_id=?) ORDER BY v.created_at DESC LIMIT ? OFFSET ?`,
   ).bind(residentId, residentId, limit, offset).all();
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
 app.post('/api/visitors', requireRoles('resident', 'admin'), async (c) => {
-  const body = await c.req.json<{ visitorName?: string; visitorPhone?: string; validFrom?: string; validUntil?: string; residentId?: string }>();
+  const body = await c.req.json<{ visitorName?: string; visitorPhone?: string; validFrom?: string; validUntil?: string; residentId?: string; propertyId?: string }>();
   if (!body.visitorName?.trim() || !body.validFrom || !body.validUntil) return jsonError(c, 400, 'visitorName, validFrom and validUntil are required');
   if (new Date(body.validUntil) <= new Date(body.validFrom)) return jsonError(c, 400, 'validUntil must be after validFrom');
   const residentId = c.get('user').role === 'resident' ? c.get('user').id : body.residentId;
   if (!residentId) return jsonError(c, 400, 'residentId is required');
+  const ownerships = await c.env.DB.prepare(
+    `SELECT property_id FROM property_ownerships WHERE resident_id=? AND status='active' AND (? IS NULL OR property_id=?) LIMIT 2`,
+  ).bind(residentId, body.propertyId ?? null, body.propertyId ?? null).all<{ property_id: string }>();
+  if (!ownerships.results.length) return jsonError(c, 400, 'The resident needs an approved property for this visitor pass');
+  if (!body.propertyId && ownerships.results.length > 1) return jsonError(c, 400, 'propertyId is required because the resident owns multiple properties');
+  const propertyId = ownerships.results[0]!.property_id;
   const id = crypto.randomUUID();
   const pin = String(crypto.getRandomValues(new Uint32Array(1))[0]! % 1_000_000).padStart(6, '0');
   const qrToken = randomToken(24);
   await c.env.DB.prepare(
-    `INSERT INTO visitor_requests(id,resident_id,visitor_name,visitor_phone,pin,qr_token,status,valid_from,valid_until) VALUES (?,?,?,?,?,?,'active',?,?)`,
-  ).bind(id, residentId, body.visitorName.trim(), body.visitorPhone?.trim() ?? null, pin, qrToken, body.validFrom, body.validUntil).run();
-  return c.json({ id, pin, qrToken }, 201);
+    `INSERT INTO visitor_requests(id,resident_id,property_id,visitor_name,visitor_phone,pin,qr_token,status,valid_from,valid_until) VALUES (?,?,?,?,?,?,?,'active',?,?)`,
+  ).bind(id, residentId, propertyId, body.visitorName.trim(), body.visitorPhone?.trim() ?? null, pin, qrToken, body.validFrom, body.validUntil).run();
+  return c.json({ id, propertyId, pin, qrToken }, 201);
 });
 
 app.post('/api/visitors/check', requireRoles('security', 'admin'), async (c) => {
@@ -471,20 +699,29 @@ app.get('/api/maintenance', async (c) => {
   const { limit, offset, page: pageNumber } = page(c);
   const residentId = user.role === 'resident' ? user.id : null;
   const result = await c.env.DB.prepare(
-    `SELECT m.*, u.name AS resident_name FROM maintenance_requests m JOIN users u ON u.id=m.resident_id
+    `SELECT m.*,u.name AS resident_name,p.unit_number,p.street FROM maintenance_requests m
+     JOIN users u ON u.id=m.resident_id LEFT JOIN properties p ON p.id=COALESCE(m.property_id,u.property_id)
      WHERE (? IS NULL OR m.resident_id=?) ORDER BY m.created_at DESC LIMIT ? OFFSET ?`,
   ).bind(residentId, residentId, limit, offset).all();
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
 app.post('/api/maintenance', requireRoles('resident', 'admin'), async (c) => {
-  const body = await c.req.json<{ description?: string; photoKey?: string; residentId?: string }>();
+  const body = await c.req.json<{ description?: string; photoKey?: string; residentId?: string; propertyId?: string }>();
   if (!body.description?.trim()) return jsonError(c, 400, 'description is required');
   const residentId = c.get('user').role === 'resident' ? c.get('user').id : body.residentId;
   if (!residentId) return jsonError(c, 400, 'residentId is required');
+  const ownerships = await c.env.DB.prepare(
+    `SELECT property_id FROM property_ownerships WHERE resident_id=? AND status='active' AND (? IS NULL OR property_id=?) LIMIT 2`,
+  ).bind(residentId, body.propertyId ?? null, body.propertyId ?? null).all<{ property_id: string }>();
+  if (!ownerships.results.length) return jsonError(c, 400, 'The resident needs an approved property for this maintenance request');
+  if (!body.propertyId && ownerships.results.length > 1) return jsonError(c, 400, 'propertyId is required because the resident owns multiple properties');
+  const propertyId = ownerships.results[0]!.property_id;
   const id = crypto.randomUUID();
-  await c.env.DB.prepare(`INSERT INTO maintenance_requests(id,resident_id,description,photo_key) VALUES (?,?,?,?)`).bind(id, residentId, body.description.trim(), body.photoKey ?? null).run();
-  return c.json({ id }, 201);
+  await c.env.DB.prepare(
+    `INSERT INTO maintenance_requests(id,resident_id,property_id,description,photo_key) VALUES (?,?,?,?,?)`,
+  ).bind(id, residentId, propertyId, body.description.trim(), body.photoKey ?? null).run();
+  return c.json({ id, propertyId }, 201);
 });
 
 app.patch('/api/maintenance/:id', requireRoles('admin'), async (c) => {
@@ -567,30 +804,38 @@ app.post('/api/incidents', requireRoles('security', 'admin'), async (c) => {
 });
 
 app.post('/api/files', async (c) => {
-  if (!c.env.FILES) return jsonError(c, 503, 'Private file storage is disabled on this deployment');
-  const contentType = c.req.header('Content-Type') ?? 'application/octet-stream';
+  const contentType = (c.req.header('Content-Type') ?? 'application/octet-stream').split(';')[0]!.trim().toLowerCase();
   const length = Number(c.req.header('Content-Length') ?? 0);
-  if (length > 500_000) return jsonError(c, 413, 'File exceeds the 500 KB compressed upload limit');
+  if (length > MAX_GITHUB_FILE_SIZE) return jsonError(c, 413, 'File exceeds the 4 MB upload limit');
+  if (!/^image\/(jpeg|png|webp)$/i.test(contentType) && !['application/pdf','text/csv'].includes(contentType)) {
+    return jsonError(c, 400, 'Only JPEG, PNG, WebP, PDF, and CSV files are accepted');
+  }
   const body = await c.req.arrayBuffer();
-  if (body.byteLength === 0 || body.byteLength > 500_000) return jsonError(c, 413, 'File must be between 1 byte and 500 KB');
-  if (!/^image\/(jpeg|png|webp)$/i.test(contentType) && contentType !== 'application/pdf') return jsonError(c, 400, 'Only JPEG, PNG, WebP, and PDF are accepted');
-  const extension = contentType === 'application/pdf' ? 'pdf' : contentType.split('/')[1]!.replace('jpeg','jpg');
-  const key = `private/${c.get('user').id}/${new Date().toISOString().slice(0,10)}/${crypto.randomUUID()}.${extension}`;
-  await c.env.FILES.put(key, body, { httpMetadata: { contentType }, customMetadata: { owner: c.get('user').id } });
-  return c.json({ key }, 201);
+  if (!body.byteLength || body.byteLength > MAX_GITHUB_FILE_SIZE) return jsonError(c, 413, 'File must be between 1 byte and 4 MB');
+  try {
+    const stored = await uploadToPrivateGitHub(c.env, {
+      body,
+      originalName: (c.req.header('X-Filename') ?? `upload-${Date.now()}`).slice(0, 200),
+      contentType,
+      uploadedBy: c.get('user').id,
+      category: (c.req.header('X-File-Category') ?? 'general').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 50) || 'general',
+    });
+    await audit(c, 'upload', 'stored_file', stored.key, { filename: stored.filename, size: stored.size });
+    return c.json(stored, 201);
+  } catch (error) {
+    return jsonError(c, 503, error instanceof Error ? error.message : 'Private GitHub storage is unavailable');
+  }
 });
 
 app.get('/api/files/*', async (c) => {
-  if (!c.env.FILES) return jsonError(c, 503, 'Private file storage is disabled on this deployment');
-  const key = c.req.path.replace('/api/files/', '');
-  const object = await c.env.FILES.get(key);
-  if (!object) return jsonError(c, 404, 'File not found');
-  const owner = object.customMetadata?.owner;
-  if (c.get('user').role === 'resident' && owner !== c.get('user').id) return jsonError(c, 403, 'File access denied');
-  const headers = new Headers();
-  object.writeHttpMetadata(headers);
-  headers.set('Cache-Control', 'private, max-age=300');
-  return new Response(object.body, { headers });
+  const key = decodeURIComponent(c.req.path.replace('/api/files/', ''));
+  try {
+    const response = await downloadFromPrivateGitHub(c.env, key, c.get('user'));
+    return response ?? jsonError(c, 404, 'File not found');
+  } catch (error) {
+    if (error instanceof Error && error.message === 'FILE_ACCESS_DENIED') return jsonError(c, 403, 'File access denied');
+    return jsonError(c, 503, error instanceof Error ? error.message : 'Private GitHub storage is unavailable');
+  }
 });
 
 app.get('/api/access/cards', async (c) => {
@@ -747,6 +992,43 @@ app.patch('/api/access/operations/:id', requireRoles('admin'), async (c) => {
   return c.json({ ok: true });
 });
 
+app.get('/api/storage-settings', requireRoles('admin'), async (c) => {
+  return c.json(await publicStorageSettings(c.env.DB));
+});
+
+app.put('/api/storage-settings', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<{
+    enabled?: boolean;
+    owner?: string;
+    repository?: string;
+    branch?: string;
+    basePath?: string;
+    accessToken?: string;
+  }>();
+  if (typeof body.enabled !== 'boolean' || !body.owner || !body.repository) return jsonError(c, 400, 'enabled, owner and repository are required');
+  try {
+    const settings = await saveStorageSettings(c.env, c.get('user').id, {
+      enabled: body.enabled,
+      owner: body.owner,
+      repository: body.repository,
+      branch: body.branch ?? 'main',
+      basePath: body.basePath ?? 'uploads',
+      accessToken: body.accessToken,
+    });
+    await audit(c, 'update', 'github_storage_settings', 'default', {
+      enabled: settings.enabled,
+      owner: settings.owner,
+      repository: settings.repository,
+      branch: settings.branch,
+      basePath: settings.basePath,
+      accessTokenChanged: Boolean(body.accessToken),
+    });
+    return c.json(settings);
+  } catch (error) {
+    return jsonError(c, 400, error instanceof Error ? error.message : 'Could not save GitHub storage settings');
+  }
+});
+
 app.get('/api/settings', requireRoles('admin'), async (c) => {
   const result = await c.env.DB.prepare(`SELECT key,value,updated_at FROM settings ORDER BY key`).all();
   return c.json({ items: result.results });
@@ -786,12 +1068,13 @@ async function saveImportJob(
   successful: number,
   errors: Array<{ row: number; error: string }>,
   uploadedBy: string,
+  storageKey: string,
 ): Promise<void> {
   const status = successful === 0 && errors.length ? 'failed' : errors.length ? 'completed_with_errors' : 'completed';
   await db.prepare(
-    `INSERT INTO import_jobs(id,kind,filename,status,total_rows,successful_rows,error_rows,errors_json,uploaded_by)
-     VALUES (?,?,?,?,?,?,?,?,?)`,
-  ).bind(id, kind, filename, status, total, successful, errors.length, errors.length ? JSON.stringify(errors.slice(0, 100)) : null, uploadedBy).run();
+    `INSERT INTO import_jobs(id,kind,filename,status,total_rows,successful_rows,error_rows,errors_json,uploaded_by,storage_key)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+  ).bind(id, kind, filename, status, total, successful, errors.length, errors.length ? JSON.stringify(errors.slice(0, 100)) : null, uploadedBy, storageKey).run();
 }
 
 async function reconcileBill(db: D1Database, billId: string): Promise<void> {

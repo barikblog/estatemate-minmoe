@@ -1,6 +1,6 @@
 # EstateMate — Cloudflare + Hikvision MinMoe (No On-site PC)
 
-EstateMate is a residential-estate operations platform with a responsive React portal, Kotlin/Compose Android client, and Cloudflare Worker API backed by D1, R2, Queues, and Durable Objects.
+EstateMate is a residential-estate operations platform with a responsive React portal, Kotlin/Compose Android client, and Cloudflare Worker API backed by D1, Queues, Durable Objects, and an administrator-configurable private GitHub upload repository.
 
 This repository replaces the original on-site Edge Sync Agent with direct **Hikvision HTTP Listening** event upload. A supported MinMoe terminal sends access events over outbound HTTPS to the Worker, so no PC is required at the estate for event collection.
 
@@ -14,15 +14,16 @@ This is a deployable foundation/MVP, not a claim that every screen in the origin
 Included:
 
 - One Cloudflare Worker serving the SPA and `/api/*`.
-- D1 schema for users, streets/properties, billing, historical bill/payment imports, visitors, maintenance, general estate notices, access cards, access events, devices, operations, settings, and audit records.
+- D1 schema for users, multi-property ownership and approval requests, streets/properties, billing, historical bill/payment imports, visitors, maintenance, general estate notices, access cards, access events, devices, operations, settings, and audit records.
 - Direct MinMoe JSON/XML/multipart HTTP Listening ingestion.
 - Per-device one-time credentials; Queue buffering; D1 event persistence; Durable Object live WebSocket feed.
 - Hourly facility-fee expiry/reactivation job and hardware-action audit queue.
 - Role-aware React portal for Administrator, Resident, Cashier, and Security.
 - General estate notices with priority, scheduling, read acknowledgements, and login popups; the former Community posting feature is removed.
 - Street-targeted batch billing and audited CSV imports for pre-existing bills and resident payments (500 rows/2 MB per upload).
+- Residents can own multiple administrator-approved properties; they can request an existing unowned unit or propose a new property, while each property retains one active owner.
 - Kotlin/Compose Android foundation with encrypted token storage, Retrofit/Hilt, Room event cache, role dashboard, and gate history.
-- Optional R2 private upload/download route with ownership checks and a 500 KB limit. The current production config disables uploads because the account owner requested no service requiring paid activation.
+- Private GitHub-backed upload/download storage with encrypted-at-rest repository access tokens, administrator-editable settings, access checks, and a 4 MB per-file limit. Paid R2 storage remains disabled.
 - PBKDF2-SHA256 passwords and HS256 sessions implemented with Workers Web Crypto.
 - Tests for password/JWT code and Hikvision JSON/XML/multipart parsing.
 
@@ -33,7 +34,7 @@ Still model/account dependent:
 - Gemini enrichment, FCM delivery, large GitHub exports, and full accounting/reconciliation UI.
 - Android production signing, push configuration, and Play distribution.
 
-See [`docs/MINMOE-NO-PC.md`](docs/MINMOE-NO-PC.md) before installing a terminal.
+See [`docs/MINMOE-NO-PC.md`](docs/MINMOE-NO-PC.md) before installing a terminal. Multi-property rules and private upload setup are documented in [`docs/MULTI-PROPERTY-OWNERSHIP.md`](docs/MULTI-PROPERTY-OWNERSHIP.md) and [`docs/GITHUB-STORAGE.md`](docs/GITHUB-STORAGE.md).
 
 ## Architecture
 
@@ -42,7 +43,7 @@ MinMoe terminal ── outbound HTTPS event POST ──┐
                                                 │
 React portal / Android ── HTTPS REST ──────────▶ Cloudflare Worker
                                                    ├── D1
-                                                   ├── R2
+                                                   ├── private GitHub repository API
                                                    ├── access-events Queue
                                                    ├── AccessLiveFeed Durable Object
                                                    └── hourly Cron
@@ -96,7 +97,7 @@ Requirements: Node.js 22+, npm 10+, and a Cloudflare account for remote resource
 
 ```bash
 cp .dev.vars.example .dev.vars
-# Fill JWT_SECRET, BOOTSTRAP_TOKEN and DEVICE_INGEST_PEPPER.
+# Fill JWT_SECRET, BOOTSTRAP_TOKEN, DEVICE_INGEST_PEPPER and STORAGE_ENCRYPTION_KEY.
 npm install
 npm run build:web
 npm run db:migrate:local
@@ -131,21 +132,23 @@ Detailed steps are in [`docs/CLOUDFLARE-DEPLOYMENT.md`](docs/CLOUDFLARE-DEPLOYME
 Summary:
 
 1. Create D1 database `estatemate-db` and replace the placeholder `database_id` in `wrangler.jsonc`.
-2. Create R2 bucket `estatemate-private`.
-3. Create queues `estatemate-access-events` and `estatemate-access-events-dlq`.
+2. Create queues `estatemate-access-events` and `estatemate-access-events-dlq`.
+3. Create a dedicated **private** GitHub repository for uploads.
 4. Set Worker secrets:
    - `JWT_SECRET`
    - `BOOTSTRAP_TOKEN`
    - `DEVICE_INGEST_PEPPER`
-   - optional `GEMINI_API_KEY`, `GITHUB_TOKEN`
+   - `STORAGE_ENCRYPTION_KEY`
+   - optional `GEMINI_API_KEY`
 5. Run the D1 migrations and deploy.
+6. In **Settings → Private GitHub upload storage**, enter the repository and a fine-grained token limited to that private repository's Contents permission.
 
 ```bash
 npx wrangler d1 migrations apply estatemate-db --remote
 npm run deploy
 ```
 
-A scoped token needs permissions for Workers Scripts, D1, R2, Queues, account metadata, and Workers routes only if a custom route is used. Never commit tokens or device passwords.
+A scoped Cloudflare token needs permissions for Workers Scripts, D1, Queues, account metadata, and Workers routes only if a custom route is used. Never commit Cloudflare, GitHub, or device credentials.
 
 ## MinMoe setup
 
@@ -180,8 +183,9 @@ Production builds require your own signing key. Do not commit a keystore or its 
 
 - Device secrets are SHA-256 hashed with a server-side pepper. The plaintext secret is shown once.
 - Query-string device keys are provided only because some terminal firmware lacks listener authentication. They are protected in transit by HTTPS but can appear in logs; Basic authentication is preferred where tested.
-- Device request bodies are capped at 2 MB. User files are capped at 500 KB and stored privately in R2.
-- A resident’s bills, cards, visitors, maintenance requests, files, and access events are scoped server-side.
+- Device request bodies are capped at 2 MB. User files are capped at 4 MB and stored through the GitHub Contents API in a dedicated private repository.
+- The GitHub storage token is encrypted with `STORAGE_ENCRYPTION_KEY`, never returned by the API, and should be a fine-grained token limited to the storage repository.
+- A resident’s properties, ownership requests, bills, cards, visitors, maintenance requests, files, and access events are scoped server-side.
 - Device events are idempotent on `(device_id, vendor_event_id)`.
 - Images embedded in multipart device events are not stored in this MVP; only normalized event metadata is retained.
 - The Worker returns HTTP 200 quickly after Queue acceptance because many Hikvision devices retry events when acknowledgement is delayed.

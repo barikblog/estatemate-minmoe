@@ -5,14 +5,13 @@
 - Cloudflare Account ID.
 - Scoped Cloudflare API token; do not use a Global API Key.
 - Node.js 22+ and npm 10+.
-- R2 enabled on the account.
+- A dedicated private GitHub repository for free-only upload storage.
 - A chosen Worker name and optional custom domain.
 
 Suggested token permissions:
 
 - Account / Workers Scripts: Edit
 - Account / D1: Edit
-- Account / Workers R2 Storage: Edit
 - Account / Queues: Edit
 - Account / Account Settings: Read
 - Zone / Workers Routes: Edit only when attaching a route to an existing zone
@@ -34,7 +33,6 @@ Do not add these exports to a tracked shell script.
 
 ```bash
 npx wrangler d1 create estatemate-db
-npx wrangler r2 bucket create estatemate-private
 npx wrangler queues create estatemate-access-events
 npx wrangler queues create estatemate-access-events-dlq
 ```
@@ -43,12 +41,13 @@ Copy the D1 UUID into `wrangler.jsonc` at `d1_databases[0].database_id`. Change 
 
 ## 3. Generate and set secrets
 
-Generate three independent random values:
+Generate four independent random values:
 
 ```bash
 openssl rand -base64 48   # JWT_SECRET
 openssl rand -base64 32   # BOOTSTRAP_TOKEN
 openssl rand -base64 48   # DEVICE_INGEST_PEPPER
+openssl rand -base64 48   # STORAGE_ENCRYPTION_KEY
 ```
 
 Set each without putting it on the command line:
@@ -57,16 +56,16 @@ Set each without putting it on the command line:
 npx wrangler secret put JWT_SECRET
 npx wrangler secret put BOOTSTRAP_TOKEN
 npx wrangler secret put DEVICE_INGEST_PEPPER
+npx wrangler secret put STORAGE_ENCRYPTION_KEY
 ```
 
 Optional:
 
 ```bash
 npx wrangler secret put GEMINI_API_KEY
-npx wrangler secret put GITHUB_TOKEN
 ```
 
-`GITHUB_OWNER` and `GITHUB_REPO` can be non-secret Worker vars when export support is enabled.
+After deployment, configure the private storage repository under **Settings → Private GitHub upload storage**. The repository owner, name, branch, and folder are editable there. Enter a fine-grained token limited to that private repository's **Contents: Read and write** permission. EstateMate encrypts the token with `STORAGE_ENCRYPTION_KEY` before persisting it in D1 and never returns it to a client.
 
 ## 4. Migrate and deploy
 
