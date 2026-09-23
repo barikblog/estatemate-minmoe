@@ -1,7 +1,8 @@
 import type { Env, JwtClaims, Role } from './types';
 
 const encoder = new TextEncoder();
-const PBKDF2_ITERATIONS = 210_000;
+// Cloudflare Workers Web Crypto currently caps PBKDF2 at 100,000 iterations.
+const PBKDF2_ITERATIONS = 100_000;
 
 export function base64Url(bytes: Uint8Array): string {
   let binary = '';
