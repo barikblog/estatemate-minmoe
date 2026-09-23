@@ -335,14 +335,29 @@ function Operations() {
 function Settings() {
   const list = useList('/api/settings');
   const [message, setMessage] = useState('');
+  const [passwordMessage, setPasswordMessage] = useState('');
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = new FormData(event.currentTarget); const value = String(form.get('value') ?? '');
     try { await api('/api/settings/facility_fee_grace_period_days', { method: 'PUT', body: JSON.stringify({ value }) }); setMessage('Grace period updated.'); list.reload(); }
     catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Failed'); }
   }
+  async function changePassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setPasswordMessage('');
+    const form = event.currentTarget;
+    const values = Object.fromEntries(new FormData(form));
+    if (values.newPassword !== values.confirmPassword) { setPasswordMessage('New passwords do not match.'); return; }
+    try {
+      await api('/api/auth/change-password', { method: 'POST', body: JSON.stringify({ currentPassword: values.currentPassword, newPassword: values.newPassword }) });
+      form.reset();
+      setPasswordMessage('Password changed successfully.');
+    } catch (reason) { setPasswordMessage(reason instanceof Error ? reason.message : 'Password change failed'); }
+  }
   return <PagePanel title="Settings" subtitle="Estate-wide operational rules">
     {message && <Notice tone={message.includes('updated') ? 'success' : 'error'}>{message}</Notice>}
     <FormCard title="Facility-fee enforcement" onSubmit={submit}><label>Grace period (days)<input name="value" type="number" min="0" max="365" defaultValue={String(list.data?.items.find((item) => item.key === 'facility_fee_grace_period_days')?.value ?? '7')} required /></label><button className="primary">Save rule</button></FormCard>
+    {passwordMessage && <Notice tone={passwordMessage.includes('successfully') ? 'success' : 'error'}>{passwordMessage}</Notice>}
+    <FormCard title="Change my password" onSubmit={changePassword}><label>Current password<input name="currentPassword" type="password" autoComplete="current-password" required /></label><label>New password<input name="newPassword" type="password" minLength={12} autoComplete="new-password" required /></label><label>Confirm new password<input name="confirmPassword" type="password" minLength={12} autoComplete="new-password" required /></label><button className="primary">Change password</button></FormCard>
     <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['key','Setting'],['value','Value'],['updated_at','Updated','date']]} /></ListState>
   </PagePanel>;
 }

@@ -143,6 +143,18 @@ app.use('/api/*', requireAuth);
 
 app.get('/api/auth/me', (c) => c.json({ user: c.get('user') }));
 
+app.post('/api/auth/change-password', async (c) => {
+  const body = await c.req.json<{ currentPassword?: string; newPassword?: string }>();
+  if (!body.currentPassword || !body.newPassword) return jsonError(c, 400, 'currentPassword and newPassword are required');
+  if (body.newPassword.length < 12) return jsonError(c, 400, 'New password must contain at least 12 characters');
+  const user = c.get('user');
+  const row = await c.env.DB.prepare(`SELECT password_hash FROM users WHERE id=?`).bind(user.id).first<{ password_hash: string }>();
+  if (!row || !(await verifyPassword(body.currentPassword, row.password_hash))) return jsonError(c, 401, 'Current password is incorrect');
+  await c.env.DB.prepare(`UPDATE users SET password_hash=?,updated_at=datetime('now') WHERE id=?`).bind(await hashPassword(body.newPassword), user.id).run();
+  await audit(c, 'change_password', 'user', user.id);
+  return c.json({ ok: true });
+});
+
 app.get('/api/dashboard', async (c) => {
   const user = c.get('user');
   if (user.role === 'resident') {
