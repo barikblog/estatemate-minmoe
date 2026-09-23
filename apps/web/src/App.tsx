@@ -2,7 +2,7 @@ import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from 
 import { ApiError, ListResponse, User, api, money, readableDate } from './api';
 
 type Row = Record<string, unknown>;
-type Section = 'dashboard' | 'residents' | 'properties' | 'bills' | 'visitors' | 'maintenance' | 'community' | 'cards' | 'events' | 'devices' | 'operations' | 'settings';
+type Section = 'dashboard' | 'residents' | 'properties' | 'bills' | 'visitors' | 'maintenance' | 'notices' | 'cards' | 'events' | 'devices' | 'operations' | 'settings';
 
 interface NavItem { id: Section; label: string; roles?: User['role'][] }
 const navItems: NavItem[] = [
@@ -12,7 +12,7 @@ const navItems: NavItem[] = [
   { id: 'bills', label: 'Bills & payments', roles: ['admin', 'cashier', 'resident'] },
   { id: 'visitors', label: 'Visitors' },
   { id: 'maintenance', label: 'Maintenance', roles: ['admin', 'resident'] },
-  { id: 'community', label: 'Community' },
+  { id: 'notices', label: 'Estate notices' },
   { id: 'cards', label: 'Access cards', roles: ['admin', 'cashier', 'resident'] },
   { id: 'events', label: 'Gate activity', roles: ['admin', 'security', 'resident'] },
   { id: 'devices', label: 'MinMoe devices', roles: ['admin', 'security'] },
@@ -78,19 +78,48 @@ function Notice({ children, tone = 'info' }: { children: ReactNode; tone?: 'info
   return <div className={`notice ${tone}`}>{children}</div>;
 }
 
+function EstateNoticePopup({ notice, remaining, onAcknowledge }: { notice: Row; remaining: number; onAcknowledge: () => void }) {
+  const severity = String(notice.severity ?? 'info');
+  return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="estate-notice-title">
+    <section className={`notice-modal ${severity}`}>
+      <div className="notice-symbol">{severity === 'urgent' ? '!' : severity === 'important' ? '◆' : 'i'}</div>
+      <p className="eyebrow">GENERAL ESTATE NOTICE</p>
+      <h2 id="estate-notice-title">{String(notice.title)}</h2>
+      <p className="notice-body">{String(notice.body)}</p>
+      {Boolean(notice.published_until) && <small>Valid until {readableDate(notice.published_until)}</small>}
+      <button className="primary wide" onClick={onAcknowledge}>{notice.requires_acknowledgement ? 'I have read this notice' : 'Close notice'}</button>
+      {remaining > 0 && <small className="remaining">{remaining} more notice{remaining === 1 ? '' : 's'} waiting</small>}
+    </section>
+  </div>;
+}
+
 function App() {
   const [user, setUser] = useState<User | null>(null);
   const [section, setSection] = useState<Section>('dashboard');
   const [checking, setChecking] = useState(true);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [popupNotices, setPopupNotices] = useState<Row[]>([]);
 
   useEffect(() => {
     api<{ user: User }>('/api/auth/me').then((result) => setUser(result.user)).catch(() => setUser(null)).finally(() => setChecking(false));
   }, []);
 
+  useEffect(() => {
+    if (!user) { setPopupNotices([]); return; }
+    api<{ items: Row[] }>('/api/notices/popup').then((result) => setPopupNotices(result.items)).catch(() => setPopupNotices([]));
+  }, [user?.id]);
+
   async function logout() {
     await api('/api/auth/logout', { method: 'POST' });
     setUser(null);
+  }
+
+  async function acknowledgePopup() {
+    const current = popupNotices[0];
+    if (!current) return;
+    try { await api(`/api/notices/${current.id}/acknowledge`, { method: 'POST' }); } finally {
+      setPopupNotices((items) => items.slice(1));
+    }
   }
 
   if (checking) return <div className="splash"><div className="brand-mark">EM</div><span>Loading EstateMate…</span></div>;
@@ -112,6 +141,7 @@ function App() {
       <header className="topbar"><button className="icon-button mobile-menu" onClick={() => setMenuOpen(true)}>☰</button><div><p className="eyebrow">{user.role} workspace</p><h1>{current.label}</h1></div><div className="top-status"><span className="pulse-dot" /> System online</div></header>
       <div className="content"><SectionView section={section} user={user} /></div>
     </main>
+    {popupNotices[0] && <EstateNoticePopup notice={popupNotices[0]} remaining={popupNotices.length - 1} onAcknowledge={acknowledgePopup} />}
   </div>;
 }
 
@@ -123,7 +153,7 @@ function SectionView({ section, user }: { section: Section; user: User }) {
     case 'bills': return <Bills user={user} />;
     case 'visitors': return <Visitors user={user} />;
     case 'maintenance': return <Maintenance user={user} />;
-    case 'community': return <Community user={user} />;
+    case 'notices': return <EstateNotices user={user} />;
     case 'cards': return <Cards user={user} />;
     case 'events': return <AccessEvents user={user} />;
     case 'devices': return <Devices user={user} />;
@@ -152,7 +182,7 @@ function Dashboard({ user }: { user: User }) {
   return <>
     <section className="hero-card"><div><p className="eyebrow">Tuesday operations</p><h2>Good day, {user.name.split(' ')[0]}.</h2><p>Here is the latest picture across your estate.</p></div><div className="hero-orb"><span>EM</span></div></section>
     <section className="stat-grid">{cards.map(([label, value, detail]) => <article className="stat-card" key={String(label)}><p>{label}</p><strong>{String(value ?? 0)}</strong><small>{detail}</small></article>)}</section>
-    {user.role === 'resident' && Boolean(data?.latestAnnouncement) && <section className="panel"><div className="panel-title"><div><p className="eyebrow">Latest announcement</p><h3>{String((data?.latestAnnouncement as Row).title)}</h3></div></div><p>{String((data?.latestAnnouncement as Row).body)}</p></section>}
+    {user.role === 'resident' && Boolean(data?.latestNotice) && <section className="panel"><div className="panel-title"><div><p className="eyebrow">Latest estate notice</p><h3>{String((data?.latestNotice as Row).title)}</h3></div></div><p>{String((data?.latestNotice as Row).body)}</p></section>}
     {user.role !== 'resident' && <section className="split-grid"><article className="panel callout"><p className="eyebrow">HARDWARE MODE</p><h3>Direct MinMoe event upload</h3><p>Terminals post gate events straight to Cloudflare. Card changes remain in the hardware-action queue until a supported command channel is confirmed.</p></article><article className="panel"><p className="eyebrow">OPERATIONS TIP</p><h3>Check unresolved device actions</h3><p>HTTP Listening is upload-only on most firmware. Mark each manual terminal update as applied to preserve an accurate audit trail.</p></article></section>}
   </>;
 }
@@ -189,16 +219,78 @@ function Properties({ user }: { user: User }) {
     await api('/api/properties', { method: 'POST', body: JSON.stringify(values) }); setShow(false); list.reload();
   }
   return <PagePanel title="Properties" subtitle="Units, addresses and assignments" action={user.role === 'admin' ? <button className="primary" onClick={() => setShow(!show)}>Add property</button> : null}>
-    {show && <FormCard title="New property" onSubmit={submit}><label>Unit number<input name="unitNumber" required /></label><label className="span-2">Address<input name="address" required /></label><button className="primary">Save property</button></FormCard>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['unit_number','Unit'],['address','Address'],['owner_name','Owner'],['created_at','Created','date']]} /></ListState>
+    {show && <FormCard title="New property" onSubmit={submit}><label>Unit number<input name="unitNumber" required /></label><label>Street<input name="street" placeholder="Example: Unity Street" required /></label><label>Address<input name="address" required /></label><button className="primary">Save property</button></FormCard>}
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['unit_number','Unit'],['street','Street'],['address','Address'],['owner_name','Owner'],['created_at','Created','date']]} /></ListState>
   </PagePanel>;
 }
 
 function Bills({ user }: { user: User }) {
   const list = useList('/api/bills?limit=50');
-  return <PagePanel title="Bills & payments" subtitle={user.role === 'resident' ? 'Your charges and payment status' : 'Estate receivables and collections'}>
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['resident_name','Resident'],['unit_number','Unit'],['bill_type','Type'],['amount_minor','Amount','money'],['paid_minor','Paid','money'],['due_date','Due'],['status','Status']]} /></ListState>
+  const streets = useAsync<{ items: Row[] }>(() => user.role === 'resident' ? Promise.resolve({ items: [] }) : api('/api/streets'), [user.role]);
+  const imports = useAsync<ListResponse<Row>>(() => user.role === 'resident' ? Promise.resolve({ items: [], page: 1, limit: 20 }) : api('/api/imports?limit=20'), [user.role]);
+  const [showBatch, setShowBatch] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  const [message, setMessage] = useState('');
+
+  async function createStreetBatch(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setMessage('');
+    const form = new FormData(event.currentTarget);
+    const amount = Number(form.get('amount'));
+    const body = {
+      name: form.get('name'), streets: form.getAll('streets'), amountMinor: Math.round(amount * 100),
+      dueDate: form.get('dueDate'), billType: form.get('billType'), description: form.get('description'),
+    };
+    try {
+      const result = await api<{ billCount: number; streets: string[] }>('/api/bills/batch', { method: 'POST', body: JSON.stringify(body) });
+      setMessage(`${result.billCount} bill${result.billCount === 1 ? '' : 's'} created for ${result.streets.join(', ')}.`);
+      setShowBatch(false); list.reload();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Batch billing failed'); }
+  }
+
+  const staff = user.role === 'admin' || user.role === 'cashier';
+  return <PagePanel title="Bills & payments" subtitle={user.role === 'resident' ? 'Your charges and payment status' : 'Estate receivables, street billing and historical imports'} action={staff ? <div className="row-actions"><button className="secondary" onClick={() => setShowImport(!showImport)}>Import CSV</button><button className="primary" onClick={() => setShowBatch(!showBatch)}>Bill selected streets</button></div> : null}>
+    {message && <Notice tone={message.includes('created') ? 'success' : 'error'}>{message}</Notice>}
+    {showBatch && <FormCard title="Create bills for selected streets" onSubmit={createStreetBatch}>
+      <label>Batch name<input name="name" placeholder="2026 facility fee" required /></label>
+      <label>Amount (NGN)<input name="amount" type="number" min="0.01" step="0.01" required /></label>
+      <label>Due date<input name="dueDate" type="date" required /></label>
+      <label>Bill type<input name="billType" defaultValue="facility_fee" required /></label>
+      <label className="span-2">Description<input name="description" /></label>
+      <fieldset className="street-picker span-2"><legend>Streets to bill</legend>{streets.loading && <small>Loading streets…</small>}{streets.data?.items.map((street) => <label className="check" key={String(street.street)}><input type="checkbox" name="streets" value={String(street.street)} /> <span>{String(street.street)} <small>({String(street.property_count)} properties)</small></span></label>)}{!streets.loading && !streets.data?.items.length && <Notice tone="warning">Add street names to properties before using street billing.</Notice>}</fieldset>
+      <button className="primary">Create street bills</button>
+    </FormCard>}
+    {showImport && <section className="import-grid">
+      <CsvImporter kind="bills" title="Import existing bills" onDone={() => { list.reload(); imports.reload(); }} />
+      <CsvImporter kind="payments" title="Import resident payments" onDone={() => { list.reload(); imports.reload(); }} />
+    </section>}
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['bill_type','Type'],['batch_name','Batch'],['external_reference','External ref.'],['amount_minor','Amount','money'],['paid_minor','Paid','money'],['due_date','Due'],['status','Status']]} /></ListState>
+    {staff && imports.data && imports.data.items.length > 0 && <section className="import-history"><h3>Recent imports</h3><DataTable rows={imports.data.items} columns={[['kind','Type'],['filename','File'],['status','Status'],['total_rows','Rows'],['successful_rows','Imported'],['error_rows','Errors'],['created_at','Uploaded','date']]} /></section>}
   </PagePanel>;
+}
+
+function CsvImporter({ kind, title, onDone }: { kind: 'bills'|'payments'; title: string; onDone: () => void }) {
+  const [result, setResult] = useState('');
+  const [busy, setBusy] = useState(false);
+  const template = kind === 'bills'
+    ? 'external_reference,unit_number,resident_email,amount,currency,due_date,bill_type,description,status,created_at\nBILL-001,A-01,resident@example.com,25000,NGN,2026-12-31,facility_fee,Imported facility fee,unpaid,2026-01-01\n'
+    : 'external_reference,bill_reference,amount,payment_method,receipt_number,status,type,submitted_at\nPAY-001,BILL-001,25000,bank_transfer,OLD-RECEIPT-001,approved,payment,2026-02-01\n';
+  function downloadTemplate() {
+    const url = URL.createObjectURL(new Blob([template], { type: 'text/csv' }));
+    const link = document.createElement('a'); link.href = url; link.download = `${kind}-import-template.csv`; link.click(); URL.revokeObjectURL(url);
+  }
+  async function upload(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setResult(''); setBusy(true);
+    const input = event.currentTarget.elements.namedItem('file') as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) { setResult('Choose a CSV file.'); setBusy(false); return; }
+    try {
+      const response = await api<{ successfulRows: number; errorRows: number; errors: Array<{ row: number; error: string }> }>(`/api/imports/${kind}`, { method: 'POST', body: await file.text(), headers: { 'Content-Type': 'text/csv', 'X-Filename': file.name } });
+      const firstError = response.errors[0] ? ` First error: row ${response.errors[0].row} — ${response.errors[0].error}` : '';
+      setResult(`${response.successfulRows} imported; ${response.errorRows} failed.${firstError}`); onDone();
+    } catch (reason) { setResult(reason instanceof Error ? reason.message : 'Import failed'); }
+    finally { setBusy(false); }
+  }
+  return <form className="form-card import-card" onSubmit={upload}><h3>{title}</h3><p>Maximum 500 rows and 2 MB per upload. Duplicate references are rejected safely.</p><input name="file" type="file" accept=".csv,text/csv" required /><div className="row-actions"><button type="button" className="secondary" onClick={downloadTemplate}>Download template</button><button className="primary" disabled={busy}>{busy ? 'Importing…' : 'Upload CSV'}</button></div>{result && <Notice tone={result.includes('failed. First') || result.includes('Import failed') ? 'error' : 'success'}>{result}</Notice>}</form>;
 }
 
 function Visitors({ user }: { user: User }) {
@@ -236,16 +328,37 @@ function Maintenance({ user }: { user: User }) {
   </PagePanel>;
 }
 
-function Community({ user }: { user: User }) {
-  const list = useList('/api/posts?limit=40');
+function EstateNotices({ user }: { user: User }) {
+  const list = useList(`/api/notices?limit=50${user.role === 'admin' ? '&scope=all' : ''}`);
   const [show, setShow] = useState(false);
+  const [message, setMessage] = useState('');
   async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); const form = new FormData(event.currentTarget); const values = Object.fromEntries(form); const body = { ...values, isAnnouncement: form.get('isAnnouncement') === 'on' };
-    await api('/api/posts', { method: 'POST', body: JSON.stringify(body) }); setShow(false); list.reload();
+    event.preventDefault(); setMessage('');
+    const form = new FormData(event.currentTarget);
+    const from = String(form.get('publishedFrom') ?? ''); const until = String(form.get('publishedUntil') ?? '');
+    const body = {
+      title: form.get('title'), body: form.get('body'), severity: form.get('severity'),
+      requiresAcknowledgement: form.get('requiresAcknowledgement') === 'on',
+      publishedFrom: from ? new Date(from).toISOString() : undefined,
+      publishedUntil: until ? new Date(until).toISOString() : undefined,
+    };
+    try { await api('/api/notices', { method: 'POST', body: JSON.stringify(body) }); setShow(false); setMessage('Estate notice published. It will appear as a popup for every user.'); list.reload(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not publish notice'); }
   }
-  return <PagePanel title="Community" subtitle="News and resident conversations" action={<button className="primary" onClick={() => setShow(!show)}>Write post</button>}>
-    {show && <FormCard title="New post" onSubmit={submit}><label>Title<input name="title" required /></label>{user.role === 'admin' && <label className="check"><input name="isAnnouncement" type="checkbox" /> Mark as announcement</label>}<label className="span-2">Message<textarea name="body" rows={4} required /></label><button className="primary">Publish</button></FormCard>}
-    <div className="post-grid">{list.data?.items.map((post) => <article className={post.is_announcement ? 'post announcement' : 'post'} key={String(post.id)}>{Boolean(post.is_announcement) && <span className="pill blue">Announcement</span>}<h3>{String(post.title)}</h3><p>{String(post.body)}</p><small>{String(post.author_name)} · {readableDate(post.created_at)}</small></article>)}</div>
+  async function acknowledge(id: unknown) { await api(`/api/notices/${id}/acknowledge`, { method: 'POST' }); list.reload(); }
+  async function deactivate(id: unknown) { await api(`/api/notices/${id}`, { method: 'PATCH', body: JSON.stringify({ status: 'inactive' }) }); list.reload(); }
+  return <PagePanel title="General estate notices" subtitle="Official notices shown to every user as an in-app popup" action={user.role === 'admin' ? <button className="primary" onClick={() => setShow(!show)}>Publish notice</button> : null}>
+    {message && <Notice tone={message.includes('published') ? 'success' : 'error'}>{message}</Notice>}
+    {show && <FormCard title="New general estate notice" onSubmit={submit}>
+      <label>Title<input name="title" required /></label>
+      <label>Priority<select name="severity"><option value="info">Information</option><option value="important">Important</option><option value="urgent">Urgent</option></select></label>
+      <label className="check"><input name="requiresAcknowledgement" type="checkbox" defaultChecked /> Require users to confirm reading</label>
+      <label className="span-2">Notice<textarea name="body" rows={5} required /></label>
+      <label>Show from<input name="publishedFrom" type="datetime-local" /></label>
+      <label>Stop showing<input name="publishedUntil" type="datetime-local" /></label>
+      <button className="primary">Publish estate notice</button>
+    </FormCard>}
+    <div className="post-grid">{list.data?.items.map((notice) => <article className={`post estate-notice ${String(notice.severity)}`} key={String(notice.id)}><span className={`pill ${String(notice.severity)}`}>{String(notice.severity)}</span><h3>{String(notice.title)}</h3><p>{String(notice.body)}</p><small>{String(notice.author_name)} · {readableDate(notice.created_at)} · {String(notice.status)}</small><div className="row-actions">{!notice.acknowledged && <button className="text" onClick={() => acknowledge(notice.id)}>Mark as read</button>}{user.role === 'admin' && notice.status === 'active' && <button className="text danger" onClick={() => deactivate(notice.id)}>Deactivate</button>}</div></article>)}</div>
   </PagePanel>;
 }
 
@@ -403,7 +516,7 @@ function nested(source: Row | null, objectKey: string, key: string): unknown {
 
 function initials(name: string): string { return name.split(/\s+/).slice(0,2).map((part) => part[0]).join('').toUpperCase(); }
 function navIcon(section: Section): string {
-  return ({ dashboard: '◫', residents: '●', properties: '⌂', bills: '₦', visitors: '↔', maintenance: '◇', community: '≡', cards: '▤', events: '⌁', devices: '▣', operations: '↻', settings: '⚙' })[section];
+  return ({ dashboard: '◫', residents: '●', properties: '⌂', bills: '₦', visitors: '↔', maintenance: '◇', notices: '!', cards: '▤', events: '⌁', devices: '▣', operations: '↻', settings: '⚙' })[section];
 }
 
 export default App;

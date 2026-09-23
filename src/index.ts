@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import type { Context, MiddlewareHandler } from 'hono';
+import { moneyToMinor, parseCsv, requireHeaders, validDate } from './csv';
 import { AccessLiveFeed } from './live-feed';
 import { extractEventDocuments, normalizeHikvisionDocument } from './hikvision';
 import { HIKVISION_PROFILES, isConnectionSupported, resolveHikvisionProfile } from './hikvision-profiles';
@@ -21,6 +22,7 @@ type AppContext = Context<{ Bindings: Env; Variables: AppVariables }>;
 const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 const MAX_PAGE_SIZE = 100;
 const DEVICE_BODY_LIMIT = 2 * 1024 * 1024;
+const CSV_BODY_LIMIT = 2 * 1024 * 1024;
 
 function jsonError(c: AppContext, status: 400 | 401 | 403 | 404 | 409 | 413 | 500 | 503, message: string) {
   return c.json({ error: message }, status);
@@ -162,13 +164,13 @@ app.get('/api/dashboard', async (c) => {
       c.env.DB.prepare(`SELECT COUNT(*) AS count, COALESCE(SUM(amount_minor),0) AS amount FROM bills WHERE resident_id = ? AND status IN ('unpaid','partial')`).bind(user.id),
       c.env.DB.prepare(`SELECT COUNT(*) AS count FROM visitor_requests WHERE resident_id = ? AND status IN ('active','checked_in')`).bind(user.id),
       c.env.DB.prepare(`SELECT COUNT(*) AS count FROM access_cards WHERE resident_id = ? AND status = 'active'`).bind(user.id),
-      c.env.DB.prepare(`SELECT id, title, body, created_at FROM community_posts WHERE is_announcement = 1 ORDER BY created_at DESC LIMIT 1`),
+      c.env.DB.prepare(`SELECT n.id,n.title,n.body,n.severity,n.created_at,CASE WHEN a.user_id IS NULL THEN 0 ELSE 1 END AS acknowledged FROM estate_notices n LEFT JOIN notice_acknowledgements a ON a.notice_id=n.id AND a.user_id=? WHERE n.status='active' AND datetime(n.published_from)<=datetime('now') AND (n.published_until IS NULL OR datetime(n.published_until)>=datetime('now')) ORDER BY n.created_at DESC LIMIT 1`).bind(user.id),
     ]);
     return c.json({
       outstandingBills: results[0]?.results[0] ?? { count: 0, amount: 0 },
       activeVisitors: results[1]?.results[0] ?? { count: 0 },
       activeCards: results[2]?.results[0] ?? { count: 0 },
-      latestAnnouncement: results[3]?.results[0] ?? null,
+      latestNotice: results[3]?.results[0] ?? null,
     });
   }
   const results = await c.env.DB.batch([
@@ -192,18 +194,59 @@ app.get('/api/properties', requireRoles('admin', 'cashier', 'security'), async (
   const search = `%${c.req.query('search')?.trim() ?? ''}%`;
   const result = await c.env.DB.prepare(
     `SELECT p.*, u.name AS owner_name FROM properties p LEFT JOIN users u ON u.id = p.owner_id
-     WHERE p.unit_number LIKE ? OR p.address LIKE ? ORDER BY p.unit_number LIMIT ? OFFSET ?`,
-  ).bind(search, search, limit, offset).all();
+     WHERE p.unit_number LIKE ? OR p.address LIKE ? OR p.street LIKE ? ORDER BY p.street,p.unit_number LIMIT ? OFFSET ?`,
+  ).bind(search, search, search, limit, offset).all();
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
 app.post('/api/properties', requireRoles('admin'), async (c) => {
-  const body = await c.req.json<{ unitNumber?: string; address?: string }>();
-  if (!body.unitNumber?.trim() || !body.address?.trim()) return jsonError(c, 400, 'unitNumber and address are required');
+  const body = await c.req.json<{ unitNumber?: string; address?: string; street?: string }>();
+  if (!body.unitNumber?.trim() || !body.address?.trim() || !body.street?.trim()) return jsonError(c, 400, 'unitNumber, address and street are required');
   const id = crypto.randomUUID();
-  await c.env.DB.prepare(`INSERT INTO properties(id, unit_number, address) VALUES (?, ?, ?)`).bind(id, body.unitNumber.trim(), body.address.trim()).run();
+  await c.env.DB.prepare(`INSERT INTO properties(id, unit_number, address, street) VALUES (?, ?, ?, ?)`).bind(id, body.unitNumber.trim(), body.address.trim(), body.street.trim()).run();
   await audit(c, 'create', 'property', id, body);
   return c.json({ id }, 201);
+});
+
+app.get('/api/streets', requireRoles('admin', 'cashier'), async (c) => {
+  const result = await c.env.DB.prepare(
+    `SELECT street, COUNT(*) AS property_count FROM properties WHERE street IS NOT NULL AND trim(street) != '' GROUP BY street ORDER BY street`,
+  ).all();
+  return c.json({ items: result.results });
+});
+
+app.post('/api/bills/batch', requireRoles('admin', 'cashier'), async (c) => {
+  const body = await c.req.json<{
+    name?: string;
+    streets?: string[];
+    amountMinor?: number;
+    dueDate?: string;
+    billType?: string;
+    description?: string;
+  }>();
+  const streets = [...new Set((body.streets ?? []).map((street) => street.trim()).filter(Boolean))];
+  if (!body.name?.trim() || !streets.length || !body.amountMinor || !body.dueDate || !body.billType?.trim()) {
+    return jsonError(c, 400, 'name, streets, amountMinor, dueDate and billType are required');
+  }
+  const amountMinor = Math.round(body.amountMinor);
+  if (amountMinor <= 0) return jsonError(c, 400, 'amountMinor must be greater than zero');
+  if (Number.isNaN(new Date(body.dueDate).valueOf())) return jsonError(c, 400, 'dueDate is invalid');
+  const placeholders = streets.map(() => '?').join(',');
+  const batchId = crypto.randomUUID();
+  await c.env.DB.prepare(
+    `INSERT INTO bill_batches(id,name,street_filter_json,amount_minor,due_date,bill_type,description,created_by)
+     VALUES (?,?,?,?,?,?,?,?)`,
+  ).bind(batchId, body.name.trim(), JSON.stringify(streets), amountMinor, body.dueDate, body.billType.trim(), body.description?.trim() ?? null, c.get('user').id).run();
+  const inserted = await c.env.DB.prepare(
+    `INSERT INTO bills(id,property_id,resident_id,amount_minor,due_date,bill_type,description,batch_id)
+     SELECT lower(hex(randomblob(16))),p.id,u.id,?,?,?,?,?
+     FROM users u JOIN properties p ON p.id=u.property_id
+     WHERE u.role='resident' AND u.status='active' AND p.street IN (${placeholders})`,
+  ).bind(amountMinor, body.dueDate, body.billType.trim(), body.description?.trim() ?? null, batchId, ...streets).run();
+  const count = inserted.meta.changes ?? 0;
+  await c.env.DB.prepare(`UPDATE bill_batches SET bill_count=? WHERE id=?`).bind(count, batchId).run();
+  await audit(c, 'create_street_bill_batch', 'bill_batch', batchId, { streets, billCount: count, amountMinor });
+  return c.json({ id: batchId, billCount: count, streets }, 201);
 });
 
 app.get('/api/users', requireRoles('admin', 'cashier', 'security'), async (c) => {
@@ -237,9 +280,10 @@ app.get('/api/bills', async (c) => {
   const residentId = user.role === 'resident' ? user.id : (c.req.query('residentId') ?? null);
   const status = c.req.query('status') ?? null;
   const result = await c.env.DB.prepare(
-    `SELECT b.*, u.name AS resident_name, p.unit_number,
+    `SELECT b.*, u.name AS resident_name, p.unit_number, p.street, bb.name AS batch_name,
       COALESCE((SELECT SUM(CASE WHEN pay.type='refund' THEN -pay.amount_minor ELSE pay.amount_minor END) FROM payments pay WHERE pay.bill_id=b.id AND pay.status='approved'),0) AS paid_minor
      FROM bills b JOIN users u ON u.id=b.resident_id JOIN properties p ON p.id=b.property_id
+     LEFT JOIN bill_batches bb ON bb.id=b.batch_id
      WHERE (? IS NULL OR b.resident_id=?) AND (? IS NULL OR b.status=?)
      ORDER BY b.due_date DESC LIMIT ? OFFSET ?`,
   ).bind(residentId, residentId, status, status, limit, offset).all();
@@ -286,6 +330,96 @@ app.patch('/api/payments/:id/review', requireRoles('cashier', 'admin'), async (c
   if (body.status === 'approved') await reconcileBill(c.env.DB, payment.bill_id);
   await audit(c, 'review', 'payment', c.req.param('id'), body);
   return c.json({ ok: true });
+});
+
+app.get('/api/imports', requireRoles('admin', 'cashier'), async (c) => {
+  const { limit, offset, page: pageNumber } = page(c);
+  const result = await c.env.DB.prepare(
+    `SELECT j.*,u.name AS uploaded_by_name FROM import_jobs j JOIN users u ON u.id=j.uploaded_by ORDER BY j.created_at DESC LIMIT ? OFFSET ?`,
+  ).bind(limit, offset).all();
+  return c.json({ items: result.results, page: pageNumber, limit });
+});
+
+app.post('/api/imports/bills', requireRoles('admin', 'cashier'), async (c) => {
+  const length = Number(c.req.header('Content-Length') ?? 0);
+  if (length > CSV_BODY_LIMIT) return jsonError(c, 413, 'CSV exceeds the 2 MB upload limit');
+  const text = await c.req.text();
+  if (!text || new TextEncoder().encode(text).byteLength > CSV_BODY_LIMIT) return jsonError(c, 413, 'CSV must be between 1 byte and 2 MB');
+  let table;
+  try {
+    table = parseCsv(text, 500);
+    requireHeaders(table, ['amount','due_date','bill_type']);
+  } catch (error) { return jsonError(c, 400, error instanceof Error ? error.message : 'Invalid CSV'); }
+  const jobId = crypto.randomUUID();
+  const errors: Array<{ row: number; error: string }> = [];
+  let successful = 0;
+  for (const [index, row] of table.rows.entries()) {
+    try {
+      if (!row.resident_email && !row.unit_number) throw new Error('resident_email or unit_number is required');
+      const target = await c.env.DB.prepare(
+        `SELECT u.id AS resident_id,p.id AS property_id FROM users u JOIN properties p ON p.id=u.property_id
+         WHERE u.role='resident' AND u.status='active' AND ((? != '' AND lower(u.email)=lower(?)) OR (? != '' AND p.unit_number=?))
+         ORDER BY CASE WHEN ? != '' AND lower(u.email)=lower(?) THEN 0 ELSE 1 END LIMIT 1`,
+      ).bind(row.resident_email ?? '', row.resident_email ?? '', row.unit_number ?? '', row.unit_number ?? '', row.resident_email ?? '', row.resident_email ?? '').first<{ resident_id: string; property_id: string }>();
+      if (!target) throw new Error('No active resident/property match');
+      const status = row.status || 'unpaid';
+      if (!['unpaid','partial','paid','void'].includes(status)) throw new Error(`Invalid status: ${status}`);
+      const amountMinor = moneyToMinor(row.amount!);
+      const dueDate = validDate(row.due_date!, 'due_date');
+      const createdAt = row.created_at ? validDate(row.created_at, 'created_at') : new Date().toISOString();
+      await c.env.DB.prepare(
+        `INSERT INTO bills(id,property_id,resident_id,amount_minor,currency,due_date,status,bill_type,description,external_reference,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      ).bind(crypto.randomUUID(), target.property_id, target.resident_id, amountMinor, row.currency || 'NGN', dueDate, status, row.bill_type, row.description || null, row.external_reference || null, createdAt).run();
+      successful += 1;
+    } catch (error) {
+      errors.push({ row: index + 2, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  const filename = (c.req.header('X-Filename') ?? 'bills.csv').slice(0, 200);
+  await saveImportJob(c.env.DB, jobId, 'bills', filename, table.rows.length, successful, errors, c.get('user').id);
+  await audit(c, 'import', 'bills', jobId, { total: table.rows.length, successful, errors: errors.length });
+  return c.json({ id: jobId, totalRows: table.rows.length, successfulRows: successful, errorRows: errors.length, errors: errors.slice(0, 100) }, errors.length ? 207 : 201);
+});
+
+app.post('/api/imports/payments', requireRoles('admin', 'cashier'), async (c) => {
+  const length = Number(c.req.header('Content-Length') ?? 0);
+  if (length > CSV_BODY_LIMIT) return jsonError(c, 413, 'CSV exceeds the 2 MB upload limit');
+  const text = await c.req.text();
+  if (!text || new TextEncoder().encode(text).byteLength > CSV_BODY_LIMIT) return jsonError(c, 413, 'CSV must be between 1 byte and 2 MB');
+  let table;
+  try {
+    table = parseCsv(text, 500);
+    requireHeaders(table, ['bill_reference','amount','payment_method','receipt_number']);
+  } catch (error) { return jsonError(c, 400, error instanceof Error ? error.message : 'Invalid CSV'); }
+  const jobId = crypto.randomUUID();
+  const errors: Array<{ row: number; error: string }> = [];
+  let successful = 0;
+  for (const [index, row] of table.rows.entries()) {
+    try {
+      const bill = await c.env.DB.prepare(`SELECT id FROM bills WHERE id=? OR external_reference=? LIMIT 1`).bind(row.bill_reference, row.bill_reference).first<{ id: string }>();
+      if (!bill) throw new Error(`Bill reference not found: ${row.bill_reference}`);
+      const method = row.payment_method;
+      if (!['cash','pos','bank_transfer','online'].includes(method!)) throw new Error(`Invalid payment_method: ${method}`);
+      const status = row.status || 'approved';
+      if (!['pending','approved','rejected'].includes(status)) throw new Error(`Invalid status: ${status}`);
+      const type = row.type || 'payment';
+      if (!['payment','refund','adjustment'].includes(type)) throw new Error(`Invalid type: ${type}`);
+      const submittedAt = row.submitted_at ? validDate(row.submitted_at, 'submitted_at') : new Date().toISOString();
+      await c.env.DB.prepare(
+        `INSERT INTO payments(id,bill_id,amount_minor,payment_method,receipt_number,recorded_by,type,status,submitted_at,reviewed_by,reviewed_at,external_reference)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      ).bind(crypto.randomUUID(), bill.id, moneyToMinor(row.amount!), method, row.receipt_number, c.get('user').id, type, status, submittedAt, status === 'approved' ? c.get('user').id : null, status === 'approved' ? new Date().toISOString() : null, row.external_reference || null).run();
+      if (status === 'approved') await reconcileBill(c.env.DB, bill.id);
+      successful += 1;
+    } catch (error) {
+      errors.push({ row: index + 2, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  const filename = (c.req.header('X-Filename') ?? 'payments.csv').slice(0, 200);
+  await saveImportJob(c.env.DB, jobId, 'payments', filename, table.rows.length, successful, errors, c.get('user').id);
+  await audit(c, 'import', 'payments', jobId, { total: table.rows.length, successful, errors: errors.length });
+  return c.json({ id: jobId, totalRows: table.rows.length, successfulRows: successful, errorRows: errors.length, errors: errors.slice(0, 100) }, errors.length ? 207 : 201);
 });
 
 app.get('/api/visitors', async (c) => {
@@ -360,21 +494,68 @@ app.patch('/api/maintenance/:id', requireRoles('admin'), async (c) => {
   return c.json({ ok: true });
 });
 
-app.get('/api/posts', async (c) => {
-  const { limit, offset, page: pageNumber } = page(c);
+app.get('/api/notices/popup', async (c) => {
+  const user = c.get('user');
   const result = await c.env.DB.prepare(
-    `SELECT p.*, u.name AS author_name FROM community_posts p JOIN users u ON u.id=p.author_id ORDER BY p.is_announcement DESC,p.created_at DESC LIMIT ? OFFSET ?`,
-  ).bind(limit, offset).all();
+    `SELECT n.id,n.title,n.body,n.severity,n.requires_acknowledgement,n.published_from,n.published_until,n.created_at
+     FROM estate_notices n LEFT JOIN notice_acknowledgements a ON a.notice_id=n.id AND a.user_id=?
+     WHERE n.status='active' AND datetime(n.published_from)<=datetime('now')
+       AND (n.published_until IS NULL OR datetime(n.published_until)>=datetime('now'))
+       AND a.user_id IS NULL
+     ORDER BY CASE n.severity WHEN 'urgent' THEN 1 WHEN 'important' THEN 2 ELSE 3 END,n.created_at DESC LIMIT 10`,
+  ).bind(user.id).all();
+  return c.json({ items: result.results });
+});
+
+app.get('/api/notices', async (c) => {
+  const user = c.get('user');
+  const { limit, offset, page: pageNumber } = page(c);
+  const includeAll = user.role === 'admin' && c.req.query('scope') === 'all';
+  const result = await c.env.DB.prepare(
+    `SELECT n.*,u.name AS author_name,CASE WHEN a.user_id IS NULL THEN 0 ELSE 1 END AS acknowledged
+     FROM estate_notices n JOIN users u ON u.id=n.created_by
+     LEFT JOIN notice_acknowledgements a ON a.notice_id=n.id AND a.user_id=?
+     WHERE (?=1 OR (n.status='active' AND datetime(n.published_from)<=datetime('now') AND (n.published_until IS NULL OR datetime(n.published_until)>=datetime('now'))))
+     ORDER BY n.created_at DESC LIMIT ? OFFSET ?`,
+  ).bind(user.id, includeAll ? 1 : 0, limit, offset).all();
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
-app.post('/api/posts', async (c) => {
-  const body = await c.req.json<{ title?: string; body?: string; isAnnouncement?: boolean }>();
+app.post('/api/notices', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<{
+    title?: string;
+    body?: string;
+    severity?: 'info'|'important'|'urgent';
+    requiresAcknowledgement?: boolean;
+    publishedFrom?: string;
+    publishedUntil?: string;
+  }>();
   if (!body.title?.trim() || !body.body?.trim()) return jsonError(c, 400, 'title and body are required');
-  if (body.isAnnouncement && c.get('user').role !== 'admin') return jsonError(c, 403, 'Only administrators can post announcements');
+  const severity = body.severity ?? 'info';
+  if (!['info','important','urgent'].includes(severity)) return jsonError(c, 400, 'Invalid severity');
+  if (body.publishedUntil && Number.isNaN(new Date(body.publishedUntil).valueOf())) return jsonError(c, 400, 'publishedUntil is invalid');
   const id = crypto.randomUUID();
-  await c.env.DB.prepare(`INSERT INTO community_posts(id,author_id,title,body,is_announcement) VALUES (?,?,?,?,?)`).bind(id, c.get('user').id, body.title.trim(), body.body.trim(), body.isAnnouncement ? 1 : 0).run();
+  await c.env.DB.prepare(
+    `INSERT INTO estate_notices(id,title,body,severity,status,requires_acknowledgement,published_from,published_until,created_by)
+     VALUES (?,?,?,?,'active',?,?,?,?)`,
+  ).bind(id, body.title.trim(), body.body.trim(), severity, body.requiresAcknowledgement === false ? 0 : 1, body.publishedFrom ?? new Date().toISOString(), body.publishedUntil ?? null, c.get('user').id).run();
+  await audit(c, 'create', 'estate_notice', id, { severity, publishedUntil: body.publishedUntil });
   return c.json({ id }, 201);
+});
+
+app.patch('/api/notices/:id', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<{ status?: 'active'|'inactive' }>();
+  if (!body.status || !['active','inactive'].includes(body.status)) return jsonError(c, 400, 'status must be active or inactive');
+  await c.env.DB.prepare(`UPDATE estate_notices SET status=?,updated_at=datetime('now') WHERE id=?`).bind(body.status, c.req.param('id')).run();
+  await audit(c, 'status_change', 'estate_notice', c.req.param('id'), body);
+  return c.json({ ok: true });
+});
+
+app.post('/api/notices/:id/acknowledge', async (c) => {
+  await c.env.DB.prepare(
+    `INSERT INTO notice_acknowledgements(notice_id,user_id) VALUES (?,?) ON CONFLICT(notice_id,user_id) DO UPDATE SET acknowledged_at=datetime('now')`,
+  ).bind(c.req.param('id'), c.get('user').id).run();
+  return c.json({ ok: true });
 });
 
 app.post('/api/incidents', requireRoles('security', 'admin'), async (c) => {
@@ -595,6 +776,23 @@ app.onError((error, c) => {
 });
 
 app.notFound((c) => c.json({ error: 'API route not found' }, 404));
+
+async function saveImportJob(
+  db: D1Database,
+  id: string,
+  kind: 'bills'|'payments',
+  filename: string,
+  total: number,
+  successful: number,
+  errors: Array<{ row: number; error: string }>,
+  uploadedBy: string,
+): Promise<void> {
+  const status = successful === 0 && errors.length ? 'failed' : errors.length ? 'completed_with_errors' : 'completed';
+  await db.prepare(
+    `INSERT INTO import_jobs(id,kind,filename,status,total_rows,successful_rows,error_rows,errors_json,uploaded_by)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+  ).bind(id, kind, filename, status, total, successful, errors.length, errors.length ? JSON.stringify(errors.slice(0, 100)) : null, uploadedBy).run();
+}
 
 async function reconcileBill(db: D1Database, billId: string): Promise<void> {
   const row = await db.prepare(

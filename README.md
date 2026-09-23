@@ -14,11 +14,13 @@ This is a deployable foundation/MVP, not a claim that every screen in the origin
 Included:
 
 - One Cloudflare Worker serving the SPA and `/api/*`.
-- D1 schema for users, property, billing, payments, visitors, maintenance, community, access cards, access events, devices, operations, settings, and audit records.
+- D1 schema for users, streets/properties, billing, historical bill/payment imports, visitors, maintenance, general estate notices, access cards, access events, devices, operations, settings, and audit records.
 - Direct MinMoe JSON/XML/multipart HTTP Listening ingestion.
 - Per-device one-time credentials; Queue buffering; D1 event persistence; Durable Object live WebSocket feed.
 - Hourly facility-fee expiry/reactivation job and hardware-action audit queue.
 - Role-aware React portal for Administrator, Resident, Cashier, and Security.
+- General estate notices with priority, scheduling, read acknowledgements, and login popups; the former Community posting feature is removed.
+- Street-targeted batch billing and audited CSV imports for pre-existing bills and resident payments (500 rows/2 MB per upload).
 - Kotlin/Compose Android foundation with encrypted token storage, Retrofit/Hilt, Room event cache, role dashboard, and gate history.
 - Optional R2 private upload/download route with ownership checks and a 500 KB limit. The current production config disables uploads because the account owner requested no service requiring paid activation.
 - PBKDF2-SHA256 passwords and HS256 sessions implemented with Workers Web Crypto.
