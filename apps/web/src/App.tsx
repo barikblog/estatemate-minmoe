@@ -2,13 +2,14 @@ import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from 
 import { ApiError, ListResponse, User, api, money, readableDate } from './api';
 
 type Row = Record<string, unknown>;
-type Section = 'dashboard' | 'residents' | 'properties' | 'bills' | 'visitors' | 'maintenance' | 'notices' | 'cards' | 'events' | 'devices' | 'operations' | 'settings';
+type Section = 'dashboard' | 'residents' | 'properties' | 'residency' | 'bills' | 'visitors' | 'maintenance' | 'notices' | 'cards' | 'events' | 'devices' | 'operations' | 'settings';
 
 interface NavItem { id: Section; label: string; roles?: User['role'][] }
 const navItems: NavItem[] = [
   { id: 'dashboard', label: 'Overview' },
   { id: 'residents', label: 'People', roles: ['admin', 'cashier', 'security'] },
   { id: 'properties', label: 'Properties', roles: ['admin', 'cashier', 'security', 'resident'] },
+  { id: 'residency', label: 'Tenancy & household', roles: ['admin', 'resident'] },
   { id: 'bills', label: 'Bills & payments', roles: ['admin', 'cashier', 'resident'] },
   { id: 'visitors', label: 'Visitors' },
   { id: 'maintenance', label: 'Maintenance', roles: ['admin', 'resident'] },
@@ -150,6 +151,7 @@ function SectionView({ section, user }: { section: Section; user: User }) {
     case 'dashboard': return <Dashboard user={user} />;
     case 'residents': return <People user={user} />;
     case 'properties': return <Properties user={user} />;
+    case 'residency': return <Residency user={user} />;
     case 'bills': return <Bills user={user} />;
     case 'visitors': return <Visitors user={user} />;
     case 'maintenance': return <Maintenance user={user} />;
@@ -192,7 +194,7 @@ function People({ user }: { user: User }) {
   const [showForm, setShowForm] = useState(false);
   return <PagePanel title="People" subtitle="Resident and staff accounts" action={user.role === 'admin' ? <button className="primary" onClick={() => setShowForm(!showForm)}>Add person</button> : null}>
     {showForm && <CreateUser onDone={() => { setShowForm(false); list.reload(); }} />}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Name'],['role','Role'],['email','Email'],['phone','Phone'],['unit_numbers','Properties'],['property_count','Property count'],['status','Status']]} /></ListState>
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Name'],['role','Role'],['email','Email'],['phone','Phone'],['unit_numbers','Owned'],['rented_units','Rented'],['dependant_units','Dependant at'],['property_count','Owned count'],['status','Status']]} /></ListState>
   </PagePanel>;
 }
 
@@ -217,6 +219,10 @@ function Properties({ user }: { user: User }) {
     () => user.role === 'resident' || user.role === 'admin' ? api('/api/property-ownership-requests?limit=100') : Promise.resolve({ items: [], page: 1, limit: 100 }),
     [user.role],
   );
+  const transfers = useAsync<ListResponse<Row>>(
+    () => user.role === 'resident' || user.role === 'admin' ? api('/api/property-transfers?limit=100') : Promise.resolve({ items: [], page: 1, limit: 100 }),
+    [user.role],
+  );
   const available = useAsync<{ items: Row[] }>(
     () => user.role === 'resident' || user.role === 'admin' ? api('/api/properties/available') : Promise.resolve({ items: [] }),
     [user.role],
@@ -224,18 +230,18 @@ function Properties({ user }: { user: User }) {
   const [showAdd, setShowAdd] = useState(false);
   const [showRequest, setShowRequest] = useState(false);
   const [showAssign, setShowAssign] = useState(false);
+  const [showTransfer, setShowTransfer] = useState(false);
   const [requestMode, setRequestMode] = useState<'existing'|'propose'>('existing');
   const [assignPropertyId, setAssignPropertyId] = useState('');
   const [message, setMessage] = useState('');
 
-  function refresh() { list.reload(); requests.reload(); available.reload(); }
+  function refresh() { list.reload(); requests.reload(); transfers.reload(); available.reload(); }
 
   async function addProperty(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setMessage(''); const values = Object.fromEntries(new FormData(event.currentTarget));
     try { await api('/api/properties', { method: 'POST', body: JSON.stringify(values) }); setShowAdd(false); setMessage('Property created.'); refresh(); }
     catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not create property'); }
   }
-
   async function requestProperty(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setMessage(''); const form = new FormData(event.currentTarget);
     const body = requestMode === 'existing'
@@ -244,74 +250,128 @@ function Properties({ user }: { user: User }) {
     try { await api('/api/property-ownership-requests', { method: 'POST', body: JSON.stringify(body) }); setShowRequest(false); setMessage('Ownership request submitted for administrator approval.'); refresh(); }
     catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not submit ownership request'); }
   }
-
   async function assignOwner(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setMessage(''); const values = Object.fromEntries(new FormData(event.currentTarget));
     try { await api('/api/property-ownerships', { method: 'POST', body: JSON.stringify(values) }); setShowAssign(false); setAssignPropertyId(''); setMessage('Property owner assigned.'); refresh(); }
     catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not assign property owner'); }
   }
-
+  async function requestTransfer(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setMessage(''); const values = Object.fromEntries(new FormData(event.currentTarget));
+    try { await api('/api/property-transfers', { method: 'POST', body: JSON.stringify(values) }); setShowTransfer(false); setMessage('Ownership transfer submitted for administrator approval.'); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not submit ownership transfer'); }
+  }
   async function reviewRequest(id: unknown, status: 'approved'|'rejected') {
     const reviewNote = prompt(status === 'approved' ? 'Optional approval note' : 'Reason for rejection') ?? '';
     try { await api(`/api/property-ownership-requests/${id}`, { method: 'PATCH', body: JSON.stringify({ status, reviewNote }) }); setMessage(`Ownership request ${status}.`); refresh(); }
     catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not review ownership request'); }
   }
-
+  async function reviewTransfer(id: unknown, action: 'approve'|'reject') {
+    const reviewNote = prompt(action === 'approve' ? 'Optional approval note' : 'Reason for rejection') ?? '';
+    try { await api(`/api/property-transfers/${id}`, { method: 'PATCH', body: JSON.stringify({ action, reviewNote }) }); setMessage(`Ownership transfer ${action === 'approve' ? 'approved' : 'rejected'}.`); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not review ownership transfer'); }
+  }
   async function revokeOwner(row: Row) {
     if (!confirm(`Remove ${String(row.owner_name)} as owner of ${String(row.unit_number)}? Existing bills remain linked.`)) return;
     try { await api(`/api/property-ownerships/${row.ownership_id}`, { method: 'DELETE' }); setMessage('Property ownership removed.'); refresh(); }
     catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not remove owner'); }
   }
-
   async function editProperty(row: Row) {
-    const unitNumber = prompt('Unit number', String(row.unit_number ?? ''));
-    if (!unitNumber) return;
-    const street = prompt('Street', String(row.street ?? ''));
-    if (!street) return;
-    const address = prompt('Address', String(row.address ?? ''));
-    if (!address) return;
-    try { await api(`/api/properties/${row.id}`, { method: 'PATCH', body: JSON.stringify({ unitNumber, street, address }) }); setMessage('Property details updated.'); refresh(); }
+    const unitNumber = prompt('Unit number', String(row.unit_number ?? '')); if (!unitNumber) return;
+    const street = prompt('Street', String(row.street ?? '')); if (!street) return;
+    const block = prompt('Block (optional)', String(row.block ?? '')) ?? String(row.block ?? '');
+    const zone = prompt('Zone (optional)', String(row.zone ?? '')) ?? String(row.zone ?? '');
+    const address = prompt('Address', String(row.address ?? '')); if (!address) return;
+    try { await api(`/api/properties/${row.id}`, { method: 'PATCH', body: JSON.stringify({ unitNumber,street,block,zone,address }) }); setMessage('Property details updated.'); refresh(); }
     catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not update property'); }
   }
 
-  const actions = user.role === 'admin' ? (row: Row) => <div className="row-actions">
-    <button className="text" onClick={() => editProperty(row)}>Edit</button>
-    {row.ownership_id
-      ? <button className="text danger" onClick={() => revokeOwner(row)}>Remove owner</button>
-      : <button className="text" onClick={() => { setAssignPropertyId(String(row.id)); setShowAssign(true); }}>Assign owner</button>}
-  </div> : undefined;
+  const actions = (row: Row) => <div className="row-actions">
+    {(user.role === 'admin' || user.role === 'cashier' || row.relationship_type === 'owner' || (row.relationship_type === 'tenant' && row.billing_responsibility === 'tenant')) && <a className="text" href={`/api/properties/${row.id}/statement?format=csv`}>Statement</a>}
+    {user.role === 'admin' && <><button className="text" onClick={() => editProperty(row)}>Edit</button>{row.ownership_id ? <button className="text danger" onClick={() => revokeOwner(row)}>Remove owner</button> : <button className="text" onClick={() => { setAssignPropertyId(String(row.id)); setShowAssign(true); }}>Assign owner</button>}</>}
+  </div>;
   const pending = requests.data?.items.filter((request) => request.status === 'pending') ?? [];
+  const pendingTransfers = transfers.data?.items.filter((transfer) => transfer.status === 'pending') ?? [];
+  const transferable = list.data?.items.filter((property) => property.ownership_id && (user.role === 'admin' || property.relationship_type === 'owner')) ?? [];
 
-  return <PagePanel
-    title={user.role === 'resident' ? 'My properties' : 'Properties'}
-    subtitle={user.role === 'resident' ? 'Every property you own and requests awaiting administrator approval' : 'Units, streets, single-owner assignments and approval requests'}
-    action={<div className="row-actions">
-      {user.role === 'resident' && <button className="primary" onClick={() => setShowRequest(!showRequest)}>Request another property</button>}
-      {user.role === 'admin' && <><button className="secondary" onClick={() => setShowAssign(!showAssign)}>Assign owner</button><button className="primary" onClick={() => setShowAdd(!showAdd)}>Add property</button></>}
-    </div>}
-  >
+  return <PagePanel title={user.role === 'resident' ? 'My properties' : 'Properties'} subtitle="Ownership, occupancy, zones, statements and transfer history" action={<div className="row-actions">
+    {(user.role === 'resident' || user.role === 'admin') && <button className="secondary" onClick={() => setShowTransfer(!showTransfer)}>Transfer ownership</button>}
+    {user.role === 'resident' && <button className="primary" onClick={() => setShowRequest(!showRequest)}>Request another property</button>}
+    {user.role === 'admin' && <><button className="secondary" onClick={() => setShowAssign(!showAssign)}>Assign owner</button><button className="primary" onClick={() => setShowAdd(!showAdd)}>Add property</button></>}
+  </div>}>
     {message && <Notice tone={message.includes('Could not') || message.includes('already') ? 'error' : 'success'}>{message}</Notice>}
-    {showAdd && <FormCard title="New property" onSubmit={addProperty}><label>Unit number<input name="unitNumber" required /></label><label>Street<input name="street" placeholder="Example: Unity Street" required /></label><label>Address<input name="address" required /></label><button className="primary">Save property</button></FormCard>}
-    {showAssign && <FormCard title="Assign an unowned property" onSubmit={assignOwner}>
-      <label>Property<select name="propertyId" value={assignPropertyId} onChange={(event) => setAssignPropertyId(event.target.value)} required><option value="">Select property</option>{available.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}</option>)}</select></label>
-      <label>Resident email<input name="residentEmail" type="email" required /></label><button className="primary">Assign owner</button>
-    </FormCard>}
-    {showRequest && <FormCard title="Request another property" onSubmit={requestProperty}>
-      <label>Request type<select value={requestMode} onChange={(event) => setRequestMode(event.target.value as 'existing'|'propose')}><option value="existing">Existing unowned property</option><option value="propose">Propose a new property</option></select></label>
-      {requestMode === 'existing' ? <label>Available property<select name="propertyId" required><option value="">Select property</option>{available.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}, {String(property.address)}</option>)}</select></label> : <><label>Unit number<input name="proposedUnitNumber" required /></label><label>Street<input name="proposedStreet" required /></label><label>Address<input name="proposedAddress" required /></label></>}
-      <label className="span-2">Note to administrator<textarea name="requestNote" rows={3} placeholder="Explain the ownership request" /></label><button className="primary">Submit for approval</button>
-    </FormCard>}
-    {user.role === 'admin' && pending.length > 0 && <section className="approval-queue"><h3>Ownership approvals</h3><DataTable rows={pending} columns={[['resident_name','Resident'],['resident_email','Email'],['unit_number','Unit'],['street','Street'],['request_note','Request note'],['created_at','Requested','date'],['status','Status']]} action={(row) => <div className="row-actions"><button className="text" onClick={() => reviewRequest(row.id, 'approved')}>Approve</button><button className="text danger" onClick={() => reviewRequest(row.id, 'rejected')}>Reject</button></div>} /></section>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={user.role === 'resident' ? [['unit_number','Unit'],['street','Street'],['address','Address'],['approved_at','Approved','date']] : [['unit_number','Unit'],['street','Street'],['address','Address'],['owner_name','Owner'],['owner_email','Owner email'],['created_at','Created','date']]} action={actions} /></ListState>
-    {(user.role === 'resident' || user.role === 'admin') && requests.data && requests.data.items.length > 0 && <section className="request-history"><h3>{user.role === 'resident' ? 'My ownership requests' : 'Request history'}</h3><DataTable rows={requests.data.items} columns={[['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['status','Status'],['review_note','Review note'],['created_at','Requested','date']]} /></section>}
+    {showAdd && <FormCard title="New property" onSubmit={addProperty}><label>Unit number<input name="unitNumber" required /></label><label>Street<input name="street" required /></label><label>Block<input name="block" /></label><label>Zone<input name="zone" /></label><label>Address<input name="address" required /></label><button className="primary">Save property</button></FormCard>}
+    {showAssign && <FormCard title="Assign an unowned property" onSubmit={assignOwner}><label>Property<select name="propertyId" value={assignPropertyId} onChange={(event) => setAssignPropertyId(event.target.value)} required><option value="">Select property</option>{available.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}</option>)}</select></label><label>Resident email<input name="residentEmail" type="email" required /></label><button className="primary">Assign owner</button></FormCard>}
+    {showRequest && <FormCard title="Request another property" onSubmit={requestProperty}><label>Request type<select value={requestMode} onChange={(event) => setRequestMode(event.target.value as 'existing'|'propose')}><option value="existing">Existing unowned property</option><option value="propose">Propose a new property</option></select></label>{requestMode === 'existing' ? <label>Available property<select name="propertyId" required><option value="">Select property</option>{available.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}, {String(property.address)}</option>)}</select></label> : <><label>Unit number<input name="proposedUnitNumber" required /></label><label>Street<input name="proposedStreet" required /></label><label>Address<input name="proposedAddress" required /></label></>}<label className="span-2">Note<textarea name="requestNote" rows={3} /></label><button className="primary">Submit for approval</button></FormCard>}
+    {showTransfer && <FormCard title="Transfer legal ownership" onSubmit={requestTransfer}><label>Property<select name="propertyId" required><option value="">Select property</option>{transferable.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.owner_name)}</option>)}</select></label><label>New owner email<input name="newOwnerEmail" type="email" required /></label><label>Effective date<input name="effectiveDate" type="date" required /></label><label className="span-2">Transfer note<textarea name="requestNote" rows={3} /></label><button className="primary">Submit transfer</button></FormCard>}
+    {user.role === 'admin' && pending.length > 0 && <section className="approval-queue"><h3>Ownership approvals</h3><DataTable rows={pending} columns={[['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['request_note','Note'],['created_at','Requested','date'],['status','Status']]} action={(row) => <div className="row-actions"><button className="text" onClick={() => reviewRequest(row.id,'approved')}>Approve</button><button className="text danger" onClick={() => reviewRequest(row.id,'rejected')}>Reject</button></div>} /></section>}
+    {user.role === 'admin' && pendingTransfers.length > 0 && <section className="approval-queue"><h3>Ownership transfer approvals</h3><DataTable rows={pendingTransfers} columns={[['unit_number','Unit'],['from_owner_name','Current owner'],['to_owner_name','New owner'],['effective_date','Effective'],['request_note','Note'],['status','Status']]} action={(row) => <div className="row-actions"><button className="text" onClick={() => reviewTransfer(row.id,'approve')}>Approve</button><button className="text danger" onClick={() => reviewTransfer(row.id,'reject')}>Reject</button></div>} /></section>}
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={user.role === 'resident' ? [['unit_number','Unit'],['zone','Zone'],['block','Block'],['street','Street'],['relationship_type','Relationship'],['main_resident_name','Main resident'],['billing_responsibility','Bill payer']] : [['unit_number','Unit'],['zone','Zone'],['block','Block'],['street','Street'],['owner_name','Owner'],['tenant_name','Tenant'],['billing_responsibility','Bill payer']]} action={actions} /></ListState>
+    {requests.data && requests.data.items.length > 0 && <section className="request-history"><h3>Ownership request history</h3><DataTable rows={requests.data.items} columns={[['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['status','Status'],['review_note','Review note'],['created_at','Requested','date']]} /></section>}
+    {transfers.data && transfers.data.items.length > 0 && <section className="request-history"><h3>Ownership transfer history</h3><DataTable rows={transfers.data.items} columns={[['unit_number','Unit'],['from_owner_name','From'],['to_owner_name','To'],['effective_date','Effective'],['status','Status'],['review_note','Review note']]} /></section>}
   </PagePanel>;
 }
 
+
+function Residency({ user }: { user: User }) {
+  const properties = useList('/api/properties?limit=100');
+  const tenancies = useList('/api/property-tenancies?limit=100');
+  const household = useList('/api/household-members?limit=100');
+  const [showTenancy, setShowTenancy] = useState(false);
+  const [showMember, setShowMember] = useState(false);
+  const [message, setMessage] = useState('');
+  function refresh() { properties.reload(); tenancies.reload(); household.reload(); }
+  async function addTenancy(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setMessage(''); const values = Object.fromEntries(new FormData(event.currentTarget));
+    try { const result = await api<{ status:string }>('/api/property-tenancies',{ method:'POST',body:JSON.stringify(values) }); setShowTenancy(false); setMessage(result.status === 'active' ? 'Tenant assigned.' : 'Tenant nomination submitted for administrator approval.'); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not create tenancy'); }
+  }
+  async function addMember(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setMessage(''); const form = new FormData(event.currentTarget);
+    const body = { propertyId:form.get('propertyId'),primaryResidentId:form.get('primaryResidentId') || undefined,name:form.get('name'),relationship:form.get('relationship'),dateOfBirth:form.get('dateOfBirth') || undefined,phone:form.get('phone'),email:form.get('email'),canCreateVisitors:form.get('canCreateVisitors') === 'on',canViewBills:form.get('canViewBills') === 'on',requestNote:form.get('requestNote') };
+    try { const result = await api<{ status:string }>('/api/household-members',{ method:'POST',body:JSON.stringify(body) }); setShowMember(false); setMessage(result.status === 'active' ? 'Household member added.' : 'Household member submitted for administrator approval.'); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not add household member'); }
+  }
+  async function tenancyAction(row: Row, action: 'approve'|'reject'|'end'|'update') {
+    const reviewNote = prompt(action === 'reject' ? 'Reason for rejection' : 'Optional note') ?? '';
+    const billingResponsibility = action === 'approve' || action === 'update' ? (prompt('Who pays new property bills? Enter owner or tenant',String(row.billing_responsibility ?? 'owner')) ?? String(row.billing_responsibility ?? 'owner')) : undefined;
+    try { await api(`/api/property-tenancies/${row.id}`,{ method:'PATCH',body:JSON.stringify({ action,reviewNote,billingResponsibility }) }); setMessage(`Tenancy ${action} completed.`); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Tenancy action failed'); }
+  }
+  async function memberAction(row: Row, action: 'approve'|'reject'|'deactivate'|'update') {
+    const reviewNote = prompt(action === 'reject' ? 'Reason for rejection' : 'Optional note') ?? '';
+    const canCreateVisitors = action === 'approve' || action === 'update' ? confirm('Allow this dependant to create visitor passes when they have a login?') : undefined;
+    const canViewBills = action === 'approve' || action === 'update' ? confirm('Allow this dependant to view the main resident’s property bills?') : undefined;
+    try { await api(`/api/household-members/${row.id}`,{ method:'PATCH',body:JSON.stringify({ action,reviewNote,canCreateVisitors,canViewBills }) }); setMessage(`Household member ${action} completed.`); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Household action failed'); }
+  }
+  async function createMemberLogin(row: Row) {
+    const email = prompt('Login email',String(row.email ?? '')); if (!email) return;
+    const temporaryPassword = prompt('Temporary password (at least 12 characters). Leave blank to link an existing resident account.','') ?? '';
+    try { await api(`/api/household-members/${row.id}/login`,{ method:'POST',body:JSON.stringify({ email,temporaryPassword:temporaryPassword || undefined }) }); setMessage('Dependant login linked.'); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not create dependant login'); }
+  }
+  const pendingTenancies = tenancies.data?.items.filter((row) => row.status === 'pending') ?? [];
+  const pendingMembers = household.data?.items.filter((row) => row.status === 'pending') ?? [];
+  const tenancyActions = user.role === 'admin' ? (row:Row) => <div className="row-actions">{row.status === 'pending' && <><button className="text" onClick={() => tenancyAction(row,'approve')}>Approve</button><button className="text danger" onClick={() => tenancyAction(row,'reject')}>Reject</button></>}{row.status === 'active' && <><button className="text" onClick={() => tenancyAction(row,'update')}>Billing</button><button className="text danger" onClick={() => tenancyAction(row,'end')}>End</button></>}</div> : undefined;
+  const memberActions = user.role === 'admin' ? (row:Row) => <div className="row-actions">{row.status === 'pending' && <><button className="text" onClick={() => memberAction(row,'approve')}>Approve</button><button className="text danger" onClick={() => memberAction(row,'reject')}>Reject</button></>}{row.status === 'active' && <><button className="text" onClick={() => memberAction(row,'update')}>Permissions</button>{!row.linked_user_id && <button className="text" onClick={() => createMemberLogin(row)}>Add login</button>}<button className="text danger" onClick={() => memberAction(row,'deactivate')}>Deactivate</button></>}</div> : undefined;
+  return <PagePanel title="Tenancy & household" subtitle="Main tenants, rented apartments, dependants, domestic staff and delegated permissions" action={<div className="row-actions"><button className="secondary" onClick={() => setShowMember(!showMember)}>Add dependant</button><button className="primary" onClick={() => setShowTenancy(!showTenancy)}>{user.role === 'admin' ? 'Assign tenant' : 'Nominate tenant'}</button></div>}>
+    <Notice tone="info"><strong>Rented apartment:</strong> legal ownership remains with the owner. The approved tenant becomes the main resident for the tenancy dates. The administrator chooses whether future property bills go to the owner or tenant.</Notice>
+    {message && <Notice tone={message.includes('Could not') || message.includes('failed') ? 'error' : 'success'}>{message}</Notice>}
+    {showTenancy && <FormCard title={user.role === 'admin' ? 'Assign a tenant' : 'Nominate a tenant for approval'} onSubmit={addTenancy}><label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.owner_name ?? property.relationship_type)}</option>)}</select></label><label>Tenant email<input name="tenantEmail" type="email" required /></label><label>Start date<input name="startDate" type="date" required /></label><label>End date<input name="endDate" type="date" /></label><label>Bill responsibility<select name="billingResponsibility"><option value="owner">Legal owner</option><option value="tenant">Main tenant</option></select></label><label className="span-2">Note<textarea name="requestNote" rows={3} /></label><button className="primary">{user.role === 'admin' ? 'Assign tenant' : 'Submit nomination'}</button></FormCard>}
+    {showMember && <FormCard title="Add a dependant or household member" onSubmit={addMember}><label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.main_resident_name ?? property.owner_name)}</option>)}</select></label>{user.role === 'admin' && <label>Main resident ID<input name="primaryResidentId" placeholder="Optional; resolved automatically" /></label>}<label>Full name<input name="name" required /></label><label>Relationship<select name="relationship"><option value="spouse">Spouse</option><option value="child">Child</option><option value="parent">Parent</option><option value="relative">Relative</option><option value="domestic_staff">Domestic staff</option><option value="caregiver">Caregiver</option><option value="other">Other</option></select></label><label>Date of birth<input name="dateOfBirth" type="date" /></label><label>Phone<input name="phone" /></label><label>Email<input name="email" type="email" /></label><label className="check"><input name="canCreateVisitors" type="checkbox" /> May create visitors after login</label><label className="check"><input name="canViewBills" type="checkbox" /> May view bills after login</label><label className="span-2">Note<textarea name="requestNote" rows={3} /></label><button className="primary">{user.role === 'admin' ? 'Add member' : 'Submit for approval'}</button></FormCard>}
+    {user.role === 'admin' && (pendingTenancies.length > 0 || pendingMembers.length > 0) && <section className="approval-queue"><h3>Pending residency approvals</h3><p>{pendingTenancies.length} tenancy nomination(s) and {pendingMembers.length} household member(s) are waiting.</p></section>}
+    <section className="residency-section"><h3>Tenancies</h3><ListState list={tenancies}><DataTable rows={tenancies.data?.items ?? []} columns={[['unit_number','Unit'],['owner_name','Legal owner'],['tenant_name','Main tenant'],['start_date','Starts'],['end_date','Ends'],['billing_responsibility','Bill payer'],['status','Status']]} action={tenancyActions} /></ListState></section>
+    <section className="residency-section"><h3>Dependants and household members</h3><ListState list={household}><DataTable rows={household.data?.items ?? []} columns={[['name','Name'],['relationship','Relationship'],['unit_number','Unit'],['primary_resident_name','Main resident'],['login_email','Login'],['can_create_visitors','Visitors'],['can_view_bills','Bills'],['status','Status']]} action={memberActions} /></ListState></section>
+  </PagePanel>;
+}
+
+
 function Bills({ user }: { user: User }) {
   const list = useList('/api/bills?limit=50');
-  const streets = useAsync<{ items: Row[] }>(() => user.role === 'resident' ? Promise.resolve({ items: [] }) : api('/api/streets'), [user.role]);
+  const groups = useAsync<{ streets:Row[];blocks:Row[];zones:Row[] }>(() => user.role === 'resident' ? Promise.resolve({ streets:[],blocks:[],zones:[] }) : api('/api/property-groups'), [user.role]);
   const imports = useAsync<ListResponse<Row>>(() => user.role === 'resident' ? Promise.resolve({ items: [], page: 1, limit: 20 }) : api('/api/imports?limit=20'), [user.role]);
   const [showBatch, setShowBatch] = useState(false);
+  const [targetType, setTargetType] = useState<'street'|'block'|'zone'>('street');
   const [showImport, setShowImport] = useState(false);
   const [message, setMessage] = useState('');
 
@@ -320,27 +380,29 @@ function Bills({ user }: { user: User }) {
     const form = new FormData(event.currentTarget);
     const amount = Number(form.get('amount'));
     const body = {
-      name: form.get('name'), streets: form.getAll('streets'), amountMinor: Math.round(amount * 100),
+      name: form.get('name'), targetType, targets: form.getAll('targets'), amountMinor: Math.round(amount * 100),
       dueDate: form.get('dueDate'), billType: form.get('billType'), description: form.get('description'),
     };
     try {
-      const result = await api<{ billCount: number; streets: string[] }>('/api/bills/batch', { method: 'POST', body: JSON.stringify(body) });
-      setMessage(`${result.billCount} bill${result.billCount === 1 ? '' : 's'} created for ${result.streets.join(', ')}.`);
+      const result = await api<{ billCount:number;targetType:string;targets:string[] }>('/api/bills/batch', { method: 'POST', body: JSON.stringify(body) });
+      setMessage(`${result.billCount} bill${result.billCount === 1 ? '' : 's'} created for ${result.targetType}: ${result.targets.join(', ')}.`);
       setShowBatch(false); list.reload();
     } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Batch billing failed'); }
   }
 
   const staff = user.role === 'admin' || user.role === 'cashier';
-  return <PagePanel title="Bills & payments" subtitle={user.role === 'resident' ? 'Your charges and payment status' : 'Estate receivables, street billing and historical imports'} action={staff ? <div className="row-actions"><button className="secondary" onClick={() => setShowImport(!showImport)}>Import CSV</button><button className="primary" onClick={() => setShowBatch(!showBatch)}>Bill selected streets</button></div> : null}>
+  const targetRows = targetType === 'block' ? groups.data?.blocks : targetType === 'zone' ? groups.data?.zones : groups.data?.streets;
+  return <PagePanel title="Bills & payments" subtitle={user.role === 'resident' ? 'Your charges and payment status' : 'Estate receivables, grouped billing and historical imports'} action={staff ? <div className="row-actions"><button className="secondary" onClick={() => setShowImport(!showImport)}>Import CSV</button><button className="primary" onClick={() => setShowBatch(!showBatch)}>Create grouped bills</button></div> : null}>
     {message && <Notice tone={message.includes('created') ? 'success' : 'error'}>{message}</Notice>}
-    {showBatch && <FormCard title="Create bills for selected streets" onSubmit={createStreetBatch}>
+    {showBatch && <FormCard title="Create bills for selected property groups" onSubmit={createStreetBatch}>
       <label>Batch name<input name="name" placeholder="2026 facility fee" required /></label>
       <label>Amount (NGN)<input name="amount" type="number" min="0.01" step="0.01" required /></label>
       <label>Due date<input name="dueDate" type="date" required /></label>
       <label>Bill type<input name="billType" defaultValue="facility_fee" required /></label>
+      <label>Group by<select value={targetType} onChange={(event) => setTargetType(event.target.value as 'street'|'block'|'zone')}><option value="street">Street</option><option value="block">Block</option><option value="zone">Zone</option></select></label>
       <label className="span-2">Description<input name="description" /></label>
-      <fieldset className="street-picker span-2"><legend>Streets to bill</legend>{streets.loading && <small>Loading streets…</small>}{streets.data?.items.map((street) => <label className="check" key={String(street.street)}><input type="checkbox" name="streets" value={String(street.street)} /> <span>{String(street.street)} <small>({String(street.property_count)} properties)</small></span></label>)}{!streets.loading && !streets.data?.items.length && <Notice tone="warning">Add street names to properties before using street billing.</Notice>}</fieldset>
-      <button className="primary">Create street bills</button>
+      <fieldset className="street-picker span-2"><legend>{targetType[0].toUpperCase()+targetType.slice(1)}s to bill</legend>{groups.loading && <small>Loading property groups…</small>}{targetRows?.map((group) => <label className="check" key={String(group.value)}><input type="checkbox" name="targets" value={String(group.value)} /> <span>{String(group.value)} <small>({String(group.property_count)} properties)</small></span></label>)}{!groups.loading && !targetRows?.length && <Notice tone="warning">Add {targetType} details to properties before using this billing group.</Notice>}</fieldset>
+      <button className="primary">Create grouped bills</button>
     </FormCard>}
     {showImport && <section className="import-grid">
       <CsvImporter kind="bills" title="Import existing bills" onDone={() => { list.reload(); imports.reload(); }} />
@@ -463,8 +525,8 @@ function Cards({ user }: { user: User }) {
   const actions = user.role === 'admin' ? (row: Row) => <div className="row-actions">{row.status === 'active' ? <button className="text danger" onClick={() => change(row.id, 'suspended')}>Suspend</button> : <button className="text" onClick={() => change(row.id, 'active')}>Activate</button>}</div> : undefined;
   return <PagePanel title="Access cards" subtitle="Credential status, fee enforcement and audit" action={user.role === 'admin' ? <button className="primary" onClick={() => setShow(!show)}>Issue card</button> : null}>
     {message && <Notice tone="error">{message}</Notice>}
-    {show && <FormCard title="Issue a physical card" onSubmit={submit}><label>Resident ID<input name="residentId" required /></label><label>Card UID / number<input name="cardUid" required /></label><label>Label<input name="cardLabel" placeholder="Household member" /></label><button className="primary">Issue card</button></FormCard>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['resident_name','Resident'],['unit_number','Unit'],['card_uid','Card UID'],['card_label','Label'],['status','Status'],['deactivated_reason','Reason'],['updated_at','Updated','date']]} action={actions} /></ListState>
+    {show && <FormCard title="Issue a physical card" onSubmit={submit}><label>Main resident ID<input name="residentId" placeholder="Use this for a main resident" /></label><label>Household member ID<input name="householdMemberId" placeholder="Or use this for a dependant" /></label><label>Card UID / number<input name="cardUid" required /></label><label>Label<input name="cardLabel" placeholder="Optional card label" /></label><button className="primary">Issue card</button></FormCard>}
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['resident_name','Main resident'],['household_member_name','Card holder'],['relationship','Relationship'],['unit_number','Unit'],['card_uid','Card UID'],['card_label','Label'],['status','Status'],['deactivated_reason','Reason'],['updated_at','Updated','date']]} action={actions} /></ListState>
   </PagePanel>;
 }
 
@@ -486,7 +548,7 @@ function AccessEvents({ user }: { user: User }) {
   }, [user.role]);
   return <PagePanel title="Gate activity" subtitle="Granted and denied access across every configured point" action={user.role !== 'resident' ? <span className={`connection ${connection}`}><span className="pulse-dot" /> {connection}</span> : null}>
     {live.length > 0 && <section className="live-strip"><p className="eyebrow">JUST RECEIVED</p>{live.map((event, index) => <div className="live-event" key={`${String(event.vendorEventId)}-${index}`}><span className={`result-dot ${event.result}`} /><strong>{String(event.personName ?? event.cardUid ?? 'Unknown credential')}</strong><span>{String(event.result)}</span><small>{readableDate(event.deviceTimestamp)}</small></div>)}</section>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['result','Result'],['person_name','Person'],['employee_no','Employee no.'],['credential_type','Method'],['card_uid','Card'],['device_name','Device'],['access_point_name','Access point'],['door_no','Door'],['direction','Direction'],['device_timestamp','Time','date']]} /></ListState>
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['result','Result'],['household_member_name','Household member'],['person_name','Device person'],['resident_name','Main resident'],['employee_no','Employee no.'],['credential_type','Method'],['card_uid','Card'],['device_name','Device'],['access_point_name','Access point'],['door_no','Door'],['direction','Direction'],['device_timestamp','Time','date']]} /></ListState>
   </PagePanel>;
 }
 
@@ -623,7 +685,7 @@ function nested(source: Row | null, objectKey: string, key: string): unknown {
 
 function initials(name: string): string { return name.split(/\s+/).slice(0,2).map((part) => part[0]).join('').toUpperCase(); }
 function navIcon(section: Section): string {
-  return ({ dashboard: '◫', residents: '●', properties: '⌂', bills: '₦', visitors: '↔', maintenance: '◇', notices: '!', cards: '▤', events: '⌁', devices: '▣', operations: '↻', settings: '⚙' })[section];
+  return ({ dashboard: '◫', residents: '●', properties: '⌂', residency: '♙', bills: '₦', visitors: '↔', maintenance: '◇', notices: '!', cards: '▤', events: '⌁', devices: '▣', operations: '↻', settings: '⚙' })[section];
 }
 
 export default App;

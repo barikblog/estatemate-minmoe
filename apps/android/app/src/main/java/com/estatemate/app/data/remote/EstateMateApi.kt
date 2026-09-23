@@ -53,8 +53,13 @@ data class PropertyDto(
     val id: String,
     @SerializedName("unit_number") val unitNumber: String,
     val street: String?,
+    val block: String?,
+    val zone: String?,
     val address: String,
     @SerializedName("owner_name") val ownerName: String?,
+    @SerializedName("tenant_name") val tenantName: String?,
+    @SerializedName("relationship_type") val relationshipType: String?,
+    @SerializedName("billing_responsibility") val billingResponsibility: String?,
     @SerializedName("approved_at") val approvedAt: String?,
 )
 data class OwnershipRequestDto(
@@ -77,6 +82,49 @@ data class OwnershipRequestBody(
 data class OwnershipRequestCreated(val id: String, val status: String)
 data class OwnershipReviewBody(val status: String, val reviewNote: String? = null)
 data class OwnershipReviewResponse(val ok: Boolean, val status: String)
+data class ActionResponse(val ok: Boolean)
+data class TenancyDto(
+    val id: String,
+    @SerializedName("property_id") val propertyId: String,
+    @SerializedName("unit_number") val unitNumber: String,
+    @SerializedName("owner_name") val ownerName: String,
+    @SerializedName("tenant_name") val tenantName: String,
+    @SerializedName("start_date") val startDate: String,
+    @SerializedName("end_date") val endDate: String?,
+    @SerializedName("billing_responsibility") val billingResponsibility: String,
+    val status: String,
+)
+data class TenancyRequestBody(
+    val propertyId: String,
+    val tenantEmail: String,
+    val startDate: String,
+    val endDate: String? = null,
+    val billingResponsibility: String = "owner",
+    val requestNote: String? = null,
+)
+data class TenancyActionBody(val action: String, val billingResponsibility: String? = null, val reviewNote: String? = null)
+data class HouseholdMemberDto(
+    val id: String,
+    @SerializedName("property_id") val propertyId: String,
+    @SerializedName("unit_number") val unitNumber: String,
+    val name: String,
+    val relationship: String,
+    @SerializedName("primary_resident_name") val primaryResidentName: String,
+    @SerializedName("login_email") val loginEmail: String?,
+    @SerializedName("can_create_visitors") val canCreateVisitors: Int,
+    @SerializedName("can_view_bills") val canViewBills: Int,
+    val status: String,
+)
+data class HouseholdRequestBody(
+    val propertyId: String,
+    val name: String,
+    val relationship: String,
+    val phone: String? = null,
+    val email: String? = null,
+    val canCreateVisitors: Boolean = false,
+    val canViewBills: Boolean = false,
+)
+data class HouseholdActionBody(val action: String, val canCreateVisitors: Boolean? = null, val canViewBills: Boolean? = null)
 
 interface EstateMateApi {
     @POST("api/auth/login")
@@ -108,4 +156,22 @@ interface EstateMateApi {
 
     @PATCH("api/property-ownership-requests/{id}")
     suspend fun reviewOwnership(@Path("id") id: String, @Body review: OwnershipReviewBody): OwnershipReviewResponse
+
+    @GET("api/property-tenancies")
+    suspend fun tenancies(@Query("limit") limit: Int = 100): ListResponse<TenancyDto>
+
+    @POST("api/property-tenancies")
+    suspend fun createTenancy(@Body request: TenancyRequestBody): OwnershipRequestCreated
+
+    @PATCH("api/property-tenancies/{id}")
+    suspend fun tenancyAction(@Path("id") id: String, @Body action: TenancyActionBody): ActionResponse
+
+    @GET("api/household-members")
+    suspend fun householdMembers(@Query("limit") limit: Int = 100): ListResponse<HouseholdMemberDto>
+
+    @POST("api/household-members")
+    suspend fun createHouseholdMember(@Body request: HouseholdRequestBody): OwnershipRequestCreated
+
+    @PATCH("api/household-members/{id}")
+    suspend fun householdAction(@Path("id") id: String, @Body action: HouseholdActionBody): ActionResponse
 }

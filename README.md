@@ -22,6 +22,9 @@ Included:
 - General estate notices with priority, scheduling, read acknowledgements, and login popups; the former Community posting feature is removed.
 - Street-targeted batch billing and audited CSV imports for pre-existing bills and resident payments (500 rows/2 MB per upload).
 - Residents can own multiple administrator-approved properties; they can request an existing unowned unit or propose a new property, while each property retains one active owner.
+- Rented-apartment workflows with owner nomination or direct administrator assignment, approval dates, one active main tenant, and owner/tenant billing responsibility.
+- Approved dependant and household profiles, optional separate logins, delegated visitor/bill permissions, and dependant access cards tied to the main resident.
+- Audited immediate or scheduled ownership transfers, downloadable property statements, and grouped street/block/zone billing.
 - Kotlin/Compose Android foundation with encrypted token storage, Retrofit/Hilt, Room event cache, role dashboard, and gate history.
 - Private GitHub-backed upload/download storage with encrypted-at-rest repository access tokens, administrator-editable settings, access checks, and a 4 MB per-file limit. Paid R2 storage remains disabled.
 - PBKDF2-SHA256 passwords and HS256 sessions implemented with Workers Web Crypto.
@@ -34,7 +37,7 @@ Still model/account dependent:
 - Gemini enrichment, FCM delivery, large GitHub exports, and full accounting/reconciliation UI.
 - Android production signing, push configuration, and Play distribution.
 
-See [`docs/MINMOE-NO-PC.md`](docs/MINMOE-NO-PC.md) before installing a terminal. Multi-property rules and private upload setup are documented in [`docs/MULTI-PROPERTY-OWNERSHIP.md`](docs/MULTI-PROPERTY-OWNERSHIP.md) and [`docs/GITHUB-STORAGE.md`](docs/GITHUB-STORAGE.md).
+See [`docs/MINMOE-NO-PC.md`](docs/MINMOE-NO-PC.md) before installing a terminal. Property workflows are documented in [`docs/MULTI-PROPERTY-OWNERSHIP.md`](docs/MULTI-PROPERTY-OWNERSHIP.md) and [`docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md`](docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md). Private upload setup is in [`docs/GITHUB-STORAGE.md`](docs/GITHUB-STORAGE.md).
 
 ## Architecture
 

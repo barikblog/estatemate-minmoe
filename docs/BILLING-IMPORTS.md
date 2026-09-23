@@ -2,9 +2,11 @@
 
 ## Property street data
 
-Every new property requires a `street`. Street-targeted billing creates one bill for every property on a selected street that has an active, administrator-approved resident owner. A resident who owns several properties receives one property-linked bill for each qualifying property.
+Every new property requires a `street` and may also have a `block` and `zone`. Grouped billing creates one bill for every qualifying property on selected streets, blocks, or zones.
 
-The batch record stores the selected streets, amount, bill type, due date, description, creator, creation time, and number of generated bills.
+An owner-occupied property is billed to its legal owner. For a rented property, the active tenancy determines whether new bills go to the legal owner or main tenant. A resident connected to several qualifying properties receives one property-linked bill for each.
+
+The batch record stores the target type and selected groups, amount, bill type, due date, description, creator, creation time, and number of generated bills.
 
 ## Existing bill import
 

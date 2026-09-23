@@ -102,6 +102,100 @@ async function audit(c: AppContext, action: string, entityType: string, entityId
   ).bind(crypto.randomUUID(), c.get('user')?.id ?? null, action, entityType, entityId, details ? JSON.stringify(details) : null).run();
 }
 
+type PropertyRelationship = {
+  relationship: 'owner'|'tenant'|'dependant';
+  can_create_visitors: number;
+  can_manage_maintenance: number;
+  can_view_bills: number;
+};
+
+async function propertyRelationship(db: D1Database, userId: string, propertyId: string): Promise<PropertyRelationship | null> {
+  return db.prepare(
+    `SELECT relationship,can_create_visitors,can_manage_maintenance,can_view_bills FROM (
+       SELECT 'owner' AS relationship,
+         CASE WHEN EXISTS (SELECT 1 FROM property_tenancies t WHERE t.property_id=? AND t.status='active' AND date(t.start_date)<=date('now') AND (t.end_date IS NULL OR date(t.end_date)>=date('now'))) THEN 0 ELSE 1 END AS can_create_visitors,
+         1 AS can_manage_maintenance,1 AS can_view_bills,1 AS priority
+       FROM property_ownerships WHERE property_id=? AND resident_id=? AND status='active'
+       UNION ALL
+       SELECT 'tenant',can_manage_visitors,can_manage_maintenance,CASE WHEN billing_responsibility='tenant' THEN 1 ELSE 0 END,2
+       FROM property_tenancies WHERE property_id=? AND tenant_id=? AND status='active'
+         AND date(start_date)<=date('now') AND (end_date IS NULL OR date(end_date)>=date('now'))
+       UNION ALL
+       SELECT 'dependant',can_create_visitors,1,can_view_bills,3
+       FROM household_members WHERE property_id=? AND linked_user_id=? AND status='active'
+     ) ORDER BY priority LIMIT 1`,
+  ).bind(propertyId,propertyId,userId,propertyId,userId,propertyId,userId).first<PropertyRelationship>();
+}
+
+async function isPrimaryResident(db: D1Database, userId: string, propertyId: string): Promise<boolean> {
+  const row = await db.prepare(
+    `SELECT 1 AS ok WHERE EXISTS (
+       SELECT 1 FROM property_tenancies WHERE property_id=? AND tenant_id=? AND status='active'
+         AND date(start_date)<=date('now') AND (end_date IS NULL OR date(end_date)>=date('now'))
+     ) OR (
+       EXISTS (SELECT 1 FROM property_ownerships WHERE property_id=? AND resident_id=? AND status='active')
+       AND NOT EXISTS (SELECT 1 FROM property_tenancies WHERE property_id=? AND status='active'
+         AND date(start_date)<=date('now') AND (end_date IS NULL OR date(end_date)>=date('now')))
+     )`,
+  ).bind(propertyId, userId, propertyId, userId, propertyId).first<{ ok: number }>();
+  return Boolean(row?.ok);
+}
+
+async function deactivatePrimaryHousehold(env: Env, propertyId: string, primaryResidentId: string, actorId: string | null): Promise<void> {
+  const cards = await env.DB.prepare(
+    `SELECT c.id,c.card_uid FROM access_cards c JOIN household_members h ON h.id=c.household_member_id
+     WHERE h.property_id=? AND h.primary_resident_id=? AND c.status='active'`,
+  ).bind(propertyId,primaryResidentId).all<{ id:string;card_uid:string }>();
+  await env.DB.prepare(
+    `UPDATE household_members SET status='inactive',deactivated_by=?,deactivated_at=datetime('now'),updated_at=datetime('now')
+     WHERE property_id=? AND primary_resident_id=? AND status IN ('pending','active')`,
+  ).bind(actorId,propertyId,primaryResidentId).run();
+  for (const card of cards.results) {
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE access_cards SET status='suspended',deactivated_at=datetime('now'),deactivated_reason='main tenancy ended',updated_at=datetime('now') WHERE id=?`).bind(card.id),
+      env.DB.prepare(`INSERT INTO card_status_changes(id,card_id,old_status,new_status,reason,changed_by) VALUES (?,?,'active','suspended','main tenancy ended',?)`).bind(crypto.randomUUID(),card.id,actorId),
+    ]);
+    await createDeviceOperations(env,card.id,'disable_card',{ cardUid:card.card_uid,enabled:false,reason:'main tenancy ended' });
+  }
+}
+
+async function completePropertyTransfer(env: Env, transferId: string, actorId: string | null): Promise<void> {
+  const transfer = await env.DB.prepare(
+    `SELECT id,property_id,from_owner_id,to_owner_id,status FROM property_transfer_requests WHERE id=? AND status IN ('pending','scheduled')`,
+  ).bind(transferId).first<{ id: string; property_id: string; from_owner_id: string; to_owner_id: string; status: string }>();
+  if (!transfer) throw new Error('Transfer is no longer open');
+  const ownership = await env.DB.prepare(
+    `SELECT id FROM property_ownerships WHERE property_id=? AND resident_id=? AND status='active'`,
+  ).bind(transfer.property_id, transfer.from_owner_id).first<{ id: string }>();
+  if (!ownership) {
+    await env.DB.prepare(
+      `UPDATE property_transfer_requests SET status='failed',failure_reason='Current ownership changed before transfer',updated_at=datetime('now') WHERE id=?`,
+    ).bind(transfer.id).run();
+    throw new Error('Current ownership changed before the transfer could complete');
+  }
+  const newOwnershipId = crypto.randomUUID();
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE property_ownerships SET status='revoked',revoked_by=?,revoked_at=datetime('now'),revocation_reason='approved ownership transfer' WHERE id=?`,
+    ).bind(actorId, ownership.id),
+    env.DB.prepare(
+      `INSERT INTO property_ownerships(id,property_id,resident_id,status,approved_by) VALUES (?,?,?,'active',?)`,
+    ).bind(newOwnershipId, transfer.property_id, transfer.to_owner_id, actorId),
+    env.DB.prepare(`UPDATE users SET property_id=COALESCE(property_id,?),updated_at=datetime('now') WHERE id=?`).bind(transfer.property_id, transfer.to_owner_id),
+    env.DB.prepare(
+      `UPDATE users SET property_id=(SELECT property_id FROM property_ownerships WHERE resident_id=? AND status='active' ORDER BY approved_at LIMIT 1),updated_at=datetime('now') WHERE id=?`,
+    ).bind(transfer.from_owner_id, transfer.from_owner_id),
+    env.DB.prepare(
+      `UPDATE property_transfer_requests SET status='completed',completed_at=datetime('now'),updated_at=datetime('now') WHERE id=?`,
+    ).bind(transfer.id),
+  ]);
+}
+
+function csvCell(value: unknown): string {
+  const text = String(value ?? '');
+  return /[",\n\r]/.test(text) ? `"${text.replaceAll('"','""')}"` : text;
+}
+
 app.get('/api/health', async (c) => {
   const db = await c.env.DB.prepare('SELECT 1 AS ok').first<{ ok: number }>();
   let fileStorage = c.env.FILE_STORAGE_MODE ?? 'disabled';
@@ -207,13 +301,25 @@ app.get('/api/properties', async (c) => {
   const search = `%${c.req.query('search')?.trim() ?? ''}%`;
   const residentId = user.role === 'resident' ? user.id : null;
   const result = await c.env.DB.prepare(
-    `SELECT p.*,po.id AS ownership_id,po.approved_at,u.id AS owner_id,u.name AS owner_name,u.email AS owner_email
+    `SELECT p.*,po.id AS ownership_id,po.approved_at,owner.id AS owner_id,owner.name AS owner_name,owner.email AS owner_email,
+       t.id AS tenancy_id,t.tenant_id,t.billing_responsibility,t.start_date AS tenancy_start_date,t.end_date AS tenancy_end_date,
+       tenant.name AS tenant_name,tenant.email AS tenant_email,
+       CASE WHEN ? IS NULL THEN NULL WHEN po.resident_id=? THEN 'owner' WHEN t.tenant_id=? THEN 'tenant' WHEN hm.linked_user_id=? THEN 'dependant' END AS relationship_type,
+       CASE WHEN t.id IS NOT NULL THEN tenant.name ELSE owner.name END AS main_resident_name
      FROM properties p
      LEFT JOIN property_ownerships po ON po.property_id=p.id AND po.status='active'
-     LEFT JOIN users u ON u.id=po.resident_id
-     WHERE (? IS NULL OR po.resident_id=?) AND (p.unit_number LIKE ? OR p.address LIKE ? OR p.street LIKE ?)
-     ORDER BY p.street,p.unit_number LIMIT ? OFFSET ?`,
-  ).bind(residentId, residentId, search, search, search, limit, offset).all();
+     LEFT JOIN users owner ON owner.id=po.resident_id
+     LEFT JOIN property_tenancies t ON t.property_id=p.id AND t.status='active' AND date(t.start_date)<=date('now') AND (t.end_date IS NULL OR date(t.end_date)>=date('now'))
+     LEFT JOIN users tenant ON tenant.id=t.tenant_id
+     LEFT JOIN household_members hm ON hm.property_id=p.id AND hm.linked_user_id=? AND hm.status='active'
+     WHERE (? IS NULL OR po.resident_id=? OR t.tenant_id=? OR hm.linked_user_id=?)
+       AND (p.unit_number LIKE ? OR p.address LIKE ? OR p.street LIKE ? OR COALESCE(p.block,'') LIKE ? OR COALESCE(p.zone,'') LIKE ?)
+     ORDER BY p.zone,p.street,p.block,p.unit_number LIMIT ? OFFSET ?`,
+  ).bind(
+    residentId,residentId,residentId,residentId,residentId,
+    residentId,residentId,residentId,residentId,
+    search,search,search,search,search,limit,offset,
+  ).all();
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
@@ -229,20 +335,22 @@ app.get('/api/properties/available', requireRoles('resident', 'admin'), async (c
 });
 
 app.post('/api/properties', requireRoles('admin'), async (c) => {
-  const body = await c.req.json<{ unitNumber?: string; address?: string; street?: string }>();
+  const body = await c.req.json<{ unitNumber?: string; address?: string; street?: string; block?: string; zone?: string }>();
   if (!body.unitNumber?.trim() || !body.address?.trim() || !body.street?.trim()) return jsonError(c, 400, 'unitNumber, address and street are required');
   const id = crypto.randomUUID();
-  await c.env.DB.prepare(`INSERT INTO properties(id,unit_number,address,street) VALUES (?,?,?,?)`).bind(id, body.unitNumber.trim(), body.address.trim(), body.street.trim()).run();
+  await c.env.DB.prepare(`INSERT INTO properties(id,unit_number,address,street,block,zone) VALUES (?,?,?,?,?,?)`).bind(
+    id,body.unitNumber.trim(),body.address.trim(),body.street.trim(),body.block?.trim() || null,body.zone?.trim() || null,
+  ).run();
   await audit(c, 'create', 'property', id, body);
   return c.json({ id }, 201);
 });
 
 app.patch('/api/properties/:id', requireRoles('admin'), async (c) => {
-  const body = await c.req.json<{ unitNumber?: string; address?: string; street?: string }>();
+  const body = await c.req.json<{ unitNumber?: string; address?: string; street?: string; block?: string; zone?: string }>();
   if (!body.unitNumber?.trim() || !body.address?.trim() || !body.street?.trim()) return jsonError(c, 400, 'unitNumber, address and street are required');
   const result = await c.env.DB.prepare(
-    `UPDATE properties SET unit_number=?,address=?,street=? WHERE id=?`,
-  ).bind(body.unitNumber.trim(), body.address.trim(), body.street.trim(), c.req.param('id')).run();
+    `UPDATE properties SET unit_number=?,address=?,street=?,block=?,zone=? WHERE id=?`,
+  ).bind(body.unitNumber.trim(),body.address.trim(),body.street.trim(),body.block?.trim() || null,body.zone?.trim() || null,c.req.param('id')).run();
   if (!result.meta.changes) return jsonError(c, 404, 'Property not found');
   await audit(c, 'update', 'property', c.req.param('id'), body);
   return c.json({ ok: true });
@@ -365,6 +473,8 @@ app.delete('/api/property-ownerships/:id', requireRoles('admin'), async (c) => {
     `SELECT id,property_id,resident_id FROM property_ownerships WHERE id=? AND status='active'`,
   ).bind(c.req.param('id')).first<{ id: string; property_id: string; resident_id: string }>();
   if (!ownership) return jsonError(c, 404, 'Active property ownership not found');
+  const activeTenancy = await c.env.DB.prepare(`SELECT id FROM property_tenancies WHERE property_id=? AND status='active'`).bind(ownership.property_id).first();
+  if (activeTenancy) return jsonError(c, 409, 'End the active tenancy before removing the property owner');
   await c.env.DB.batch([
     c.env.DB.prepare(
       `UPDATE property_ownerships SET status='revoked',revoked_by=?,revoked_at=datetime('now'),revocation_reason=? WHERE id=?`,
@@ -375,6 +485,321 @@ app.delete('/api/property-ownerships/:id', requireRoles('admin'), async (c) => {
   ]);
   await audit(c, 'revoke', 'property_ownership', ownership.id, ownership);
   return c.json({ ok: true });
+});
+
+app.get('/api/property-tenancies', requireRoles('resident', 'admin'), async (c) => {
+  const user = c.get('user');
+  const residentId = user.role === 'resident' ? user.id : null;
+  const { limit, offset, page: pageNumber } = page(c);
+  const result = await c.env.DB.prepare(
+    `SELECT t.*,p.unit_number,p.street,p.block,p.zone,tenant.name AS tenant_name,tenant.email AS tenant_email,
+       owner.name AS owner_name,owner.email AS owner_email,requester.name AS requested_by_name,reviewer.name AS approved_by_name
+     FROM property_tenancies t
+     JOIN properties p ON p.id=t.property_id
+     JOIN users tenant ON tenant.id=t.tenant_id
+     JOIN property_ownerships po ON po.property_id=p.id AND po.status='active'
+     JOIN users owner ON owner.id=po.resident_id
+     JOIN users requester ON requester.id=t.requested_by
+     LEFT JOIN users reviewer ON reviewer.id=t.approved_by
+     WHERE (? IS NULL OR t.tenant_id=? OR po.resident_id=?)
+     ORDER BY CASE t.status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END,t.created_at DESC LIMIT ? OFFSET ?`,
+  ).bind(residentId,residentId,residentId,limit,offset).all();
+  return c.json({ items: result.results, page: pageNumber, limit });
+});
+
+app.post('/api/property-tenancies', requireRoles('resident', 'admin'), async (c) => {
+  const body = await c.req.json<{
+    propertyId?: string;
+    tenantId?: string;
+    tenantEmail?: string;
+    startDate?: string;
+    endDate?: string;
+    billingResponsibility?: 'owner'|'tenant';
+    requestNote?: string;
+  }>();
+  if (!body.propertyId || (!body.tenantId && !body.tenantEmail?.trim()) || !body.startDate) return jsonError(c, 400, 'propertyId, tenant and startDate are required');
+  if (Number.isNaN(new Date(body.startDate).valueOf()) || (body.endDate && Number.isNaN(new Date(body.endDate).valueOf()))) return jsonError(c, 400, 'Tenancy dates are invalid');
+  if (body.endDate && new Date(body.endDate) < new Date(body.startDate)) return jsonError(c, 400, 'endDate must not be before startDate');
+  const user = c.get('user');
+  const owner = await c.env.DB.prepare(
+    `SELECT po.resident_id FROM property_ownerships po WHERE po.property_id=? AND po.status='active'`,
+  ).bind(body.propertyId).first<{ resident_id: string }>();
+  if (!owner) return jsonError(c, 409, 'The property must have an active owner before it can be rented');
+  if (user.role === 'resident' && owner.resident_id !== user.id) return jsonError(c, 403, 'Only the property owner can nominate a tenant');
+  const tenant = await c.env.DB.prepare(
+    `SELECT id FROM users WHERE role='resident' AND status='active' AND (id=? OR lower(email)=lower(?)) LIMIT 1`,
+  ).bind(body.tenantId ?? '', body.tenantEmail?.trim() ?? '').first<{ id: string }>();
+  if (!tenant) return jsonError(c, 404, 'Active tenant account not found');
+  if (tenant.id === owner.resident_id) return jsonError(c, 400, 'The legal owner does not need a tenancy record for their own property');
+  const billing = body.billingResponsibility ?? 'owner';
+  if (!['owner','tenant'].includes(billing)) return jsonError(c, 400, 'billingResponsibility must be owner or tenant');
+  const id = crypto.randomUUID();
+  const direct = user.role === 'admin';
+  await c.env.DB.prepare(
+    `INSERT INTO property_tenancies(id,property_id,tenant_id,status,start_date,end_date,billing_responsibility,request_note,requested_by,approved_by,approved_at)
+     VALUES (?,?,?, ?,?,?,?,?,?,?,?)`,
+  ).bind(
+    id,body.propertyId,tenant.id,direct ? 'active' : 'pending',body.startDate,body.endDate ?? null,billing,
+    body.requestNote?.trim() ?? null,user.id,direct ? user.id : null,direct ? new Date().toISOString() : null,
+  ).run();
+  if (direct) await c.env.DB.prepare(`UPDATE users SET property_id=COALESCE(property_id,?),updated_at=datetime('now') WHERE id=?`).bind(body.propertyId,tenant.id).run();
+  await audit(c, direct ? 'assign' : 'request', 'property_tenancy', id, { propertyId: body.propertyId, tenantId: tenant.id, billingResponsibility: billing });
+  return c.json({ id, status: direct ? 'active' : 'pending' }, 201);
+});
+
+app.patch('/api/property-tenancies/:id', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<{ action?: 'approve'|'reject'|'end'|'update'; billingResponsibility?: 'owner'|'tenant'; reviewNote?: string; endDate?: string }>();
+  if (!body.action || !['approve','reject','end','update'].includes(body.action)) return jsonError(c, 400, 'Invalid tenancy action');
+  const tenancy = await c.env.DB.prepare(`SELECT * FROM property_tenancies WHERE id=?`).bind(c.req.param('id')).first<Record<string,string|number|null>>();
+  if (!tenancy) return jsonError(c, 404, 'Tenancy not found');
+  const billing = body.billingResponsibility ?? String(tenancy.billing_responsibility);
+  if (!['owner','tenant'].includes(billing)) return jsonError(c, 400, 'billingResponsibility must be owner or tenant');
+  if (body.action === 'approve') {
+    if (tenancy.status !== 'pending') return jsonError(c, 409, 'Only pending tenancies can be approved');
+    const conflict = await c.env.DB.prepare(`SELECT id FROM property_tenancies WHERE property_id=? AND status='active'`).bind(tenancy.property_id).first();
+    if (conflict) return jsonError(c, 409, 'This property already has an active tenancy');
+    await c.env.DB.prepare(
+      `UPDATE property_tenancies SET status='active',billing_responsibility=?,review_note=?,approved_by=?,approved_at=datetime('now'),updated_at=datetime('now') WHERE id=?`,
+    ).bind(billing,body.reviewNote?.trim() ?? null,c.get('user').id,c.req.param('id')).run();
+    await c.env.DB.prepare(`UPDATE users SET property_id=COALESCE(property_id,?),updated_at=datetime('now') WHERE id=?`).bind(tenancy.property_id,tenancy.tenant_id).run();
+  } else if (body.action === 'reject') {
+    if (tenancy.status !== 'pending') return jsonError(c, 409, 'Only pending tenancies can be rejected');
+    await c.env.DB.prepare(
+      `UPDATE property_tenancies SET status='rejected',review_note=?,approved_by=?,approved_at=datetime('now'),updated_at=datetime('now') WHERE id=?`,
+    ).bind(body.reviewNote?.trim() ?? null,c.get('user').id,c.req.param('id')).run();
+  } else if (body.action === 'end') {
+    if (tenancy.status !== 'active') return jsonError(c, 409, 'Only active tenancies can be ended');
+    await c.env.DB.prepare(
+      `UPDATE property_tenancies SET status='ended',end_date=COALESCE(?,date('now')),review_note=?,ended_by=?,ended_at=datetime('now'),updated_at=datetime('now') WHERE id=?`,
+    ).bind(body.endDate ?? null,body.reviewNote?.trim() ?? null,c.get('user').id,c.req.param('id')).run();
+    await deactivatePrimaryHousehold(c.env,String(tenancy.property_id),String(tenancy.tenant_id),c.get('user').id);
+    await c.env.DB.prepare(
+      `UPDATE users SET property_id=COALESCE(
+        (SELECT property_id FROM property_ownerships WHERE resident_id=? AND status='active' ORDER BY approved_at LIMIT 1),
+        (SELECT property_id FROM property_tenancies WHERE tenant_id=? AND status='active' ORDER BY start_date LIMIT 1),
+        (SELECT property_id FROM household_members WHERE linked_user_id=? AND status='active' ORDER BY created_at LIMIT 1)
+       ),updated_at=datetime('now') WHERE id=?`,
+    ).bind(tenancy.tenant_id,tenancy.tenant_id,tenancy.tenant_id,tenancy.tenant_id).run();
+  } else {
+    if (tenancy.status !== 'active') return jsonError(c, 409, 'Only active tenancies can be updated');
+    await c.env.DB.prepare(
+      `UPDATE property_tenancies SET billing_responsibility=?,end_date=COALESCE(?,end_date),review_note=?,updated_at=datetime('now') WHERE id=?`,
+    ).bind(billing,body.endDate ?? null,body.reviewNote?.trim() ?? null,c.req.param('id')).run();
+  }
+  await audit(c, body.action, 'property_tenancy', c.req.param('id'), { billingResponsibility: billing, reviewNote: body.reviewNote });
+  return c.json({ ok: true, action: body.action });
+});
+
+app.get('/api/household-members', requireRoles('resident', 'admin'), async (c) => {
+  const user = c.get('user');
+  const residentId = user.role === 'resident' ? user.id : null;
+  const propertyId = c.req.query('propertyId') ?? null;
+  const { limit, offset, page: pageNumber } = page(c);
+  const result = await c.env.DB.prepare(
+    `SELECT h.*,p.unit_number,p.street,primary_user.name AS primary_resident_name,linked.name AS login_name,linked.email AS login_email,
+       reviewer.name AS approved_by_name
+     FROM household_members h
+     JOIN properties p ON p.id=h.property_id
+     JOIN users primary_user ON primary_user.id=h.primary_resident_id
+     LEFT JOIN users linked ON linked.id=h.linked_user_id
+     LEFT JOIN users reviewer ON reviewer.id=h.approved_by
+     WHERE (? IS NULL OR h.primary_resident_id=? OR h.linked_user_id=?
+       OR EXISTS (SELECT 1 FROM property_ownerships po WHERE po.property_id=h.property_id AND po.resident_id=? AND po.status='active'))
+       AND (? IS NULL OR h.property_id=?)
+     ORDER BY CASE h.status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END,h.name LIMIT ? OFFSET ?`,
+  ).bind(residentId,residentId,residentId,residentId,propertyId,propertyId,limit,offset).all();
+  return c.json({ items: result.results, page: pageNumber, limit });
+});
+
+app.post('/api/household-members', requireRoles('resident', 'admin'), async (c) => {
+  const body = await c.req.json<{
+    propertyId?: string;
+    primaryResidentId?: string;
+    name?: string;
+    relationship?: string;
+    dateOfBirth?: string;
+    phone?: string;
+    email?: string;
+    canCreateVisitors?: boolean;
+    canViewBills?: boolean;
+    requestNote?: string;
+  }>();
+  const relationships = ['spouse','child','parent','relative','domestic_staff','caregiver','other'];
+  if (!body.propertyId || !body.name?.trim() || !body.relationship || !relationships.includes(body.relationship)) return jsonError(c, 400, 'propertyId, name and a valid relationship are required');
+  const user = c.get('user');
+  let primaryResidentId = user.role === 'resident' ? user.id : body.primaryResidentId;
+  if (user.role === 'resident' && !(await isPrimaryResident(c.env.DB,user.id,body.propertyId))) return jsonError(c, 403, 'Only the main owner-occupant or active tenant can add dependants');
+  if (!primaryResidentId && user.role === 'admin') {
+    const primary = await c.env.DB.prepare(
+      `SELECT COALESCE((SELECT tenant_id FROM property_tenancies WHERE property_id=? AND status='active' AND date(start_date)<=date('now') AND (end_date IS NULL OR date(end_date)>=date('now')) LIMIT 1),(SELECT resident_id FROM property_ownerships WHERE property_id=? AND status='active' LIMIT 1)) AS id`,
+    ).bind(body.propertyId,body.propertyId).first<{ id: string|null }>();
+    primaryResidentId = primary?.id ?? undefined;
+  }
+  if (!primaryResidentId || !(await isPrimaryResident(c.env.DB,primaryResidentId,body.propertyId))) return jsonError(c, 400, 'A valid main resident is required for this property');
+  const id = crypto.randomUUID();
+  const direct = user.role === 'admin';
+  await c.env.DB.prepare(
+    `INSERT INTO household_members(id,property_id,primary_resident_id,name,relationship,date_of_birth,phone,email,status,can_create_visitors,can_view_bills,request_note,requested_by,approved_by,approved_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  ).bind(
+    id,body.propertyId,primaryResidentId,body.name.trim(),body.relationship,body.dateOfBirth ?? null,body.phone?.trim() ?? null,body.email?.trim().toLowerCase() ?? null,
+    direct ? 'active' : 'pending',body.canCreateVisitors ? 1 : 0,body.canViewBills ? 1 : 0,body.requestNote?.trim() ?? null,user.id,direct ? user.id : null,direct ? new Date().toISOString() : null,
+  ).run();
+  await audit(c, direct ? 'create' : 'request', 'household_member', id, { propertyId: body.propertyId, relationship: body.relationship });
+  return c.json({ id, status: direct ? 'active' : 'pending' }, 201);
+});
+
+app.patch('/api/household-members/:id', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<{ action?: 'approve'|'reject'|'deactivate'|'update'; canCreateVisitors?: boolean; canViewBills?: boolean; reviewNote?: string }>();
+  if (!body.action || !['approve','reject','deactivate','update'].includes(body.action)) return jsonError(c, 400, 'Invalid household action');
+  const member = await c.env.DB.prepare(`SELECT * FROM household_members WHERE id=?`).bind(c.req.param('id')).first<Record<string,string|number|null>>();
+  if (!member) return jsonError(c, 404, 'Household member not found');
+  const visitorPermission = body.canCreateVisitors == null ? Number(member.can_create_visitors) : body.canCreateVisitors ? 1 : 0;
+  const billPermission = body.canViewBills == null ? Number(member.can_view_bills) : body.canViewBills ? 1 : 0;
+  const status = body.action === 'approve' ? 'active' : body.action === 'reject' ? 'rejected' : body.action === 'deactivate' ? 'inactive' : String(member.status);
+  if (body.action === 'approve' && member.status !== 'pending') return jsonError(c, 409, 'Only pending household members can be approved');
+  await c.env.DB.prepare(
+    `UPDATE household_members SET status=?,can_create_visitors=?,can_view_bills=?,review_note=?,approved_by=CASE WHEN ?='active' THEN ? ELSE approved_by END,
+       approved_at=CASE WHEN ?='active' THEN datetime('now') ELSE approved_at END,
+       deactivated_by=CASE WHEN ?='inactive' THEN ? ELSE deactivated_by END,
+       deactivated_at=CASE WHEN ?='inactive' THEN datetime('now') ELSE deactivated_at END,updated_at=datetime('now') WHERE id=?`,
+  ).bind(status,visitorPermission,billPermission,body.reviewNote?.trim() ?? null,status,c.get('user').id,status,status,c.get('user').id,status,c.req.param('id')).run();
+  if (status === 'inactive' || status === 'rejected') {
+    const cards = await c.env.DB.prepare(`SELECT id,card_uid FROM access_cards WHERE household_member_id=? AND status='active'`).bind(c.req.param('id')).all<{ id:string;card_uid:string }>();
+    for (const card of cards.results) {
+      await c.env.DB.batch([
+        c.env.DB.prepare(`UPDATE access_cards SET status='suspended',updated_at=datetime('now'),deactivated_at=datetime('now'),deactivated_reason='household membership inactive' WHERE id=?`).bind(card.id),
+        c.env.DB.prepare(`INSERT INTO card_status_changes(id,card_id,old_status,new_status,reason,changed_by) VALUES (?,?,'active','suspended','household membership inactive',?)`).bind(crypto.randomUUID(),card.id,c.get('user').id),
+      ]);
+      await createDeviceOperations(c.env,card.id,'disable_card',{ cardUid:card.card_uid,enabled:false,reason:'household membership inactive' });
+    }
+  }
+  await audit(c, body.action, 'household_member', c.req.param('id'), { canCreateVisitors: Boolean(visitorPermission), canViewBills: Boolean(billPermission) });
+  return c.json({ ok: true, status });
+});
+
+app.post('/api/household-members/:id/login', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<{ email?: string; temporaryPassword?: string; phone?: string }>();
+  if (!body.email?.trim()) return jsonError(c, 400, 'email is required');
+  const member = await c.env.DB.prepare(`SELECT * FROM household_members WHERE id=? AND status='active'`).bind(c.req.param('id')).first<Record<string,string|number|null>>();
+  if (!member) return jsonError(c, 404, 'Active household member not found');
+  if (member.linked_user_id) return jsonError(c, 409, 'This household member already has a linked login');
+  let linked = await c.env.DB.prepare(`SELECT id FROM users WHERE lower(email)=lower(?) AND role='resident' AND status='active'`).bind(body.email.trim()).first<{ id:string }>();
+  const statements: D1PreparedStatement[] = [];
+  if (!linked) {
+    if (!body.temporaryPassword || body.temporaryPassword.length < 12) return jsonError(c, 400, 'A temporary password of at least 12 characters is required for a new login');
+    linked = { id: crypto.randomUUID() };
+    statements.push(c.env.DB.prepare(
+      `INSERT INTO users(id,name,email,phone,password_hash,role,property_id) VALUES (?,?,?,?,?,'resident',?)`,
+    ).bind(linked.id,member.name,body.email.trim().toLowerCase(),body.phone?.trim() ?? member.phone ?? null,await hashPassword(body.temporaryPassword),member.property_id));
+  }
+  statements.push(c.env.DB.prepare(`UPDATE household_members SET linked_user_id=?,email=?,updated_at=datetime('now') WHERE id=?`).bind(linked.id,body.email.trim().toLowerCase(),c.req.param('id')));
+  await c.env.DB.batch(statements);
+  await audit(c, 'create_login', 'household_member', c.req.param('id'), { linkedUserId: linked.id, email: body.email });
+  return c.json({ ok: true, linkedUserId: linked.id });
+});
+
+app.get('/api/property-transfers', requireRoles('resident', 'admin'), async (c) => {
+  const user = c.get('user');
+  const residentId = user.role === 'resident' ? user.id : null;
+  const { limit, offset, page: pageNumber } = page(c);
+  const result = await c.env.DB.prepare(
+    `SELECT tr.*,p.unit_number,p.street,from_user.name AS from_owner_name,from_user.email AS from_owner_email,
+       to_user.name AS to_owner_name,to_user.email AS to_owner_email,reviewer.name AS approved_by_name
+     FROM property_transfer_requests tr JOIN properties p ON p.id=tr.property_id
+     JOIN users from_user ON from_user.id=tr.from_owner_id JOIN users to_user ON to_user.id=tr.to_owner_id
+     LEFT JOIN users reviewer ON reviewer.id=tr.approved_by
+     WHERE (? IS NULL OR tr.from_owner_id=? OR tr.to_owner_id=?)
+     ORDER BY CASE tr.status WHEN 'pending' THEN 0 WHEN 'scheduled' THEN 1 ELSE 2 END,tr.created_at DESC LIMIT ? OFFSET ?`,
+  ).bind(residentId,residentId,residentId,limit,offset).all();
+  return c.json({ items: result.results, page: pageNumber, limit });
+});
+
+app.post('/api/property-transfers', requireRoles('resident', 'admin'), async (c) => {
+  const body = await c.req.json<{ propertyId?: string; newOwnerId?: string; newOwnerEmail?: string; effectiveDate?: string; requestNote?: string; approveNow?: boolean }>();
+  if (!body.propertyId || (!body.newOwnerId && !body.newOwnerEmail?.trim()) || !body.effectiveDate) return jsonError(c, 400, 'propertyId, new owner and effectiveDate are required');
+  if (Number.isNaN(new Date(body.effectiveDate).valueOf())) return jsonError(c, 400, 'effectiveDate is invalid');
+  const owner = await c.env.DB.prepare(`SELECT resident_id FROM property_ownerships WHERE property_id=? AND status='active'`).bind(body.propertyId).first<{ resident_id:string }>();
+  if (!owner) return jsonError(c, 404, 'Active property owner not found');
+  if (c.get('user').role === 'resident' && owner.resident_id !== c.get('user').id) return jsonError(c, 403, 'Only the current owner can request a transfer');
+  const nextOwner = await c.env.DB.prepare(
+    `SELECT id FROM users WHERE role='resident' AND status='active' AND (id=? OR lower(email)=lower(?)) LIMIT 1`,
+  ).bind(body.newOwnerId ?? '',body.newOwnerEmail?.trim() ?? '').first<{ id:string }>();
+  if (!nextOwner) return jsonError(c, 404, 'New owner account not found');
+  if (nextOwner.id === owner.resident_id) return jsonError(c, 400, 'New owner must be different from the current owner');
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare(
+    `INSERT INTO property_transfer_requests(id,property_id,from_owner_id,to_owner_id,effective_date,status,request_note,requested_by)
+     VALUES (?,?,?,?,?,'pending',?,?)`,
+  ).bind(id,body.propertyId,owner.resident_id,nextOwner.id,body.effectiveDate,body.requestNote?.trim() ?? null,c.get('user').id).run();
+  if (c.get('user').role === 'admin' && body.approveNow) {
+    if (new Date(body.effectiveDate) <= new Date()) {
+      await c.env.DB.prepare(`UPDATE property_transfer_requests SET approved_by=?,approved_at=datetime('now') WHERE id=?`).bind(c.get('user').id,id).run();
+      await completePropertyTransfer(c.env,id,c.get('user').id);
+    } else {
+      await c.env.DB.prepare(`UPDATE property_transfer_requests SET status='scheduled',approved_by=?,approved_at=datetime('now'),updated_at=datetime('now') WHERE id=?`).bind(c.get('user').id,id).run();
+    }
+  }
+  await audit(c, 'request', 'property_transfer', id, { propertyId: body.propertyId, newOwnerId: nextOwner.id, effectiveDate: body.effectiveDate });
+  return c.json({ id }, 201);
+});
+
+app.patch('/api/property-transfers/:id', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<{ action?: 'approve'|'reject'|'cancel'; reviewNote?: string }>();
+  if (!body.action || !['approve','reject','cancel'].includes(body.action)) return jsonError(c, 400, 'Invalid transfer action');
+  const transfer = await c.env.DB.prepare(`SELECT * FROM property_transfer_requests WHERE id=?`).bind(c.req.param('id')).first<Record<string,string|null>>();
+  if (!transfer) return jsonError(c, 404, 'Transfer request not found');
+  if (body.action === 'approve') {
+    if (transfer.status !== 'pending') return jsonError(c, 409, 'Only pending transfers can be approved');
+    await c.env.DB.prepare(`UPDATE property_transfer_requests SET approved_by=?,approved_at=datetime('now'),review_note=?,updated_at=datetime('now') WHERE id=?`).bind(c.get('user').id,body.reviewNote?.trim() ?? null,c.req.param('id')).run();
+    if (new Date(String(transfer.effective_date)) <= new Date()) await completePropertyTransfer(c.env,c.req.param('id'),c.get('user').id);
+    else await c.env.DB.prepare(`UPDATE property_transfer_requests SET status='scheduled' WHERE id=?`).bind(c.req.param('id')).run();
+  } else {
+    if (!['pending','scheduled'].includes(String(transfer.status))) return jsonError(c, 409, 'Only open transfers can be closed');
+    await c.env.DB.prepare(`UPDATE property_transfer_requests SET status=?,review_note=?,approved_by=?,approved_at=datetime('now'),updated_at=datetime('now') WHERE id=?`).bind(body.action === 'reject' ? 'rejected' : 'cancelled',body.reviewNote?.trim() ?? null,c.get('user').id,c.req.param('id')).run();
+  }
+  await audit(c, body.action, 'property_transfer', c.req.param('id'), { reviewNote: body.reviewNote });
+  return c.json({ ok: true });
+});
+
+app.get('/api/properties/:id/statement', async (c) => {
+  const user = c.get('user');
+  const property = await c.env.DB.prepare(`SELECT id,unit_number,street,block,zone,address FROM properties WHERE id=?`).bind(c.req.param('id')).first<Record<string,string|null>>();
+  if (!property) return jsonError(c, 404, 'Property not found');
+  let residentFilter: string|null = null;
+  if (!['admin','cashier'].includes(user.role)) {
+    const relationship = await propertyRelationship(c.env.DB,user.id,c.req.param('id'));
+    if (!relationship || !relationship.can_view_bills) return jsonError(c, 403, 'You do not have permission to view this property statement');
+    if (relationship.relationship === 'tenant') residentFilter = user.id;
+    if (relationship.relationship === 'dependant') {
+      const household = await c.env.DB.prepare(`SELECT primary_resident_id FROM household_members WHERE property_id=? AND linked_user_id=? AND status='active'`).bind(c.req.param('id'),user.id).first<{ primary_resident_id:string }>();
+      residentFilter = household?.primary_resident_id ?? user.id;
+    }
+  }
+  const bills = await c.env.DB.prepare(
+    `SELECT b.id,b.external_reference,b.bill_type,b.description,b.currency,b.amount_minor,b.due_date,b.status,b.created_at,u.name AS billed_to,
+       COALESCE(SUM(CASE WHEN pay.status='approved' THEN CASE WHEN pay.type='refund' THEN -pay.amount_minor ELSE pay.amount_minor END ELSE 0 END),0) AS paid_minor
+     FROM bills b JOIN users u ON u.id=b.resident_id LEFT JOIN payments pay ON pay.bill_id=b.id
+     WHERE b.property_id=? AND (? IS NULL OR b.resident_id=?)
+     GROUP BY b.id ORDER BY b.created_at,b.due_date`,
+  ).bind(c.req.param('id'),residentFilter,residentFilter).all<Record<string,unknown>>();
+  const totalBilled = bills.results.reduce((sum,row) => sum + Number(row.amount_minor ?? 0),0);
+  const totalPaid = bills.results.reduce((sum,row) => sum + Number(row.paid_minor ?? 0),0);
+  if (c.req.query('format') === 'csv') {
+    const header = ['bill_id','external_reference','bill_type','description','billed_to','amount','paid','balance','due_date','status','created_at'];
+    const lines = bills.results.map((row) => [row.id,row.external_reference,row.bill_type,row.description,row.billed_to,(Number(row.amount_minor)/100).toFixed(2),(Number(row.paid_minor)/100).toFixed(2),((Number(row.amount_minor)-Number(row.paid_minor))/100).toFixed(2),row.due_date,row.status,row.created_at].map(csvCell).join(','));
+    return new Response([header.join(','),...lines].join('\n'), { headers: { 'Content-Type':'text/csv; charset=utf-8','Content-Disposition':`attachment; filename="${String(property.unit_number).replace(/[^A-Za-z0-9_-]/g,'-')}-statement.csv"` } });
+  }
+  return c.json({ property,summary:{ billedMinor:totalBilled,paidMinor:totalPaid,balanceMinor:totalBilled-totalPaid },items:bills.results });
+});
+
+app.get('/api/property-groups', requireRoles('admin', 'cashier'), async (c) => {
+  const results = await c.env.DB.batch([
+    c.env.DB.prepare(`SELECT street AS value,COUNT(*) AS property_count FROM properties WHERE trim(COALESCE(street,''))!='' GROUP BY street ORDER BY street`),
+    c.env.DB.prepare(`SELECT block AS value,COUNT(*) AS property_count FROM properties WHERE trim(COALESCE(block,''))!='' GROUP BY block ORDER BY block`),
+    c.env.DB.prepare(`SELECT zone AS value,COUNT(*) AS property_count FROM properties WHERE trim(COALESCE(zone,''))!='' GROUP BY zone ORDER BY zone`),
+  ]);
+  return c.json({ streets:results[0]?.results ?? [],blocks:results[1]?.results ?? [],zones:results[2]?.results ?? [] });
 });
 
 app.get('/api/streets', requireRoles('admin', 'cashier'), async (c) => {
@@ -388,36 +813,45 @@ app.post('/api/bills/batch', requireRoles('admin', 'cashier'), async (c) => {
   const body = await c.req.json<{
     name?: string;
     streets?: string[];
+    targetType?: 'street'|'block'|'zone';
+    targets?: string[];
     amountMinor?: number;
     dueDate?: string;
     billType?: string;
     description?: string;
   }>();
-  const streets = [...new Set((body.streets ?? []).map((street) => street.trim()).filter(Boolean))];
-  if (!body.name?.trim() || !streets.length || !body.amountMinor || !body.dueDate || !body.billType?.trim()) {
-    return jsonError(c, 400, 'name, streets, amountMinor, dueDate and billType are required');
+  const targetType = body.targetType ?? 'street';
+  if (!['street','block','zone'].includes(targetType)) return jsonError(c, 400, 'targetType must be street, block or zone');
+  const targets = [...new Set((body.targets ?? body.streets ?? []).map((value) => value.trim()).filter(Boolean))];
+  if (!body.name?.trim() || !targets.length || !body.amountMinor || !body.dueDate || !body.billType?.trim()) {
+    return jsonError(c, 400, 'name, targets, amountMinor, dueDate and billType are required');
   }
   const amountMinor = Math.round(body.amountMinor);
   if (amountMinor <= 0) return jsonError(c, 400, 'amountMinor must be greater than zero');
   if (Number.isNaN(new Date(body.dueDate).valueOf())) return jsonError(c, 400, 'dueDate is invalid');
-  const placeholders = streets.map(() => '?').join(',');
+  const placeholders = targets.map(() => '?').join(',');
+  const column = targetType === 'block' ? 'block' : targetType === 'zone' ? 'zone' : 'street';
   const batchId = crypto.randomUUID();
   await c.env.DB.prepare(
-    `INSERT INTO bill_batches(id,name,street_filter_json,amount_minor,due_date,bill_type,description,created_by)
-     VALUES (?,?,?,?,?,?,?,?)`,
-  ).bind(batchId, body.name.trim(), JSON.stringify(streets), amountMinor, body.dueDate, body.billType.trim(), body.description?.trim() ?? null, c.get('user').id).run();
+    `INSERT INTO bill_batches(id,name,street_filter_json,target_type,target_filter_json,amount_minor,due_date,bill_type,description,created_by)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+  ).bind(batchId,body.name.trim(),JSON.stringify(targets),targetType,JSON.stringify(targets),amountMinor,body.dueDate,body.billType.trim(),body.description?.trim() ?? null,c.get('user').id).run();
   const inserted = await c.env.DB.prepare(
     `INSERT INTO bills(id,property_id,resident_id,amount_minor,due_date,bill_type,description,batch_id)
-     SELECT lower(hex(randomblob(16))),p.id,u.id,?,?,?,?,?
+     SELECT lower(hex(randomblob(16))),p.id,
+       CASE WHEN t.id IS NOT NULL AND t.billing_responsibility='tenant' THEN t.tenant_id ELSE po.resident_id END,
+       ?,?,?,?,?
      FROM properties p
      JOIN property_ownerships po ON po.property_id=p.id AND po.status='active'
-     JOIN users u ON u.id=po.resident_id
-     WHERE u.role='resident' AND u.status='active' AND p.street IN (${placeholders})`,
-  ).bind(amountMinor, body.dueDate, body.billType.trim(), body.description?.trim() ?? null, batchId, ...streets).run();
+     LEFT JOIN property_tenancies t ON t.property_id=p.id AND t.status='active'
+       AND date(t.start_date)<=date('now') AND (t.end_date IS NULL OR date(t.end_date)>=date('now'))
+     JOIN users payer ON payer.id=CASE WHEN t.id IS NOT NULL AND t.billing_responsibility='tenant' THEN t.tenant_id ELSE po.resident_id END
+     WHERE payer.role='resident' AND payer.status='active' AND p.${column} IN (${placeholders})`,
+  ).bind(amountMinor,body.dueDate,body.billType.trim(),body.description?.trim() ?? null,batchId,...targets).run();
   const count = inserted.meta.changes ?? 0;
-  await c.env.DB.prepare(`UPDATE bill_batches SET bill_count=? WHERE id=?`).bind(count, batchId).run();
-  await audit(c, 'create_street_bill_batch', 'bill_batch', batchId, { streets, billCount: count, amountMinor });
-  return c.json({ id: batchId, billCount: count, streets }, 201);
+  await c.env.DB.prepare(`UPDATE bill_batches SET bill_count=? WHERE id=?`).bind(count,batchId).run();
+  await audit(c, 'create_property_group_bill_batch', 'bill_batch', batchId, { targetType, targets, billCount: count, amountMinor });
+  return c.json({ id:batchId,billCount:count,targetType,targets,streets:targetType === 'street' ? targets : [] },201);
 });
 
 app.get('/api/users', requireRoles('admin', 'cashier', 'security'), async (c) => {
@@ -427,7 +861,9 @@ app.get('/api/users', requireRoles('admin', 'cashier', 'security'), async (c) =>
   const result = await c.env.DB.prepare(
     `SELECT u.id,u.name,u.email,u.phone,u.role,u.status,u.property_id,u.created_at,
        GROUP_CONCAT(CASE WHEN po.status='active' THEN p.unit_number END, ', ') AS unit_numbers,
-       COUNT(CASE WHEN po.status='active' THEN 1 END) AS property_count
+       COUNT(CASE WHEN po.status='active' THEN 1 END) AS property_count,
+       (SELECT GROUP_CONCAT(tp.unit_number,', ') FROM property_tenancies t JOIN properties tp ON tp.id=t.property_id WHERE t.tenant_id=u.id AND t.status='active') AS rented_units,
+       (SELECT GROUP_CONCAT(hp.unit_number,', ') FROM household_members h JOIN properties hp ON hp.id=h.property_id WHERE h.linked_user_id=u.id AND h.status='active') AS dependant_units
      FROM users u
      LEFT JOIN property_ownerships po ON po.resident_id=u.id AND po.status='active'
      LEFT JOIN properties p ON p.id=po.property_id
@@ -561,12 +997,14 @@ app.post('/api/imports/bills', requireRoles('admin', 'cashier'), async (c) => {
     try {
       if (!row.resident_email && !row.unit_number) throw new Error('resident_email or unit_number is required');
       const matches = await c.env.DB.prepare(
-        `SELECT u.id AS resident_id,p.id AS property_id
-         FROM property_ownerships po
-         JOIN users u ON u.id=po.resident_id
-         JOIN properties p ON p.id=po.property_id
-         WHERE po.status='active' AND u.role='resident' AND u.status='active'
-           AND (?='' OR lower(u.email)=lower(?)) AND (?='' OR p.unit_number=?)
+        `SELECT payer.id AS resident_id,p.id AS property_id
+         FROM properties p
+         JOIN property_ownerships po ON po.property_id=p.id AND po.status='active'
+         LEFT JOIN property_tenancies t ON t.property_id=p.id AND t.status='active'
+           AND date(t.start_date)<=date('now') AND (t.end_date IS NULL OR date(t.end_date)>=date('now'))
+         JOIN users payer ON payer.id=CASE WHEN t.id IS NOT NULL AND t.billing_responsibility='tenant' THEN t.tenant_id ELSE po.resident_id END
+         WHERE payer.role='resident' AND payer.status='active'
+           AND (?='' OR lower(payer.email)=lower(?)) AND (?='' OR p.unit_number=?)
          LIMIT 2`,
       ).bind(row.resident_email ?? '', row.resident_email ?? '', row.unit_number ?? '', row.unit_number ?? '').all<{ resident_id: string; property_id: string }>();
       if (!matches.results.length) throw new Error('No active resident/property ownership match');
@@ -662,12 +1100,22 @@ app.post('/api/visitors', requireRoles('resident', 'admin'), async (c) => {
   if (new Date(body.validUntil) <= new Date(body.validFrom)) return jsonError(c, 400, 'validUntil must be after validFrom');
   const residentId = c.get('user').role === 'resident' ? c.get('user').id : body.residentId;
   if (!residentId) return jsonError(c, 400, 'residentId is required');
-  const ownerships = await c.env.DB.prepare(
-    `SELECT property_id FROM property_ownerships WHERE resident_id=? AND status='active' AND (? IS NULL OR property_id=?) LIMIT 2`,
-  ).bind(residentId, body.propertyId ?? null, body.propertyId ?? null).all<{ property_id: string }>();
-  if (!ownerships.results.length) return jsonError(c, 400, 'The resident needs an approved property for this visitor pass');
-  if (!body.propertyId && ownerships.results.length > 1) return jsonError(c, 400, 'propertyId is required because the resident owns multiple properties');
-  const propertyId = ownerships.results[0]!.property_id;
+  let propertyId = body.propertyId;
+  if (propertyId) {
+    const relationship = await propertyRelationship(c.env.DB,residentId,propertyId);
+    if (!relationship || !relationship.can_create_visitors) return jsonError(c, 403, 'This resident cannot create visitors for the selected property');
+  } else {
+    const matches = await c.env.DB.prepare(
+      `SELECT property_id FROM (
+         SELECT property_id FROM property_ownerships WHERE resident_id=? AND status='active'
+         UNION SELECT property_id FROM property_tenancies WHERE tenant_id=? AND status='active' AND can_manage_visitors=1 AND date(start_date)<=date('now') AND (end_date IS NULL OR date(end_date)>=date('now'))
+         UNION SELECT property_id FROM household_members WHERE linked_user_id=? AND status='active' AND can_create_visitors=1
+       ) LIMIT 2`,
+    ).bind(residentId,residentId,residentId).all<{ property_id:string }>();
+    if (!matches.results.length) return jsonError(c, 400, 'The resident has no property with visitor permission');
+    if (matches.results.length > 1) return jsonError(c, 400, 'propertyId is required because the resident can manage multiple properties');
+    propertyId = matches.results[0]!.property_id;
+  }
   const id = crypto.randomUUID();
   const pin = String(crypto.getRandomValues(new Uint32Array(1))[0]! % 1_000_000).padStart(6, '0');
   const qrToken = randomToken(24);
@@ -711,12 +1159,22 @@ app.post('/api/maintenance', requireRoles('resident', 'admin'), async (c) => {
   if (!body.description?.trim()) return jsonError(c, 400, 'description is required');
   const residentId = c.get('user').role === 'resident' ? c.get('user').id : body.residentId;
   if (!residentId) return jsonError(c, 400, 'residentId is required');
-  const ownerships = await c.env.DB.prepare(
-    `SELECT property_id FROM property_ownerships WHERE resident_id=? AND status='active' AND (? IS NULL OR property_id=?) LIMIT 2`,
-  ).bind(residentId, body.propertyId ?? null, body.propertyId ?? null).all<{ property_id: string }>();
-  if (!ownerships.results.length) return jsonError(c, 400, 'The resident needs an approved property for this maintenance request');
-  if (!body.propertyId && ownerships.results.length > 1) return jsonError(c, 400, 'propertyId is required because the resident owns multiple properties');
-  const propertyId = ownerships.results[0]!.property_id;
+  let propertyId = body.propertyId;
+  if (propertyId) {
+    const relationship = await propertyRelationship(c.env.DB,residentId,propertyId);
+    if (!relationship || !relationship.can_manage_maintenance) return jsonError(c, 403, 'This resident cannot create maintenance requests for the selected property');
+  } else {
+    const matches = await c.env.DB.prepare(
+      `SELECT property_id FROM (
+         SELECT property_id FROM property_ownerships WHERE resident_id=? AND status='active'
+         UNION SELECT property_id FROM property_tenancies WHERE tenant_id=? AND status='active' AND can_manage_maintenance=1 AND date(start_date)<=date('now') AND (end_date IS NULL OR date(end_date)>=date('now'))
+         UNION SELECT property_id FROM household_members WHERE linked_user_id=? AND status='active'
+       ) LIMIT 2`,
+    ).bind(residentId,residentId,residentId).all<{ property_id:string }>();
+    if (!matches.results.length) return jsonError(c, 400, 'The resident has no property available for maintenance');
+    if (matches.results.length > 1) return jsonError(c, 400, 'propertyId is required because the resident can manage multiple properties');
+    propertyId = matches.results[0]!.property_id;
+  }
   const id = crypto.randomUUID();
   await c.env.DB.prepare(
     `INSERT INTO maintenance_requests(id,resident_id,property_id,description,photo_key) VALUES (?,?,?,?,?)`,
@@ -843,19 +1301,33 @@ app.get('/api/access/cards', async (c) => {
   const { limit, offset, page: pageNumber } = page(c);
   const residentId = user.role === 'resident' ? user.id : (c.req.query('residentId') ?? null);
   const result = await c.env.DB.prepare(
-    `SELECT c.*, u.name AS resident_name, p.unit_number FROM access_cards c JOIN users u ON u.id=c.resident_id LEFT JOIN properties p ON p.id=u.property_id
-     WHERE (? IS NULL OR c.resident_id=?) ORDER BY c.created_at DESC LIMIT ? OFFSET ?`,
-  ).bind(residentId, residentId, limit, offset).all();
+    `SELECT c.*,u.name AS resident_name,hm.name AS household_member_name,hm.relationship,
+       COALESCE(hp.unit_number,p.unit_number) AS unit_number
+     FROM access_cards c JOIN users u ON u.id=c.resident_id
+     LEFT JOIN household_members hm ON hm.id=c.household_member_id
+     LEFT JOIN properties hp ON hp.id=hm.property_id LEFT JOIN properties p ON p.id=u.property_id
+     WHERE (? IS NULL OR c.resident_id=? OR hm.linked_user_id=?) ORDER BY c.created_at DESC LIMIT ? OFFSET ?`,
+  ).bind(residentId,residentId,residentId,limit,offset).all();
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
 app.post('/api/access/cards', requireRoles('admin'), async (c) => {
-  const body = await c.req.json<{ residentId?: string; cardUid?: string; cardLabel?: string }>();
-  if (!body.residentId || !body.cardUid?.trim()) return jsonError(c, 400, 'residentId and cardUid are required');
+  const body = await c.req.json<{ residentId?: string; householdMemberId?: string; cardUid?: string; cardLabel?: string }>();
+  if ((!body.residentId && !body.householdMemberId) || !body.cardUid?.trim()) return jsonError(c, 400, 'residentId or householdMemberId, and cardUid are required');
+  let residentId = body.residentId;
+  let householdMemberId: string|null = null;
+  let label = body.cardLabel?.trim() ?? null;
+  if (body.householdMemberId) {
+    const member = await c.env.DB.prepare(`SELECT id,primary_resident_id,name FROM household_members WHERE id=? AND status='active'`).bind(body.householdMemberId).first<{ id:string;primary_resident_id:string;name:string }>();
+    if (!member) return jsonError(c, 404, 'Active household member not found');
+    residentId = member.primary_resident_id;
+    householdMemberId = member.id;
+    label ||= member.name;
+  }
   const id = crypto.randomUUID();
-  await c.env.DB.prepare(`INSERT INTO access_cards(id,resident_id,card_uid,card_label) VALUES (?,?,?,?)`).bind(id, body.residentId, body.cardUid.trim(), body.cardLabel?.trim() ?? null).run();
-  await createDeviceOperations(c.env, id, 'upsert_card', { cardUid: body.cardUid.trim(), residentId: body.residentId, enabled: true });
-  await audit(c, 'issue', 'access_card', id, body);
+  await c.env.DB.prepare(`INSERT INTO access_cards(id,resident_id,household_member_id,card_uid,card_label) VALUES (?,?,?,?,?)`).bind(id,residentId,householdMemberId,body.cardUid.trim(),label).run();
+  await createDeviceOperations(c.env,id,'upsert_card',{ cardUid:body.cardUid.trim(),residentId,householdMemberId,enabled:true });
+  await audit(c, 'issue', 'access_card', id, { ...body, residentId, householdMemberId });
   return c.json({ id, hardwareSync: 'manual_action_required' }, 201);
 });
 
@@ -880,12 +1352,13 @@ app.get('/api/access/events', async (c) => {
   const resultFilter = c.req.query('result') ?? null;
   const deviceId = c.req.query('deviceId') ?? null;
   const result = await c.env.DB.prepare(
-    `SELECT e.*, d.name AS device_name, ap.name AS access_point_name, u.name AS resident_name
+    `SELECT e.*,d.name AS device_name,ap.name AS access_point_name,u.name AS resident_name,hm.name AS household_member_name,hm.relationship
      FROM access_events e JOIN hikvision_devices d ON d.id=e.device_id
      LEFT JOIN access_points ap ON ap.id=e.access_point_id LEFT JOIN users u ON u.id=e.resident_id
-     WHERE (? IS NULL OR e.resident_id=?) AND (? IS NULL OR e.result=?) AND (? IS NULL OR e.device_id=?)
+     LEFT JOIN household_members hm ON hm.id=e.household_member_id
+     WHERE (? IS NULL OR e.resident_id=? OR hm.linked_user_id=?) AND (? IS NULL OR e.result=?) AND (? IS NULL OR e.device_id=?)
      ORDER BY e.device_timestamp DESC LIMIT ? OFFSET ?`,
-  ).bind(residentId, residentId, resultFilter, resultFilter, deviceId, deviceId, limit, offset).all();
+  ).bind(residentId,residentId,residentId,resultFilter,resultFilter,deviceId,deviceId,limit,offset).all();
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
@@ -1163,12 +1636,13 @@ async function handleDeviceEvent(request: Request, env: Env, deviceId: string): 
 async function consumeAccessEvents(batch: MessageBatch<NormalizedAccessEvent>, env: Env): Promise<void> {
   const statements = batch.messages.map(({ body: event }) => env.DB.prepare(
     `INSERT OR IGNORE INTO access_events(
-      id,vendor_event_id,device_id,access_point_id,card_id,resident_id,card_uid,employee_no,person_name,credential_type,door_no,direction,result,event_type,device_timestamp,profile_key,raw_summary
+      id,vendor_event_id,device_id,access_point_id,card_id,resident_id,household_member_id,card_uid,employee_no,person_name,credential_type,door_no,direction,result,event_type,device_timestamp,profile_key,raw_summary
      ) VALUES (?,?,?,?,
        (SELECT id FROM access_cards WHERE card_uid=? LIMIT 1),
-       (SELECT resident_id FROM access_cards WHERE card_uid=? LIMIT 1),?,?,?,?,?,?,?,?,?,?,?)`,
+       (SELECT resident_id FROM access_cards WHERE card_uid=? LIMIT 1),
+       (SELECT household_member_id FROM access_cards WHERE card_uid=? LIMIT 1),?,?,?,?,?,?,?,?,?,?,?)`,
   ).bind(
-    event.id,event.vendorEventId,event.deviceId,event.accessPointId,event.cardUid,event.cardUid,
+    event.id,event.vendorEventId,event.deviceId,event.accessPointId,event.cardUid,event.cardUid,event.cardUid,
     event.cardUid,event.employeeNo,event.personName,event.credentialType,event.doorNo,event.direction,event.result,
     event.eventType,event.deviceTimestamp,event.profileKey,event.rawSummary,
   ));
@@ -1179,6 +1653,30 @@ async function consumeAccessEvents(batch: MessageBatch<NormalizedAccessEvent>, e
     body: JSON.stringify({ type: 'access_events', events: batch.messages.map((message) => message.body) }),
   });
   batch.ackAll();
+}
+
+async function processPropertyLifecycle(env: Env): Promise<void> {
+  const expired = await env.DB.prepare(
+    `SELECT id,property_id,tenant_id FROM property_tenancies WHERE status='active' AND end_date IS NOT NULL AND date(end_date)<date('now')`,
+  ).all<{ id:string;property_id:string;tenant_id:string }>();
+  for (const tenancy of expired.results) {
+    await env.DB.prepare(`UPDATE property_tenancies SET status='ended',ended_at=datetime('now'),updated_at=datetime('now') WHERE id=? AND status='active'`).bind(tenancy.id).run();
+    await deactivatePrimaryHousehold(env,tenancy.property_id,tenancy.tenant_id,null);
+    await env.DB.prepare(
+      `UPDATE users SET property_id=COALESCE(
+        (SELECT property_id FROM property_ownerships WHERE resident_id=? AND status='active' ORDER BY approved_at LIMIT 1),
+        (SELECT property_id FROM property_tenancies WHERE tenant_id=? AND status='active' ORDER BY start_date LIMIT 1),
+        (SELECT property_id FROM household_members WHERE linked_user_id=? AND status='active' ORDER BY created_at LIMIT 1)
+       ),updated_at=datetime('now') WHERE id=?`,
+    ).bind(tenancy.tenant_id,tenancy.tenant_id,tenancy.tenant_id,tenancy.tenant_id).run();
+  }
+  const dueTransfers = await env.DB.prepare(
+    `SELECT id FROM property_transfer_requests WHERE status='scheduled' AND datetime(effective_date)<=datetime('now') ORDER BY effective_date LIMIT 100`,
+  ).all<{ id:string }>();
+  for (const transfer of dueTransfers.results) {
+    try { await completePropertyTransfer(env,transfer.id,null); }
+    catch (error) { console.error('Scheduled property transfer failed',transfer.id,error); }
+  }
 }
 
 async function enforceFacilityFees(env: Env): Promise<void> {
@@ -1230,6 +1728,6 @@ export default {
     await consumeAccessEvents(batch, env);
   },
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(enforceFacilityFees(env));
+    ctx.waitUntil(Promise.all([processPropertyLifecycle(env),enforceFacilityFees(env)]).then(() => undefined));
   },
 };

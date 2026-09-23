@@ -38,13 +38,8 @@ A bill CSV row may identify ownership by `unit_number`, `resident_email`, or bot
 
 Visitor passes and maintenance requests now store the selected property. Residents with multiple properties must select the correct unit when creating either record. This keeps gate and maintenance records associated with the intended property.
 
-## Recommended next additions
+## Related implemented workflows
 
-These are not required for the current single-owner model but are useful future enhancements:
+Migration `0005` adds separate tenancies, dependants/household members, optional dependant logins, delegated visitor and bill permissions, effective-dated ownership transfers, downloadable property statements, and block/zone grouping. See [`TENANTS-DEPENDANTS-AND-TRANSFERS.md`](TENANTS-DEPENDANTS-AND-TRANSFERS.md).
 
-- a separate tenant/occupant relationship, distinct from legal ownership;
-- ownership-transfer workflows with effective dates;
-- verified ownership-document uploads and document-expiry reminders;
-- household members and delegated visitor-management permissions per property;
-- property-level account statements and downloadable ownership history;
-- configurable estate blocks, zones, and service categories in addition to streets.
+Verified ownership-document uploads remain intentionally excluded because the administrator selected **keep property documents skipped**. Generic private GitHub storage and billing-import archives remain available.

@@ -62,9 +62,13 @@ import androidx.lifecycle.viewModelScope
 import com.estatemate.app.data.EstateRepository
 import com.estatemate.app.data.local.CachedAccessEvent
 import com.estatemate.app.data.remote.DashboardResponse
+import com.estatemate.app.data.remote.HouseholdMemberDto
+import com.estatemate.app.data.remote.HouseholdRequestBody
 import com.estatemate.app.data.remote.OwnershipRequestBody
 import com.estatemate.app.data.remote.OwnershipRequestDto
 import com.estatemate.app.data.remote.PropertyDto
+import com.estatemate.app.data.remote.TenancyDto
+import com.estatemate.app.data.remote.TenancyRequestBody
 import com.estatemate.app.data.remote.UserDto
 import dagger.hilt.android.AndroidEntryPoint
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -110,6 +114,8 @@ data class AppState(
     val properties: List<PropertyDto> = emptyList(),
     val availableProperties: List<PropertyDto> = emptyList(),
     val ownershipRequests: List<OwnershipRequestDto> = emptyList(),
+    val tenancies: List<TenancyDto> = emptyList(),
+    val householdMembers: List<HouseholdMemberDto> = emptyList(),
     val busy: Boolean = false,
     val error: String? = null,
 )
@@ -119,6 +125,8 @@ private data class RefreshPayload(
     val properties: List<PropertyDto>,
     val availableProperties: List<PropertyDto>,
     val ownershipRequests: List<OwnershipRequestDto>,
+    val tenancies: List<TenancyDto>,
+    val householdMembers: List<HouseholdMemberDto>,
 )
 
 @HiltViewModel
@@ -150,14 +158,18 @@ class MainViewModel @Inject constructor(private val repository: EstateRepository
             val properties = repository.properties()
             val available = if (role == "resident") repository.availableProperties() else emptyList()
             val requests = if (role == "resident" || role == "admin") repository.ownershipRequests() else emptyList()
+            val tenancies = if (role == "resident" || role == "admin") repository.tenancies() else emptyList()
+            val household = if (role == "resident" || role == "admin") repository.householdMembers() else emptyList()
             repository.refreshEvents()
-            RefreshPayload(dashboard, properties, available, requests)
+            RefreshPayload(dashboard,properties,available,requests,tenancies,household)
         }.onSuccess { payload ->
             _state.value = _state.value.copy(
                 dashboard = payload.dashboard,
                 properties = payload.properties,
                 availableProperties = payload.availableProperties,
                 ownershipRequests = payload.ownershipRequests,
+                tenancies = payload.tenancies,
+                householdMembers = payload.householdMembers,
                 busy = false,
             )
         }.onFailure { error -> _state.value = _state.value.copy(busy = false, error = error.message ?: "Unable to refresh") }
@@ -177,6 +189,30 @@ class MainViewModel @Inject constructor(private val repository: EstateRepository
             .onFailure { error -> _state.value = _state.value.copy(busy = false, error = error.message ?: "Ownership review failed") }
     }
 
+    fun createTenancy(request: TenancyRequestBody) = viewModelScope.launch {
+        _state.value = _state.value.copy(busy = true,error = null)
+        runCatching { repository.createTenancy(request) }.onSuccess { refresh() }
+            .onFailure { error -> _state.value = _state.value.copy(busy = false,error = error.message ?: "Tenancy request failed") }
+    }
+
+    fun tenancyAction(id: String, action: String, billing: String? = null) = viewModelScope.launch {
+        _state.value = _state.value.copy(busy = true,error = null)
+        runCatching { repository.tenancyAction(id,action,billing) }.onSuccess { refresh() }
+            .onFailure { error -> _state.value = _state.value.copy(busy = false,error = error.message ?: "Tenancy action failed") }
+    }
+
+    fun createHouseholdMember(request: HouseholdRequestBody) = viewModelScope.launch {
+        _state.value = _state.value.copy(busy = true,error = null)
+        runCatching { repository.createHouseholdMember(request) }.onSuccess { refresh() }
+            .onFailure { error -> _state.value = _state.value.copy(busy = false,error = error.message ?: "Household request failed") }
+    }
+
+    fun householdAction(id: String, action: String, visitors: Boolean? = null, bills: Boolean? = null) = viewModelScope.launch {
+        _state.value = _state.value.copy(busy = true,error = null)
+        runCatching { repository.householdAction(id,action,visitors,bills) }.onSuccess { refresh() }
+            .onFailure { error -> _state.value = _state.value.copy(busy = false,error = error.message ?: "Household action failed") }
+    }
+
     fun logout() = viewModelScope.launch {
         repository.logout()
         _state.value = AppState(checkingSession = false)
@@ -190,7 +226,7 @@ fun EstateMateApp(viewModel: MainViewModel = hiltViewModel()) {
     when {
         state.checkingSession -> FullScreenLoading()
         state.user == null -> LoginScreen(state.busy, state.error, viewModel::login)
-        else -> HomeScreen(state, events, viewModel::refresh, viewModel::requestOwnership, viewModel::reviewOwnership, viewModel::logout)
+        else -> HomeScreen(state,events,viewModel::refresh,viewModel::requestOwnership,viewModel::reviewOwnership,viewModel::createTenancy,viewModel::tenancyAction,viewModel::createHouseholdMember,viewModel::householdAction,viewModel::logout)
     }
 }
 
@@ -244,6 +280,10 @@ private fun HomeScreen(
     refresh: () -> Unit,
     requestOwnership: (OwnershipRequestBody) -> Unit,
     reviewOwnership: (String, Boolean) -> Unit,
+    createTenancy: (TenancyRequestBody) -> Unit,
+    tenancyAction: (String, String, String?) -> Unit,
+    createHouseholdMember: (HouseholdRequestBody) -> Unit,
+    householdAction: (String, String, Boolean?, Boolean?) -> Unit,
     logout: () -> Unit,
 ) {
     var tab by remember { mutableStateOf(HomeTab.Overview) }
@@ -275,7 +315,7 @@ private fun HomeScreen(
         Box(Modifier.fillMaxSize().padding(padding)) {
             when (tab) {
                 HomeTab.Overview -> Overview(state)
-                HomeTab.Properties -> Properties(state, requestOwnership, reviewOwnership)
+                HomeTab.Properties -> Properties(state,requestOwnership,reviewOwnership,createTenancy,tenancyAction,createHouseholdMember,householdAction)
                 HomeTab.Activity -> Activity(events)
                 HomeTab.Account -> Account(state.user!!, logout)
             }
@@ -329,12 +369,22 @@ private fun Properties(
     state: AppState,
     requestOwnership: (OwnershipRequestBody) -> Unit,
     reviewOwnership: (String, Boolean) -> Unit,
+    createTenancy: (TenancyRequestBody) -> Unit,
+    tenancyAction: (String, String, String?) -> Unit,
+    createHouseholdMember: (HouseholdRequestBody) -> Unit,
+    householdAction: (String, String, Boolean?, Boolean?) -> Unit,
 ) {
     val resident = state.user?.role == "resident"
     var unitNumber by remember { mutableStateOf("") }
     var street by remember { mutableStateOf("") }
     var address by remember { mutableStateOf("") }
     var note by remember { mutableStateOf("") }
+    var tenancyPropertyId by remember { mutableStateOf("") }
+    var tenantEmail by remember { mutableStateOf("") }
+    var tenancyStart by remember { mutableStateOf("") }
+    var memberPropertyId by remember { mutableStateOf("") }
+    var memberName by remember { mutableStateOf("") }
+    var memberRelationship by remember { mutableStateOf("child") }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(18.dp), verticalArrangement = Arrangement.spacedBy(11.dp)) {
         item { Text(if (resident) "My properties" else "Estate properties", fontSize = 24.sp, fontWeight = FontWeight.ExtraBold, color = EstateNavy) }
         if (state.error != null) item { Text(state.error, color = MaterialTheme.colorScheme.error, fontSize = 13.sp) }
@@ -343,8 +393,14 @@ private fun Properties(
             Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(14.dp)) {
                 Column(Modifier.fillMaxWidth().padding(17.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(property.unitNumber, fontSize = 19.sp, fontWeight = FontWeight.ExtraBold, color = EstateNavy)
-                    Text(listOfNotNull(property.street, property.address).joinToString(" · "), color = Color(0xFF68748A), fontSize = 12.sp)
-                    if (!resident && property.ownerName != null) Text("Owner: ${property.ownerName}", color = EstateBlue, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                    Text(listOfNotNull(property.zone,property.block,property.street,property.address).joinToString(" · "), color = Color(0xFF68748A), fontSize = 12.sp)
+                    if (property.ownerName != null) Text("Owner: ${property.ownerName}", color = EstateBlue, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                    if (property.tenantName != null) Text("Main tenant: ${property.tenantName} · bills: ${property.billingResponsibility}", color = Color(0xFF68748A), fontSize = 12.sp)
+                    if (property.relationshipType != null) Text("Your relationship: ${property.relationshipType}", color = Color(0xFF137444), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    if (!resident || property.relationshipType == "owner") Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = { tenancyPropertyId = property.id }) { Text("Rent out") }
+                        Button(onClick = { memberPropertyId = property.id }) { Text("Add dependant") }
+                    }
                 }
             }
         }
@@ -388,6 +444,59 @@ private fun Properties(
                         if (!resident && request.status == "pending") Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(onClick = { reviewOwnership(request.id, true) }, enabled = !state.busy) { Text("Approve") }
                             Button(onClick = { reviewOwnership(request.id, false) }, enabled = !state.busy, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) { Text("Reject") }
+                        }
+                    }
+                }
+            }
+        }
+        if (tenancyPropertyId.isNotBlank()) item {
+            Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(14.dp)) {
+                Column(Modifier.fillMaxWidth().padding(17.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(if (resident) "Nominate a tenant" else "Assign a tenant", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    OutlinedTextField(tenantEmail,{ tenantEmail=it },label={ Text("Tenant account email") },modifier=Modifier.fillMaxWidth(),singleLine=true)
+                    OutlinedTextField(tenancyStart,{ tenancyStart=it },label={ Text("Start date (YYYY-MM-DD)") },modifier=Modifier.fillMaxWidth(),singleLine=true)
+                    Button(onClick={ createTenancy(TenancyRequestBody(tenancyPropertyId,tenantEmail,tenancyStart)) },enabled=!state.busy && tenantEmail.isNotBlank() && tenancyStart.isNotBlank(),modifier=Modifier.fillMaxWidth()) { Text(if (resident) "Submit tenancy" else "Assign tenant") }
+                }
+            }
+        }
+        if (state.tenancies.isNotEmpty()) {
+            item { Text("Tenancies",fontSize=18.sp,fontWeight=FontWeight.Bold,color=EstateNavy,modifier=Modifier.padding(top=10.dp)) }
+            items(state.tenancies,key={ "tenancy-${it.id}" }) { tenancy ->
+                Card(colors=CardDefaults.cardColors(containerColor=if(tenancy.status=="pending") Color(0xFFFFFBF2) else Color.White),shape=RoundedCornerShape(13.dp)) {
+                    Column(Modifier.fillMaxWidth().padding(15.dp),verticalArrangement=Arrangement.spacedBy(5.dp)) {
+                        Text("${tenancy.unitNumber}: ${tenancy.tenantName}",fontWeight=FontWeight.Bold)
+                        Text("Owner ${tenancy.ownerName} · bills ${tenancy.billingResponsibility}",fontSize=11.sp,color=Color(0xFF68748A))
+                        Text("${tenancy.startDate} — ${tenancy.endDate ?: "open"} · ${tenancy.status}",fontSize=11.sp,color=EstateBlue)
+                        if(!resident && tenancy.status=="pending") Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+                            Button(onClick={ tenancyAction(tenancy.id,"approve",tenancy.billingResponsibility) }) { Text("Approve") }
+                            Button(onClick={ tenancyAction(tenancy.id,"reject",null) },colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)) { Text("Reject") }
+                        }
+                        if(!resident && tenancy.status=="active") Button(onClick={ tenancyAction(tenancy.id,"end",null) },colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)) { Text("End tenancy") }
+                    }
+                }
+            }
+        }
+        if (memberPropertyId.isNotBlank()) item {
+            Card(colors=CardDefaults.cardColors(containerColor=Color.White),shape=RoundedCornerShape(14.dp)) {
+                Column(Modifier.fillMaxWidth().padding(17.dp),verticalArrangement=Arrangement.spacedBy(10.dp)) {
+                    Text("Add dependant",fontSize=18.sp,fontWeight=FontWeight.Bold)
+                    OutlinedTextField(memberName,{memberName=it},label={Text("Full name")},modifier=Modifier.fillMaxWidth(),singleLine=true)
+                    OutlinedTextField(memberRelationship,{memberRelationship=it},label={Text("Relationship: child, spouse, parent…")},modifier=Modifier.fillMaxWidth(),singleLine=true)
+                    Button(onClick={ createHouseholdMember(HouseholdRequestBody(memberPropertyId,memberName,memberRelationship)) },enabled=!state.busy && memberName.isNotBlank() && memberRelationship.isNotBlank(),modifier=Modifier.fillMaxWidth()) { Text(if(resident) "Submit for approval" else "Add dependant") }
+                }
+            }
+        }
+        if (state.householdMembers.isNotEmpty()) {
+            item { Text("Dependants and household",fontSize=18.sp,fontWeight=FontWeight.Bold,color=EstateNavy,modifier=Modifier.padding(top=10.dp)) }
+            items(state.householdMembers,key={ "member-${it.id}" }) { member ->
+                Card(colors=CardDefaults.cardColors(containerColor=if(member.status=="pending") Color(0xFFFFFBF2) else Color.White),shape=RoundedCornerShape(13.dp)) {
+                    Column(Modifier.fillMaxWidth().padding(15.dp),verticalArrangement=Arrangement.spacedBy(5.dp)) {
+                        Text("${member.name} · ${member.relationship}",fontWeight=FontWeight.Bold)
+                        Text("${member.unitNumber} · main resident ${member.primaryResidentName}",fontSize=11.sp,color=Color(0xFF68748A))
+                        Text("${member.status} · visitors ${if(member.canCreateVisitors==1) "allowed" else "not allowed"}",fontSize=11.sp,color=EstateBlue)
+                        if(!resident && member.status=="pending") Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+                            Button(onClick={ householdAction(member.id,"approve",true,false) }) { Text("Approve") }
+                            Button(onClick={ householdAction(member.id,"reject",null,null) },colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)) { Text("Reject") }
                         }
                     }
                 }
