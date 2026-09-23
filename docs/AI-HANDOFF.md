@@ -1,6 +1,6 @@
 # AI handoff — EstateMate
 
-Updated: 2026-09-23 (Africa/Lagos)
+Updated: 2026-09-24 (Africa/Lagos)
 
 Repository: https://github.com/barikblog/estatemate-minmoe
 
@@ -49,6 +49,7 @@ It adds device inventory metadata/soft deletion, visitor credentials, scan sessi
   - visitor/card hardware-action queues;
   - proof metadata linking and reviewer listing.
 - The Render relay health endpoint and event forwarding to the Worker passed locally.
+- GitHub Actions run `35934290140` applied migration `0006` and deployed commit `d28a66b` successfully; production health, portal configuration, visitor, device/profile, operation and storage-settings reads passed afterward.
 - Android source from the previous tenancy phase remains uncompiled in this environment because JDK 17 and Android SDK are unavailable.
 
 ## Important hardware truth
