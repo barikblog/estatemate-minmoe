@@ -20,7 +20,7 @@ Included:
 - Hourly facility-fee expiry/reactivation job and hardware-action audit queue.
 - Role-aware React portal for Administrator, Resident, Cashier, and Security.
 - Kotlin/Compose Android foundation with encrypted token storage, Retrofit/Hilt, Room event cache, role dashboard, and gate history.
-- R2 private upload/download route with ownership checks and a 500 KB limit.
+- Optional R2 private upload/download route with ownership checks and a 500 KB limit. The current production config disables uploads because the account owner requested no service requiring paid activation.
 - PBKDF2-SHA256 passwords and HS256 sessions implemented with Workers Web Crypto.
 - Tests for password/JWT code and Hikvision JSON/XML/multipart parsing.
 

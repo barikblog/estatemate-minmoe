@@ -2,13 +2,14 @@ export type Role = 'admin' | 'resident' | 'security' | 'cashier';
 
 export interface Env {
   DB: D1Database;
-  FILES: R2Bucket;
+  FILES?: R2Bucket;
   ACCESS_EVENTS: Queue<NormalizedAccessEvent>;
   LIVE_FEED: DurableObjectNamespace;
   ASSETS: Fetcher;
   APP_NAME: string;
   ALLOWED_ORIGINS: string;
   HIKVISION_MODE: string;
+  FILE_STORAGE_MODE?: string;
   JWT_SECRET: string;
   BOOTSTRAP_TOKEN: string;
   DEVICE_INGEST_PEPPER: string;

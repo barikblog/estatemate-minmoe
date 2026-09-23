@@ -95,7 +95,13 @@ async function audit(c: AppContext, action: string, entityType: string, entityId
 
 app.get('/api/health', async (c) => {
   const db = await c.env.DB.prepare('SELECT 1 AS ok').first<{ ok: number }>();
-  return c.json({ ok: db?.ok === 1, app: c.env.APP_NAME, time: new Date().toISOString(), hikvisionMode: c.env.HIKVISION_MODE });
+  return c.json({
+    ok: db?.ok === 1,
+    app: c.env.APP_NAME,
+    time: new Date().toISOString(),
+    hikvisionMode: c.env.HIKVISION_MODE,
+    fileStorage: c.env.FILES ? 'r2' : (c.env.FILE_STORAGE_MODE ?? 'disabled'),
+  });
 });
 
 app.post('/api/auth/bootstrap', async (c) => {
@@ -368,6 +374,7 @@ app.post('/api/incidents', requireRoles('security', 'admin'), async (c) => {
 });
 
 app.post('/api/files', async (c) => {
+  if (!c.env.FILES) return jsonError(c, 503, 'Private file storage is disabled on this deployment');
   const contentType = c.req.header('Content-Type') ?? 'application/octet-stream';
   const length = Number(c.req.header('Content-Length') ?? 0);
   if (length > 500_000) return jsonError(c, 413, 'File exceeds the 500 KB compressed upload limit');
@@ -381,6 +388,7 @@ app.post('/api/files', async (c) => {
 });
 
 app.get('/api/files/*', async (c) => {
+  if (!c.env.FILES) return jsonError(c, 503, 'Private file storage is disabled on this deployment');
   const key = c.req.path.replace('/api/files/', '');
   const object = await c.env.FILES.get(key);
   if (!object) return jsonError(c, 404, 'File not found');
