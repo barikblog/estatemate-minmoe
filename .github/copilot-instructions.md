@@ -1,0 +1,1 @@
+Follow `/AGENTS.md` and `/docs/AI-HANDOFF.md` before changing this repository. Keep Cloudflare D1 migrations append-only, preserve historical records, store uploaded binaries only in the configured private GitHub repository, and never commit credentials. Validate Worker, web, tests and the full fresh migration chain before committing.

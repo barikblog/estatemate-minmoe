@@ -4,14 +4,18 @@ export type HikvisionProfileKey =
   | 'minmoe_pro_6xx'
   | 'minmoe_ultra_6xx'
   | 'minmoe_turnstile_module'
+  | 'qr_terminal_k1t807_k1t502'
+  | 'access_terminal_8xx'
   | 'access_terminal_5xx'
   | 'attendance_k1a'
   | 'controller_k2600'
   | 'controller_k2700_k2800'
+  | 'generic_network_access'
   | 'generic_isapi';
 
 export type ConnectionPattern =
   | 'direct_http_listener'
+  | 'render_http_bridge'
   | 'hikvision_cloud_openapi'
   | 'offsite_isup_gateway'
   | 'manual_sync';
@@ -80,7 +84,7 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['^DS-K1T3', '^K1T3'],
     devicePattern: 'standalone_terminal',
     authenticationMethods: ['face', 'card', 'fingerprint', 'PIN', 'QR where fitted'],
-    supportedConnections: ['direct_http_listener', 'hikvision_cloud_openapi', 'offsite_isup_gateway', 'manual_sync'],
+    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'hikvision_cloud_openapi', 'offsite_isup_gateway', 'manual_sync'],
     defaultConnection: 'direct_http_listener',
     httpListener: { expected: true, formats: ['json', 'xml', 'multipart'], note: 'Availability and HTTPS/auth options vary by firmware build.' },
     aliases: aliases({ cardUid: ['cardNoString'], employeeNo: ['employeeNo'] }),
@@ -95,7 +99,7 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['^DS-K1T67', '^K1T67'],
     devicePattern: 'standalone_terminal',
     authenticationMethods: ['face', 'card', 'fingerprint', 'PIN', 'QR', 'mobile credential where fitted'],
-    supportedConnections: ['direct_http_listener', 'hikvision_cloud_openapi', 'offsite_isup_gateway', 'manual_sync'],
+    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'hikvision_cloud_openapi', 'offsite_isup_gateway', 'manual_sync'],
     defaultConnection: 'direct_http_listener',
     httpListener: { expected: true, formats: ['json', 'xml', 'multipart'], note: 'Confirm firmware upload format and certificate validation.' },
     aliases: aliases({ credentialType: ['mask', 'helmet', 'recognitionMode'] }),
@@ -110,7 +114,7 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['^DS-K1T68', '^K1T68'],
     devicePattern: 'standalone_terminal',
     authenticationMethods: ['face', 'card', 'fingerprint', 'PIN', 'QR', 'palm/iris where fitted'],
-    supportedConnections: ['direct_http_listener', 'hikvision_cloud_openapi', 'offsite_isup_gateway', 'manual_sync'],
+    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'hikvision_cloud_openapi', 'offsite_isup_gateway', 'manual_sync'],
     defaultConnection: 'direct_http_listener',
     httpListener: { expected: true, formats: ['json', 'xml', 'multipart'], note: 'Large image events are accepted only up to the configured request limit.' },
     aliases: aliases({ credentialType: ['irisMode', 'palmMode', 'recognitionMode'] }),
@@ -125,12 +129,42 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['^DS-K560', '^DS-K567', '^DS-K3.*FACE'],
     devicePattern: 'turnstile_module',
     authenticationMethods: ['face', 'card', 'QR where fitted'],
-    supportedConnections: ['direct_http_listener', 'offsite_isup_gateway', 'manual_sync'],
+    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'offsite_isup_gateway', 'manual_sync'],
     defaultConnection: 'direct_http_listener',
     httpListener: { expected: true, formats: ['json', 'xml', 'multipart'], note: 'Verify whether the turnstile controller or face module owns the event upload.' },
     aliases: aliases({ direction: ['laneDirection'], doorNo: ['laneNo', 'barrierNo'] }),
     grantedPatterns: [...commonGranted, 'faceMatch', 'barrierOpen'],
     deniedPatterns: [...commonDenied, 'faceMismatch', 'barrierDenied'],
+  },
+  {
+    key: 'qr_terminal_k1t807_k1t502',
+    label: 'QR-capable K1T807 / K1T502 terminal',
+    family: 'QR Access Terminal',
+    description: 'DS-K1T807 QRE1 and DS-K1T502 QR/CQR/QRE1 variants with an integrated or fitted QR reader.',
+    modelPatterns: ['^DS-K1T807.*QR', '^K1T807.*QR', '^DS-K1T502.*(QR|CQR)', '^K1T502.*(QR|CQR)'],
+    devicePattern: 'standalone_terminal',
+    authenticationMethods: ['card', 'PIN', 'QR', 'fingerprint/Bluetooth where fitted'],
+    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'offsite_isup_gateway', 'manual_sync'],
+    defaultConnection: 'direct_http_listener',
+    httpListener: { expected: true, formats: ['json', 'xml', 'multipart'], note: 'Provision the numeric visitor credential to the terminal before relying on its QR reader.' },
+    aliases: aliases({ cardUid: ['cardNoString', 'qrCode'], credentialType: ['qrCodeMode'] }),
+    grantedPatterns: [...commonGranted, 'legalCardPass', 'qrCodePass'],
+    deniedPatterns: [...commonDenied, 'invalidCard', 'invalidQRCode'],
+  },
+  {
+    key: 'access_terminal_8xx',
+    label: 'K1T8xx card/fingerprint terminal',
+    family: 'Card / Fingerprint Terminal',
+    description: 'DS-K1T801/802/804/805/808 and related variants. DS-K1T808MFWX-B supports card, fingerprint and PIN, not an integrated QR camera.',
+    modelPatterns: ['^DS-K1T8', '^K1T8'],
+    devicePattern: 'standalone_terminal',
+    authenticationMethods: ['card', 'fingerprint where fitted', 'PIN'],
+    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'offsite_isup_gateway', 'manual_sync'],
+    defaultConnection: 'direct_http_listener',
+    httpListener: { expected: true, formats: ['json', 'xml', 'multipart'], note: 'ISAPI/ISUP support depends on model and firmware; use PIN or card because most K1T8xx models have no QR scanner.' },
+    aliases: aliases({ cardUid: ['cardNoString'] }),
+    grantedPatterns: [...commonGranted, 'legalCardPass', 'fingerprintPass'],
+    deniedPatterns: [...commonDenied, 'invalidCard', 'fingerprintMismatch'],
   },
   {
     key: 'access_terminal_5xx',
@@ -140,7 +174,7 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['^DS-K1T5', '^K1T5'],
     devicePattern: 'standalone_terminal',
     authenticationMethods: ['card', 'face where fitted', 'fingerprint where fitted', 'PIN'],
-    supportedConnections: ['direct_http_listener', 'offsite_isup_gateway', 'manual_sync'],
+    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'offsite_isup_gateway', 'manual_sync'],
     defaultConnection: 'direct_http_listener',
     httpListener: { expected: true, formats: ['json', 'xml', 'multipart'], note: 'The K1T502 family documents HTTP/HTTPS event alarm upload; verify each regional firmware.' },
     aliases: aliases({ cardUid: ['cardNoString'] }),
@@ -155,7 +189,7 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['^DS-K1A', '^K1A'],
     devicePattern: 'attendance_terminal',
     authenticationMethods: ['face', 'card', 'fingerprint', 'PIN'],
-    supportedConnections: ['direct_http_listener', 'offsite_isup_gateway', 'manual_sync'],
+    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'offsite_isup_gateway', 'manual_sync'],
     defaultConnection: 'direct_http_listener',
     httpListener: { expected: true, formats: ['json', 'xml', 'multipart'], note: 'Attendance check-in/out labels are normalized to entry/exit when present.' },
     aliases: aliases({ direction: ['attendanceStatus', 'label'], timestamp: ['attendanceTime'] }),
@@ -170,7 +204,7 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['^DS-K260', '^K260'],
     devicePattern: 'multi_door_controller',
     authenticationMethods: ['card', 'PIN', 'reader-dependent biometrics'],
-    supportedConnections: ['direct_http_listener', 'offsite_isup_gateway', 'manual_sync'],
+    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'offsite_isup_gateway', 'manual_sync'],
     defaultConnection: 'offsite_isup_gateway',
     httpListener: { expected: false, formats: ['json', 'xml'], note: 'EHome/ISUP or a management platform is common; confirm direct HTTP host notification on the actual firmware.' },
     aliases: aliases({ doorNo: ['doorNo', 'cardReaderNo'], direction: ['cardReaderKind'] }),
@@ -193,6 +227,21 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     deniedPatterns: [...commonDenied, 'invalidCard', 'interlock', 'antiPassback'],
   },
   {
+    key: 'generic_network_access',
+    label: 'Other network access-control device',
+    family: 'Vendor-neutral network access',
+    description: 'Explicit profile for a non-Hikvision controller or terminal that can send authenticated JSON/XML HTTP events using mapped common fields.',
+    modelPatterns: [],
+    devicePattern: 'standalone_terminal',
+    authenticationMethods: ['card', 'PIN', 'QR or biometrics when provided by the device'],
+    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'manual_sync'],
+    defaultConnection: 'manual_sync',
+    httpListener: { expected: false, formats: ['json', 'xml', 'multipart'], note: 'Validate a real event sample before enabling production decisions or automatic commands.' },
+    aliases: aliases(),
+    grantedPatterns: commonGranted,
+    deniedPatterns: commonDenied,
+  },
+  {
     key: 'generic_isapi',
     label: 'Generic Hikvision ISAPI access device',
     family: 'Generic ISAPI',
@@ -200,7 +249,7 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['.*'],
     devicePattern: 'standalone_terminal',
     authenticationMethods: ['unknown'],
-    supportedConnections: ['direct_http_listener', 'offsite_isup_gateway', 'manual_sync'],
+    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'offsite_isup_gateway', 'manual_sync'],
     defaultConnection: 'manual_sync',
     httpListener: { expected: false, formats: ['json', 'xml', 'multipart'], note: 'Run the device-profile validation procedure before production.' },
     aliases: aliases(),

@@ -3,7 +3,7 @@ import type { Context, MiddlewareHandler } from 'hono';
 import { moneyToMinor, parseCsv, requireHeaders, validDate } from './csv';
 import { AccessLiveFeed } from './live-feed';
 import { extractEventDocuments, normalizeHikvisionDocument } from './hikvision';
-import { HIKVISION_PROFILES, isConnectionSupported, resolveHikvisionProfile } from './hikvision-profiles';
+import { HIKVISION_PROFILES, getHikvisionProfile, isConnectionSupported, resolveHikvisionProfile } from './hikvision-profiles';
 import {
   MAX_GITHUB_FILE_SIZE,
   downloadFromPrivateGitHub,
@@ -196,6 +196,41 @@ function csvCell(value: unknown): string {
   return /[",\n\r]/.test(text) ? `"${text.replaceAll('"','""')}"` : text;
 }
 
+function proofKeys(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map(String).filter((key) => /^github\/[0-9a-f-]{36}$/i.test(key)))].slice(0,5);
+}
+
+async function linkProofFiles(db: D1Database, keys: string[], entityType: string, entityId: string, uploaderId: string): Promise<void> {
+  if (!keys.length) return;
+  const placeholders = keys.map(() => '?').join(',');
+  await db.prepare(
+    `UPDATE stored_files SET linked_entity_type=?,linked_entity_id=?
+     WHERE storage_key IN (${placeholders}) AND uploaded_by=? AND status='active' AND linked_entity_id IS NULL`,
+  ).bind(entityType,entityId,...keys,uploaderId).run();
+}
+
+async function newVisitorCredential(db: D1Database): Promise<string> {
+  for (let attempt=0; attempt<10; attempt+=1) {
+    const parts = crypto.getRandomValues(new Uint32Array(2));
+    const value = `${String(parts[0]! % 1_000_000).padStart(6,'0')}${String(parts[1]! % 1_000_000).padStart(6,'0')}`;
+    const existing = await db.prepare(`SELECT 1 AS ok FROM visitor_requests WHERE credential_number=?`).bind(value).first();
+    if (!existing) return value;
+  }
+  throw new Error('Could not generate a unique visitor credential');
+}
+
+function maskedCredential(value: string): string {
+  return value.length <= 4 ? '****' : `${'*'.repeat(Math.min(8,value.length-4))}${value.slice(-4)}`;
+}
+
+const PORTAL_SETTING_KEYS = [
+  'portal_name','estate_name','portal_short_name','portal_tagline','portal_welcome_text','theme_mode',
+  'theme_primary_color','theme_accent_color','theme_navigation_color','theme_surface_color','theme_corner_style',
+  'support_email','support_phone','estate_timezone','currency','visitor_default_duration_hours',
+  'visitor_gate_policy','visitor_credential_format','card_scan_timeout_minutes','render_bridge_url',
+] as const;
+
 app.get('/api/health', async (c) => {
   const db = await c.env.DB.prepare('SELECT 1 AS ok').first<{ ok: number }>();
   let fileStorage = c.env.FILE_STORAGE_MODE ?? 'disabled';
@@ -210,6 +245,16 @@ app.get('/api/health', async (c) => {
     hikvisionMode: c.env.HIKVISION_MODE,
     fileStorage,
   });
+});
+
+app.get('/api/portal-config', async (c) => {
+  const placeholders = PORTAL_SETTING_KEYS.map(() => '?').join(',');
+  try {
+    const rows = await c.env.DB.prepare(`SELECT key,value FROM settings WHERE key IN (${placeholders})`).bind(...PORTAL_SETTING_KEYS).all<{ key:string;value:string }>();
+    return c.json(Object.fromEntries(rows.results.map((row) => [row.key,row.value])));
+  } catch {
+    return c.json({ portal_name:'EstateMate',estate_name:'EstateMate Estate',portal_short_name:'EM',theme_mode:'light',theme_primary_color:'#1769e0',theme_accent_color:'#35d07f',theme_navigation_color:'#0d1b37',theme_surface_color:'#ffffff' });
+  }
 });
 
 app.post('/api/auth/bootstrap', async (c) => {
@@ -366,7 +411,8 @@ app.get('/api/property-ownership-requests', requireRoles('resident', 'admin'), a
        COALESCE(p.unit_number,r.proposed_unit_number) AS unit_number,
        COALESCE(p.street,r.proposed_street) AS street,
        COALESCE(p.address,r.proposed_address) AS address,
-       reviewer.name AS reviewed_by_name
+       reviewer.name AS reviewed_by_name,
+       (SELECT COUNT(*) FROM stored_files sf WHERE sf.linked_entity_type='property_ownership_request' AND sf.linked_entity_id=r.id AND sf.status='active') AS proof_count
      FROM property_ownership_requests r
      JOIN users u ON u.id=r.requester_id
      LEFT JOIN properties p ON p.id=r.property_id
@@ -384,6 +430,7 @@ app.post('/api/property-ownership-requests', requireRoles('resident'), async (c)
     proposedStreet?: string;
     proposedAddress?: string;
     requestNote?: string;
+    proofKeys?: string[];
   }>();
   const proposing = !body.propertyId;
   if (proposing && (!body.proposedUnitNumber?.trim() || !body.proposedStreet?.trim() || !body.proposedAddress?.trim())) {
@@ -403,6 +450,7 @@ app.post('/api/property-ownership-requests', requireRoles('resident'), async (c)
     id,c.get('user').id,body.propertyId ?? null,body.proposedUnitNumber?.trim() ?? null,
     body.proposedStreet?.trim() ?? null,body.proposedAddress?.trim() ?? null,body.requestNote?.trim() ?? null,
   ).run();
+  await linkProofFiles(c.env.DB,proofKeys(body.proofKeys),'property_ownership_request',id,c.get('user').id);
   await audit(c, 'request', 'property_ownership', id, { propertyId: body.propertyId, proposedUnitNumber: body.proposedUnitNumber });
   return c.json({ id, status: 'pending' }, 201);
 });
@@ -493,7 +541,8 @@ app.get('/api/property-tenancies', requireRoles('resident', 'admin'), async (c) 
   const { limit, offset, page: pageNumber } = page(c);
   const result = await c.env.DB.prepare(
     `SELECT t.*,p.unit_number,p.street,p.block,p.zone,tenant.name AS tenant_name,tenant.email AS tenant_email,
-       owner.name AS owner_name,owner.email AS owner_email,requester.name AS requested_by_name,reviewer.name AS approved_by_name
+       owner.name AS owner_name,owner.email AS owner_email,requester.name AS requested_by_name,reviewer.name AS approved_by_name,
+       (SELECT COUNT(*) FROM stored_files sf WHERE sf.linked_entity_type='property_tenancy' AND sf.linked_entity_id=t.id AND sf.status='active') AS proof_count
      FROM property_tenancies t
      JOIN properties p ON p.id=t.property_id
      JOIN users tenant ON tenant.id=t.tenant_id
@@ -516,6 +565,7 @@ app.post('/api/property-tenancies', requireRoles('resident', 'admin'), async (c)
     endDate?: string;
     billingResponsibility?: 'owner'|'tenant';
     requestNote?: string;
+    proofKeys?: string[];
   }>();
   if (!body.propertyId || (!body.tenantId && !body.tenantEmail?.trim()) || !body.startDate) return jsonError(c, 400, 'propertyId, tenant and startDate are required');
   if (Number.isNaN(new Date(body.startDate).valueOf()) || (body.endDate && Number.isNaN(new Date(body.endDate).valueOf()))) return jsonError(c, 400, 'Tenancy dates are invalid');
@@ -543,6 +593,7 @@ app.post('/api/property-tenancies', requireRoles('resident', 'admin'), async (c)
     body.requestNote?.trim() ?? null,user.id,direct ? user.id : null,direct ? new Date().toISOString() : null,
   ).run();
   if (direct) await c.env.DB.prepare(`UPDATE users SET property_id=COALESCE(property_id,?),updated_at=datetime('now') WHERE id=?`).bind(body.propertyId,tenant.id).run();
+  await linkProofFiles(c.env.DB,proofKeys(body.proofKeys),'property_tenancy',id,user.id);
   await audit(c, direct ? 'assign' : 'request', 'property_tenancy', id, { propertyId: body.propertyId, tenantId: tenant.id, billingResponsibility: billing });
   return c.json({ id, status: direct ? 'active' : 'pending' }, 201);
 });
@@ -597,7 +648,8 @@ app.get('/api/household-members', requireRoles('resident', 'admin'), async (c) =
   const { limit, offset, page: pageNumber } = page(c);
   const result = await c.env.DB.prepare(
     `SELECT h.*,p.unit_number,p.street,primary_user.name AS primary_resident_name,linked.name AS login_name,linked.email AS login_email,
-       reviewer.name AS approved_by_name
+       reviewer.name AS approved_by_name,
+       (SELECT COUNT(*) FROM stored_files sf WHERE sf.linked_entity_type='household_member' AND sf.linked_entity_id=h.id AND sf.status='active') AS proof_count
      FROM household_members h
      JOIN properties p ON p.id=h.property_id
      JOIN users primary_user ON primary_user.id=h.primary_resident_id
@@ -623,6 +675,7 @@ app.post('/api/household-members', requireRoles('resident', 'admin'), async (c) 
     canCreateVisitors?: boolean;
     canViewBills?: boolean;
     requestNote?: string;
+    proofKeys?: string[];
   }>();
   const relationships = ['spouse','child','parent','relative','domestic_staff','caregiver','other'];
   if (!body.propertyId || !body.name?.trim() || !body.relationship || !relationships.includes(body.relationship)) return jsonError(c, 400, 'propertyId, name and a valid relationship are required');
@@ -645,6 +698,7 @@ app.post('/api/household-members', requireRoles('resident', 'admin'), async (c) 
     id,body.propertyId,primaryResidentId,body.name.trim(),body.relationship,body.dateOfBirth ?? null,body.phone?.trim() ?? null,body.email?.trim().toLowerCase() ?? null,
     direct ? 'active' : 'pending',body.canCreateVisitors ? 1 : 0,body.canViewBills ? 1 : 0,body.requestNote?.trim() ?? null,user.id,direct ? user.id : null,direct ? new Date().toISOString() : null,
   ).run();
+  await linkProofFiles(c.env.DB,proofKeys(body.proofKeys),'household_member',id,user.id);
   await audit(c, direct ? 'create' : 'request', 'household_member', id, { propertyId: body.propertyId, relationship: body.relationship });
   return c.json({ id, status: direct ? 'active' : 'pending' }, 201);
 });
@@ -705,7 +759,8 @@ app.get('/api/property-transfers', requireRoles('resident', 'admin'), async (c) 
   const { limit, offset, page: pageNumber } = page(c);
   const result = await c.env.DB.prepare(
     `SELECT tr.*,p.unit_number,p.street,from_user.name AS from_owner_name,from_user.email AS from_owner_email,
-       to_user.name AS to_owner_name,to_user.email AS to_owner_email,reviewer.name AS approved_by_name
+       to_user.name AS to_owner_name,to_user.email AS to_owner_email,reviewer.name AS approved_by_name,
+       (SELECT COUNT(*) FROM stored_files sf WHERE sf.linked_entity_type='property_transfer' AND sf.linked_entity_id=tr.id AND sf.status='active') AS proof_count
      FROM property_transfer_requests tr JOIN properties p ON p.id=tr.property_id
      JOIN users from_user ON from_user.id=tr.from_owner_id JOIN users to_user ON to_user.id=tr.to_owner_id
      LEFT JOIN users reviewer ON reviewer.id=tr.approved_by
@@ -716,7 +771,7 @@ app.get('/api/property-transfers', requireRoles('resident', 'admin'), async (c) 
 });
 
 app.post('/api/property-transfers', requireRoles('resident', 'admin'), async (c) => {
-  const body = await c.req.json<{ propertyId?: string; newOwnerId?: string; newOwnerEmail?: string; effectiveDate?: string; requestNote?: string; approveNow?: boolean }>();
+  const body = await c.req.json<{ propertyId?: string; newOwnerId?: string; newOwnerEmail?: string; effectiveDate?: string; requestNote?: string; approveNow?: boolean; proofKeys?: string[] }>();
   if (!body.propertyId || (!body.newOwnerId && !body.newOwnerEmail?.trim()) || !body.effectiveDate) return jsonError(c, 400, 'propertyId, new owner and effectiveDate are required');
   if (Number.isNaN(new Date(body.effectiveDate).valueOf())) return jsonError(c, 400, 'effectiveDate is invalid');
   const owner = await c.env.DB.prepare(`SELECT resident_id FROM property_ownerships WHERE property_id=? AND status='active'`).bind(body.propertyId).first<{ resident_id:string }>();
@@ -732,6 +787,7 @@ app.post('/api/property-transfers', requireRoles('resident', 'admin'), async (c)
     `INSERT INTO property_transfer_requests(id,property_id,from_owner_id,to_owner_id,effective_date,status,request_note,requested_by)
      VALUES (?,?,?,?,?,'pending',?,?)`,
   ).bind(id,body.propertyId,owner.resident_id,nextOwner.id,body.effectiveDate,body.requestNote?.trim() ?? null,c.get('user').id).run();
+  await linkProofFiles(c.env.DB,proofKeys(body.proofKeys),'property_transfer',id,c.get('user').id);
   if (c.get('user').role === 'admin' && body.approveNow) {
     if (new Date(body.effectiveDate) <= new Date()) {
       await c.env.DB.prepare(`UPDATE property_transfer_requests SET approved_by=?,approved_at=datetime('now') WHERE id=?`).bind(c.get('user').id,id).run();
@@ -928,7 +984,7 @@ app.post('/api/bills', requireRoles('admin', 'cashier'), async (c) => {
 });
 
 app.post('/api/payments', requireRoles('resident', 'cashier', 'admin'), async (c) => {
-  const body = await c.req.json<{ billId?: string; amountMinor?: number; paymentMethod?: 'cash'|'pos'|'bank_transfer'|'online'; proofImageKey?: string }>();
+  const body = await c.req.json<{ billId?: string; amountMinor?: number; paymentMethod?: 'cash'|'pos'|'bank_transfer'|'online'; proofImageKey?: string; proofKeys?: string[] }>();
   if (!body.billId || !body.amountMinor || !body.paymentMethod) return jsonError(c, 400, 'billId, amountMinor and paymentMethod are required');
   const user = c.get('user');
   if (user.role === 'resident') {
@@ -943,8 +999,23 @@ app.post('/api/payments', requireRoles('resident', 'cashier', 'admin'), async (c
      VALUES (?,?,?,?,?,?,?,?,?,?)`,
   ).bind(id, body.billId, Math.round(body.amountMinor), body.proofImageKey ?? null, body.paymentMethod, receipt, user.id, status, status === 'approved' ? user.id : null, status === 'approved' ? new Date().toISOString() : null).run();
   if (status === 'approved') await reconcileBill(c.env.DB, body.billId);
+  const paymentProofs = proofKeys(body.proofKeys ?? (body.proofImageKey ? [body.proofImageKey] : []));
+  await linkProofFiles(c.env.DB,paymentProofs,'payment',id,user.id);
   await audit(c, 'create', 'payment', id, { billId: body.billId, status, receipt });
   return c.json({ id, receiptNumber: receipt, status }, 201);
+});
+
+app.get('/api/payments', requireRoles('resident','cashier','admin'), async (c) => {
+  const user=c.get('user');
+  const { limit,offset,page:pageNumber }=page(c);
+  const residentId=user.role==='resident'?user.id:null;
+  const result=await c.env.DB.prepare(
+    `SELECT pay.*,b.bill_type,b.property_id,u.name AS resident_name,p.unit_number,
+       (SELECT COUNT(*) FROM stored_files sf WHERE sf.linked_entity_type='payment' AND sf.linked_entity_id=pay.id AND sf.status='active') AS proof_count
+     FROM payments pay JOIN bills b ON b.id=pay.bill_id JOIN users u ON u.id=b.resident_id JOIN properties p ON p.id=b.property_id
+     WHERE (? IS NULL OR b.resident_id=?) ORDER BY pay.submitted_at DESC LIMIT ? OFFSET ?`,
+  ).bind(residentId,residentId,limit,offset).all();
+  return c.json({ items:result.results,page:pageNumber,limit });
 });
 
 app.patch('/api/payments/:id/review', requireRoles('cashier', 'admin'), async (c) => {
@@ -1087,15 +1158,18 @@ app.get('/api/visitors', async (c) => {
   const { limit, offset, page: pageNumber } = page(c);
   const residentId = user.role === 'resident' ? user.id : null;
   const result = await c.env.DB.prepare(
-    `SELECT v.*,u.name AS resident_name,p.unit_number,p.street FROM visitor_requests v
-     JOIN users u ON u.id=v.resident_id LEFT JOIN properties p ON p.id=COALESCE(v.property_id,u.property_id)
+    `SELECT v.*,u.name AS resident_name,p.unit_number,p.street,d.name AS device_name,d.model AS device_model,d.profile_key,
+       (SELECT COUNT(*) FROM stored_files sf WHERE sf.linked_entity_type='visitor_request' AND sf.linked_entity_id=v.id AND sf.status='active') AS proof_count
+     FROM visitor_requests v JOIN users u ON u.id=v.resident_id
+     LEFT JOIN properties p ON p.id=COALESCE(v.property_id,u.property_id)
+     LEFT JOIN hikvision_devices d ON d.id=v.device_id
      WHERE (? IS NULL OR v.resident_id=?) ORDER BY v.created_at DESC LIMIT ? OFFSET ?`,
   ).bind(residentId, residentId, limit, offset).all();
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
 app.post('/api/visitors', requireRoles('resident', 'admin'), async (c) => {
-  const body = await c.req.json<{ visitorName?: string; visitorPhone?: string; validFrom?: string; validUntil?: string; residentId?: string; propertyId?: string }>();
+  const body = await c.req.json<{ visitorName?: string; visitorPhone?: string; validFrom?: string; validUntil?: string; residentId?: string; propertyId?: string; deviceId?: string; proofKeys?: string[] }>();
   if (!body.visitorName?.trim() || !body.validFrom || !body.validUntil) return jsonError(c, 400, 'visitorName, validFrom and validUntil are required');
   if (new Date(body.validUntil) <= new Date(body.validFrom)) return jsonError(c, 400, 'validUntil must be after validFrom');
   const residentId = c.get('user').role === 'resident' ? c.get('user').id : body.residentId;
@@ -1116,30 +1190,108 @@ app.post('/api/visitors', requireRoles('resident', 'admin'), async (c) => {
     if (matches.results.length > 1) return jsonError(c, 400, 'propertyId is required because the resident can manage multiple properties');
     propertyId = matches.results[0]!.property_id;
   }
+  let device: { id:string;name:string;model:string|null;profile_key:string;connection_pattern:string }|null=null;
+  if (body.deviceId) {
+    device=await c.env.DB.prepare(`SELECT id,name,model,profile_key,connection_pattern FROM hikvision_devices WHERE id=? AND deleted_at IS NULL AND status!='disabled'`).bind(body.deviceId).first<{ id:string;name:string;model:string|null;profile_key:string;connection_pattern:string }>();
+    if (!device) return jsonError(c,404,'Selected access-control device is unavailable');
+  }
   const id = crypto.randomUUID();
   const pin = String(crypto.getRandomValues(new Uint32Array(1))[0]! % 1_000_000).padStart(6, '0');
   const qrToken = randomToken(24);
+  const credentialNumber=await newVisitorCredential(c.env.DB);
+  const profile=device?getHikvisionProfile(device.profile_key):null;
+  const credentialMode=profile?.authenticationMethods.some((method)=>method==='QR')?'qr':profile?.authenticationMethods.includes('PIN')?'pin':'hybrid';
   await c.env.DB.prepare(
-    `INSERT INTO visitor_requests(id,resident_id,property_id,visitor_name,visitor_phone,pin,qr_token,status,valid_from,valid_until) VALUES (?,?,?,?,?,?,?,'active',?,?)`,
-  ).bind(id, residentId, propertyId, body.visitorName.trim(), body.visitorPhone?.trim() ?? null, pin, qrToken, body.validFrom, body.validUntil).run();
-  return c.json({ id, propertyId, pin, qrToken }, 201);
+    `INSERT INTO visitor_requests(id,resident_id,property_id,visitor_name,visitor_phone,pin,qr_token,credential_number,barcode_payload,credential_mode,device_id,requires_security_approval,status,valid_from,valid_until)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'active',?,?)`,
+  ).bind(id,residentId,propertyId,body.visitorName.trim(),body.visitorPhone?.trim() ?? null,pin,qrToken,credentialNumber,credentialNumber,credentialMode,device?.id ?? null,1,body.validFrom,body.validUntil).run();
+  await linkProofFiles(c.env.DB,proofKeys(body.proofKeys),'visitor_request',id,c.get('user').id);
+  if (device) {
+    const status=['hikvision_cloud_openapi','offsite_isup_gateway'].includes(device.connection_pattern)?'pending':'manual_action_required';
+    await c.env.DB.prepare(
+      `INSERT INTO visitor_device_operations(id,visitor_request_id,device_id,operation,payload_json,status) VALUES (?,?,?,'upsert_visitor',?,?)`,
+    ).bind(crypto.randomUUID(),id,device.id,JSON.stringify({ credentialNumber,visitorName:body.visitorName.trim(),validFrom:body.validFrom,validUntil:body.validUntil,enabled:false,requiresSecurityApproval:true }),status).run();
+  }
+  await audit(c,'create','visitor_request',id,{ propertyId,deviceId:device?.id ?? null,credentialMode });
+  return c.json({ id, propertyId, pin, qrToken, credentialNumber, barcodePayload:credentialNumber, credentialMode, requiresSecurityApproval:true }, 201);
+});
+
+app.post('/api/visitors/scan', requireRoles('security','admin'), async (c) => {
+  const body=await c.req.json<{ code?:string;source?:'phone_camera'|'device'|'manual' }>();
+  const code=body.code?.trim();
+  if (!code) return jsonError(c,400,'Visitor QR, barcode or PIN is required');
+  const visitor=await c.env.DB.prepare(
+    `SELECT v.*,u.name AS resident_name,u.phone AS resident_phone,p.unit_number,p.street,p.address,d.name AS device_name
+     FROM visitor_requests v JOIN users u ON u.id=v.resident_id
+     LEFT JOIN properties p ON p.id=v.property_id LEFT JOIN hikvision_devices d ON d.id=v.device_id
+     WHERE v.pin=? OR v.qr_token=? OR v.credential_number=? OR v.barcode_payload=? LIMIT 1`,
+  ).bind(code,code,code,code).first<Record<string,string|number|null>>();
+  const scanId=crypto.randomUUID();
+  if (!visitor) {
+    await c.env.DB.prepare(`INSERT INTO visitor_code_scans(id,scanned_by,source,scanned_value_masked,decision) VALUES (?,?,?,?,'invalid')`).bind(scanId,c.get('user').id,body.source ?? 'manual',maskedCredential(code)).run();
+    return jsonError(c,404,'Visitor pass not found');
+  }
+  const now=Date.now();
+  const valid=now>=new Date(String(visitor.valid_from)).valueOf() && now<=new Date(String(visitor.valid_until)).valueOf() && !['revoked','expired','checked_out'].includes(String(visitor.status));
+  await c.env.DB.prepare(`INSERT INTO visitor_code_scans(id,visitor_request_id,scanned_by,source,scanned_value_masked,decision) VALUES (?,?,?,?,?,'previewed')`).bind(scanId,visitor.id,c.get('user').id,body.source ?? 'manual',maskedCredential(code)).run();
+  await audit(c,'preview','visitor_pass',String(visitor.id),{ scanId,source:body.source ?? 'manual',valid });
+  return c.json({ scanId,valid,reason:valid?null:'Pass is outside its validity window or no longer active',visitor });
+});
+
+app.post('/api/visitors/:id/decision', requireRoles('security','admin'), async (c) => {
+  const body=await c.req.json<{ decision?:'accepted'|'rejected';action?:'in'|'out';scanId?:string;note?:string }>();
+  if (!body.decision || !['accepted','rejected'].includes(body.decision)) return jsonError(c,400,'decision must be accepted or rejected');
+  if (!body.scanId) return jsonError(c,400,'Preview the scanned visitor code before making a decision');
+  const scan=await c.env.DB.prepare(`SELECT id FROM visitor_code_scans WHERE id=? AND visitor_request_id=? AND scanned_by=? AND decision='previewed'`).bind(body.scanId,c.req.param('id'),c.get('user').id).first();
+  if (!scan) return jsonError(c,409,'This visitor scan is missing, already decided, or belongs to another security user');
+  const visitor=await c.env.DB.prepare(`SELECT * FROM visitor_requests WHERE id=?`).bind(c.req.param('id')).first<Record<string,string|number|null>>();
+  if (!visitor) return jsonError(c,404,'Visitor pass not found');
+  const now=new Date();
+  const valid=now>=new Date(String(visitor.valid_from)) && now<=new Date(String(visitor.valid_until)) && !['revoked','expired','checked_out'].includes(String(visitor.status));
+  if (body.decision==='accepted' && !valid) return jsonError(c,403,'Visitor pass is not valid now');
+  if (body.decision==='accepted') {
+    const action=body.action ?? 'in';
+    if (action==='in') await c.env.DB.prepare(`UPDATE visitor_requests SET status='checked_in',checked_in_at=datetime('now'),checked_in_by=?,rejected_at=NULL,rejected_by=NULL,rejection_note=NULL WHERE id=?`).bind(c.get('user').id,visitor.id).run();
+    else await c.env.DB.prepare(`UPDATE visitor_requests SET status='checked_out',checked_out_at=datetime('now') WHERE id=?`).bind(visitor.id).run();
+  } else {
+    await c.env.DB.prepare(`UPDATE visitor_requests SET rejected_at=datetime('now'),rejected_by=?,rejection_note=? WHERE id=?`).bind(c.get('user').id,body.note?.trim() ?? 'Rejected by gate security',visitor.id).run();
+  }
+  await c.env.DB.prepare(`UPDATE visitor_code_scans SET decision=?,action=?,note=? WHERE id=? AND scanned_by=?`).bind(body.decision,body.action ?? null,body.note?.trim() ?? null,body.scanId,c.get('user').id).run();
+  await audit(c,body.decision,'visitor_pass',String(visitor.id),{ action:body.action,note:body.note });
+  return c.json({ ok:true,decision:body.decision,action:body.action ?? null });
+});
+
+app.post('/api/visitors/device-scan-sessions', requireRoles('security','admin'), async (c) => {
+  const body=await c.req.json<{ deviceId?:string }>();
+  if (!body.deviceId) return jsonError(c,400,'deviceId is required');
+  const device=await c.env.DB.prepare(`SELECT id FROM hikvision_devices WHERE id=? AND deleted_at IS NULL AND status!='disabled'`).bind(body.deviceId).first();
+  if (!device) return jsonError(c,404,'Access-control device not found');
+  await c.env.DB.prepare(`UPDATE credential_scan_sessions SET status='expired',updated_at=datetime('now') WHERE device_id=? AND status='waiting' AND datetime(expires_at)<=datetime('now')`).bind(body.deviceId).run();
+  const timeout=await c.env.DB.prepare(`SELECT CAST(value AS INTEGER) AS minutes FROM settings WHERE key='card_scan_timeout_minutes'`).first<{ minutes:number }>();
+  const id=crypto.randomUUID();
+  try {
+    await c.env.DB.prepare(`INSERT INTO credential_scan_sessions(id,purpose,device_id,requested_by,expires_at) VALUES (?,'visitor_validation',?,?,datetime('now','+' || ? || ' minutes'))`).bind(id,body.deviceId,c.get('user').id,timeout?.minutes || 5).run();
+  } catch { return jsonError(c,409,'This device already has an active scan session'); }
+  return c.json({ id,status:'waiting',expiresInMinutes:timeout?.minutes || 5 },201);
+});
+
+app.get('/api/visitors/device-scan-sessions/:id', requireRoles('security','admin'), async (c) => {
+  const session=await c.env.DB.prepare(
+    `SELECT s.*,v.visitor_name,v.visitor_phone,v.status AS visitor_status,v.valid_from,v.valid_until,u.name AS resident_name,p.unit_number,p.street
+     FROM credential_scan_sessions s LEFT JOIN visitor_requests v ON v.id=s.visitor_request_id
+     LEFT JOIN users u ON u.id=v.resident_id LEFT JOIN properties p ON p.id=v.property_id
+     WHERE s.id=? AND s.requested_by=? AND s.purpose='visitor_validation'`,
+  ).bind(c.req.param('id'),c.get('user').id).first();
+  if (!session) return jsonError(c,404,'Visitor device scan session not found');
+  return c.json(session);
 });
 
 app.post('/api/visitors/check', requireRoles('security', 'admin'), async (c) => {
   const body = await c.req.json<{ pin?: string; action?: 'in'|'out' }>();
   if (!body.pin || !body.action) return jsonError(c, 400, 'pin and action are required');
-  const visitor = await c.env.DB.prepare(
-    `SELECT id, visitor_name, resident_id, status, valid_from, valid_until FROM visitor_requests WHERE pin=? LIMIT 1`,
-  ).bind(body.pin).first<Record<string, string>>();
-  if (!visitor) return jsonError(c, 404, 'Visitor pass not found');
-  const now = new Date();
-  if (now < new Date(visitor.valid_from!) || now > new Date(visitor.valid_until!) || ['revoked','expired'].includes(visitor.status!)) return jsonError(c, 403, 'Visitor pass is not valid now');
-  if (body.action === 'in') {
-    await c.env.DB.prepare(`UPDATE visitor_requests SET status='checked_in', checked_in_at=datetime('now'), checked_in_by=? WHERE id=?`).bind(c.get('user').id, visitor.id).run();
-  } else {
-    await c.env.DB.prepare(`UPDATE visitor_requests SET status='checked_out', checked_out_at=datetime('now') WHERE id=?`).bind(visitor.id).run();
-  }
-  return c.json({ visitor, action: body.action, ok: true });
+  const visitor = await c.env.DB.prepare(`SELECT id FROM visitor_requests WHERE pin=? LIMIT 1`).bind(body.pin).first<{ id:string }>();
+  if (!visitor) return jsonError(c,404,'Visitor pass not found');
+  return c.json({ error:'Preview this visitor pass before accepting it',visitorId:visitor.id },409);
 });
 
 app.get('/api/maintenance', async (c) => {
@@ -1147,7 +1299,9 @@ app.get('/api/maintenance', async (c) => {
   const { limit, offset, page: pageNumber } = page(c);
   const residentId = user.role === 'resident' ? user.id : null;
   const result = await c.env.DB.prepare(
-    `SELECT m.*,u.name AS resident_name,p.unit_number,p.street FROM maintenance_requests m
+    `SELECT m.*,u.name AS resident_name,p.unit_number,p.street,
+       (SELECT COUNT(*) FROM stored_files sf WHERE sf.linked_entity_type='maintenance_request' AND sf.linked_entity_id=m.id AND sf.status='active') AS proof_count
+     FROM maintenance_requests m
      JOIN users u ON u.id=m.resident_id LEFT JOIN properties p ON p.id=COALESCE(m.property_id,u.property_id)
      WHERE (? IS NULL OR m.resident_id=?) ORDER BY m.created_at DESC LIMIT ? OFFSET ?`,
   ).bind(residentId, residentId, limit, offset).all();
@@ -1155,7 +1309,7 @@ app.get('/api/maintenance', async (c) => {
 });
 
 app.post('/api/maintenance', requireRoles('resident', 'admin'), async (c) => {
-  const body = await c.req.json<{ description?: string; photoKey?: string; residentId?: string; propertyId?: string }>();
+  const body = await c.req.json<{ description?: string; photoKey?: string; proofKeys?: string[]; residentId?: string; propertyId?: string }>();
   if (!body.description?.trim()) return jsonError(c, 400, 'description is required');
   const residentId = c.get('user').role === 'resident' ? c.get('user').id : body.residentId;
   if (!residentId) return jsonError(c, 400, 'residentId is required');
@@ -1176,9 +1330,11 @@ app.post('/api/maintenance', requireRoles('resident', 'admin'), async (c) => {
     propertyId = matches.results[0]!.property_id;
   }
   const id = crypto.randomUUID();
+  const maintenanceProofs = proofKeys(body.proofKeys ?? (body.photoKey ? [body.photoKey] : []));
   await c.env.DB.prepare(
     `INSERT INTO maintenance_requests(id,resident_id,property_id,description,photo_key) VALUES (?,?,?,?,?)`,
-  ).bind(id, residentId, propertyId, body.description.trim(), body.photoKey ?? null).run();
+  ).bind(id, residentId, propertyId, body.description.trim(), maintenanceProofs[0] ?? null).run();
+  await linkProofFiles(c.env.DB,maintenanceProofs,'maintenance_request',id,c.get('user').id);
   return c.json({ id, propertyId }, 201);
 });
 
@@ -1296,6 +1452,74 @@ app.get('/api/files/*', async (c) => {
   }
 });
 
+app.get('/api/evidence/:entityType/:entityId', requireRoles('admin','cashier','resident'), async (c) => {
+  const user = c.get('user');
+  const entityType = c.req.param('entityType').replace(/[^a-z_]/g,'');
+  const entityId = c.req.param('entityId');
+  const result = await c.env.DB.prepare(
+    `SELECT storage_key,original_name,content_type,size_bytes,category,uploaded_by,created_at
+     FROM stored_files WHERE linked_entity_type=? AND linked_entity_id=? AND status='active'
+       AND (? != 'resident' OR uploaded_by=?) ORDER BY created_at`,
+  ).bind(entityType,entityId,user.role,user.id).all();
+  return c.json({ items:result.results });
+});
+
+app.post('/api/access/card-scan-sessions', requireRoles('admin'), async (c) => {
+  const body=await c.req.json<{ deviceId?:string;residentId?:string;householdMemberId?:string;cardLabel?:string }>();
+  if (!body.deviceId || (!body.residentId && !body.householdMemberId)) return jsonError(c,400,'deviceId and a main resident or household member are required');
+  const device=await c.env.DB.prepare(`SELECT id FROM hikvision_devices WHERE id=? AND deleted_at IS NULL AND status!='disabled'`).bind(body.deviceId).first();
+  if (!device) return jsonError(c,404,'Access-control device not found');
+  let residentId=body.residentId ?? null;
+  if (body.householdMemberId) {
+    const member=await c.env.DB.prepare(`SELECT primary_resident_id FROM household_members WHERE id=? AND status='active'`).bind(body.householdMemberId).first<{ primary_resident_id:string }>();
+    if (!member) return jsonError(c,404,'Active household member not found');
+    residentId=member.primary_resident_id;
+  } else {
+    const resident=await c.env.DB.prepare(`SELECT id FROM users WHERE id=? AND role='resident' AND status='active'`).bind(residentId).first();
+    if (!resident) return jsonError(c,404,'Active resident not found');
+  }
+  await c.env.DB.prepare(`UPDATE credential_scan_sessions SET status='expired',updated_at=datetime('now') WHERE device_id=? AND status='waiting' AND datetime(expires_at)<=datetime('now')`).bind(body.deviceId).run();
+  const timeout=await c.env.DB.prepare(`SELECT CAST(value AS INTEGER) AS minutes FROM settings WHERE key='card_scan_timeout_minutes'`).first<{ minutes:number }>();
+  const id=crypto.randomUUID();
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO credential_scan_sessions(id,purpose,device_id,requested_by,resident_id,household_member_id,card_label,expires_at)
+       VALUES (?,'card_enrollment',?,?,?,?,?,datetime('now','+' || ? || ' minutes'))`,
+    ).bind(id,body.deviceId,c.get('user').id,residentId,body.householdMemberId ?? null,body.cardLabel?.trim() ?? null,timeout?.minutes || 5).run();
+  } catch { return jsonError(c,409,'This device already has an active scan session'); }
+  await audit(c,'start_card_scan','credential_scan_session',id,{ deviceId:body.deviceId,residentId,householdMemberId:body.householdMemberId });
+  return c.json({ id,status:'waiting',expiresInMinutes:timeout?.minutes || 5 },201);
+});
+
+app.get('/api/access/card-scan-sessions/:id', requireRoles('admin'), async (c) => {
+  const session=await c.env.DB.prepare(
+    `SELECT s.*,d.name AS device_name,d.model,u.name AS resident_name,hm.name AS household_member_name
+     FROM credential_scan_sessions s JOIN hikvision_devices d ON d.id=s.device_id
+     LEFT JOIN users u ON u.id=s.resident_id LEFT JOIN household_members hm ON hm.id=s.household_member_id
+     WHERE s.id=? AND s.requested_by=? AND s.purpose='card_enrollment'`,
+  ).bind(c.req.param('id'),c.get('user').id).first();
+  if (!session) return jsonError(c,404,'Card scan session not found');
+  return c.json(session);
+});
+
+app.post('/api/access/card-scan-sessions/:id/complete', requireRoles('admin'), async (c) => {
+  const session=await c.env.DB.prepare(`SELECT * FROM credential_scan_sessions WHERE id=? AND requested_by=? AND purpose='card_enrollment' AND status='captured'`).bind(c.req.param('id'),c.get('user').id).first<Record<string,string|null>>();
+  if (!session?.captured_credential || !session.resident_id) return jsonError(c,409,'No card credential has been captured yet');
+  const cardId=crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`INSERT INTO access_cards(id,resident_id,household_member_id,card_uid,card_label) VALUES (?,?,?,?,?)`).bind(cardId,session.resident_id,session.household_member_id,session.captured_credential,session.card_label),
+    c.env.DB.prepare(`UPDATE credential_scan_sessions SET status='completed',completed_at=datetime('now'),updated_at=datetime('now') WHERE id=?`).bind(session.id),
+  ]);
+  await createDeviceOperations(c.env,cardId,'upsert_card',{ cardUid:session.captured_credential,residentId:session.resident_id,householdMemberId:session.household_member_id,enabled:true,enrolledViaDeviceId:session.device_id });
+  await audit(c,'issue_scanned','access_card',cardId,{ scanSessionId:session.id,deviceId:session.device_id });
+  return c.json({ id:cardId,cardUid:session.captured_credential,hardwareSync:'queued' },201);
+});
+
+app.delete('/api/access/card-scan-sessions/:id', requireRoles('admin'), async (c) => {
+  await c.env.DB.prepare(`UPDATE credential_scan_sessions SET status='cancelled',updated_at=datetime('now') WHERE id=? AND requested_by=? AND status IN ('waiting','captured')`).bind(c.req.param('id'),c.get('user').id).run();
+  return c.json({ ok:true });
+});
+
 app.get('/api/access/cards', async (c) => {
   const user = c.get('user');
   const { limit, offset, page: pageNumber } = page(c);
@@ -1323,6 +1547,9 @@ app.post('/api/access/cards', requireRoles('admin'), async (c) => {
     residentId = member.primary_resident_id;
     householdMemberId = member.id;
     label ||= member.name;
+  } else {
+    const resident=await c.env.DB.prepare(`SELECT id FROM users WHERE id=? AND role='resident' AND status='active'`).bind(residentId).first();
+    if (!resident) return jsonError(c,404,'Active resident not found');
   }
   const id = crypto.randomUUID();
   await c.env.DB.prepare(`INSERT INTO access_cards(id,resident_id,household_member_id,card_uid,card_label) VALUES (?,?,?,?,?)`).bind(id,residentId,householdMemberId,body.cardUid.trim(),label).run();
@@ -1352,10 +1579,11 @@ app.get('/api/access/events', async (c) => {
   const resultFilter = c.req.query('result') ?? null;
   const deviceId = c.req.query('deviceId') ?? null;
   const result = await c.env.DB.prepare(
-    `SELECT e.*,d.name AS device_name,ap.name AS access_point_name,u.name AS resident_name,hm.name AS household_member_name,hm.relationship
+    `SELECT e.*,d.name AS device_name,ap.name AS access_point_name,u.name AS resident_name,hm.name AS household_member_name,hm.relationship,
+       v.visitor_name,v.status AS visitor_status
      FROM access_events e JOIN hikvision_devices d ON d.id=e.device_id
      LEFT JOIN access_points ap ON ap.id=e.access_point_id LEFT JOIN users u ON u.id=e.resident_id
-     LEFT JOIN household_members hm ON hm.id=e.household_member_id
+     LEFT JOIN household_members hm ON hm.id=e.household_member_id LEFT JOIN visitor_requests v ON v.id=e.visitor_request_id
      WHERE (? IS NULL OR e.resident_id=? OR hm.linked_user_id=?) AND (? IS NULL OR e.result=?) AND (? IS NULL OR e.device_id=?)
      ORDER BY e.device_timestamp DESC LIMIT ? OFFSET ?`,
   ).bind(residentId,residentId,residentId,resultFilter,resultFilter,deviceId,deviceId,limit,offset).all();
@@ -1380,14 +1608,28 @@ app.get('/api/access/profiles', requireRoles('admin', 'security'), (c) => c.json
     supportedConnections: profile.supportedConnections,
     defaultConnection: profile.defaultConnection,
     httpListener: profile.httpListener,
+    visitorCredentials: {
+      qr: profile.authenticationMethods.includes('QR'),
+      pin: profile.authenticationMethods.includes('PIN'),
+      card: profile.authenticationMethods.includes('card'),
+      recommended: profile.authenticationMethods.includes('QR') ? 'QR plus numeric credential' : profile.authenticationMethods.includes('PIN') ? 'Six-digit PIN plus phone-scannable pass' : 'Card/reader credential plus phone-scannable pass',
+    },
   })),
 }));
+
+app.get('/api/access/device-options', async (c) => {
+  const devices=await c.env.DB.prepare(`SELECT id,name,vendor,model,gate_name,direction,profile_key,connection_pattern,status FROM hikvision_devices WHERE deleted_at IS NULL AND status!='disabled' ORDER BY gate_name,name`).all<Record<string,string|null>>();
+  return c.json({ items:devices.results.map((device) => {
+    const profile=getHikvisionProfile(device.profile_key);
+    return { ...device,authenticationMethods:profile.authenticationMethods,supportsQr:profile.authenticationMethods.includes('QR'),supportsPin:profile.authenticationMethods.includes('PIN') };
+  }) });
+});
 
 app.get('/api/access/devices', requireRoles('admin', 'security'), async (c) => {
   const devices = await c.env.DB.prepare(
     `SELECT d.*, ap.id AS access_point_id, ap.name AS access_point_name,
       (SELECT COUNT(*) FROM device_operations o WHERE o.device_id=d.id AND o.status='manual_action_required') AS pending_operations
-     FROM hikvision_devices d LEFT JOIN access_points ap ON ap.device_id=d.id ORDER BY d.created_at DESC`,
+     FROM hikvision_devices d LEFT JOIN access_points ap ON ap.device_id=d.id WHERE d.deleted_at IS NULL ORDER BY d.created_at DESC`,
   ).all();
   return c.json({ items: devices.results, mode: c.env.HIKVISION_MODE });
 });
@@ -1395,6 +1637,7 @@ app.get('/api/access/devices', requireRoles('admin', 'security'), async (c) => {
 app.post('/api/access/devices', requireRoles('admin'), async (c) => {
   const body = await c.req.json<{
     name?: string;
+    vendor?: string;
     serialNumber?: string;
     model?: string;
     firmware?: string;
@@ -1406,13 +1649,13 @@ app.post('/api/access/devices', requireRoles('admin'), async (c) => {
   }>();
   if (!body.name?.trim() || !body.gateName?.trim() || !body.direction) return jsonError(c, 400, 'name, gateName and direction are required');
   const profile = resolveHikvisionProfile(body.model, body.profileKey ?? 'auto');
-  const connectionPattern = body.connectionPattern ?? profile.defaultConnection;
+  const connectionPattern = body.connectionPattern || profile.defaultConnection;
   if (!isConnectionSupported(profile, connectionPattern)) {
     return jsonError(c, 400, `${profile.label} does not offer ${connectionPattern} as a supported connection option`);
   }
   const listenerFormat = body.listenerFormat ?? 'auto';
   if (!['auto','json','xml','multipart'].includes(listenerFormat)) return jsonError(c, 400, 'Invalid listenerFormat');
-  const legacyMode = connectionPattern === 'direct_http_listener' ? 'http_listener' : connectionPattern === 'offsite_isup_gateway' ? 'isup_bridge' : 'manual';
+  const legacyMode = ['direct_http_listener','render_http_bridge'].includes(connectionPattern) ? 'http_listener' : connectionPattern === 'offsite_isup_gateway' ? 'isup_bridge' : 'manual';
   const id = crypto.randomUUID();
   const pointId = crypto.randomUUID();
   const credentialId = crypto.randomUUID();
@@ -1421,19 +1664,24 @@ app.post('/api/access/devices', requireRoles('admin'), async (c) => {
   const keyHash = await sha256(`${secret}:${c.env.DEVICE_INGEST_PEPPER}`);
   await c.env.DB.batch([
     c.env.DB.prepare(
-      `INSERT INTO hikvision_devices(id,name,serial_number,model,firmware,gate_name,direction,integration_mode,profile_key,connection_pattern,listener_format)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO hikvision_devices(id,name,vendor,serial_number,model,firmware,gate_name,direction,integration_mode,profile_key,connection_pattern,listener_format,capabilities_json)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).bind(
-      id, body.name.trim(), body.serialNumber?.trim() ?? null, body.model?.trim() ?? null,
-      body.firmware?.trim() ?? null, body.gateName.trim(), body.direction, legacyMode,
-      profile.key, connectionPattern, listenerFormat,
+      id,body.name.trim(),body.vendor?.trim() || 'Hikvision',body.serialNumber?.trim() || null,body.model?.trim() || null,
+      body.firmware?.trim() || null,body.gateName.trim(),body.direction,legacyMode,profile.key,connectionPattern,listenerFormat,
+      JSON.stringify({ authenticationMethods:profile.authenticationMethods,devicePattern:profile.devicePattern }),
     ),
     c.env.DB.prepare(`INSERT INTO access_points(id,name,gate_name,direction,device_id) VALUES (?,?,?,?,?)`).bind(pointId, `${body.gateName.trim()} ${body.direction === 'both' ? 'Entry' : body.direction}`, body.gateName.trim(), body.direction === 'exit' ? 'exit' : 'entry', id),
     c.env.DB.prepare(`INSERT INTO device_credentials(id,device_id,username,api_key_hash) VALUES (?,?,?,?)`).bind(credentialId, id, username, keyHash),
   ]);
-  const endpoint = `${new URL(c.req.url).origin}/api/hikvision/v1/events/${id}?key=${encodeURIComponent(secret)}`;
-  await audit(c, 'create', 'hikvision_device', id, { model: body.model, firmware: body.firmware, profileKey: profile.key, connectionPattern });
-  const warning = connectionPattern === 'direct_http_listener'
+  const workerEndpoint = `${new URL(c.req.url).origin}/api/hikvision/v1/events/${id}?key=${encodeURIComponent(secret)}`;
+  const bridgeSetting = await c.env.DB.prepare(`SELECT value FROM settings WHERE key='render_bridge_url'`).first<{ value:string }>();
+  const bridgeOrigin=bridgeSetting?.value?.replace(/\/$/,'') ?? '';
+  const endpoint = connectionPattern==='render_http_bridge' && bridgeOrigin ? `${bridgeOrigin}/v1/events/${id}?key=${encodeURIComponent(secret)}` : workerEndpoint;
+  await audit(c, 'create', 'hikvision_device', id, { vendor:body.vendor,model: body.model, firmware: body.firmware, profileKey: profile.key, connectionPattern });
+  const warning = connectionPattern === 'render_http_bridge'
+    ? (bridgeOrigin ? 'Render free relay selected. It forwards HTTPS events only, can sleep after 15 idle minutes, and does not provide ISUP/TCP or automatic hardware commands.' : 'Set the Render bridge URL in Portal customisation before configuring this device; use the Worker endpoint until then.')
+    : connectionPattern === 'direct_http_listener'
     ? 'The secret is shown once. Direct HTTP Listening uploads events only; card commands still need a verified return channel.'
     : connectionPattern === 'manual_sync'
       ? 'No automatic device transport is enabled. Use the hardware action queue and acknowledge each applied change.'
@@ -1443,17 +1691,72 @@ app.post('/api/access/devices', requireRoles('admin'), async (c) => {
     username,
     secret,
     endpoint,
+    workerEndpoint,
     profile: { key: profile.key, label: profile.label, httpListener: profile.httpListener },
     connectionPattern,
     warning,
   }, 201);
 });
 
+app.patch('/api/access/devices/:id', requireRoles('admin'), async (c) => {
+  const body=await c.req.json<{ name?:string;vendor?:string;serialNumber?:string;model?:string;firmware?:string;gateName?:string;direction?:'entry'|'exit'|'both';profileKey?:string;connectionPattern?:string;listenerFormat?:'auto'|'json'|'xml'|'multipart';status?:'pending'|'online'|'offline'|'disabled' }>();
+  if (!body.name?.trim() || !body.gateName?.trim() || !body.direction) return jsonError(c,400,'name, gateName and direction are required');
+  const existing=await c.env.DB.prepare(`SELECT id FROM hikvision_devices WHERE id=? AND deleted_at IS NULL`).bind(c.req.param('id')).first();
+  if (!existing) return jsonError(c,404,'Access-control device not found');
+  const profile=resolveHikvisionProfile(body.model,body.profileKey ?? 'auto');
+  const connectionPattern=body.connectionPattern || profile.defaultConnection;
+  if (!isConnectionSupported(profile,connectionPattern)) return jsonError(c,400,`${profile.label} does not offer ${connectionPattern} as a supported connection option`);
+  const listenerFormat=body.listenerFormat ?? 'auto';
+  if (!['auto','json','xml','multipart'].includes(listenerFormat)) return jsonError(c,400,'Invalid listenerFormat');
+  const status=body.status ?? 'offline';
+  const legacyMode=['direct_http_listener','render_http_bridge'].includes(connectionPattern)?'http_listener':connectionPattern==='offsite_isup_gateway'?'isup_bridge':'manual';
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE hikvision_devices SET name=?,vendor=?,serial_number=?,model=?,firmware=?,gate_name=?,direction=?,integration_mode=?,profile_key=?,connection_pattern=?,listener_format=?,status=?,capabilities_json=?,updated_at=datetime('now') WHERE id=?`,
+    ).bind(body.name.trim(),body.vendor?.trim() || 'Hikvision',body.serialNumber?.trim() || null,body.model?.trim() || null,body.firmware?.trim() || null,body.gateName.trim(),body.direction,legacyMode,profile.key,connectionPattern,listenerFormat,status,JSON.stringify({ authenticationMethods:profile.authenticationMethods,devicePattern:profile.devicePattern }),c.req.param('id')),
+    c.env.DB.prepare(`UPDATE access_points SET name=?,gate_name=?,direction=?,updated_at=datetime('now') WHERE device_id=?`).bind(`${body.gateName.trim()} ${body.direction==='both'?'Entry':body.direction}`,body.gateName.trim(),body.direction==='exit'?'exit':'entry',c.req.param('id')),
+  ]);
+  await audit(c,'update','access_device',c.req.param('id'),{ ...body,profileKey:profile.key,connectionPattern });
+  return c.json({ ok:true,profile:{ key:profile.key,label:profile.label } });
+});
+
+app.delete('/api/access/devices/:id', requireRoles('admin'), async (c) => {
+  const existing=await c.env.DB.prepare(`SELECT id,name FROM hikvision_devices WHERE id=? AND deleted_at IS NULL`).bind(c.req.param('id')).first<{ id:string;name:string }>();
+  if (!existing) return jsonError(c,404,'Access-control device not found');
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE hikvision_devices SET status='disabled',deleted_at=datetime('now'),updated_at=datetime('now') WHERE id=?`).bind(existing.id),
+    c.env.DB.prepare(`UPDATE access_points SET enabled=0,updated_at=datetime('now') WHERE device_id=?`).bind(existing.id),
+    c.env.DB.prepare(`UPDATE device_credentials SET revoked_at=datetime('now') WHERE device_id=? AND revoked_at IS NULL`).bind(existing.id),
+    c.env.DB.prepare(`UPDATE credential_scan_sessions SET status='cancelled',updated_at=datetime('now') WHERE device_id=? AND status IN ('waiting','captured')`).bind(existing.id),
+  ]);
+  await audit(c,'delete','access_device',existing.id,{ name:existing.name,mode:'soft-delete-history-preserved' });
+  return c.json({ ok:true,historyPreserved:true });
+});
+
+app.post('/api/access/devices/:id/rotate-secret', requireRoles('admin'), async (c) => {
+  const device=await c.env.DB.prepare(`SELECT id,connection_pattern FROM hikvision_devices WHERE id=? AND deleted_at IS NULL`).bind(c.req.param('id')).first<{ id:string;connection_pattern:string }>();
+  if (!device) return jsonError(c,404,'Access-control device not found');
+  const secret=randomToken(32); const keyHash=await sha256(`${secret}:${c.env.DEVICE_INGEST_PEPPER}`);
+  await c.env.DB.prepare(`UPDATE device_credentials SET api_key_hash=?,revoked_at=NULL WHERE device_id=?`).bind(keyHash,device.id).run();
+  const workerEndpoint=`${new URL(c.req.url).origin}/api/hikvision/v1/events/${device.id}?key=${encodeURIComponent(secret)}`;
+  const bridge=await c.env.DB.prepare(`SELECT value FROM settings WHERE key='render_bridge_url'`).first<{ value:string }>();
+  const endpoint=device.connection_pattern==='render_http_bridge' && bridge?.value ? `${bridge.value.replace(/\/$/,'')}/v1/events/${device.id}?key=${encodeURIComponent(secret)}`:workerEndpoint;
+  await audit(c,'rotate_secret','access_device',device.id);
+  return c.json({ secret,endpoint,workerEndpoint,warning:'Shown once. Update the physical device immediately; the previous secret no longer works.' });
+});
+
 app.get('/api/access/operations', requireRoles('admin'), async (c) => {
   const { limit, offset, page: pageNumber } = page(c);
   const result = await c.env.DB.prepare(
-    `SELECT o.*,d.name AS device_name,c.card_uid FROM device_operations o JOIN hikvision_devices d ON d.id=o.device_id LEFT JOIN access_cards c ON c.id=o.card_id
-     WHERE o.status IN ('pending','manual_action_required','failed') ORDER BY o.created_at LIMIT ? OFFSET ?`,
+    `SELECT * FROM (
+       SELECT o.id,o.device_id,o.operation,o.payload_json,o.status,o.attempts,o.error_message,o.created_at,o.updated_at,d.name AS device_name,c.card_uid,'card' AS credential_kind
+       FROM device_operations o JOIN hikvision_devices d ON d.id=o.device_id LEFT JOIN access_cards c ON c.id=o.card_id
+       WHERE o.status IN ('pending','manual_action_required','failed')
+       UNION ALL
+       SELECT o.id,o.device_id,o.operation,o.payload_json,o.status,o.attempts,o.error_message,o.created_at,o.updated_at,d.name,v.credential_number,'visitor'
+       FROM visitor_device_operations o JOIN hikvision_devices d ON d.id=o.device_id JOIN visitor_requests v ON v.id=o.visitor_request_id
+       WHERE o.status IN ('pending','manual_action_required','failed')
+     ) ORDER BY created_at LIMIT ? OFFSET ?`,
   ).bind(limit, offset).all();
   return c.json({ items: result.results, page: pageNumber, limit, note: 'HTTP Listening is upload-only. These operations require manual application or a supported ISUP/Hikvision cloud command bridge.' });
 });
@@ -1461,7 +1764,8 @@ app.get('/api/access/operations', requireRoles('admin'), async (c) => {
 app.patch('/api/access/operations/:id', requireRoles('admin'), async (c) => {
   const body = await c.req.json<{ status?: 'applied'|'failed'; errorMessage?: string }>();
   if (!body.status || !['applied','failed'].includes(body.status)) return jsonError(c, 400, 'status must be applied or failed');
-  await c.env.DB.prepare(`UPDATE device_operations SET status=?,error_message=?,updated_at=datetime('now') WHERE id=?`).bind(body.status, body.errorMessage ?? null, c.req.param('id')).run();
+  const cardOperation=await c.env.DB.prepare(`UPDATE device_operations SET status=?,error_message=?,updated_at=datetime('now') WHERE id=?`).bind(body.status,body.errorMessage ?? null,c.req.param('id')).run();
+  if (!cardOperation.meta.changes) await c.env.DB.prepare(`UPDATE visitor_device_operations SET status=?,error_message=?,updated_at=datetime('now') WHERE id=?`).bind(body.status,body.errorMessage ?? null,c.req.param('id')).run();
   return c.json({ ok: true });
 });
 
@@ -1500,6 +1804,27 @@ app.put('/api/storage-settings', requireRoles('admin'), async (c) => {
   } catch (error) {
     return jsonError(c, 400, error instanceof Error ? error.message : 'Could not save GitHub storage settings');
   }
+});
+
+app.put('/api/portal-config', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<Record<string,unknown>>();
+  const entries = PORTAL_SETTING_KEYS.filter((key) => key in body).map((key) => [key,String(body[key] ?? '').trim()] as const);
+  if (!entries.length) return jsonError(c,400,'No portal settings were supplied');
+  for (const [key,value] of entries) {
+    if (value.length > 500) return jsonError(c,400,`${key} is too long`);
+    if (key.startsWith('theme_') && key.endsWith('_color') && !/^#[0-9a-f]{6}$/i.test(value)) return jsonError(c,400,`${key} must be a six-digit hex colour`);
+    if (key === 'theme_mode' && !['light','dark','system'].includes(value)) return jsonError(c,400,'theme_mode must be light, dark or system');
+    if (key === 'theme_corner_style' && !['compact','comfortable','rounded'].includes(value)) return jsonError(c,400,'Invalid corner style');
+    if (key === 'visitor_gate_policy' && value !== 'security_approval') return jsonError(c,400,'Security approval is the configured visitor gate policy');
+    if (key === 'render_bridge_url' && value && !/^https:\/\/[A-Za-z0-9.-]+\/?$/.test(value)) return jsonError(c,400,'Render bridge URL must be an HTTPS origin');
+    if (['visitor_default_duration_hours','card_scan_timeout_minutes'].includes(key) && (!/^\d{1,3}$/.test(value) || Number(value)<1)) return jsonError(c,400,`${key} must be a positive number`);
+  }
+  await c.env.DB.batch(entries.map(([key,value]) => c.env.DB.prepare(
+    `INSERT INTO settings(key,value,updated_by,updated_at) VALUES (?,?,?,datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_by=excluded.updated_by,updated_at=excluded.updated_at`,
+  ).bind(key,value,c.get('user').id)));
+  await audit(c,'update','portal_config','default',Object.fromEntries(entries));
+  return c.json({ ok:true,values:Object.fromEntries(entries) });
 });
 
 app.get('/api/settings', requireRoles('admin'), async (c) => {
@@ -1566,7 +1891,7 @@ async function createDeviceOperations(
   operation: 'upsert_card'|'enable_card'|'disable_card'|'delete_card',
   payload: unknown,
 ): Promise<void> {
-  const devices = await env.DB.prepare(`SELECT id,connection_pattern FROM hikvision_devices WHERE status != 'disabled'`).all<{ id: string; connection_pattern: string }>();
+  const devices = await env.DB.prepare(`SELECT id,connection_pattern FROM hikvision_devices WHERE status != 'disabled' AND deleted_at IS NULL`).all<{ id: string; connection_pattern: string }>();
   if (!devices.results.length) return;
   await env.DB.batch(devices.results.map((device) => {
     const status = ['hikvision_cloud_openapi','offsite_isup_gateway'].includes(device.connection_pattern)
@@ -1595,7 +1920,7 @@ async function authenticateDevice(request: Request, env: Env, deviceId: string):
     `SELECT dc.username,dc.api_key_hash,d.id,d.name,d.direction,d.profile_key,d.connection_pattern,ap.id AS access_point_id
      FROM device_credentials dc JOIN hikvision_devices d ON d.id=dc.device_id
      LEFT JOIN access_points ap ON ap.device_id=d.id AND ap.enabled=1
-     WHERE d.id=? AND dc.revoked_at IS NULL AND (? IS NULL OR dc.username=?) LIMIT 1`,
+     WHERE d.id=? AND d.deleted_at IS NULL AND dc.revoked_at IS NULL AND (? IS NULL OR dc.username=?) LIMIT 1`,
   ).bind(deviceId, username, username).first<Record<string, string | null>>();
   if (!credential) return null;
   if (await sha256(`${secret}:${env.DEVICE_INGEST_PEPPER}`) !== credential.api_key_hash) return null;
@@ -1636,17 +1961,25 @@ async function handleDeviceEvent(request: Request, env: Env, deviceId: string): 
 async function consumeAccessEvents(batch: MessageBatch<NormalizedAccessEvent>, env: Env): Promise<void> {
   const statements = batch.messages.map(({ body: event }) => env.DB.prepare(
     `INSERT OR IGNORE INTO access_events(
-      id,vendor_event_id,device_id,access_point_id,card_id,resident_id,household_member_id,card_uid,employee_no,person_name,credential_type,door_no,direction,result,event_type,device_timestamp,profile_key,raw_summary
+      id,vendor_event_id,device_id,access_point_id,card_id,resident_id,household_member_id,visitor_request_id,card_uid,employee_no,person_name,credential_type,door_no,direction,result,event_type,device_timestamp,profile_key,raw_summary
      ) VALUES (?,?,?,?,
        (SELECT id FROM access_cards WHERE card_uid=? LIMIT 1),
        (SELECT resident_id FROM access_cards WHERE card_uid=? LIMIT 1),
-       (SELECT household_member_id FROM access_cards WHERE card_uid=? LIMIT 1),?,?,?,?,?,?,?,?,?,?,?)`,
+       (SELECT household_member_id FROM access_cards WHERE card_uid=? LIMIT 1),
+       (SELECT id FROM visitor_requests WHERE credential_number=? OR pin=? LIMIT 1),?,?,?,?,?,?,?,?,?,?,?)`,
   ).bind(
-    event.id,event.vendorEventId,event.deviceId,event.accessPointId,event.cardUid,event.cardUid,event.cardUid,
+    event.id,event.vendorEventId,event.deviceId,event.accessPointId,event.cardUid,event.cardUid,event.cardUid,event.cardUid,event.cardUid,
     event.cardUid,event.employeeNo,event.personName,event.credentialType,event.doorNo,event.direction,event.result,
     event.eventType,event.deviceTimestamp,event.profileKey,event.rawSummary,
   ));
   if (statements.length) await env.DB.batch(statements);
+  const captured = batch.messages.filter((message) => Boolean(message.body.cardUid)).map(({ body:event }) => env.DB.prepare(
+    `UPDATE credential_scan_sessions SET captured_credential=?,
+       visitor_request_id=CASE WHEN purpose='visitor_validation' THEN (SELECT id FROM visitor_requests WHERE credential_number=? OR pin=? LIMIT 1) ELSE visitor_request_id END,
+       status='captured',captured_at=datetime('now'),updated_at=datetime('now')
+     WHERE device_id=? AND status='waiting' AND datetime(expires_at)>datetime('now')`,
+  ).bind(event.cardUid,event.cardUid,event.cardUid,event.deviceId));
+  if (captured.length) await env.DB.batch(captured);
   const live = env.LIVE_FEED.get(env.LIVE_FEED.idFromName('global'));
   await live.fetch('https://internal/broadcast', {
     method: 'POST',

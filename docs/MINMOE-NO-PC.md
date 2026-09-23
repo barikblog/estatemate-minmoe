@@ -62,6 +62,14 @@ Supported deployment patterns:
 5. Multi-door K2600/K2700/K2800 controller, with one access-point row per door/reader direction.
 6. Multiple mixed series in one estate; every device keeps its own profile and transport.
 
+## Optional Render free HTTPS relay
+
+For a compatible terminal that can send HTTP/HTTPS event notifications, EstateMate includes a stateless Render Blueprint (`render.yaml`, service code in `bridge/`). It forwards event payloads to the Cloudflare Worker and does not store data.
+
+This is an optional compatibility route, not an ISUP server. Render Free spins down after 15 minutes without inbound traffic, can take about one minute to wake, and exposes web traffic rather than arbitrary Hikvision ISUP TCP services. Keep the direct Worker endpoint as the recommended path and fallback. See [`VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md`](VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md).
+
+DS-K1T808MFWX-B can use card/fingerprint/PIN and documents ISAPI/ISUP support, but does not document an integrated QR camera. DS-K2802 is a two-door controller requiring attached Wiegand readers and should not be treated as a MinMoe optical terminal.
+
 ## Required model-validation test
 
 For each terminal model/firmware:

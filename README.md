@@ -15,8 +15,9 @@ Included:
 
 - One Cloudflare Worker serving the SPA and `/api/*`.
 - D1 schema for users, multi-property ownership and approval requests, streets/properties, billing, historical bill/payment imports, visitors, maintenance, general estate notices, access cards, access events, devices, operations, settings, and audit records.
-- Direct MinMoe JSON/XML/multipart HTTP Listening ingestion.
-- Per-device one-time credentials; Queue buffering; D1 event persistence; Durable Object live WebSocket feed.
+- Direct or optional Render-relayed JSON/XML/multipart HTTP Listening ingestion for compatible Internet-connected access devices.
+- Per-device one-time credentials; editable/soft-deletable device inventory; Queue buffering; D1 event persistence; Durable Object live WebSocket feed.
+- Device-tap card enrollment, phone/device visitor-code scanning, QR + Code 128 visitor passes, and preview-before-entry Security decisions.
 - Hourly facility-fee expiry/reactivation job and hardware-action audit queue.
 - Role-aware React portal for Administrator, Resident, Cashier, and Security.
 - General estate notices with priority, scheduling, read acknowledgements, and login popups; the former Community posting feature is removed.
@@ -26,7 +27,8 @@ Included:
 - Approved dependant and household profiles, optional separate logins, delegated visitor/bill permissions, and dependant access cards tied to the main resident.
 - Audited immediate or scheduled ownership transfers, downloadable property statements, and grouped street/block/zone billing.
 - Kotlin/Compose Android foundation with encrypted token storage, Retrofit/Hilt, Room event cache, role dashboard, and gate history.
-- Private GitHub-backed upload/download storage with encrypted-at-rest repository access tokens, administrator-editable settings, access checks, and a 4 MB per-file limit. Paid R2 storage remains disabled.
+- Private GitHub-backed upload/download storage with encrypted-at-rest repository access tokens, supporting proof on ownership/tenancy/household/visitor/maintenance/payment forms, access checks, and a 4 MB per-file limit. Paid R2 storage remains disabled.
+- Administrator-editable portal identity, theme colours, light/dark mode, support details, visitor defaults, scan timeout and optional Render relay URL.
 - PBKDF2-SHA256 passwords and HS256 sessions implemented with Workers Web Crypto.
 - Tests for password/JWT code and Hikvision JSON/XML/multipart parsing.
 
@@ -37,14 +39,14 @@ Still model/account dependent:
 - Gemini enrichment, FCM delivery, large GitHub exports, and full accounting/reconciliation UI.
 - Android production signing, push configuration, and Play distribution.
 
-See [`docs/MINMOE-NO-PC.md`](docs/MINMOE-NO-PC.md) before installing a terminal. Property workflows are documented in [`docs/MULTI-PROPERTY-OWNERSHIP.md`](docs/MULTI-PROPERTY-OWNERSHIP.md) and [`docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md`](docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md). Private upload setup is in [`docs/GITHUB-STORAGE.md`](docs/GITHUB-STORAGE.md).
+See [`docs/MINMOE-NO-PC.md`](docs/MINMOE-NO-PC.md) and [`docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md`](docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md) before installing a device. Property workflows are in [`docs/MULTI-PROPERTY-OWNERSHIP.md`](docs/MULTI-PROPERTY-OWNERSHIP.md) and [`docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md`](docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md). Proof uploads and theming are documented in [`docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md`](docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md). Private upload setup is in [`docs/GITHUB-STORAGE.md`](docs/GITHUB-STORAGE.md). AI agents should begin with [`AGENTS.md`](AGENTS.md).
 
 ## Architecture
 
 ```text
-MinMoe terminal ── outbound HTTPS event POST ──┐
-                                                │
-React portal / Android ── HTTPS REST ──────────▶ Cloudflare Worker
+Access device ── outbound HTTPS event POST ──────────────┐
+              └── optional Render Free HTTPS relay ──────┤
+React portal / Android ── HTTPS REST ────────────────────▶ Cloudflare Worker
                                                    ├── D1
                                                    ├── private GitHub repository API
                                                    ├── access-events Queue
@@ -66,15 +68,19 @@ Device registration now offers profile auto-detection plus an explicit override 
 | MinMoe Pro | `DS-K1T67x` | Standalone terminal |
 | MinMoe Ultra | `DS-K1T68x`, explicitly selected Ultra K1T67x | Standalone terminal |
 | MinMoe turnstile module | K560/K567 and configured modules | Embedded/turnstile |
+| QR K1T807/K1T502 | QR/QRE/CQR variants | QR access terminal |
+| K1T8xx | `DS-K1T808MFWX-B` and K1T80x variants | Card/fingerprint/PIN terminal |
 | K1T5xx | `DS-K1T5xx` | Access terminal |
 | K1A | `DS-K1Axxx` | Attendance/access terminal |
 | DS-K2600 | K2601/K2602/K2604 | Multi-door controller |
-| DS-K2700/K2800 | K27xx/K28xx | Multi-door controller |
-| Generic ISAPI | Unknown/unlisted models | Conservative fallback |
+| DS-K2700/K2800 | K27xx/K28xx including DS-K2802 | Multi-door controller; external reader required |
+| Other network access | Explicitly validated non-Hikvision device | Vendor-neutral conservative parser |
+| Generic ISAPI | Unknown/unlisted Hikvision models | Conservative fallback |
 
 Each profile carries model patterns, event-field aliases, grant/deny mappings, credential types, expected event formats, and permitted connection patterns. The selectable connection patterns are:
 
 - **Direct HTTP Listening:** outbound event upload, no assumed return command channel.
+- **Render free HTTPS relay:** optional stateless event forwarding for HTTP-capable devices; subject to free-tier sleep/cold starts and not an ISUP/TCP server.
 - **Hikvision cloud/OpenAPI:** pending adapter; enable only with approved API documentation and credentials.
 - **Off-site ISUP gateway:** bidirectional option hosted away from the estate, not on-site.
 - **Manual synchronization:** event/audit platform with operator-applied hardware changes.
@@ -86,10 +92,13 @@ The generic parser retains unknown values rather than inventing a grant result. 
 ```text
 apps/web/                  React + Vite portal
 apps/android/              Android Studio Kotlin/Compose project
+bridge/                    Optional stateless Render Free HTTPS event relay
 src/                       Worker/API, parser, auth, Queue and Durable Object
 migrations/                Versioned D1 schema
-scripts/                    Setup helpers
+scripts/                    Setup and AI-continuation helpers
 docs/                       Device, architecture and deployment guides
+AGENTS.md                   Starting instructions for another AI coding agent
+render.yaml                 Render Blueprint (free web service only)
 wrangler.jsonc              Local/current deployment config
 wrangler.template.jsonc     Clean template for another Cloudflare account
 ```
@@ -156,7 +165,7 @@ A scoped Cloudflare token needs permissions for Workers Scripts, D1, Queues, acc
 ## MinMoe setup
 
 1. Sign in as an EstateMate administrator.
-2. Go to **MinMoe devices → Register device** and enter the exact model, firmware, serial, gate, and direction.
+2. Go to **Access-control devices → Register device** and enter the exact model, firmware, serial, gate, and direction.
 3. Copy the endpoint and one-time secret.
 4. In the terminal web interface, find **Network → Network Service/Advanced → HTTP Listening** (wording varies).
 5. Choose **HTTPS**, enter the Worker hostname, port `443`, and URL/path shown by EstateMate.

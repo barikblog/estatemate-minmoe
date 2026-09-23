@@ -115,4 +115,4 @@ Each property is billed once per batch, and the current tenancy billing-responsi
 
 ## Audit and privacy
 
-Tenancy approvals, household approvals, permission changes, login creation, access-card actions and ownership transfers are audit logged. No property or tenancy document upload was added in this phase, following the explicit decision to keep property files skipped.
+Tenancy approvals, household approvals, permission changes, login creation, access-card actions and ownership transfers are audit logged. Supporting proof can now be attached to ownership, transfer, tenancy, household, visitor, maintenance and payment forms and is stored in the configured private GitHub repository. See [`PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md`](PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md).

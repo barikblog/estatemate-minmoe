@@ -42,4 +42,4 @@ Visitor passes and maintenance requests now store the selected property. Residen
 
 Migration `0005` adds separate tenancies, dependants/household members, optional dependant logins, delegated visitor and bill permissions, effective-dated ownership transfers, downloadable property statements, and block/zone grouping. See [`TENANTS-DEPENDANTS-AND-TRANSFERS.md`](TENANTS-DEPENDANTS-AND-TRANSFERS.md).
 
-Verified ownership-document uploads remain intentionally excluded because the administrator selected **keep property documents skipped**. Generic private GitHub storage and billing-import archives remain available.
+Ownership requests and transfers now accept optional supporting proof stored in the configured private GitHub repository. The upload is linked to the approval record and remains available to authorized reviewers. See [`PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md`](PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md).

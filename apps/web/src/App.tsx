@@ -1,10 +1,29 @@
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
+import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, ListResponse, User, api, money, readableDate } from './api';
 
 type Row = Record<string, unknown>;
 type Section = 'dashboard' | 'residents' | 'properties' | 'residency' | 'bills' | 'visitors' | 'maintenance' | 'notices' | 'cards' | 'events' | 'devices' | 'operations' | 'settings';
 
 interface NavItem { id: Section; label: string; roles?: User['role'][] }
+type PortalConfig = Record<string,string>;
+const defaultPortalConfig: PortalConfig = {
+  portal_name:'EstateMate',estate_name:'EstateMate Estate',portal_short_name:'EM',portal_tagline:'One estate. One secure view.',
+  portal_welcome_text:'Manage residents, visitors, accounts and gate access from a single, secure workspace.',theme_mode:'light',
+  theme_primary_color:'#1769e0',theme_accent_color:'#35d07f',theme_navigation_color:'#0d1b37',theme_surface_color:'#ffffff',
+  theme_corner_style:'comfortable',currency:'NGN',estate_timezone:'Africa/Lagos',visitor_default_duration_hours:'8',visitor_gate_policy:'security_approval',
+};
+
+function applyPortalTheme(config: PortalConfig) {
+  const root=document.documentElement;
+  root.style.setProperty('--blue',config.theme_primary_color || defaultPortalConfig.theme_primary_color);
+  root.style.setProperty('--green',config.theme_accent_color || defaultPortalConfig.theme_accent_color);
+  root.style.setProperty('--navy',config.theme_navigation_color || defaultPortalConfig.theme_navigation_color);
+  root.style.setProperty('--surface',config.theme_surface_color || defaultPortalConfig.theme_surface_color);
+  root.style.setProperty('--radius',config.theme_corner_style==='rounded'?'22px':config.theme_corner_style==='compact'?'8px':'15px');
+  const mode=config.theme_mode==='system'?(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'):config.theme_mode;
+  root.dataset.theme=mode || 'light';
+}
+
 const navItems: NavItem[] = [
   { id: 'dashboard', label: 'Overview' },
   { id: 'residents', label: 'People', roles: ['admin', 'cashier', 'security'] },
@@ -16,7 +35,7 @@ const navItems: NavItem[] = [
   { id: 'notices', label: 'Estate notices' },
   { id: 'cards', label: 'Access cards', roles: ['admin', 'cashier', 'resident'] },
   { id: 'events', label: 'Gate activity', roles: ['admin', 'security', 'resident'] },
-  { id: 'devices', label: 'MinMoe devices', roles: ['admin', 'security'] },
+  { id: 'devices', label: 'Access-control devices', roles: ['admin', 'security'] },
   { id: 'operations', label: 'Hardware actions', roles: ['admin'] },
   { id: 'settings', label: 'Settings', roles: ['admin'] },
 ];
@@ -35,7 +54,7 @@ function useAsync<T>(loader: () => Promise<T>, dependencies: unknown[]) {
   return { data, error, loading, reload };
 }
 
-function Login({ onLogin }: { onLogin: (user: User) => void }) {
+function Login({ onLogin, config }: { onLogin: (user: User) => void; config:PortalConfig }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -54,15 +73,15 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
 
   return <main className="auth-shell">
     <section className="auth-panel brand-panel">
-      <div className="brand-mark">EM</div>
-      <p className="eyebrow">ONE ESTATE. ONE VIEW.</p>
-      <h1>Welcome to<br />EstateMate.</h1>
-      <p className="auth-intro">Manage residents, visitors, accounts and gate access from a single, secure workspace.</p>
+      <div className="brand-mark">{config.portal_short_name}</div>
+      <p className="eyebrow">{config.portal_tagline}</p>
+      <h1>Welcome to<br />{config.portal_name}.</h1>
+      <p className="auth-intro">{config.portal_welcome_text}</p>
       <div className="brand-proof"><span className="pulse-dot" /> Cloud and gate operations connected</div>
     </section>
     <section className="auth-panel form-panel">
       <form className="login-card" onSubmit={submit}>
-        <span className="mini-logo">EM</span>
+        <span className="mini-logo">{config.portal_short_name}</span>
         <h2>Sign in</h2>
         <p>Use the account issued by your estate administrator.</p>
         {error && <Notice tone="error">{error}</Notice>}
@@ -100,8 +119,10 @@ function App() {
   const [checking, setChecking] = useState(true);
   const [menuOpen, setMenuOpen] = useState(false);
   const [popupNotices, setPopupNotices] = useState<Row[]>([]);
+  const [portalConfig,setPortalConfig]=useState<PortalConfig>(defaultPortalConfig);
 
   useEffect(() => {
+    api<PortalConfig>('/api/portal-config').then((value) => { const merged={ ...defaultPortalConfig,...value };setPortalConfig(merged);applyPortalTheme(merged); }).catch(() => applyPortalTheme(defaultPortalConfig));
     api<{ user: User }>('/api/auth/me').then((result) => setUser(result.user)).catch(() => setUser(null)).finally(() => setChecking(false));
   }, []);
 
@@ -123,8 +144,8 @@ function App() {
     }
   }
 
-  if (checking) return <div className="splash"><div className="brand-mark">EM</div><span>Loading EstateMate…</span></div>;
-  if (!user) return <Login onLogin={setUser} />;
+  if (checking) return <div className="splash"><div className="brand-mark">{portalConfig.portal_short_name}</div><span>Loading {portalConfig.portal_name}…</span></div>;
+  if (!user) return <Login onLogin={setUser} config={portalConfig} />;
 
   const availableNav = navItems.filter((item) => !item.roles || item.roles.includes(user.role));
   const current = availableNav.find((item) => item.id === section) ?? availableNav[0]!;
@@ -132,7 +153,7 @@ function App() {
 
   return <div className="app-shell">
     <aside className={menuOpen ? 'sidebar open' : 'sidebar'}>
-      <header className="side-brand"><span className="mini-logo">EM</span><strong>EstateMate</strong><button className="icon-button close-menu" onClick={() => setMenuOpen(false)}>×</button></header>
+      <header className="side-brand"><span className="mini-logo">{portalConfig.portal_short_name}</span><strong>{portalConfig.portal_name}</strong><button className="icon-button close-menu" onClick={() => setMenuOpen(false)}>×</button></header>
       <p className="nav-caption">WORKSPACE</p>
       <nav>{availableNav.map((item) => <button key={item.id} className={section === item.id ? 'nav-active' : ''} onClick={() => { setSection(item.id); setMenuOpen(false); }}><span className="nav-icon">{navIcon(item.id)}</span>{item.label}</button>)}</nav>
       <footer className="user-card"><span className="avatar">{initials(user.name)}</span><span><strong>{user.name}</strong><small>{user.role}</small></span><button className="icon-button" title="Sign out" onClick={logout}>↗</button></footer>
@@ -244,11 +265,13 @@ function Properties({ user }: { user: User }) {
   }
   async function requestProperty(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setMessage(''); const form = new FormData(event.currentTarget);
-    const body = requestMode === 'existing'
-      ? { propertyId: form.get('propertyId'), requestNote: form.get('requestNote') }
-      : { proposedUnitNumber: form.get('proposedUnitNumber'), proposedStreet: form.get('proposedStreet'), proposedAddress: form.get('proposedAddress'), requestNote: form.get('requestNote') };
-    try { await api('/api/property-ownership-requests', { method: 'POST', body: JSON.stringify(body) }); setShowRequest(false); setMessage('Ownership request submitted for administrator approval.'); refresh(); }
-    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not submit ownership request'); }
+    try {
+      const proofKeys=await uploadProofFiles(event.currentTarget,'ownership-proofs');
+      const body = requestMode === 'existing'
+        ? { propertyId: form.get('propertyId'), requestNote: form.get('requestNote'),proofKeys }
+        : { proposedUnitNumber: form.get('proposedUnitNumber'), proposedStreet: form.get('proposedStreet'), proposedAddress: form.get('proposedAddress'), requestNote: form.get('requestNote'),proofKeys };
+      await api('/api/property-ownership-requests', { method: 'POST', body: JSON.stringify(body) }); setShowRequest(false); setMessage('Ownership request submitted for administrator approval.'); refresh();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not submit ownership request'); }
   }
   async function assignOwner(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setMessage(''); const values = Object.fromEntries(new FormData(event.currentTarget));
@@ -257,7 +280,7 @@ function Properties({ user }: { user: User }) {
   }
   async function requestTransfer(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setMessage(''); const values = Object.fromEntries(new FormData(event.currentTarget));
-    try { await api('/api/property-transfers', { method: 'POST', body: JSON.stringify(values) }); setShowTransfer(false); setMessage('Ownership transfer submitted for administrator approval.'); refresh(); }
+    try { const proofKeys=await uploadProofFiles(event.currentTarget,'ownership-transfer-proofs'); await api('/api/property-transfers', { method: 'POST', body: JSON.stringify({ ...values,proofKeys }) }); setShowTransfer(false); setMessage('Ownership transfer submitted for administrator approval.'); refresh(); }
     catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not submit ownership transfer'); }
   }
   async function reviewRequest(id: unknown, status: 'approved'|'rejected') {
@@ -301,13 +324,13 @@ function Properties({ user }: { user: User }) {
     {message && <Notice tone={message.includes('Could not') || message.includes('already') ? 'error' : 'success'}>{message}</Notice>}
     {showAdd && <FormCard title="New property" onSubmit={addProperty}><label>Unit number<input name="unitNumber" required /></label><label>Street<input name="street" required /></label><label>Block<input name="block" /></label><label>Zone<input name="zone" /></label><label>Address<input name="address" required /></label><button className="primary">Save property</button></FormCard>}
     {showAssign && <FormCard title="Assign an unowned property" onSubmit={assignOwner}><label>Property<select name="propertyId" value={assignPropertyId} onChange={(event) => setAssignPropertyId(event.target.value)} required><option value="">Select property</option>{available.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}</option>)}</select></label><label>Resident email<input name="residentEmail" type="email" required /></label><button className="primary">Assign owner</button></FormCard>}
-    {showRequest && <FormCard title="Request another property" onSubmit={requestProperty}><label>Request type<select value={requestMode} onChange={(event) => setRequestMode(event.target.value as 'existing'|'propose')}><option value="existing">Existing unowned property</option><option value="propose">Propose a new property</option></select></label>{requestMode === 'existing' ? <label>Available property<select name="propertyId" required><option value="">Select property</option>{available.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}, {String(property.address)}</option>)}</select></label> : <><label>Unit number<input name="proposedUnitNumber" required /></label><label>Street<input name="proposedStreet" required /></label><label>Address<input name="proposedAddress" required /></label></>}<label className="span-2">Note<textarea name="requestNote" rows={3} /></label><button className="primary">Submit for approval</button></FormCard>}
-    {showTransfer && <FormCard title="Transfer legal ownership" onSubmit={requestTransfer}><label>Property<select name="propertyId" required><option value="">Select property</option>{transferable.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.owner_name)}</option>)}</select></label><label>New owner email<input name="newOwnerEmail" type="email" required /></label><label>Effective date<input name="effectiveDate" type="date" required /></label><label className="span-2">Transfer note<textarea name="requestNote" rows={3} /></label><button className="primary">Submit transfer</button></FormCard>}
-    {user.role === 'admin' && pending.length > 0 && <section className="approval-queue"><h3>Ownership approvals</h3><DataTable rows={pending} columns={[['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['request_note','Note'],['created_at','Requested','date'],['status','Status']]} action={(row) => <div className="row-actions"><button className="text" onClick={() => reviewRequest(row.id,'approved')}>Approve</button><button className="text danger" onClick={() => reviewRequest(row.id,'rejected')}>Reject</button></div>} /></section>}
-    {user.role === 'admin' && pendingTransfers.length > 0 && <section className="approval-queue"><h3>Ownership transfer approvals</h3><DataTable rows={pendingTransfers} columns={[['unit_number','Unit'],['from_owner_name','Current owner'],['to_owner_name','New owner'],['effective_date','Effective'],['request_note','Note'],['status','Status']]} action={(row) => <div className="row-actions"><button className="text" onClick={() => reviewTransfer(row.id,'approve')}>Approve</button><button className="text danger" onClick={() => reviewTransfer(row.id,'reject')}>Reject</button></div>} /></section>}
+    {showRequest && <FormCard title="Request another property" onSubmit={requestProperty}><label>Request type<select value={requestMode} onChange={(event) => setRequestMode(event.target.value as 'existing'|'propose')}><option value="existing">Existing unowned property</option><option value="propose">Propose a new property</option></select></label>{requestMode === 'existing' ? <label>Available property<select name="propertyId" required><option value="">Select property</option>{available.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}, {String(property.address)}</option>)}</select></label> : <><label>Unit number<input name="proposedUnitNumber" required /></label><label>Street<input name="proposedStreet" required /></label><label>Address<input name="proposedAddress" required /></label></>}<label className="span-2">Note<textarea name="requestNote" rows={3} /></label><ProofFilesField label="Ownership proof (recommended)" /><button className="primary">Submit for approval</button></FormCard>}
+    {showTransfer && <FormCard title="Transfer legal ownership" onSubmit={requestTransfer}><label>Property<select name="propertyId" required><option value="">Select property</option>{transferable.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.owner_name)}</option>)}</select></label><label>New owner email<input name="newOwnerEmail" type="email" required /></label><label>Effective date<input name="effectiveDate" type="date" required /></label><label className="span-2">Transfer note<textarea name="requestNote" rows={3} /></label><ProofFilesField label="Transfer authority or sale proof (recommended)" /><button className="primary">Submit transfer</button></FormCard>}
+    {user.role === 'admin' && pending.length > 0 && <section className="approval-queue"><h3>Ownership approvals</h3><DataTable rows={pending} columns={[['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['request_note','Note'],['created_at','Requested','date'],['status','Status']]} action={(row) => <div className="row-actions"><EvidenceButton entityType="property_ownership_request" entityId={row.id} count={row.proof_count} /><button className="text" onClick={() => reviewRequest(row.id,'approved')}>Approve</button><button className="text danger" onClick={() => reviewRequest(row.id,'rejected')}>Reject</button></div>} /></section>}
+    {user.role === 'admin' && pendingTransfers.length > 0 && <section className="approval-queue"><h3>Ownership transfer approvals</h3><DataTable rows={pendingTransfers} columns={[['unit_number','Unit'],['from_owner_name','Current owner'],['to_owner_name','New owner'],['effective_date','Effective'],['request_note','Note'],['status','Status']]} action={(row) => <div className="row-actions"><EvidenceButton entityType="property_transfer" entityId={row.id} count={row.proof_count} /><button className="text" onClick={() => reviewTransfer(row.id,'approve')}>Approve</button><button className="text danger" onClick={() => reviewTransfer(row.id,'reject')}>Reject</button></div>} /></section>}
     <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={user.role === 'resident' ? [['unit_number','Unit'],['zone','Zone'],['block','Block'],['street','Street'],['relationship_type','Relationship'],['main_resident_name','Main resident'],['billing_responsibility','Bill payer']] : [['unit_number','Unit'],['zone','Zone'],['block','Block'],['street','Street'],['owner_name','Owner'],['tenant_name','Tenant'],['billing_responsibility','Bill payer']]} action={actions} /></ListState>
-    {requests.data && requests.data.items.length > 0 && <section className="request-history"><h3>Ownership request history</h3><DataTable rows={requests.data.items} columns={[['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['status','Status'],['review_note','Review note'],['created_at','Requested','date']]} /></section>}
-    {transfers.data && transfers.data.items.length > 0 && <section className="request-history"><h3>Ownership transfer history</h3><DataTable rows={transfers.data.items} columns={[['unit_number','Unit'],['from_owner_name','From'],['to_owner_name','To'],['effective_date','Effective'],['status','Status'],['review_note','Review note']]} /></section>}
+    {requests.data && requests.data.items.length > 0 && <section className="request-history"><h3>Ownership request history</h3><DataTable rows={requests.data.items} columns={[['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['status','Status'],['review_note','Review note'],['created_at','Requested','date']]} action={(row)=><EvidenceButton entityType="property_ownership_request" entityId={row.id} count={row.proof_count} />} /></section>}
+    {transfers.data && transfers.data.items.length > 0 && <section className="request-history"><h3>Ownership transfer history</h3><DataTable rows={transfers.data.items} columns={[['unit_number','Unit'],['from_owner_name','From'],['to_owner_name','To'],['effective_date','Effective'],['status','Status'],['review_note','Review note']]} action={(row)=><EvidenceButton entityType="property_transfer" entityId={row.id} count={row.proof_count} />} /></section>}
   </PagePanel>;
 }
 
@@ -322,13 +345,13 @@ function Residency({ user }: { user: User }) {
   function refresh() { properties.reload(); tenancies.reload(); household.reload(); }
   async function addTenancy(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setMessage(''); const values = Object.fromEntries(new FormData(event.currentTarget));
-    try { const result = await api<{ status:string }>('/api/property-tenancies',{ method:'POST',body:JSON.stringify(values) }); setShowTenancy(false); setMessage(result.status === 'active' ? 'Tenant assigned.' : 'Tenant nomination submitted for administrator approval.'); refresh(); }
+    try { const proofKeys=await uploadProofFiles(event.currentTarget,'tenancy-proofs'); const result = await api<{ status:string }>('/api/property-tenancies',{ method:'POST',body:JSON.stringify({ ...values,proofKeys }) }); setShowTenancy(false); setMessage(result.status === 'active' ? 'Tenant assigned.' : 'Tenant nomination submitted for administrator approval.'); refresh(); }
     catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not create tenancy'); }
   }
   async function addMember(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setMessage(''); const form = new FormData(event.currentTarget);
     const body = { propertyId:form.get('propertyId'),primaryResidentId:form.get('primaryResidentId') || undefined,name:form.get('name'),relationship:form.get('relationship'),dateOfBirth:form.get('dateOfBirth') || undefined,phone:form.get('phone'),email:form.get('email'),canCreateVisitors:form.get('canCreateVisitors') === 'on',canViewBills:form.get('canViewBills') === 'on',requestNote:form.get('requestNote') };
-    try { const result = await api<{ status:string }>('/api/household-members',{ method:'POST',body:JSON.stringify(body) }); setShowMember(false); setMessage(result.status === 'active' ? 'Household member added.' : 'Household member submitted for administrator approval.'); refresh(); }
+    try { const proofKeys=await uploadProofFiles(event.currentTarget,'household-proofs'); const result = await api<{ status:string }>('/api/household-members',{ method:'POST',body:JSON.stringify({ ...body,proofKeys }) }); setShowMember(false); setMessage(result.status === 'active' ? 'Household member added.' : 'Household member submitted for administrator approval.'); refresh(); }
     catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not add household member'); }
   }
   async function tenancyAction(row: Row, action: 'approve'|'reject'|'end'|'update') {
@@ -352,13 +375,13 @@ function Residency({ user }: { user: User }) {
   }
   const pendingTenancies = tenancies.data?.items.filter((row) => row.status === 'pending') ?? [];
   const pendingMembers = household.data?.items.filter((row) => row.status === 'pending') ?? [];
-  const tenancyActions = user.role === 'admin' ? (row:Row) => <div className="row-actions">{row.status === 'pending' && <><button className="text" onClick={() => tenancyAction(row,'approve')}>Approve</button><button className="text danger" onClick={() => tenancyAction(row,'reject')}>Reject</button></>}{row.status === 'active' && <><button className="text" onClick={() => tenancyAction(row,'update')}>Billing</button><button className="text danger" onClick={() => tenancyAction(row,'end')}>End</button></>}</div> : undefined;
-  const memberActions = user.role === 'admin' ? (row:Row) => <div className="row-actions">{row.status === 'pending' && <><button className="text" onClick={() => memberAction(row,'approve')}>Approve</button><button className="text danger" onClick={() => memberAction(row,'reject')}>Reject</button></>}{row.status === 'active' && <><button className="text" onClick={() => memberAction(row,'update')}>Permissions</button>{!row.linked_user_id && <button className="text" onClick={() => createMemberLogin(row)}>Add login</button>}<button className="text danger" onClick={() => memberAction(row,'deactivate')}>Deactivate</button></>}</div> : undefined;
+  const tenancyActions = (row:Row) => <div className="row-actions"><EvidenceButton entityType="property_tenancy" entityId={row.id} count={row.proof_count} />{user.role==='admin'&&<>{row.status === 'pending' && <><button className="text" onClick={() => tenancyAction(row,'approve')}>Approve</button><button className="text danger" onClick={() => tenancyAction(row,'reject')}>Reject</button></>}{row.status === 'active' && <><button className="text" onClick={() => tenancyAction(row,'update')}>Billing</button><button className="text danger" onClick={() => tenancyAction(row,'end')}>End</button></>}</>}</div>;
+  const memberActions = (row:Row) => <div className="row-actions"><EvidenceButton entityType="household_member" entityId={row.id} count={row.proof_count} />{user.role==='admin'&&<>{row.status === 'pending' && <><button className="text" onClick={() => memberAction(row,'approve')}>Approve</button><button className="text danger" onClick={() => memberAction(row,'reject')}>Reject</button></>}{row.status === 'active' && <><button className="text" onClick={() => memberAction(row,'update')}>Permissions</button>{!row.linked_user_id && <button className="text" onClick={() => createMemberLogin(row)}>Add login</button>}<button className="text danger" onClick={() => memberAction(row,'deactivate')}>Deactivate</button></>}</>}</div>;
   return <PagePanel title="Tenancy & household" subtitle="Main tenants, rented apartments, dependants, domestic staff and delegated permissions" action={<div className="row-actions"><button className="secondary" onClick={() => setShowMember(!showMember)}>Add dependant</button><button className="primary" onClick={() => setShowTenancy(!showTenancy)}>{user.role === 'admin' ? 'Assign tenant' : 'Nominate tenant'}</button></div>}>
     <Notice tone="info"><strong>Rented apartment:</strong> legal ownership remains with the owner. The approved tenant becomes the main resident for the tenancy dates. The administrator chooses whether future property bills go to the owner or tenant.</Notice>
     {message && <Notice tone={message.includes('Could not') || message.includes('failed') ? 'error' : 'success'}>{message}</Notice>}
-    {showTenancy && <FormCard title={user.role === 'admin' ? 'Assign a tenant' : 'Nominate a tenant for approval'} onSubmit={addTenancy}><label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.owner_name ?? property.relationship_type)}</option>)}</select></label><label>Tenant email<input name="tenantEmail" type="email" required /></label><label>Start date<input name="startDate" type="date" required /></label><label>End date<input name="endDate" type="date" /></label><label>Bill responsibility<select name="billingResponsibility"><option value="owner">Legal owner</option><option value="tenant">Main tenant</option></select></label><label className="span-2">Note<textarea name="requestNote" rows={3} /></label><button className="primary">{user.role === 'admin' ? 'Assign tenant' : 'Submit nomination'}</button></FormCard>}
-    {showMember && <FormCard title="Add a dependant or household member" onSubmit={addMember}><label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.main_resident_name ?? property.owner_name)}</option>)}</select></label>{user.role === 'admin' && <label>Main resident ID<input name="primaryResidentId" placeholder="Optional; resolved automatically" /></label>}<label>Full name<input name="name" required /></label><label>Relationship<select name="relationship"><option value="spouse">Spouse</option><option value="child">Child</option><option value="parent">Parent</option><option value="relative">Relative</option><option value="domestic_staff">Domestic staff</option><option value="caregiver">Caregiver</option><option value="other">Other</option></select></label><label>Date of birth<input name="dateOfBirth" type="date" /></label><label>Phone<input name="phone" /></label><label>Email<input name="email" type="email" /></label><label className="check"><input name="canCreateVisitors" type="checkbox" /> May create visitors after login</label><label className="check"><input name="canViewBills" type="checkbox" /> May view bills after login</label><label className="span-2">Note<textarea name="requestNote" rows={3} /></label><button className="primary">{user.role === 'admin' ? 'Add member' : 'Submit for approval'}</button></FormCard>}
+    {showTenancy && <FormCard title={user.role === 'admin' ? 'Assign a tenant' : 'Nominate a tenant for approval'} onSubmit={addTenancy}><label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.owner_name ?? property.relationship_type)}</option>)}</select></label><label>Tenant email<input name="tenantEmail" type="email" required /></label><label>Start date<input name="startDate" type="date" required /></label><label>End date<input name="endDate" type="date" /></label><label>Bill responsibility<select name="billingResponsibility"><option value="owner">Legal owner</option><option value="tenant">Main tenant</option></select></label><label className="span-2">Note<textarea name="requestNote" rows={3} /></label><ProofFilesField label="Tenancy agreement or authority proof (recommended)" /><button className="primary">{user.role === 'admin' ? 'Assign tenant' : 'Submit nomination'}</button></FormCard>}
+    {showMember && <FormCard title="Add a dependant or household member" onSubmit={addMember}><label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.main_resident_name ?? property.owner_name)}</option>)}</select></label>{user.role === 'admin' && <label>Main resident ID<input name="primaryResidentId" placeholder="Optional; resolved automatically" /></label>}<label>Full name<input name="name" required /></label><label>Relationship<select name="relationship"><option value="spouse">Spouse</option><option value="child">Child</option><option value="parent">Parent</option><option value="relative">Relative</option><option value="domestic_staff">Domestic staff</option><option value="caregiver">Caregiver</option><option value="other">Other</option></select></label><label>Date of birth<input name="dateOfBirth" type="date" /></label><label>Phone<input name="phone" /></label><label>Email<input name="email" type="email" /></label><label className="check"><input name="canCreateVisitors" type="checkbox" /> May create visitors after login</label><label className="check"><input name="canViewBills" type="checkbox" /> May view bills after login</label><label className="span-2">Note<textarea name="requestNote" rows={3} /></label><ProofFilesField label="Identity, relationship or consent proof (recommended)" /><button className="primary">{user.role === 'admin' ? 'Add member' : 'Submit for approval'}</button></FormCard>}
     {user.role === 'admin' && (pendingTenancies.length > 0 || pendingMembers.length > 0) && <section className="approval-queue"><h3>Pending residency approvals</h3><p>{pendingTenancies.length} tenancy nomination(s) and {pendingMembers.length} household member(s) are waiting.</p></section>}
     <section className="residency-section"><h3>Tenancies</h3><ListState list={tenancies}><DataTable rows={tenancies.data?.items ?? []} columns={[['unit_number','Unit'],['owner_name','Legal owner'],['tenant_name','Main tenant'],['start_date','Starts'],['end_date','Ends'],['billing_responsibility','Bill payer'],['status','Status']]} action={tenancyActions} /></ListState></section>
     <section className="residency-section"><h3>Dependants and household members</h3><ListState list={household}><DataTable rows={household.data?.items ?? []} columns={[['name','Name'],['relationship','Relationship'],['unit_number','Unit'],['primary_resident_name','Main resident'],['login_email','Login'],['can_create_visitors','Visitors'],['can_view_bills','Bills'],['status','Status']]} action={memberActions} /></ListState></section>
@@ -368,12 +391,28 @@ function Residency({ user }: { user: User }) {
 
 function Bills({ user }: { user: User }) {
   const list = useList('/api/bills?limit=50');
+  const payments = useList('/api/payments?limit=50');
   const groups = useAsync<{ streets:Row[];blocks:Row[];zones:Row[] }>(() => user.role === 'resident' ? Promise.resolve({ streets:[],blocks:[],zones:[] }) : api('/api/property-groups'), [user.role]);
   const imports = useAsync<ListResponse<Row>>(() => user.role === 'resident' ? Promise.resolve({ items: [], page: 1, limit: 20 }) : api('/api/imports?limit=20'), [user.role]);
   const [showBatch, setShowBatch] = useState(false);
   const [targetType, setTargetType] = useState<'street'|'block'|'zone'>('street');
   const [showImport, setShowImport] = useState(false);
+  const [showPayment,setShowPayment]=useState(false);
   const [message, setMessage] = useState('');
+
+  async function submitPayment(event:FormEvent<HTMLFormElement>) {
+    event.preventDefault();setMessage('');const form=new FormData(event.currentTarget);
+    try {
+      const proofKeys=await uploadProofFiles(event.currentTarget,'payment-proofs');
+      const result=await api<{ receiptNumber:string;status:string }>('/api/payments',{ method:'POST',body:JSON.stringify({ billId:form.get('billId'),amountMinor:Math.round(Number(form.get('amount'))*100),paymentMethod:form.get('paymentMethod'),proofKeys }) });
+      setMessage(`Payment ${result.receiptNumber} submitted with status ${result.status}.`);setShowPayment(false);list.reload();payments.reload();
+    } catch(reason) { setMessage(reason instanceof Error?reason.message:'Payment submission failed'); }
+  }
+
+  async function reviewPayment(id:unknown,status:'approved'|'rejected') {
+    const note=prompt(status==='rejected'?'Reason for rejection':'Optional review note') ?? '';
+    await api(`/api/payments/${id}/review`,{ method:'PATCH',body:JSON.stringify({ status,note }) });payments.reload();list.reload();
+  }
 
   async function createStreetBatch(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setMessage('');
@@ -392,8 +431,9 @@ function Bills({ user }: { user: User }) {
 
   const staff = user.role === 'admin' || user.role === 'cashier';
   const targetRows = targetType === 'block' ? groups.data?.blocks : targetType === 'zone' ? groups.data?.zones : groups.data?.streets;
-  return <PagePanel title="Bills & payments" subtitle={user.role === 'resident' ? 'Your charges and payment status' : 'Estate receivables, grouped billing and historical imports'} action={staff ? <div className="row-actions"><button className="secondary" onClick={() => setShowImport(!showImport)}>Import CSV</button><button className="primary" onClick={() => setShowBatch(!showBatch)}>Create grouped bills</button></div> : null}>
-    {message && <Notice tone={message.includes('created') ? 'success' : 'error'}>{message}</Notice>}
+  return <PagePanel title="Bills & payments" subtitle={user.role === 'resident' ? 'Your charges and payment status' : 'Estate receivables, grouped billing and historical imports'} action={<div className="row-actions"><button className="secondary" onClick={() => setShowPayment(!showPayment)}>Record payment</button>{staff&&<><button className="secondary" onClick={() => setShowImport(!showImport)}>Import CSV</button><button className="primary" onClick={() => setShowBatch(!showBatch)}>Create grouped bills</button></>}</div>}>
+    {message && <Notice tone={message.includes('created') || message.includes('submitted') ? 'success' : 'error'}>{message}</Notice>}
+    {showPayment&&<FormCard title={user.role==='resident'?'Submit payment proof':'Record a payment'} onSubmit={submitPayment}><label>Bill<select name="billId" required><option value="">Select bill</option>{list.data?.items.filter((bill)=>!['paid','void'].includes(String(bill.status))).map((bill)=><option key={String(bill.id)} value={String(bill.id)}>{String(bill.unit_number)} — {String(bill.bill_type)} — {money(bill.amount_minor)}</option>)}</select></label><label>Amount (NGN)<input name="amount" type="number" min="0.01" step="0.01" required /></label><label>Method<select name="paymentMethod"><option value="bank_transfer">Bank transfer</option><option value="pos">POS</option><option value="online">Online</option><option value="cash">Cash</option></select></label><ProofFilesField label="Receipt or payment proof (recommended; required by estate policy where applicable)" /><button className="primary">Submit payment</button></FormCard>}
     {showBatch && <FormCard title="Create bills for selected property groups" onSubmit={createStreetBatch}>
       <label>Batch name<input name="name" placeholder="2026 facility fee" required /></label>
       <label>Amount (NGN)<input name="amount" type="number" min="0.01" step="0.01" required /></label>
@@ -409,6 +449,7 @@ function Bills({ user }: { user: User }) {
       <CsvImporter kind="payments" title="Import resident payments" onDone={() => { list.reload(); imports.reload(); }} />
     </section>}
     <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['bill_type','Type'],['batch_name','Batch'],['external_reference','External ref.'],['amount_minor','Amount','money'],['paid_minor','Paid','money'],['due_date','Due'],['status','Status']]} /></ListState>
+    <section className="request-history"><h3>Payment submissions</h3><ListState list={payments}><DataTable rows={payments.data?.items ?? []} columns={[['receipt_number','Receipt'],['resident_name','Resident'],['unit_number','Unit'],['amount_minor','Amount','money'],['payment_method','Method'],['status','Status'],['submitted_at','Submitted','date']]} action={(row)=><div className="row-actions"><EvidenceButton entityType="payment" entityId={row.id} count={row.proof_count} />{staff&&row.status==='pending'&&<><button className="text" onClick={()=>reviewPayment(row.id,'approved')}>Approve</button><button className="text danger" onClick={()=>reviewPayment(row.id,'rejected')}>Reject</button></>}</div>} /></ListState></section>
     {staff && imports.data && imports.data.items.length > 0 && <section className="import-history"><h3>Recent imports</h3><DataTable rows={imports.data.items} columns={[['kind','Type'],['filename','File'],['status','Status'],['total_rows','Rows'],['successful_rows','Imported'],['error_rows','Errors'],['created_at','Uploaded','date']]} action={(row) => row.storage_key ? <a className="text" href={`/api/files/${encodeURIComponent(String(row.storage_key))}`}>Download source</a> : null} /></section>}
   </PagePanel>;
 }
@@ -438,26 +479,85 @@ function CsvImporter({ kind, title, onDone }: { kind: 'bills'|'payments'; title:
   return <form className="form-card import-card" onSubmit={upload}><h3>{title}</h3><p>Maximum 500 rows and 2 MB per upload. Duplicate references are rejected safely.</p><input name="file" type="file" accept=".csv,text/csv" required /><div className="row-actions"><button type="button" className="secondary" onClick={downloadTemplate}>Download template</button><button className="primary" disabled={busy}>{busy ? 'Importing…' : 'Upload CSV'}</button></div>{result && <Notice tone={result.includes('failed. First') || result.includes('Import failed') ? 'error' : 'success'}>{result}</Notice>}</form>;
 }
 
+function CameraCodeScanner({ onCode,onClose }: { onCode:(code:string)=>void;onClose:()=>void }) {
+  const video=useRef<HTMLVideoElement>(null);const [error,setError]=useState('');
+  useEffect(()=>{
+    let controls:{ stop:()=>void }|undefined;let finished=false;let cancelled=false;
+    import('@zxing/browser').then(({ BrowserMultiFormatReader })=>{
+      if(cancelled)return;const reader=new BrowserMultiFormatReader();
+      return reader.decodeFromVideoDevice(undefined,video.current!, (result,_failure,scanControls)=>{
+        if (result&&!finished) { finished=true;scanControls.stop();onCode(result.getText()); }
+      });
+    }).then((value)=>{if(value)controls=value;}).catch((reason:unknown)=>setError(reason instanceof Error?reason.message:'Camera could not start'));
+    return ()=>{cancelled=true;controls?.stop();};
+  },[onCode]);
+  return <div className="scanner-box"><video ref={video} muted playsInline /><p>Point the camera at the visitor QR code or Code 128 barcode.</p>{error&&<Notice tone="error">{error}</Notice>}<button type="button" className="secondary" onClick={onClose}>Close camera</button></div>;
+}
+
+function VisitorPass({ pass,onClose }: { pass:Row;onClose:()=>void }) {
+  const [qr,setQr]=useState('');const barcode=useRef<SVGSVGElement>(null);
+  const credential=String(pass.credential_number ?? pass.credentialNumber ?? pass.pin ?? '');
+  useEffect(()=>{ if (!credential) return;let cancelled=false;Promise.all([import('qrcode'),import('jsbarcode')]).then(([qrModule,barcodeModule])=>{if(cancelled)return;qrModule.default.toDataURL(credential,{ width:280,margin:2,errorCorrectionLevel:'M' }).then((value)=>!cancelled&&setQr(value));if(barcode.current)barcodeModule.default(barcode.current,credential,{ format:'CODE128',displayValue:true,fontSize:16,height:64,margin:8 });});return()=>{cancelled=true;}; },[credential]);
+  return <div className="modal-backdrop" role="dialog" aria-modal="true"><section className="notice-modal visitor-pass-modal"><div className="visitor-pass printable-pass"><p className="eyebrow">ESTATE VISITOR PASS</p><h2>{String(pass.visitor_name ?? pass.visitorName ?? 'Visitor')}</h2><p>Host: <strong>{String(pass.resident_name ?? pass.residentName ?? 'Estate resident')}</strong></p><p>Property: <strong>{String(pass.unit_number ?? pass.propertyId ?? 'Selected property')} {pass.street?`— ${String(pass.street)}`:''}</strong></p>{qr&&<img className="pass-qr" src={qr} alt={`Visitor QR ${credential}`} />}<svg className="pass-barcode" ref={barcode} /><strong className="credential-number">{credential}</strong><small>Unique visitor number</small>{Boolean(pass.pin)&&<p className="pass-pin">Keypad PIN: <strong>{String(pass.pin)}</strong></p>}<div className="pass-dates"><span>From {readableDate(pass.valid_from ?? pass.validFrom)}</span><span>Until {readableDate(pass.valid_until ?? pass.validUntil)}</span></div><p className="pass-policy">Security must scan and review this pass before accepting entry. Device recognition requires a compatible, configured reader.</p></div><div className="row-actions no-print"><button className="primary" onClick={()=>window.print()}>Print pass</button><button className="secondary" onClick={onClose}>Close</button></div></section></div>;
+}
+
 function Visitors({ user }: { user: User }) {
   const list = useList('/api/visitors?limit=50');
   const properties = useList('/api/properties?limit=100');
+  const devices=useAsync<{ items:Row[] }>(()=>api('/api/access/device-options'),[]);
+  const portal=useAsync<PortalConfig>(()=>api('/api/portal-config'),[]);
+  const defaultStart=useMemo(()=>new Date(),[]);const defaultEnd=new Date(defaultStart.valueOf()+Number(portal.data?.visitor_default_duration_hours||8)*3600000);
   const [show, setShow] = useState(false);
   const [result, setResult] = useState('');
+  const [selectedPass,setSelectedPass]=useState<Row|null>(null);
+  const [preview,setPreview]=useState<Row|null>(null);
+  const [scanId,setScanId]=useState('');
+  const [camera,setCamera]=useState(false);
+  const [deviceSession,setDeviceSession]=useState<Row|null>(null);
+
   async function create(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setResult(''); const raw = Object.fromEntries(new FormData(event.currentTarget));
-    try { const created = await api<{ pin: string }>('/api/visitors', { method: 'POST', body: JSON.stringify(raw) }); setResult(`Pass created. PIN: ${created.pin}`); list.reload(); }
-    catch (reason) { setResult(reason instanceof Error ? reason.message : 'Failed'); }
+    event.preventDefault(); setResult(''); const form=event.currentTarget;const raw=Object.fromEntries(new FormData(form));delete raw.proofFiles;
+    try {
+      const proofKeys=await uploadProofFiles(form,'visitor-proofs');
+      const created = await api<Row>('/api/visitors', { method: 'POST', body: JSON.stringify({ ...raw,proofKeys }) });
+      const property=properties.data?.items.find((item)=>item.id===raw.propertyId);
+      setSelectedPass({ ...raw,...created,visitor_name:raw.visitorName,valid_from:raw.validFrom,valid_until:raw.validUntil,resident_name:user.role==='resident'?user.name:raw.residentId,unit_number:property?.unit_number,street:property?.street });
+      setResult('Pass created. Share the QR/barcode and unique number with the visitor.');setShow(false);list.reload();
+    } catch (reason) { setResult(reason instanceof Error ? reason.message : 'Failed'); }
   }
-  async function check(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setResult(''); const values = Object.fromEntries(new FormData(event.currentTarget));
-    try { const checked = await api<{ visitor: Row; action: string }>('/api/visitors/check', { method: 'POST', body: JSON.stringify(values) }); setResult(`${String(checked.visitor.visitor_name)} checked ${checked.action}.`); list.reload(); }
-    catch (reason) { setResult(reason instanceof Error ? reason.message : 'Failed'); }
+  const previewCode=useCallback(async(code:string,source:'phone_camera'|'device'|'manual')=>{
+    setResult('');setCamera(false);
+    try { const checked=await api<{ scanId:string;valid:boolean;reason?:string;visitor:Row }>('/api/visitors/scan',{ method:'POST',body:JSON.stringify({ code,source }) });setPreview({ ...checked.visitor,valid:checked.valid,invalid_reason:checked.reason });setScanId(checked.scanId); }
+    catch(reason) { setPreview(null);setResult(reason instanceof Error?reason.message:'Pass lookup failed'); }
+  },[]);
+  async function manualPreview(event:FormEvent<HTMLFormElement>) { event.preventDefault();const form=new FormData(event.currentTarget);await previewCode(String(form.get('code')??''),'manual'); }
+  async function decide(decision:'accepted'|'rejected',action:'in'|'out'='in') {
+    if (!preview) return;const note=decision==='rejected'?(prompt('Reason for rejection','')??''):'';
+    try { await api(`/api/visitors/${preview.id}/decision`,{ method:'POST',body:JSON.stringify({ decision,action,scanId,note }) });setResult(decision==='accepted'?`Accepted ${String(preview.visitor_name)} for check ${action}.`:`Rejected ${String(preview.visitor_name)}.`);setPreview(null);setScanId('');list.reload(); }
+    catch(reason) { setResult(reason instanceof Error?reason.message:'Decision failed'); }
   }
-  return <PagePanel title="Visitors" subtitle="Issue passes and manage arrivals" action={(user.role === 'resident' || user.role === 'admin') ? <button className="primary" onClick={() => setShow(!show)}>New pass</button> : null}>
-    {result && <Notice tone={result.includes('created') || result.includes('checked') ? 'success' : 'error'}>{result}</Notice>}
-    {show && <FormCard title="Create visitor pass" onSubmit={create}><label>Visitor name<input name="visitorName" required /></label><label>Phone<input name="visitorPhone" /></label>{user.role === 'admin' && <label>Resident ID<input name="residentId" required /></label>}{user.role === 'resident' ? <label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}</option>)}</select></label> : <label>Property ID<input name="propertyId" required /></label>}<label>Valid from<input name="validFrom" type="datetime-local" required /></label><label>Valid until<input name="validUntil" type="datetime-local" required /></label><button className="primary">Issue pass</button></FormCard>}
-    {(user.role === 'security' || user.role === 'admin') && <FormCard title="Gate check" onSubmit={check}><label>Six-digit PIN<input name="pin" inputMode="numeric" pattern="[0-9]{6}" required /></label><label>Action<select name="action"><option value="in">Check in</option><option value="out">Check out</option></select></label><button className="primary">Verify pass</button></FormCard>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['visitor_name','Visitor'],['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['pin','PIN'],['status','Status'],['valid_until','Valid until','date']]} /></ListState>
+  async function startDeviceScan(event:FormEvent<HTMLFormElement>) {
+    event.preventDefault();const form=new FormData(event.currentTarget);
+    try { const session=await api<Row>('/api/visitors/device-scan-sessions',{ method:'POST',body:JSON.stringify({ deviceId:form.get('deviceId') }) });setDeviceSession(session);setResult('Waiting for the visitor credential to be presented at the selected device…'); }
+    catch(reason) { setResult(reason instanceof Error?reason.message:'Could not start device scan'); }
+  }
+  useEffect(()=>{
+    if (!deviceSession?.id || deviceSession.status==='captured') return;
+    const timer=setInterval(()=>api<Row>(`/api/visitors/device-scan-sessions/${deviceSession.id}`).then((session)=>{
+      setDeviceSession(session);if(session.status==='captured'&&session.captured_credential)previewCode(String(session.captured_credential),'device');
+    }).catch(()=>undefined),2000);
+    return ()=>clearInterval(timer);
+  },[deviceSession?.id,deviceSession?.status,previewCode]);
+
+  const staff=user.role==='security'||user.role==='admin';
+  return <PagePanel title="Visitors" subtitle="QR/barcode passes, preview-before-entry decisions and auditable arrivals" action={(user.role === 'resident' || user.role === 'admin') ? <button className="primary" onClick={() => setShow(!show)}>New pass</button> : null}>
+    {result && <Notice tone={result.includes('created')||result.includes('Accepted')?'success':result.includes('Waiting')?'info':'error'}>{result}</Notice>}
+    <Notice tone="info"><strong>Recommended:</strong> use the QR code for phones and QR-capable readers, Code 128 as a second scanner format, and the written unique number or six-digit PIN on terminals such as DS-K1T808MFWX-B. DS-K2802 needs a compatible Wiegand reader.</Notice>
+    {show && <FormCard title="Create visitor pass" onSubmit={create}><label>Visitor name<input name="visitorName" required /></label><label>Phone<input name="visitorPhone" /></label>{user.role === 'admin' && <label>Resident ID<input name="residentId" required /></label>}{user.role === 'resident' ? <label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}</option>)}</select></label> : <label>Property ID<input name="propertyId" required /></label>}<label>Preferred gate device<select name="deviceId"><option value="">Phone/security scan only</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.model||device.vendor)} {device.supportsQr?'(QR)':'(PIN/card)'}</option>)}</select></label><label>Valid from<input name="validFrom" type="datetime-local" defaultValue={localDateTime(defaultStart)} required /></label><label>Valid until<input name="validUntil" type="datetime-local" defaultValue={localDateTime(defaultEnd)} required /></label><ProofFilesField label="Visitor identity or invitation proof (optional)" /><button className="primary">Issue secure pass</button></FormCard>}
+    {staff&&<section className="scan-grid"><form className="form-card" onSubmit={manualPreview}><h3>Phone or manual scan</h3><label>QR, barcode, unique number or PIN<input name="code" required /></label><div className="row-actions"><button className="primary">Preview details</button><button type="button" className="secondary" onClick={()=>setCamera(!camera)}>Use phone camera</button></div>{camera&&<CameraCodeScanner onCode={(code)=>previewCode(code,'phone_camera')} onClose={()=>setCamera(false)} />}</form><form className="form-card" onSubmit={startDeviceScan}><h3>Scan at an access-control device</h3><label>Device<select name="deviceId" required><option value="">Select device</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.gate_name)}</option>)}</select></label><button className="primary">Start device scan</button><small>The next credential event from this device is captured for review. No entry is accepted automatically.</small></form></section>}
+    {preview&&<section className={`visitor-preview ${preview.valid?'valid':'invalid'}`}><p className="eyebrow">VISITOR PASS PREVIEW — NO ENTRY ACCEPTED YET</p><h3>{String(preview.visitor_name)}</h3><dl><div><dt>Host</dt><dd>{String(preview.resident_name)}</dd></div><div><dt>Property</dt><dd>{String(preview.unit_number)} — {String(preview.street)}</dd></div><div><dt>Phone</dt><dd>{String(preview.visitor_phone??'—')}</dd></div><div><dt>Valid</dt><dd>{readableDate(preview.valid_from)} to {readableDate(preview.valid_until)}</dd></div><div><dt>Status</dt><dd>{String(preview.status)}</dd></div></dl>{!preview.valid&&<Notice tone="error">{String(preview.invalid_reason||'This pass is not valid.')}</Notice>}<div className="row-actions">{Boolean(preview.valid)&&<><button className="primary" onClick={()=>decide('accepted','in')}>Accept check-in</button>{preview.status==='checked_in'&&<button className="secondary" onClick={()=>decide('accepted','out')}>Accept check-out</button>}</>}<button className="secondary" onClick={()=>decide('rejected')}>Reject</button></div></section>}
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['visitor_name','Visitor'],['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['credential_number','Unique number'],['device_name','Preferred device'],['status','Status'],['valid_until','Valid until','date']]} action={(row)=><div className="row-actions"><button className="text" onClick={()=>setSelectedPass(row)}>View pass</button><EvidenceButton entityType="visitor_request" entityId={row.id} count={row.proof_count} /></div>} /></ListState>
+    {selectedPass&&<VisitorPass pass={selectedPass} onClose={()=>setSelectedPass(null)} />}
   </PagePanel>;
 }
 
@@ -467,11 +567,12 @@ function Maintenance({ user }: { user: User }) {
   const [show, setShow] = useState(false);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const values = Object.fromEntries(new FormData(event.currentTarget));
-    await api('/api/maintenance', { method: 'POST', body: JSON.stringify(values) }); setShow(false); list.reload();
+    const proofKeys=await uploadProofFiles(event.currentTarget,'maintenance-proofs');
+    await api('/api/maintenance', { method: 'POST', body: JSON.stringify({ ...values,proofKeys }) }); setShow(false); list.reload();
   }
   return <PagePanel title="Maintenance" subtitle="Requests and work status" action={<button className="primary" onClick={() => setShow(!show)}>New request</button>}>
-    {show && <FormCard title="Report a maintenance issue" onSubmit={submit}><label className="span-2">Description<textarea name="description" rows={4} required /></label>{user.role === 'admin' && <label>Resident ID<input name="residentId" required /></label>}{user.role === 'resident' ? <label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}</option>)}</select></label> : <label>Property ID<input name="propertyId" required /></label>}<button className="primary">Submit request</button></FormCard>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['description','Description'],['status','Status'],['ai_urgency','Urgency'],['created_at','Reported','date']]} /></ListState>
+    {show && <FormCard title="Report a maintenance issue" onSubmit={submit}><label className="span-2">Description<textarea name="description" rows={4} required /></label>{user.role === 'admin' && <label>Resident ID<input name="residentId" required /></label>}{user.role === 'resident' ? <label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}</option>)}</select></label> : <label>Property ID<input name="propertyId" required /></label>}<ProofFilesField label="Photos, quotation or supporting proof (recommended)" /><button className="primary">Submit request</button></FormCard>}
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['description','Description'],['status','Status'],['ai_urgency','Urgency'],['created_at','Reported','date']]} action={(row)=><EvidenceButton entityType="maintenance_request" entityId={row.id} count={row.proof_count} />} /></ListState>
   </PagePanel>;
 }
 
@@ -511,21 +612,42 @@ function EstateNotices({ user }: { user: User }) {
 
 function Cards({ user }: { user: User }) {
   const list = useList('/api/access/cards?limit=50');
+  const devices=useAsync<{ items:Row[] }>(()=>user.role==='admin'?api('/api/access/device-options'):Promise.resolve({ items:[] }),[user.role]);
   const [show, setShow] = useState(false);
   const [message, setMessage] = useState('');
+  const [mode,setMode]=useState<'device'|'manual'>('device');
+  const [scanSession,setScanSession]=useState<Row|null>(null);
   async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setMessage(''); const values = Object.fromEntries(new FormData(event.currentTarget));
-    try { await api('/api/access/cards', { method: 'POST', body: JSON.stringify(values) }); setShow(false); list.reload(); }
-    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Failed'); }
+    event.preventDefault(); setMessage(''); const form=new FormData(event.currentTarget);const values=Object.fromEntries(form);
+    try {
+      if(mode==='device') {
+        const session=await api<Row>('/api/access/card-scan-sessions',{ method:'POST',body:JSON.stringify({ deviceId:form.get('deviceId'),residentId:form.get('residentId')||undefined,householdMemberId:form.get('householdMemberId')||undefined,cardLabel:form.get('cardLabel') }) });
+        setScanSession(session);setMessage('Waiting for the card to be tapped or scanned at the selected access-control device.');
+      } else {
+        await api('/api/access/cards', { method: 'POST', body: JSON.stringify(values) }); setShow(false);setMessage('Card issued and hardware actions queued.');list.reload();
+      }
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Failed'); }
   }
+  useEffect(()=>{
+    if(!scanSession?.id||scanSession.status==='captured') return;
+    const timer=setInterval(()=>api<Row>(`/api/access/card-scan-sessions/${scanSession.id}`).then(setScanSession).catch(()=>undefined),2000);
+    return()=>clearInterval(timer);
+  },[scanSession?.id,scanSession?.status]);
+  async function completeScan() {
+    if(!scanSession?.id)return;
+    try { const card=await api<Row>(`/api/access/card-scan-sessions/${scanSession.id}/complete`,{ method:'POST' });setMessage(`Card ${String(card.cardUid)} issued and synchronized to the hardware-action queue.`);setScanSession(null);setShow(false);list.reload(); }
+    catch(reason){setMessage(reason instanceof Error?reason.message:'Could not issue scanned card');}
+  }
+  async function cancelScan(){if(scanSession?.id)await api(`/api/access/card-scan-sessions/${scanSession.id}`,{ method:'DELETE' });setScanSession(null);setMessage('Card scan cancelled.');}
   async function change(id: unknown, status: string) {
     if (!confirm(`Set this card to ${status}?`)) return;
     await api(`/api/access/cards/${id}`, { method: 'PATCH', body: JSON.stringify({ status, reason: 'Portal administrator action' }) }); list.reload();
   }
   const actions = user.role === 'admin' ? (row: Row) => <div className="row-actions">{row.status === 'active' ? <button className="text danger" onClick={() => change(row.id, 'suspended')}>Suspend</button> : <button className="text" onClick={() => change(row.id, 'active')}>Activate</button>}</div> : undefined;
-  return <PagePanel title="Access cards" subtitle="Credential status, fee enforcement and audit" action={user.role === 'admin' ? <button className="primary" onClick={() => setShow(!show)}>Issue card</button> : null}>
-    {message && <Notice tone="error">{message}</Notice>}
-    {show && <FormCard title="Issue a physical card" onSubmit={submit}><label>Main resident ID<input name="residentId" placeholder="Use this for a main resident" /></label><label>Household member ID<input name="householdMemberId" placeholder="Or use this for a dependant" /></label><label>Card UID / number<input name="cardUid" required /></label><label>Label<input name="cardLabel" placeholder="Optional card label" /></label><button className="primary">Issue card</button></FormCard>}
+  return <PagePanel title="Access cards" subtitle="Enroll by tapping a selected device, or enter a known card number manually" action={user.role === 'admin' ? <button className="primary" onClick={() => setShow(!show)}>Issue card</button> : null}>
+    {message && <Notice tone={message.includes('issued')?'success':message.includes('Waiting')?'info':'error'}>{message}</Notice>}
+    {show && <FormCard title="Issue a physical card" onSubmit={submit}><label>Enrollment method<select value={mode} onChange={(event)=>setMode(event.target.value as 'device'|'manual')}><option value="device">Tap/scan at selected device (recommended)</option><option value="manual">Enter card UID manually</option></select></label>{mode==='device'&&<label>Access-control device<select name="deviceId" required><option value="">Select device</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.model||device.vendor)} — {String(device.gate_name)}</option>)}</select></label>}<label>Main resident ID<input name="residentId" placeholder="Use this for a main resident" /></label><label>Household member ID<input name="householdMemberId" placeholder="Or use this for a dependant" /></label>{mode==='manual'&&<label>Card UID / number<input name="cardUid" required /></label>}<label>Label<input name="cardLabel" placeholder="Optional card label" /></label><button className="primary">{mode==='device'?'Start scan':'Issue card'}</button></FormCard>}
+    {scanSession&&<section className={`enrollment-session ${String(scanSession.status)}`}><p className="eyebrow">DEVICE CARD ENROLLMENT</p><h3>{scanSession.status==='captured'?'Card detected':'Waiting for a card…'}</h3>{Boolean(scanSession.captured_credential)&&<strong className="credential-number">{String(scanSession.captured_credential)}</strong>}<p>Present the card at the selected device. EstateMate captures the next card credential event, including a denied unknown-card event.</p><div className="row-actions">{scanSession.status==='captured'&&<button className="primary" onClick={completeScan}>Confirm and issue card</button>}<button className="secondary" onClick={cancelScan}>Cancel</button></div></section>}
     <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['resident_name','Main resident'],['household_member_name','Card holder'],['relationship','Relationship'],['unit_number','Unit'],['card_uid','Card UID'],['card_label','Label'],['status','Status'],['deactivated_reason','Reason'],['updated_at','Updated','date']]} action={actions} /></ListState>
   </PagePanel>;
 }
@@ -548,7 +670,7 @@ function AccessEvents({ user }: { user: User }) {
   }, [user.role]);
   return <PagePanel title="Gate activity" subtitle="Granted and denied access across every configured point" action={user.role !== 'resident' ? <span className={`connection ${connection}`}><span className="pulse-dot" /> {connection}</span> : null}>
     {live.length > 0 && <section className="live-strip"><p className="eyebrow">JUST RECEIVED</p>{live.map((event, index) => <div className="live-event" key={`${String(event.vendorEventId)}-${index}`}><span className={`result-dot ${event.result}`} /><strong>{String(event.personName ?? event.cardUid ?? 'Unknown credential')}</strong><span>{String(event.result)}</span><small>{readableDate(event.deviceTimestamp)}</small></div>)}</section>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['result','Result'],['household_member_name','Household member'],['person_name','Device person'],['resident_name','Main resident'],['employee_no','Employee no.'],['credential_type','Method'],['card_uid','Card'],['device_name','Device'],['access_point_name','Access point'],['door_no','Door'],['direction','Direction'],['device_timestamp','Time','date']]} /></ListState>
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['result','Result'],['visitor_name','Visitor'],['household_member_name','Household member'],['person_name','Device person'],['resident_name','Main resident'],['employee_no','Employee no.'],['credential_type','Method'],['card_uid','Card'],['device_name','Device'],['access_point_name','Access point'],['door_no','Door'],['direction','Direction'],['device_timestamp','Time','date']]} /></ListState>
   </PagePanel>;
 }
 
@@ -563,23 +685,34 @@ function Devices({ user }: { user: User }) {
     try { const result = await api<Row>('/api/access/devices', { method: 'POST', body: JSON.stringify(values) }); setCredentials(result); setShow(false); list.reload(); }
     catch (reason) { setError(reason instanceof Error ? reason.message : 'Failed'); }
   }
-  return <PagePanel title="MinMoe devices" subtitle="Internet-connected terminal health and event ingestion" action={user.role === 'admin' ? <button className="primary" onClick={() => setShow(!show)}>Register device</button> : null}>
-    <Notice tone="warning"><strong>No-PC mode:</strong> HTTP Listening sends events to EstateMate, but it does not provide a return command channel. Do not expose the terminal’s ISAPI port to the public Internet.</Notice>
+  async function edit(row:Row) {
+    const name=prompt('Display name',String(row.name??''));if(!name)return;
+    const vendor=prompt('Vendor',String(row.vendor??'Hikvision'))??String(row.vendor??'Hikvision');
+    const gateName=prompt('Gate name',String(row.gate_name??''));if(!gateName)return;
+    const model=prompt('Model',String(row.model??''))??String(row.model??'');
+    const firmware=prompt('Firmware',String(row.firmware??''))??String(row.firmware??'');
+    const serialNumber=prompt('Serial number',String(row.serial_number??''))??String(row.serial_number??'');
+    try { await api(`/api/access/devices/${row.id}`,{ method:'PATCH',body:JSON.stringify({ name,vendor,gateName,model,firmware,serialNumber,direction:row.direction,profileKey:row.profile_key,connectionPattern:row.connection_pattern,listenerFormat:row.listener_format,status:row.status }) });list.reload(); }
+    catch(reason){setError(reason instanceof Error?reason.message:'Device update failed');}
+  }
+  async function remove(row:Row) { if(!confirm(`Delete ${String(row.name)}? Credentials will be revoked while historical gate events remain.`))return;try{await api(`/api/access/devices/${row.id}`,{ method:'DELETE' });list.reload();setError('');}catch(reason){setError(reason instanceof Error?reason.message:'Delete failed');} }
+  async function rotate(row:Row){if(!confirm(`Rotate the ingest secret for ${String(row.name)}? The old endpoint will stop working immediately.`))return;try{setCredentials(await api<Row>(`/api/access/devices/${row.id}/rotate-secret`,{ method:'POST' }));}catch(reason){setError(reason instanceof Error?reason.message:'Secret rotation failed');}}
+  return <PagePanel title="Access-control devices" subtitle="Hikvision MinMoe, card/fingerprint terminals, DS-K2800 controllers and validated third-party devices" action={user.role === 'admin' ? <button className="primary" onClick={() => setShow(!show)}>Register device</button> : null}>
+    <Notice tone="warning"><strong>No-PC mode:</strong> direct or Render-relayed HTTP Listening sends events over the Internet to EstateMate. It does not create a return command channel. DS-K2802 requires a compatible reader and typically an ISUP/management gateway for remote commands; never expose ISAPI directly to the Internet.</Notice>
     {error && <Notice tone="error">{error}</Notice>}
-    {credentials && <section className="credential-box"><p className="eyebrow">COPY NOW — SHOWN ONCE</p><h3>Device event endpoint</h3><code>{String(credentials.endpoint)}</code><p>Profile: <code>{String((credentials.profile as Row | undefined)?.label ?? '')}</code></p><p>Connection: <code>{String(credentials.connectionPattern)}</code></p><p>Username: <code>{String(credentials.username)}</code></p><p>Secret: <code>{String(credentials.secret)}</code></p><button className="secondary" onClick={() => navigator.clipboard.writeText(String(credentials.endpoint))}>Copy endpoint</button></section>}
-    {show && <FormCard title="Register Hikvision access device" onSubmit={submit}>
-      <label>Display name<input name="name" placeholder="Gate 1 terminal" required /></label>
+    {credentials && <section className="credential-box"><p className="eyebrow">COPY NOW — SHOWN ONCE</p><h3>Device event endpoint</h3><code>{String(credentials.endpoint)}</code>{Boolean(credentials.workerEndpoint)&&<p>Direct Worker fallback: <code>{String(credentials.workerEndpoint)}</code></p>}<p>Profile: <code>{String((credentials.profile as Row | undefined)?.label ?? '')}</code></p><p>Connection: <code>{String(credentials.connectionPattern??'')}</code></p>{Boolean(credentials.username)&&<p>Username: <code>{String(credentials.username)}</code></p>}<p>Secret: <code>{String(credentials.secret)}</code></p><p>{String(credentials.warning??'')}</p><button className="secondary" onClick={() => navigator.clipboard.writeText(String(credentials.endpoint))}>Copy endpoint</button></section>}
+    {show && <FormCard title="Register an Internet-connected access device" onSubmit={submit}>
+      <label>Display name<input name="name" placeholder="Gate 1 terminal" required /></label><label>Vendor<input name="vendor" defaultValue="Hikvision" /></label>
       <label>Gate name<input name="gateName" placeholder="Main gate" required /></label>
       <label>Direction<select name="direction"><option value="entry">Entry</option><option value="exit">Exit</option><option value="both">Both</option></select></label>
-      <label>Model<input name="model" placeholder="DS-K1T341CMFW" /></label>
-      <label>Firmware<input name="firmware" placeholder="Full version and build" /></label>
-      <label>Serial number<input name="serialNumber" /></label>
-      <label>Series profile<select name="profileKey"><option value="auto">Auto-detect from model</option>{profiles.data?.items.map((profile) => <option key={String(profile.key)} value={String(profile.key)}>{String(profile.label)}</option>)}</select></label>
-      <label>Connection pattern<select name="connectionPattern"><option value="direct_http_listener">Direct HTTP Listening</option><option value="hikvision_cloud_openapi">Hikvision cloud/OpenAPI</option><option value="offsite_isup_gateway">Off-site ISUP gateway</option><option value="manual_sync">Manual synchronization</option></select></label>
+      <label>Model<input name="model" list="access-models" placeholder="DS-K1T808MFWX-B or DS-K2802" /><datalist id="access-models"><option value="DS-K1T808MFWX-B" /><option value="DS-K2802" /><option value="DS-K2602T" /><option value="DS-K1T807EBWX-QRE1" /><option value="DS-K1T502DBWX-QRE1" /><option value="DS-K1T341CMFW" /><option value="DS-K1T671M" /><option value="DS-K1T680DFG" /></datalist></label>
+      <label>Firmware<input name="firmware" placeholder="Full version and build" /></label><label>Serial number<input name="serialNumber" /></label>
+      <label>Series profile<select name="profileKey"><option value="auto">Auto-detect from model (recommended)</option>{profiles.data?.items.map((profile) => <option key={String(profile.key)} value={String(profile.key)}>{String(profile.label)}</option>)}</select></label>
+      <label>Connection pattern<select name="connectionPattern"><option value="">Use profile recommendation (recommended)</option><option value="direct_http_listener">Direct Cloudflare HTTP Listening</option><option value="render_http_bridge">Render free HTTPS relay (optional; sleeps)</option><option value="hikvision_cloud_openapi">Hikvision cloud/OpenAPI</option><option value="offsite_isup_gateway">Off-site ISUP gateway</option><option value="manual_sync">Manual synchronization</option></select></label>
       <label>Listener format<select name="listenerFormat"><option value="auto">Auto-detect</option><option value="json">JSON</option><option value="xml">XML</option><option value="multipart">Multipart</option></select></label>
       <button className="primary">Register</button>
     </FormCard>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Device'],['model','Model'],['profile_key','Series profile'],['connection_pattern','Connection'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['last_seen_at','Last event','date'],['pending_operations','Pending actions']]} /></ListState>
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Device'],['vendor','Vendor'],['model','Model'],['profile_key','Series profile'],['connection_pattern','Connection'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['last_seen_at','Last event','date'],['pending_operations','Pending actions']]} action={user.role==='admin'?(row)=><div className="row-actions"><button className="text" onClick={()=>edit(row)}>Edit</button><button className="text" onClick={()=>rotate(row)}>Rotate secret</button><button className="text danger" onClick={()=>remove(row)}>Delete</button></div>:undefined} /></ListState>
   </PagePanel>;
 }
 
@@ -588,14 +721,16 @@ function Operations() {
   async function mark(id: unknown, status: 'applied'|'failed') { await api(`/api/access/operations/${id}`, { method: 'PATCH', body: JSON.stringify({ status }) }); list.reload(); }
   return <PagePanel title="Hardware actions" subtitle="Changes that must reach each physical terminal">
     <Notice tone="warning">With HTTP Listening only, apply these changes in the terminal UI, iVMS-4200, or an approved Hikvision cloud command channel. Then mark them applied here.</Notice>
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['device_name','Device'],['operation','Action'],['card_uid','Card'],['status','Status'],['created_at','Created','date'],['error_message','Error']]} action={(row) => <div className="row-actions"><button className="text" onClick={() => mark(row.id, 'applied')}>Mark applied</button><button className="text danger" onClick={() => mark(row.id, 'failed')}>Failed</button></div>} /></ListState>
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['device_name','Device'],['credential_kind','Credential'],['operation','Action'],['card_uid','Number'],['status','Status'],['created_at','Created','date'],['error_message','Error']]} action={(row) => <div className="row-actions"><button className="text" onClick={() => mark(row.id, 'applied')}>Mark applied</button><button className="text danger" onClick={() => mark(row.id, 'failed')}>Failed</button></div>} /></ListState>
   </PagePanel>;
 }
 
 function Settings() {
   const list = useList('/api/settings');
   const storage = useAsync<Row>(() => api('/api/storage-settings'), []);
+  const portal=useAsync<PortalConfig>(()=>api('/api/portal-config'),[]);
   const [message, setMessage] = useState('');
+  const [portalMessage,setPortalMessage]=useState('');
   const [passwordMessage, setPasswordMessage] = useState('');
   const [storageMessage, setStorageMessage] = useState('');
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -612,6 +747,11 @@ function Settings() {
     try { await api('/api/storage-settings', { method: 'PUT', body: JSON.stringify(body) }); setStorageMessage('Private GitHub storage verified and updated.'); storage.reload(); (storageForm.elements.namedItem('accessToken') as HTMLInputElement).value = ''; }
     catch (reason) { setStorageMessage(reason instanceof Error ? reason.message : 'Storage update failed'); }
   }
+  async function savePortal(event:FormEvent<HTMLFormElement>) {
+    event.preventDefault();setPortalMessage('');const values=Object.fromEntries(new FormData(event.currentTarget));
+    try { await api('/api/portal-config',{ method:'PUT',body:JSON.stringify(values) });setPortalMessage('Portal customisation saved. Reloading the theme…');portal.reload();setTimeout(()=>location.reload(),700); }
+    catch(reason){setPortalMessage(reason instanceof Error?reason.message:'Portal customisation failed');}
+  }
   async function changePassword(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setPasswordMessage('');
@@ -627,6 +767,8 @@ function Settings() {
   return <PagePanel title="Settings" subtitle="Estate-wide operational rules and private storage">
     {message && <Notice tone={message.includes('updated') ? 'success' : 'error'}>{message}</Notice>}
     <FormCard title="Facility-fee enforcement" onSubmit={submit}><label>Grace period (days)<input name="value" type="number" min="0" max="365" defaultValue={String(list.data?.items.find((item) => item.key === 'facility_fee_grace_period_days')?.value ?? '7')} required /></label><button className="primary">Save rule</button></FormCard>
+    {portalMessage&&<Notice tone={portalMessage.includes('saved')?'success':'error'}>{portalMessage}</Notice>}
+    {portal.data&&<FormCard title="Portal identity, theme and recommended defaults" onSubmit={savePortal}><label>Portal name<input name="portal_name" defaultValue={portal.data.portal_name||'EstateMate'} required /></label><label>Estate name<input name="estate_name" defaultValue={portal.data.estate_name||'EstateMate Estate'} required /></label><label>Short mark<input name="portal_short_name" maxLength={4} defaultValue={portal.data.portal_short_name||'EM'} required /></label><label>Tagline<input name="portal_tagline" defaultValue={portal.data.portal_tagline} /></label><label className="span-2">Welcome text<textarea name="portal_welcome_text" rows={3} defaultValue={portal.data.portal_welcome_text} /></label><label>Theme mode<select name="theme_mode" defaultValue={portal.data.theme_mode||'light'}><option value="light">Light (recommended)</option><option value="dark">Dark</option><option value="system">Follow device</option></select></label><label>Corner style<select name="theme_corner_style" defaultValue={portal.data.theme_corner_style||'comfortable'}><option value="comfortable">Comfortable (recommended)</option><option value="compact">Compact</option><option value="rounded">Rounded</option></select></label><label>Primary colour<input name="theme_primary_color" type="color" defaultValue={portal.data.theme_primary_color||'#1769e0'} /></label><label>Accent colour<input name="theme_accent_color" type="color" defaultValue={portal.data.theme_accent_color||'#35d07f'} /></label><label>Navigation colour<input name="theme_navigation_color" type="color" defaultValue={portal.data.theme_navigation_color||'#0d1b37'} /></label><label>Surface colour<input name="theme_surface_color" type="color" defaultValue={portal.data.theme_surface_color||'#ffffff'} /></label><label>Support email<input name="support_email" type="email" defaultValue={portal.data.support_email} /></label><label>Support phone<input name="support_phone" defaultValue={portal.data.support_phone} /></label><label>Timezone<input name="estate_timezone" defaultValue={portal.data.estate_timezone||'Africa/Lagos'} /></label><label>Currency<input name="currency" defaultValue={portal.data.currency||'NGN'} maxLength={3} /></label><label>Default visitor hours<input name="visitor_default_duration_hours" type="number" min="1" max="168" defaultValue={portal.data.visitor_default_duration_hours||'8'} /></label><label>Gate decision policy<select name="visitor_gate_policy" defaultValue="security_approval"><option value="security_approval">Show details, then Security approves (recommended)</option></select></label><label>Visitor credential format<select name="visitor_credential_format" defaultValue="qr_code128_pin"><option value="qr_code128_pin">QR + Code 128 + PIN (recommended)</option></select></label><label>Card scan timeout (minutes)<input name="card_scan_timeout_minutes" type="number" min="1" max="30" defaultValue={portal.data.card_scan_timeout_minutes||'5'} /></label><label className="span-2">Render bridge HTTPS origin<input name="render_bridge_url" type="url" placeholder="https://estatemate-access-bridge.onrender.com" defaultValue={portal.data.render_bridge_url} /><small>Optional free stateless relay. It sleeps after 15 idle minutes and cannot host Hikvision ISUP/TCP.</small></label><button className="primary">Save portal customisation</button></FormCard>}
     {storageMessage && <Notice tone={storageMessage.includes('updated') ? 'success' : 'error'}>{storageMessage}</Notice>}
     <Notice tone="warning"><strong>Private repository required.</strong> EstateMate encrypts the GitHub token before saving it and never displays it again. Use a fine-grained token limited to this repository’s Contents permission.</Notice>
     {storage.data && <FormCard title="Private GitHub upload storage" onSubmit={saveStorage}>
@@ -642,6 +784,29 @@ function Settings() {
     <FormCard title="Change my password" onSubmit={changePassword}><label>Current password<input name="currentPassword" type="password" autoComplete="current-password" required /></label><label>New password<input name="newPassword" type="password" minLength={12} autoComplete="new-password" required /></label><label>Confirm new password<input name="confirmPassword" type="password" minLength={12} autoComplete="new-password" required /></label><button className="primary">Change password</button></FormCard>
     <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['key','Setting'],['value','Value'],['updated_at','Updated','date']]} /></ListState>
   </PagePanel>;
+}
+
+async function uploadProofFiles(form: HTMLFormElement, category:string): Promise<string[]> {
+  const input=form.elements.namedItem('proofFiles') as HTMLInputElement|null;
+  const files=[...(input?.files ?? [])].slice(0,5);
+  const keys:string[]=[];
+  for (const file of files) {
+    const uploaded=await api<{ key:string }>('/api/files',{ method:'POST',body:file,headers:{ 'Content-Type':file.type || 'application/pdf','X-Filename':file.name,'X-File-Category':category } });
+    keys.push(uploaded.key);
+  }
+  return keys;
+}
+
+function ProofFilesField({ label='Supporting proof (optional)' }: { label?:string }) {
+  return <label className="span-2">{label}<input name="proofFiles" type="file" multiple accept="image/jpeg,image/png,image/webp,application/pdf,.pdf" /><small>Up to five JPEG, PNG, WebP or PDF files, maximum 4 MB each. Stored in the configured private GitHub repository.</small></label>;
+}
+
+function EvidenceButton({ entityType,entityId,count }: { entityType:string;entityId:unknown;count:unknown }) {
+  const [files,setFiles]=useState<Row[]|null>(null); const [error,setError]=useState('');
+  const total=Number(count ?? 0);
+  async function open() { setError('');try { const value=await api<{ items:Row[] }>(`/api/evidence/${entityType}/${entityId}`);setFiles(value.items); } catch(reason) { setError(reason instanceof Error?reason.message:'Could not load proof'); } }
+  if (!total) return null;
+  return <><button className="text" onClick={open}>Proof ({total})</button>{(files||error)&&<div className="modal-backdrop" role="dialog" aria-modal="true"><section className="notice-modal evidence-modal"><p className="eyebrow">SUPPORTING EVIDENCE</p><h2>Uploaded proof</h2>{error&&<Notice tone="error">{error}</Notice>}{files?.map((file)=><a className="evidence-link" key={String(file.storage_key)} href={`/api/files/${encodeURIComponent(String(file.storage_key))}`}>{String(file.original_name)} <small>{Math.ceil(Number(file.size_bytes)/1024)} KB</small></a>)}{files?.length===0&&<p>No accessible files were found.</p>}<button className="secondary wide" onClick={()=>{setFiles(null);setError('');}}>Close</button></section></div>}</>;
 }
 
 function useList(url: string) {
@@ -683,6 +848,7 @@ function nested(source: Row | null, objectKey: string, key: string): unknown {
   return object && typeof object === 'object' ? (object as Row)[key] : null;
 }
 
+function localDateTime(date:Date):string { const offset=date.getTimezoneOffset()*60000;return new Date(date.valueOf()-offset).toISOString().slice(0,16); }
 function initials(name: string): string { return name.split(/\s+/).slice(0,2).map((part) => part[0]).join('').toUpperCase(); }
 function navIcon(section: Section): string {
   return ({ dashboard: '◫', residents: '●', properties: '⌂', residency: '♙', bills: '₦', visitors: '↔', maintenance: '◇', notices: '!', cards: '▤', events: '⌁', devices: '▣', operations: '↻', settings: '⚙' })[section];
