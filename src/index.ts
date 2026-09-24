@@ -10,6 +10,7 @@ import { HIKVISION_PROFILES, getHikvisionProfile, isConnectionSupported, resolve
 import {
   MAX_GITHUB_FILE_SIZE,
   downloadFromPrivateGitHub,
+  downloadPortalBrandingImage,
   publicStorageSettings,
   saveStorageSettings,
   uploadToPrivateGitHub,
@@ -87,13 +88,56 @@ const requireAuth: MiddlewareHandler<{ Bindings: Env; Variables: AppVariables }>
   if (!token) return jsonError(c, 401, 'Authentication required');
   const claims = await verifyJwt(c.env, token);
   if (!claims) return jsonError(c, 401, 'Session is invalid or expired');
+  // A gate-selection token is not a session. It exists only to be exchanged for
+  // one through POST /api/auth/select-gate, so it must never satisfy auth here.
+  if (claims.pendingGate) return jsonError(c, 401, 'Select the gate you are working before continuing');
   const user = await c.env.DB.prepare(
     `SELECT id,name,email,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,property_id FROM users WHERE id=? AND status='active' AND (account_expires_at IS NULL OR datetime(account_expires_at)>datetime('now')) LIMIT 1`,
   ).bind(claims.sub).first<AuthUser>();
   if (!user) return jsonError(c, 401, 'User is inactive or no longer exists');
   c.set('user', user);
+  let sessionGate: string | null = null;
+  if (user.role === 'security' && claims.gate) {
+    // Re-check the assignment on every request: if an administrator unassigns the
+    // gate mid-shift the officer must select a new one rather than keep acting at
+    // a post they no longer cover.
+    const stillAssigned = await c.env.DB.prepare(
+      `SELECT 1 AS ok FROM security_gate_assignments a JOIN hikvision_devices d ON d.id=a.device_id
+       WHERE a.security_user_id=? AND a.device_id=? AND a.active=1 AND d.deleted_at IS NULL AND d.status!='disabled'`,
+    ).bind(user.id, claims.gate).first<{ ok: number }>();
+    if (!stillAssigned) return jsonError(c, 401, 'Your gate assignment changed. Sign in again and select your gate.');
+    sessionGate = claims.gate;
+  }
+  c.set('sessionGate', sessionGate);
   await next();
 };
+
+/**
+ * The gate (access-control device id) this session is restricted to.
+ *
+ * Only a Security officer who selected a gate at login is scoped; every other
+ * role keeps estate-wide visibility, and a Security account with no gate
+ * assignments remains unscoped so nobody is locked out before an administrator
+ * configures their posts.
+ */
+function gateScope(c: AppContext): string | null {
+  return c.get('sessionGate') ?? null;
+}
+
+/**
+ * Access-control devices (gates) a Security officer is actively assigned to.
+ * Soft-deleted and disabled devices are excluded so a retired terminal can never
+ * be selected for a new shift.
+ */
+async function assignedGates(db: D1Database, securityUserId: string): Promise<Array<Record<string, string | null>>> {
+  const result = await db.prepare(
+    `SELECT d.id,d.name,d.gate_name,d.direction,d.model,d.status
+     FROM security_gate_assignments a JOIN hikvision_devices d ON d.id=a.device_id
+     WHERE a.security_user_id=? AND a.active=1 AND d.deleted_at IS NULL AND d.status!='disabled'
+     ORDER BY d.gate_name,d.name`,
+  ).bind(securityUserId).all<Record<string, string | null>>();
+  return result.results;
+}
 
 function requireRoles(...roles: Role[]): MiddlewareHandler<{ Bindings: Env; Variables: AppVariables }> {
   return async (c, next) => {
@@ -253,7 +297,17 @@ const PORTAL_SETTING_KEYS = [
   'theme_primary_color','theme_accent_color','theme_navigation_color','theme_surface_color','theme_corner_style',
   'support_email','support_phone','estate_timezone','currency','visitor_default_duration_hours',
   'visitor_gate_policy','visitor_credential_format','card_scan_timeout_minutes',
+  'portal_gate_image_key','portal_gate_image_caption','portal_gate_image_enabled',
 ] as const;
+
+/** Keys whose value is a literal 'true'/'false' flag rather than free text. */
+const BOOLEAN_SETTING_KEYS: readonly string[] = ['portal_gate_image_enabled'];
+
+/**
+ * How long a Security officer has to pick their gate after signing in before
+ * the gate-selection token expires and they must log in again.
+ */
+const GATE_SELECTION_TTL_SECONDS = 5 * 60;
 
 /**
  * Accepted ways to initiate a payment. Online card collection is deliberately
@@ -299,6 +353,31 @@ app.get('/api/portal-config', async (c) => {
   }
 });
 
+/**
+ * Estate gate welcome photograph shown behind the login welcome text and the
+ * dashboard hero.
+ *
+ * Unauthenticated by necessity: the login screen renders before any session
+ * exists. Safety comes from what may be published, not from who asks —
+ * downloadPortalBrandingImage only serves a file the administrator explicitly
+ * uploaded under the `portal-branding` category and pointed this setting at.
+ */
+app.get('/api/portal-gate-image', async (c) => {
+  try {
+    const rows = await c.env.DB.prepare(
+      `SELECT key,value FROM settings WHERE key IN ('portal_gate_image_key','portal_gate_image_enabled')`,
+    ).all<{ key:string;value:string }>();
+    const values = Object.fromEntries(rows.results.map((row) => [row.key,row.value]));
+    if (values.portal_gate_image_enabled !== 'true' || !values.portal_gate_image_key) {
+      return jsonError(c,404,'No estate gate image has been configured');
+    }
+    const image = await downloadPortalBrandingImage(c.env, values.portal_gate_image_key);
+    return image ?? jsonError(c,404,'The configured estate gate image is no longer available');
+  } catch {
+    return jsonError(c,503,'Private GitHub storage is unavailable');
+  }
+});
+
 app.post('/api/auth/bootstrap', async (c) => {
   const count = await c.env.DB.prepare('SELECT COUNT(*) AS total FROM users').first<{ total: number }>();
   if ((count?.total ?? 0) > 0) return jsonError(c, 409, 'Bootstrap has already been completed');
@@ -323,10 +402,63 @@ app.post('/api/auth/login', async (c) => {
     `SELECT id,name,email,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,property_id,password_hash FROM users WHERE email=? AND status='active' AND (account_expires_at IS NULL OR datetime(account_expires_at)>datetime('now')) LIMIT 1`,
   ).bind(body.email.trim().toLowerCase()).first<AuthUser & { password_hash: string }>();
   if (!user || !(await verifyPassword(body.password, user.password_hash))) return jsonError(c, 401, 'Invalid email or password');
+  const { password_hash: _passwordHash, ...safeUser } = user;
+
+  // A Security officer posted at a specific gate must say which gate they are
+  // working for this session. No session cookie is set yet: the short-lived
+  // selection token below can only be exchanged through /api/auth/select-gate.
+  if (user.role === 'security') {
+    const gates = await assignedGates(c.env.DB, user.id);
+    if (gates.length) {
+      const selectionToken = await signJwt(c.env, user, GATE_SELECTION_TTL_SECONDS, { pendingGate: true });
+      return c.json({ requiresGateSelection: true, gates, selectionToken, user: safeUser });
+    }
+  }
+
   const token = await signJwt(c.env, user);
   c.header('Set-Cookie', `estatemate_session=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=43200`);
-  const { password_hash: _, ...safeUser } = user;
-  return c.json({ token, user: safeUser });
+  // An officer with no gate assignments keeps estate-wide visibility so nobody is
+  // locked out before an administrator configures their posts.
+  return c.json({ token, user: safeUser, ...(user.role === 'security' ? { gateSelectionUnavailable: true } : {}) });
+});
+
+/**
+ * Exchange a gate-selection token for a session scoped to one gate.
+ *
+ * Doubles as "switch gate" for an officer who is already signed in: an existing
+ * valid session may re-select without re-entering a password.
+ */
+app.post('/api/auth/select-gate', async (c) => {
+  const body = await c.req.json<{ selectionToken?: string; deviceId?: string }>();
+  const deviceId = body.deviceId?.trim();
+  if (!deviceId) return jsonError(c, 400, 'deviceId is required');
+
+  const sessionToken = bearerToken(c.req.header('Authorization')) ?? cookieValue(c.req.header('Cookie'), 'estatemate_session');
+  const sessionClaims = sessionToken ? await verifyJwt(c.env, sessionToken) : null;
+  let claims = sessionClaims && !sessionClaims.pendingGate ? sessionClaims : null;
+  if (!claims) {
+    if (!body.selectionToken) return jsonError(c, 400, 'selectionToken is required');
+    const pending = await verifyJwt(c.env, body.selectionToken);
+    if (!pending || !pending.pendingGate) return jsonError(c, 401, 'Gate selection has expired. Sign in again.');
+    claims = pending;
+  }
+
+  const user = await c.env.DB.prepare(
+    `SELECT id,name,email,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,property_id FROM users WHERE id=? AND status='active' AND (account_expires_at IS NULL OR datetime(account_expires_at)>datetime('now')) LIMIT 1`,
+  ).bind(claims.sub).first<AuthUser>();
+  if (!user) return jsonError(c, 401, 'User is inactive or no longer exists');
+  if (user.role !== 'security') return jsonError(c, 403, 'Only a Security officer selects a gate for a session');
+
+  const gate = (await assignedGates(c.env.DB, user.id)).find((device) => device.id === deviceId);
+  if (!gate) return jsonError(c, 403, 'You are not assigned to that gate');
+
+  const token = await signJwt(c.env, user, 60 * 60 * 12, { gate: deviceId });
+  c.header('Set-Cookie', `estatemate_session=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=43200`);
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE security_gate_sessions SET ended_at=datetime('now'),end_reason='replaced' WHERE security_user_id=? AND ended_at IS NULL`).bind(user.id),
+    c.env.DB.prepare(`INSERT INTO security_gate_sessions(id,security_user_id,device_id) VALUES (?,?,?)`).bind(crypto.randomUUID(), user.id, deviceId),
+  ]);
+  return c.json({ token, user, gate });
 });
 
 app.post('/api/auth/logout', (c) => {
@@ -336,7 +468,19 @@ app.post('/api/auth/logout', (c) => {
 
 app.use('/api/*', requireAuth);
 
-app.get('/api/auth/me', (c) => c.json({ user: c.get('user') }));
+app.get('/api/auth/me', async (c) => {
+  const deviceId = gateScope(c);
+  if (!deviceId) return c.json({ user: c.get('user'), gate: null });
+  const gate = await c.env.DB.prepare(
+    `SELECT id,name,gate_name,direction FROM hikvision_devices WHERE id=?`,
+  ).bind(deviceId).first<Record<string, string | null>>();
+  return c.json({ user: c.get('user'), gate: gate ?? null });
+});
+
+/** Gates the signed-in Security officer may work, for the "switch gate" control. */
+app.get('/api/auth/gates', requireRoles('security'), async (c) => {
+  return c.json({ items: await assignedGates(c.env.DB, c.get('user').id), selected: gateScope(c) });
+});
 
 app.post('/api/auth/change-password', async (c) => {
   const body = await c.req.json<{ currentPassword?: string; newPassword?: string }>();
@@ -1646,14 +1790,18 @@ app.get('/api/visitors', async (c) => {
   const user = c.get('user');
   const { limit, offset, page: pageNumber } = page(c);
   const residentId = user.role === 'resident' ? user.id : null;
+  // A guard posted at one gate sees passes valid there: either issued for every
+  // gate (gate_scope='both') or explicitly attached to their own device.
+  const scopedGate = gateScope(c);
   const result = await c.env.DB.prepare(
     `SELECT v.*,u.name AS resident_name,p.unit_number,p.street,d.name AS device_name,d.model AS device_model,d.profile_key,
        (SELECT COUNT(*) FROM stored_files sf WHERE sf.linked_entity_type='visitor_request' AND sf.linked_entity_id=v.id AND sf.status='active') AS proof_count
      FROM visitor_requests v JOIN users u ON u.id=v.resident_id
      LEFT JOIN properties p ON p.id=COALESCE(v.property_id,u.property_id)
      LEFT JOIN hikvision_devices d ON d.id=v.device_id
-     WHERE (? IS NULL OR v.resident_id=?) ORDER BY v.created_at DESC LIMIT ? OFFSET ?`,
-  ).bind(residentId, residentId, limit, offset).all();
+     WHERE (? IS NULL OR v.resident_id=?) AND (? IS NULL OR v.gate_scope='both' OR v.device_id=?)
+     ORDER BY v.created_at DESC LIMIT ? OFFSET ?`,
+  ).bind(residentId, residentId, scopedGate, scopedGate, limit, offset).all();
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
@@ -1731,6 +1879,15 @@ app.post('/api/visitors/scan', requireRoles('security','admin','manager'), async
   if (!visitor) {
     await c.env.DB.prepare(`INSERT INTO visitor_code_scans(id,scanned_by,source,scanned_value_masked,decision) VALUES (?,?,?,?,'invalid')`).bind(scanId,c.get('user').id,body.source ?? 'manual',maskedCredential(code)).run();
     return jsonError(c,404,'Visitor pass not found');
+  }
+  // A guard posted at one gate may only action a pass that belongs there. Passes
+  // issued for every gate (gate_scope='both') stay valid at all posts.
+  const scopedGate = gateScope(c);
+  if (scopedGate && visitor.gate_scope === 'gate' && visitor.device_id !== scopedGate) {
+    await c.env.DB.prepare(`INSERT INTO visitor_code_scans(id,visitor_request_id,scanned_by,source,scanned_value_masked,decision,note) VALUES (?,?,?,?,?,'invalid',?)`)
+      .bind(scanId,visitor.id,c.get('user').id,body.source ?? 'manual',maskedCredential(code),'Presented at a gate the pass was not issued for').run();
+    await audit(c,'gate_mismatch','visitor_pass',String(visitor.id),{ scanId,scopedGate,passDeviceId:visitor.device_id });
+    return jsonError(c,403,'This pass was issued for a different gate. Direct the visitor to that gate.');
   }
   const timeZone=await estateTimeZone(c.env.DB);
   const evaluation=evaluateVisitorPass(visitor,timeZone);
@@ -2182,6 +2339,53 @@ app.delete('/api/access/card-scan-sessions/:id', requireRoles('admin','manager')
   return c.json({ ok:true });
 });
 
+/**
+ * Searchable people picker used when issuing an access card.
+ *
+ * Returns active main residents and active household members (dependants) in one
+ * list so an Administrator or Manager picks a real person instead of pasting an
+ * id. `kind` says which field to submit: `residentId` for a main resident,
+ * `householdMemberId` for a dependant.
+ */
+app.get('/api/access/card-recipients', requireRoles('admin','manager'), async (c) => {
+  const search = `%${c.req.query('search')?.trim() ?? ''}%`;
+  const { limit } = page(c);
+  const residents = await c.env.DB.prepare(
+    `SELECT u.id,u.name,u.email,u.phone,
+       (SELECT GROUP_CONCAT(p.unit_number,', ') FROM property_ownerships po JOIN properties p ON p.id=po.property_id WHERE po.resident_id=u.id AND po.status='active') AS owned_units,
+       (SELECT GROUP_CONCAT(tp.unit_number,', ') FROM property_tenancies t JOIN properties tp ON tp.id=t.property_id WHERE t.tenant_id=u.id AND t.status='active') AS rented_units
+     FROM users u
+     WHERE u.role='resident' AND u.status='active' AND (u.name LIKE ? OR u.email LIKE ? OR COALESCE(u.phone,'') LIKE ?
+       OR EXISTS (SELECT 1 FROM property_ownerships po JOIN properties p ON p.id=po.property_id WHERE po.resident_id=u.id AND po.status='active' AND p.unit_number LIKE ?)
+       OR EXISTS (SELECT 1 FROM property_tenancies t JOIN properties p ON p.id=t.property_id WHERE t.tenant_id=u.id AND t.status='active' AND p.unit_number LIKE ?))
+     ORDER BY u.name LIMIT ?`,
+  ).bind(search,search,search,search,search,limit).all<Record<string,string|null>>();
+  const members = await c.env.DB.prepare(
+    `SELECT h.id,h.name,h.relationship,COALESCE(h.phone,'') AS phone,p.unit_number,p.street,primary_user.name AS primary_resident_name
+     FROM household_members h JOIN properties p ON p.id=h.property_id
+     JOIN users primary_user ON primary_user.id=h.primary_resident_id
+     WHERE h.status='active' AND (h.name LIKE ? OR COALESCE(h.phone,'') LIKE ? OR primary_user.name LIKE ? OR p.unit_number LIKE ?)
+     ORDER BY h.name LIMIT ?`,
+  ).bind(search,search,search,search,limit).all<Record<string,string|null>>();
+  const items = [
+    ...residents.results.map((row) => ({
+      kind: 'resident',
+      id: row.id,
+      name: row.name,
+      detail: [row.owned_units ? `Owns ${row.owned_units}` : null, row.rented_units ? `Rents ${row.rented_units}` : null].filter(Boolean).join(' · ') || 'Main resident',
+      meta: row.email,
+    })),
+    ...members.results.map((row) => ({
+      kind: 'household_member',
+      id: row.id,
+      name: row.name,
+      detail: `Dependant (${row.relationship}) of ${row.primary_resident_name}`,
+      meta: [row.unit_number, row.street].filter(Boolean).join(' — '),
+    })),
+  ].sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  return c.json({ items, limit });
+});
+
 app.get('/api/access/cards', async (c) => {
   const user = c.get('user');
   const { limit, offset, page: pageNumber } = page(c);
@@ -2239,7 +2443,9 @@ app.get('/api/access/events', async (c) => {
   const { limit, offset, page: pageNumber } = page(c);
   const residentId = user.role === 'resident' ? user.id : (c.req.query('residentId') ?? null);
   const resultFilter = c.req.query('result') ?? null;
-  const deviceId = c.req.query('deviceId') ?? null;
+  // A gate-scoped Security session only ever sees its own gate, whatever
+  // deviceId filter the client asked for.
+  const deviceId = gateScope(c) ?? (c.req.query('deviceId') ?? null);
   const result = await c.env.DB.prepare(
     `SELECT e.*,d.name AS device_name,ap.name AS access_point_name,u.name AS resident_name,hm.name AS household_member_name,hm.relationship,
        v.visitor_name,v.status AS visitor_status
@@ -2279,7 +2485,8 @@ app.get('/api/access/profiles', requireRoles('admin','manager','security'), (c) 
 }));
 
 app.get('/api/access/device-options', async (c) => {
-  const devices=await c.env.DB.prepare(`SELECT id,name,vendor,model,gate_name,direction,profile_key,connection_pattern,status FROM hikvision_devices WHERE deleted_at IS NULL AND status!='disabled' ORDER BY gate_name,name`).all<Record<string,string|null>>();
+  const scopedGate = gateScope(c);
+  const devices=await c.env.DB.prepare(`SELECT id,name,vendor,model,gate_name,direction,profile_key,connection_pattern,status FROM hikvision_devices WHERE deleted_at IS NULL AND status!='disabled' AND (? IS NULL OR id=?) ORDER BY gate_name,name`).bind(scopedGate,scopedGate).all<Record<string,string|null>>();
   return c.json({ items:devices.results.map((device) => {
     const profile=getHikvisionProfile(device.profile_key);
     return { ...device,authenticationMethods:profile.authenticationMethods,supportsQr:profile.authenticationMethods.includes('QR'),supportsPin:profile.authenticationMethods.includes('PIN') };
@@ -2287,6 +2494,8 @@ app.get('/api/access/device-options', async (c) => {
 });
 
 app.get('/api/access/devices', requireRoles('admin','manager','security'), async (c) => {
+  // A gate-scoped Security session manages only the terminal they are posted at.
+  const scopedGate = gateScope(c);
   const devices = await c.env.DB.prepare(
     `SELECT d.id,d.name,d.vendor,d.serial_number,d.model,d.firmware,d.mac_address,d.gate_name,d.direction,d.integration_mode,d.status,d.last_seen_at,d.profile_key,d.connection_pattern,d.profile_config_json,d.capabilities_json,
       d.isapi_agent_id,d.isapi_sync_enabled,d.last_isapi_sync_at,d.last_isapi_sync_status,d.isapi_host,d.isapi_port,d.isapi_username,
@@ -2296,8 +2505,9 @@ app.get('/api/access/devices', requireRoles('admin','manager','security'), async
       (SELECT COUNT(*) FROM device_operations o WHERE o.device_id=d.id AND o.status='manual_action_required') AS pending_operations,
       (SELECT COUNT(*) FROM device_operations o WHERE o.device_id=d.id AND o.status IN ('pending','sent','failed')) AS queued_operations,
       (SELECT a.name FROM isapi_agents a WHERE a.id=d.isapi_agent_id AND a.deleted_at IS NULL) AS isapi_agent_name
-     FROM hikvision_devices d LEFT JOIN access_points ap ON ap.device_id=d.id WHERE d.deleted_at IS NULL ORDER BY d.created_at DESC`,
-  ).all();
+     FROM hikvision_devices d LEFT JOIN access_points ap ON ap.device_id=d.id
+     WHERE d.deleted_at IS NULL AND (? IS NULL OR d.id=?) ORDER BY d.created_at DESC`,
+  ).bind(scopedGate, scopedGate).all();
   return c.json({ items: devices.results, mode: c.env.HIKVISION_MODE });
 });
 
@@ -2373,9 +2583,92 @@ app.delete('/api/access/devices/:id', requireRoles('admin','manager'), async (c)
     c.env.DB.prepare(`UPDATE access_points SET enabled=0,updated_at=datetime('now') WHERE device_id=?`).bind(existing.id),
     c.env.DB.prepare(`UPDATE device_credentials SET revoked_at=datetime('now') WHERE device_id=? AND revoked_at IS NULL`).bind(existing.id),
     c.env.DB.prepare(`UPDATE credential_scan_sessions SET status='cancelled',updated_at=datetime('now') WHERE device_id=? AND status IN ('waiting','captured')`).bind(existing.id),
+    // A retired gate can no longer be selected for a shift.
+    c.env.DB.prepare(`UPDATE security_gate_assignments SET active=0,updated_at=datetime('now') WHERE device_id=?`).bind(existing.id),
+    c.env.DB.prepare(`UPDATE security_gate_sessions SET ended_at=datetime('now'),end_reason='device_retired' WHERE device_id=? AND ended_at IS NULL`).bind(existing.id),
   ]);
   await audit(c,'delete','access_device',existing.id,{ name:existing.name,mode:'soft-delete-history-preserved' });
   return c.json({ ok:true,historyPreserved:true });
+});
+
+/**
+ * Security gate assignments: which gates an officer may be posted at.
+ * Assigning a guard to a post is an operational task, so Managers may do it too.
+ */
+app.get('/api/security/gate-assignments', requireRoles('admin','manager'), async (c) => {
+  const result = await c.env.DB.prepare(
+    `SELECT a.id,a.security_user_id,a.device_id,a.note,a.active,a.created_at,a.updated_at,
+       u.name AS security_name,u.email AS security_email,u.status AS security_status,
+       d.name AS device_name,d.gate_name,d.direction,d.status AS device_status,d.deleted_at AS device_deleted_at,
+       assigner.name AS assigned_by_name
+     FROM security_gate_assignments a
+     JOIN users u ON u.id=a.security_user_id
+     JOIN hikvision_devices d ON d.id=a.device_id
+     LEFT JOIN users assigner ON assigner.id=a.assigned_by
+     ORDER BY a.active DESC,u.name,d.gate_name`,
+  ).all();
+  return c.json({ items: result.results });
+});
+
+app.post('/api/security/gate-assignments', requireRoles('admin','manager'), async (c) => {
+  const body = await c.req.json<{ securityUserId?: string; deviceId?: string; note?: string }>();
+  const securityUserId = body.securityUserId?.trim();
+  const deviceId = body.deviceId?.trim();
+  if (!securityUserId || !deviceId) return jsonError(c,400,'securityUserId and deviceId are required');
+  const officer = await c.env.DB.prepare(
+    `SELECT id,name FROM users WHERE id=? AND status='active' AND role='security' AND is_manager=0`,
+  ).bind(securityUserId).first<{ id:string;name:string }>();
+  if (!officer) return jsonError(c,404,'Active Security account not found');
+  const device = await c.env.DB.prepare(
+    `SELECT id,name FROM hikvision_devices WHERE id=? AND deleted_at IS NULL AND status!='disabled'`,
+  ).bind(deviceId).first<{ id:string;name:string }>();
+  if (!device) return jsonError(c,404,'Active access-control device not found');
+  const id = crypto.randomUUID();
+  // Re-assigning a previously removed post reactivates the original row so the
+  // UNIQUE(security_user_id,device_id) history stays one row per pairing.
+  await c.env.DB.prepare(
+    `INSERT INTO security_gate_assignments(id,security_user_id,device_id,note,assigned_by) VALUES (?,?,?,?,?)
+     ON CONFLICT(security_user_id,device_id) DO UPDATE SET active=1,note=excluded.note,assigned_by=excluded.assigned_by,updated_at=datetime('now')`,
+  ).bind(id,securityUserId,deviceId,body.note?.trim() ?? null,c.get('user').id).run();
+  // On the upsert path the surviving row keeps its original id, so read it back
+  // rather than returning an id that does not exist.
+  const saved = await c.env.DB.prepare(
+    `SELECT id FROM security_gate_assignments WHERE security_user_id=? AND device_id=?`,
+  ).bind(securityUserId,deviceId).first<{ id: string }>();
+  const assignmentId = saved?.id ?? id;
+  await audit(c,'assign_gate','security_gate_assignment',assignmentId,{ securityUserId,deviceId,note:body.note?.trim() ?? null });
+  return c.json({ id:assignmentId,securityUserId,deviceId },201);
+});
+
+app.delete('/api/security/gate-assignments/:id', requireRoles('admin','manager'), async (c) => {
+  const id = c.req.param('id');
+  const existing = await c.env.DB.prepare(
+    `SELECT security_user_id,device_id FROM security_gate_assignments WHERE id=? AND active=1`,
+  ).bind(id).first<Record<string,string>>();
+  if (!existing) return jsonError(c,404,'Active gate assignment not found');
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE security_gate_assignments SET active=0,updated_at=datetime('now') WHERE id=?`).bind(id),
+    c.env.DB.prepare(`UPDATE security_gate_sessions SET ended_at=datetime('now'),end_reason='assignment_removed' WHERE security_user_id=? AND device_id=? AND ended_at IS NULL`)
+      .bind(existing.security_user_id,existing.device_id),
+  ]);
+  await audit(c,'unassign_gate','security_gate_assignment',id,existing);
+  return c.json({ ok:true });
+});
+
+/** Shift history: which gate each officer selected, for coverage disputes. */
+app.get('/api/security/gate-sessions', requireRoles('admin','manager','security'), async (c) => {
+  const user = c.get('user');
+  // An officer sees only their own shifts; administrators and Managers see all.
+  const onlyOwn = user.role === 'security' ? user.id : (c.req.query('securityUserId') ?? null);
+  const { limit, offset, page: pageNumber } = page(c);
+  const result = await c.env.DB.prepare(
+    `SELECT s.id,s.security_user_id,s.device_id,s.started_at,s.ended_at,s.end_reason,
+       u.name AS security_name,d.name AS device_name,d.gate_name
+     FROM security_gate_sessions s JOIN users u ON u.id=s.security_user_id
+     JOIN hikvision_devices d ON d.id=s.device_id
+     WHERE (? IS NULL OR s.security_user_id=?) ORDER BY s.started_at DESC LIMIT ? OFFSET ?`,
+  ).bind(onlyOwn,onlyOwn,limit,offset).all();
+  return c.json({ items: result.results, page: pageNumber, limit });
 });
 
 
@@ -2812,6 +3105,7 @@ app.put('/api/portal-config', requireRoles('admin'), async (c) => {
     if (key === 'theme_corner_style' && !['compact','comfortable','rounded'].includes(value)) return jsonError(c,400,'Invalid corner style');
     if (key === 'visitor_gate_policy' && value !== 'security_approval') return jsonError(c,400,'Security approval is the configured visitor gate policy');
     if (['visitor_default_duration_hours','card_scan_timeout_minutes'].includes(key) && (!/^\d{1,3}$/.test(value) || Number(value)<1)) return jsonError(c,400,`${key} must be a positive number`);
+    if (BOOLEAN_SETTING_KEYS.includes(key) && !['true','false'].includes(value)) return jsonError(c,400,`${key} must be true or false`);
   }
   await c.env.DB.batch(entries.map(([key,value]) => c.env.DB.prepare(
     `INSERT INTO settings(key,value,updated_by,updated_at) VALUES (?,?,?,datetime('now'))

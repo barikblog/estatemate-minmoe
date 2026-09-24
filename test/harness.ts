@@ -210,6 +210,8 @@ export interface ApiResponse {
   status: number;
   json: Record<string, unknown>;
   text: string;
+  /** Set-Cookie header, exposed so tests can assert when no session is issued. */
+  setCookie: string | null;
 }
 
 export async function call(
@@ -233,5 +235,10 @@ export async function call(
   const text = await response.text();
   let json: unknown = null;
   try { json = JSON.parse(text); } catch { /* non-JSON responses stay in `text` */ }
-  return { status: response.status, json: (json ?? {}) as Record<string, unknown>, text };
+  return {
+    status: response.status,
+    json: (json ?? {}) as Record<string, unknown>,
+    text,
+    setCookie: response.headers.get('Set-Cookie'),
+  };
 }

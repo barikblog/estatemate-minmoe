@@ -250,3 +250,42 @@ export async function downloadFromPrivateGitHub(
     },
   });
 }
+
+const PORTAL_BRANDING_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+
+/**
+ * Serves the estate gate welcome image chosen by an Administrator.
+ *
+ * This is deliberately readable without a session: the login screen renders
+ * before anyone is authenticated, so the gate photograph has to be reachable
+ * anonymously. Safety comes from what can be published rather than who asks —
+ * only a file explicitly uploaded under the `portal-branding` category, with an
+ * image content type, and still referenced by `portal_gate_image_key` is ever
+ * returned. Proof uploads, imports and every other category remain behind the
+ * authenticated `/api/files/*` route.
+ */
+export async function downloadPortalBrandingImage(env: Env, storageKey: string): Promise<Response | null> {
+  if (!storageKey) return null;
+  const file = await env.DB.prepare(
+    `SELECT storage_key,github_owner,github_repository,github_branch,github_path,original_name,content_type,size_bytes
+     FROM stored_files
+     WHERE storage_key=? AND status='active' AND category='portal-branding'`,
+  ).bind(storageKey).first<{ storage_key: string; github_owner: string; github_repository: string; github_branch: string; github_path: string; original_name: string; content_type: string; size_bytes: number }>();
+  if (!file || !PORTAL_BRANDING_IMAGE_TYPES.has(file.content_type)) return null;
+  const config = await activeStorageConfig(env);
+  const response = await fetch(`${repoUrl({ owner: file.github_owner, repository: file.github_repository }, `/contents/${contentPath(file.github_path)}`)}?ref=${encodeURIComponent(file.github_branch)}`, {
+    headers: githubHeaders(config.token, 'application/vnd.github.raw+json'),
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`GitHub storage download failed (${response.status})`);
+  return new Response(response.body, {
+    headers: {
+      'Content-Type': file.content_type,
+      'Content-Length': String(file.size_bytes),
+      // Rendered inline as a page backdrop, not offered as a download.
+      'Content-Disposition': 'inline',
+      'Cache-Control': 'public, max-age=300',
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
+}

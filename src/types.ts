@@ -28,6 +28,17 @@ export interface JwtClaims {
   sub: string;
   role: Role;
   name: string;
+  /**
+   * Device id of the gate a Security officer selected for this session. Only
+   * ever set for `security`; every other role stays unscoped.
+   */
+  gate?: string | null;
+  /**
+   * Marks a short-lived gate-selection token. Such a token may only be
+   * exchanged for a real session through POST /api/auth/select-gate and is
+   * rejected by the normal authentication middleware.
+   */
+  pendingGate?: boolean;
   iat: number;
   exp: number;
 }
@@ -77,5 +88,7 @@ export function flattenQueuePayload(body: AccessEventQueuePayload): NormalizedAc
 
 export interface AppVariables {
   user: AuthUser;
+  /** Gate (device id) the current Security session is scoped to, else null. */
+  sessionGate: string | null;
   device: DeviceIdentity;
 }

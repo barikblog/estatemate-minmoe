@@ -9,7 +9,37 @@ import retrofit2.http.Path
 import retrofit2.http.Query
 
 data class LoginRequest(val email: String, val password: String)
-data class LoginResponse(val token: String, val user: UserDto)
+
+/**
+ * A Security officer with assigned gates does not receive a session from login.
+ * The Worker instead returns [requiresGateSelection] with the [gates] they may
+ * work and a short-lived [selectionToken] to exchange through selectGate.
+ *
+ * [token] is therefore nullable: Gson does not enforce Kotlin nullability, so a
+ * missing field would otherwise arrive as null behind a non-null type and be
+ * stored as an absent session, making every later call fail with 401.
+ */
+data class LoginResponse(
+    val token: String?,
+    val user: UserDto,
+    @SerializedName("requiresGateSelection") val requiresGateSelection: Boolean?,
+    @SerializedName("selectionToken") val selectionToken: String?,
+    val gates: List<GateDto>?,
+)
+
+data class GateDto(
+    val id: String,
+    val name: String?,
+    @SerializedName("gate_name") val gateName: String?,
+    val direction: String?,
+)
+
+data class SelectGateRequest(
+    @SerializedName("selectionToken") val selectionToken: String,
+    @SerializedName("deviceId") val deviceId: String,
+)
+
+data class SelectGateResponse(val token: String, val user: UserDto, val gate: GateDto?)
 data class UserDto(
     val id: String,
     val name: String,
@@ -129,6 +159,9 @@ data class HouseholdActionBody(val action: String, val canCreateVisitors: Boolea
 interface EstateMateApi {
     @POST("api/auth/login")
     suspend fun login(@Body request: LoginRequest): LoginResponse
+
+    @POST("api/auth/select-gate")
+    suspend fun selectGate(@Body request: SelectGateRequest): SelectGateResponse
 
     @GET("api/auth/me")
     suspend fun me(): MeResponse

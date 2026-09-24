@@ -1,4 +1,4 @@
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { CSSProperties, FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, ListResponse, User, api, money, readableDate } from './api';
 import type { PassShareSource } from './pass-export';
 import { exportRecordsToExcel, exportRecordsToPdf } from './records-export';
@@ -13,7 +13,31 @@ const defaultPortalConfig: PortalConfig = {
   portal_welcome_text:'Manage residents, visitors, accounts and gate access from a single, secure workspace.',theme_mode:'light',
   theme_primary_color:'#1769e0',theme_accent_color:'#35d07f',theme_navigation_color:'#0d1b37',theme_surface_color:'#ffffff',
   theme_corner_style:'comfortable',currency:'NGN',estate_timezone:'Africa/Lagos',visitor_default_duration_hours:'8',visitor_gate_policy:'security_approval',
+  portal_gate_image_key:'',portal_gate_image_caption:'',portal_gate_image_enabled:'false',
 };
+
+/**
+ * URL of the administrator-published estate gate photograph, or null when none is
+ * configured. The route is unauthenticated because the login screen has to show
+ * it before anyone signs in.
+ */
+function gateImageUrl(config: PortalConfig): string | null {
+  return config.portal_gate_image_enabled === 'true' && config.portal_gate_image_key ? '/api/portal-gate-image' : null;
+}
+
+/**
+ * Layered backdrop for the estate gate photograph. A dark scrim sits over the
+ * image so the welcome text stays legible whatever an administrator uploads.
+ */
+function gateImageStyle(url: string | null): CSSProperties | undefined {
+  if (!url) return undefined;
+  return {
+    backgroundImage: `linear-gradient(158deg, rgba(6,20,44,.9), rgba(9,32,70,.66) 46%, rgba(11,45,104,.55)), url(${url})`,
+    backgroundSize: 'auto, cover',
+    backgroundPosition: 'center',
+    backgroundRepeat: 'no-repeat',
+  };
+}
 
 function applyPortalTheme(config: PortalConfig) {
   const root=document.documentElement;
@@ -75,32 +99,123 @@ function PortalFooter({ portalName }: { portalName?:string }) {
   </footer>;
 }
 
-function Login({ onLogin, config }: { onLogin: (user: User) => void; config:PortalConfig }) {
+/**
+ * Second step of a Security sign-in: the officer picks which of their assigned
+ * gates they are working, and that choice scopes the whole session.
+ */
+function GatePicker({ config, gates, officerName, selectionToken, onSelected, onBack }: {
+  config: PortalConfig;
+  gates: Row[];
+  officerName: string;
+  selectionToken: string;
+  onSelected: (user: User, gate: Row) => void;
+  onBack: () => void;
+}) {
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState('');
+  const image = gateImageUrl(config);
+
+  async function choose(deviceId: string) {
+    setBusy(deviceId); setError('');
+    try {
+      const result = await api<{ user: User; gate: Row }>('/api/auth/select-gate', {
+        method: 'POST',
+        body: JSON.stringify({ selectionToken, deviceId }),
+      });
+      onSelected(result.user, result.gate);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not start your shift');
+      setBusy('');
+    }
+  }
+
+  return <main className="auth-shell">
+    <section className={image ? 'auth-panel brand-panel has-gate-image' : 'auth-panel brand-panel'} style={gateImageStyle(image)}>
+      <div className="brand-copy">
+        <div className="brand-mark">{config.portal_short_name}</div>
+        <p className="eyebrow">{config.portal_tagline}</p>
+        <h1>Welcome to<br />{config.portal_name}.</h1>
+        <p className="auth-intro">{config.portal_welcome_text}</p>
+        {image && config.portal_gate_image_caption && <p className="gate-image-caption">{config.portal_gate_image_caption}</p>}
+        <div className="brand-proof"><span className="pulse-dot" /> Cloud and gate operations connected</div>
+      </div>
+    </section>
+    <section className="auth-panel form-panel">
+      {image && <div className="mobile-gate-banner" style={gateImageStyle(image)}>{config.portal_gate_image_caption || `${config.estate_name} gate`}</div>}
+      <div className="login-card">
+        <span className="mini-logo">{config.portal_short_name}</span>
+        <h2>Select your gate</h2>
+        <p>{officerName.split(' ')[0]}, which gate are you posted at for this session? Your visitor queue, gate activity and device list are limited to that post.</p>
+        {error && <Notice tone="error">{error}</Notice>}
+        <div className="gate-choice-list">
+          {gates.map((gate) => {
+            const id = String(gate.id);
+            return <button key={id} type="button" className="gate-choice" disabled={Boolean(busy)} onClick={() => choose(id)}>
+              <strong>{String(gate.gate_name || gate.name)}</strong>
+              <small>{String(gate.name)} · {String(gate.direction)}{gate.model ? ` · ${String(gate.model)}` : ''}</small>
+              {busy === id && <span className="gate-choice-busy">Starting shift…</span>}
+            </button>;
+          })}
+        </div>
+        <button type="button" className="text" onClick={onBack}>← Sign in as someone else</button>
+      </div>
+      <PortalFooter portalName={config.portal_name} />
+    </section>
+  </main>;
+}
+
+function Login({ onLogin, config }: { onLogin: (user: User, gate?: Row | null) => void; config:PortalConfig }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [gateStep, setGateStep] = useState<{ gates: Row[]; selectionToken: string; officerName: string } | null>(null);
+  const image = gateImageUrl(config);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
     setLoading(true); setError('');
     try {
-      const result = await api<{ user: User }>('/api/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
-      onLogin(result.user);
+      const result = await api<{
+        user: User;
+        requiresGateSelection?: boolean;
+        gates?: Row[];
+        selectionToken?: string;
+      }>('/api/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
+      // A Security officer with assigned gates must choose one before a session
+      // cookie is issued, so the API hands back a short-lived selection token.
+      if (result.requiresGateSelection && result.gates?.length && result.selectionToken) {
+        setGateStep({ gates: result.gates, selectionToken: result.selectionToken, officerName: result.user.name });
+        return;
+      }
+      onLogin(result.user, null);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Login failed');
     } finally { setLoading(false); }
   }
 
+  if (gateStep) return <GatePicker
+    config={config}
+    gates={gateStep.gates}
+    officerName={gateStep.officerName}
+    selectionToken={gateStep.selectionToken}
+    onSelected={(user, gate) => onLogin(user, gate)}
+    onBack={() => { setGateStep(null); setPassword(''); setError(''); }}
+  />;
+
   return <main className="auth-shell">
-    <section className="auth-panel brand-panel">
-      <div className="brand-mark">{config.portal_short_name}</div>
-      <p className="eyebrow">{config.portal_tagline}</p>
-      <h1>Welcome to<br />{config.portal_name}.</h1>
-      <p className="auth-intro">{config.portal_welcome_text}</p>
-      <div className="brand-proof"><span className="pulse-dot" /> Cloud and gate operations connected</div>
+    <section className={image ? 'auth-panel brand-panel has-gate-image' : 'auth-panel brand-panel'} style={gateImageStyle(image)}>
+      <div className="brand-copy">
+        <div className="brand-mark">{config.portal_short_name}</div>
+        <p className="eyebrow">{config.portal_tagline}</p>
+        <h1>Welcome to<br />{config.portal_name}.</h1>
+        <p className="auth-intro">{config.portal_welcome_text}</p>
+        {image && config.portal_gate_image_caption && <p className="gate-image-caption">{config.portal_gate_image_caption}</p>}
+        <div className="brand-proof"><span className="pulse-dot" /> Cloud and gate operations connected</div>
+      </div>
     </section>
     <section className="auth-panel form-panel">
+      {image && <div className="mobile-gate-banner" style={gateImageStyle(image)}>{config.portal_gate_image_caption || `${config.estate_name} gate`}</div>}
       <form className="login-card" onSubmit={submit}>
         <span className="mini-logo">{config.portal_short_name}</span>
         <h2>Sign in</h2>
@@ -135,8 +250,47 @@ function EstateNoticePopup({ notice, remaining, onAcknowledge }: { notice: Row; 
   </div>;
 }
 
+/** Lets a signed-in Security officer move to another assigned gate mid-shift. */
+function SwitchGateDialog({ current, onSwitched, onClose }: { current: Row | null; onSwitched: (gate: Row) => void; onClose: () => void }) {
+  const gates = useAsync<{ items: Row[]; selected: string | null }>(() => api('/api/auth/gates'), []);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState('');
+  async function choose(deviceId: string) {
+    setBusy(deviceId); setError('');
+    try {
+      const result = await api<{ gate: Row }>('/api/auth/select-gate', { method: 'POST', body: JSON.stringify({ deviceId }) });
+      onSwitched(result.gate);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not switch gate'); setBusy(''); }
+  }
+  return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="switch-gate-title">
+    <section className="notice-modal">
+      <p className="eyebrow">SHIFT POST</p>
+      <h2 id="switch-gate-title">Switch gate</h2>
+      <p className="notice-body">Choose the gate you are now posted at. Your visitor queue and gate activity follow this selection.</p>
+      {error && <Notice tone="error">{error}</Notice>}
+      {gates.error && <Notice tone="error">{gates.error}</Notice>}
+      {gates.loading && <Loading />}
+      <div className="gate-choice-list">
+        {(gates.data?.items ?? []).map((item) => {
+          const id = String(item.id);
+          const active = String(current?.id ?? '') === id;
+          return <button key={id} type="button" className={active ? 'gate-choice current' : 'gate-choice'} disabled={Boolean(busy)} onClick={() => choose(id)}>
+            <strong>{String(item.gate_name || item.name)}</strong>
+            <small>{String(item.name)} · {String(item.direction)}</small>
+            {active && <span className="gate-choice-current">Current post</span>}
+            {busy === id && <span className="gate-choice-busy">Switching…</span>}
+          </button>;
+        })}
+      </div>
+      <button type="button" className="secondary wide" onClick={onClose}>Close</button>
+    </section>
+  </div>;
+}
+
 function App() {
   const [user, setUser] = useState<User | null>(null);
+  const [gate, setGate] = useState<Row | null>(null);
+  const [switchingGate, setSwitchingGate] = useState(false);
   const [section, setSection] = useState<Section>('dashboard');
   const [checking, setChecking] = useState(true);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -145,7 +299,9 @@ function App() {
 
   useEffect(() => {
     api<PortalConfig>('/api/portal-config').then((value) => { const merged={ ...defaultPortalConfig,...value };setPortalConfig(merged);applyPortalTheme(merged); }).catch(() => applyPortalTheme(defaultPortalConfig));
-    api<{ user: User }>('/api/auth/me').then((result) => setUser(result.user)).catch(() => setUser(null)).finally(() => setChecking(false));
+    // A refreshed Security session keeps its selected gate because the gate is a
+    // claim on the session token, echoed back here.
+    api<{ user: User; gate?: Row | null }>('/api/auth/me').then((result) => { setUser(result.user); setGate(result.gate ?? null); }).catch(() => setUser(null)).finally(() => setChecking(false));
   }, []);
 
   useEffect(() => {
@@ -169,6 +325,8 @@ function App() {
   async function logout() {
     await api('/api/auth/logout', { method: 'POST' });
     setUser(null);
+    setGate(null);
+    setSwitchingGate(false);
     setSection('dashboard');
     setMenuOpen(false);
   }
@@ -182,7 +340,7 @@ function App() {
   }
 
   if (checking) return <div className="splash"><div className="brand-mark">{portalConfig.portal_short_name}</div><span>Loading {portalConfig.portal_name}…</span></div>;
-  if (!user) return <Login onLogin={setUser} config={portalConfig} />;
+  if (!user) return <Login config={portalConfig} onLogin={(nextUser, nextGate) => { setUser(nextUser); setGate(nextGate ?? null); }} />;
 
   const availableNav = navItems.filter((item) => !item.roles || item.roles.includes(user.role));
   const current = availableNav.find((item) => item.id === section) ?? availableNav[0]!;
@@ -196,16 +354,19 @@ function App() {
     </aside>
     {menuOpen && <button className="scrim" aria-label="Close menu" onClick={() => setMenuOpen(false)} />}
     <main className="workspace">
-      <header className="topbar"><button className="icon-button mobile-menu" onClick={() => setMenuOpen(true)}>☰</button><div><p className="eyebrow">{user.role} workspace</p><h1>{current.label}</h1></div><div className="top-status"><span className="pulse-dot" /> System online</div></header>
-      <div className="content"><SectionView section={current.id} user={user} onNavigate={setSection} /><PortalFooter portalName={portalConfig.portal_name} /></div>
+      <header className="topbar"><button className="icon-button mobile-menu" onClick={() => setMenuOpen(true)}>☰</button><div><p className="eyebrow">{user.role} workspace</p><h1>{current.label}</h1></div>
+        {user.role === 'security' && gate && <button type="button" className="gate-chip" title="Change the gate you are posted at" onClick={() => setSwitchingGate(true)}>🚪 {String(gate.gate_name || gate.name)}<span>switch</span></button>}
+        <div className="top-status"><span className="pulse-dot" /> System online</div></header>
+      <div className="content"><SectionView section={current.id} user={user} config={portalConfig} gate={gate} onNavigate={setSection} /><PortalFooter portalName={portalConfig.portal_name} /></div>
     </main>
     {popupNotices[0] && <EstateNoticePopup notice={popupNotices[0]} remaining={popupNotices.length - 1} onAcknowledge={acknowledgePopup} />}
+    {switchingGate && <SwitchGateDialog current={gate} onSwitched={(next) => { setGate(next); setSwitchingGate(false); setSection('dashboard'); }} onClose={() => setSwitchingGate(false)} />}
   </div>;
 }
 
-function SectionView({ section, user, onNavigate }: { section: Section; user: User; onNavigate?: (s: Section) => void }) {
+function SectionView({ section, user, config, gate, onNavigate }: { section: Section; user: User; config: PortalConfig; gate: Row | null; onNavigate?: (s: Section) => void }) {
   switch (section) {
-    case 'dashboard': return <Dashboard user={user} onNavigate={onNavigate} />;
+    case 'dashboard': return <Dashboard user={user} config={config} gate={gate} onNavigate={onNavigate} />;
     case 'residents': return <People user={user} />;
     case 'properties': return <Properties user={user} />;
     case 'residency': return <Residency user={user} />;
@@ -223,11 +384,45 @@ function SectionView({ section, user, onNavigate }: { section: Section; user: Us
   }
 }
 
-function Dashboard({ user, onNavigate }: { user: User; onNavigate?: (s: Section) => void }) {
+/**
+ * Administrator guidance for terminating access, kept in the portal because the
+ * person offboarding a resident is usually at the gate desk rather than reading
+ * docs. Terminating access is a chain; skipping a step leaves a way in.
+ */
+const TERMINATION_STEPS: Array<{ title: string; body: string; actionLabel: string; section: Section }> = [
+  { title: 'Revoke or suspend the access card', body: 'Open Access cards, find the person, then Suspend for a temporary stop. EstateMate queues the matching disable-card hardware action for every linked device, and records the change in the card status history.', actionLabel: 'Open Access cards', section: 'cards' },
+  { title: 'Deactivate dependants and household members', body: 'A spouse, child, relative or domestic staff member keeps gate access through their household membership. Under Tenancy & household, deactivate the member so any card issued to them stops working.', actionLabel: 'Open Tenancy & household', section: 'residency' },
+  { title: 'End the tenancy or the resident account', body: 'Ending a tenancy removes the right to occupy; deactivating the account under People removes the login. Do both when someone moves out. Ownership, billing, card, visitor and gate-event history is preserved either way.', actionLabel: 'Open People', section: 'residents' },
+  { title: 'Cancel that household’s live visitor passes', body: 'Reject any pending or checked-in pass issued by the departing household, so a visitor cannot still use an invitation that no longer holds.', actionLabel: 'Open Visitors', section: 'visitors' },
+  { title: 'Retire the gate terminal itself', body: 'Under Access-control devices, disable or delete the device. It is soft-deleted so historical gate events keep their reference, and Security officers assigned to that post must select a different gate at their next login.', actionLabel: 'Open devices', section: 'devices' },
+  { title: 'Confirm the hardware action actually cleared', body: 'Terminating in EstateMate is not enough — the terminal has to agree. Open Hardware actions and mark each queued disable or revoke as applied, or fix the failures. Until then the physical card can still open the gate.', actionLabel: 'Open Hardware actions', section: 'operations' },
+];
+
+function AccessTerminationGuide({ onNavigate }: { onNavigate?: (s: Section) => void }) {
+  const [open, setOpen] = useState(false);
+  return <section className="panel termination-guide">
+    <div className="panel-title">
+      <div><p className="eyebrow">ACCESS CONTROL</p><h3>How to terminate access</h3></div>
+      <button type="button" className="secondary sm" onClick={() => setOpen((value) => !value)} aria-expanded={open}>{open ? 'Hide steps' : 'Show steps'}</button>
+    </div>
+    <p>Work down the chain: the credential, the person, the pass, the terminal, and finally the hardware. Stopping at any earlier step leaves a way in.</p>
+    {open && <ol className="termination-steps">
+      {TERMINATION_STEPS.map((step, index) => <li key={step.title}>
+        <span className="step-number">{index + 1}</span>
+        <div><strong>{step.title}</strong><p>{step.body}</p>
+          {onNavigate && <button type="button" className="text" onClick={() => onNavigate(step.section)}>{step.actionLabel} →</button>}
+        </div>
+      </li>)}
+    </ol>}
+  </section>;
+}
+
+function Dashboard({ user, config, gate, onNavigate }: { user: User; config: PortalConfig; gate: Row | null; onNavigate?: (s: Section) => void }) {
   const { data, error, loading } = useAsync<Row>(() => api('/api/dashboard'), [user.id]);
   if (loading) return <Loading />;
   if (error) return <Notice tone="error">{error}</Notice>;
   const isOperator = user.role === 'admin' || user.role === 'manager';
+  const image = gateImageUrl(config);
   const openMaint = Number(nested(data, 'openMaintenance', 'count') ?? 0);
   const cards: Array<[string, unknown, string]> = user.role === 'resident'
     ? [
@@ -249,8 +444,20 @@ function Dashboard({ user, onNavigate }: { user: User; onNavigate?: (s: Section)
         {onNavigate && <button type="button" className="secondary sm" onClick={() => onNavigate('maintenance')}>View requests →</button>}
       </div>
     )}
-    <section className="hero-card"><div><p className="eyebrow">Estate operations</p><h2>Good day, {user.name.split(' ')[0]}.</h2><p>Here is the latest picture across your estate.</p></div><div className="hero-orb"><span>EM</span></div></section>
+    {user.role === 'security' && <Notice tone={gate ? 'success' : 'warning'}>{gate
+      ? <>Posted at <strong>{String(gate.gate_name || gate.name)}</strong> for this session. Your visitor queue, gate activity and device list are limited to this gate.</>
+      : <>No gate has been assigned to your account yet, so you can still see every gate. Ask an administrator to assign your post under Settings → Security gate assignments to lock each session to one gate.</>}</Notice>}
+    <section className={image ? 'hero-card has-gate-image' : 'hero-card'} style={gateImageStyle(image)}>
+      <div>
+        <p className="eyebrow">Estate operations</p>
+        <h2>Welcome, {user.name.split(' ')[0]}.</h2>
+        <p>Good day — here is the latest picture across {config.estate_name || config.portal_name}.</p>
+        {image && config.portal_gate_image_caption && <p className="gate-image-caption">{config.portal_gate_image_caption}</p>}
+      </div>
+      <div className="hero-orb"><span>{config.portal_short_name || 'EM'}</span></div>
+    </section>
     <section className="stat-grid">{cards.map(([label, value, detail]) => <article className="stat-card" key={String(label)}><p>{label}</p><strong>{String(value ?? 0)}</strong><small>{detail}</small></article>)}</section>
+    {isOperator && <AccessTerminationGuide onNavigate={onNavigate} />}
     {user.role === 'resident' && Boolean(data?.latestNotice) && <section className="panel"><div className="panel-title"><div><p className="eyebrow">Latest estate notice</p><h3>{String((data?.latestNotice as Row).title)}</h3></div></div><p>{String((data?.latestNotice as Row).body)}</p></section>}
     {user.role !== 'resident' && <section className="split-grid"><article className="panel callout"><p className="eyebrow">HARDWARE MODE</p><h3>Direct MinMoe event upload</h3><p>Terminals post gate events straight to Cloudflare. Card changes remain in the hardware-action queue until a supported command channel is confirmed.</p></article><article className="panel"><p className="eyebrow">OPERATIONS TIP</p><h3>Check unresolved device actions</h3><p>HTTP Listening is upload-only on most firmware. Mark each manual terminal update as applied to preserve an accurate audit trail.</p></article></section>}
   </>;
@@ -1077,6 +1284,63 @@ function EstateNotices({ user }: { user: User }) {
   </PagePanel>;
 }
 
+interface CardRecipient { kind: 'resident' | 'household_member'; id: string; name: string; detail: string; meta: string | null }
+interface PickedPerson { kind: CardRecipient['kind']; id: string; name: string; detail: string }
+
+/**
+ * Searchable picker for the person a card is issued to.
+ *
+ * Replaces the old pair of raw "Main resident ID" / "Household member ID" text
+ * boxes: pasting an id was error-prone at the gate desk and failed silently when
+ * the id belonged to an inactive account. Search matches name, unit, email and
+ * phone across active residents and active household members at once.
+ */
+function PersonPicker({ picked, onPick }: { picked: PickedPerson | null; onPick: (next: PickedPerson | null) => void }) {
+  const [search, setSearch] = useState('');
+  const [debounced, setDebounced] = useState('');
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    const timer = setTimeout(() => setDebounced(search.trim()), 250);
+    return () => clearTimeout(timer);
+  }, [search]);
+  const results = useAsync<{ items: CardRecipient[] }>(
+    () => api(`/api/access/card-recipients?limit=25&search=${encodeURIComponent(debounced)}`),
+    [debounced],
+  );
+
+  if (picked) return <div className="person-picked">
+    <span className="avatar">{initials(picked.name)}</span>
+    <div><strong>{picked.name}</strong><small>{picked.kind === 'resident' ? 'Main resident' : 'Household member (dependant)'} · {picked.detail}</small></div>
+    <button type="button" className="icon-button" title="Choose someone else" onClick={() => { onPick(null); setSearch(''); setOpen(true); }}>×</button>
+  </div>;
+
+  return <div className="person-picker">
+    <label>Card holder
+      <input
+        type="search"
+        value={search}
+        placeholder="Search existing residents and household members by name, unit, email or phone"
+        onChange={(event) => { setSearch(event.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        autoComplete="off"
+      />
+      <small>Only active main residents and active household members can hold a card.</small>
+    </label>
+    {open && <div className="person-results">
+      {results.loading && <Loading />}
+      {results.error && <Notice tone="error">{results.error}</Notice>}
+      {!results.loading && !results.error && !(results.data?.items ?? []).length && (
+        <p className="person-empty">No active resident or household member matches{debounced ? ` “${debounced}”` : ' yet'}. Register them under People or Tenancy &amp; household first.</p>
+      )}
+      {(results.data?.items ?? []).map((item) => <button type="button" key={`${item.kind}:${item.id}`} className="person-result" onClick={() => { onPick({ kind: item.kind, id: item.id, name: item.name, detail: item.detail }); setOpen(false); }}>
+        <span className="avatar">{initials(item.name)}</span>
+        <span className="person-identity"><strong>{item.name}</strong><small>{item.detail}{item.meta ? ` · ${item.meta}` : ''}</small></span>
+        <em>{item.kind === 'resident' ? 'Resident' : 'Dependant'}</em>
+      </button>)}
+    </div>}
+  </div>;
+}
+
 function Cards({ user }: { user: User }) {
   const operator=user.role==='admin'||user.role==='manager';
   const list = useList('/api/access/cards?limit=50');
@@ -1085,14 +1349,20 @@ function Cards({ user }: { user: User }) {
   const [message, setMessage] = useState('');
   const [mode,setMode]=useState<'device'|'manual'>('device');
   const [scanSession,setScanSession]=useState<Row|null>(null);
+  const [picked,setPicked]=useState<PickedPerson|null>(null);
   async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setMessage(''); const form=new FormData(event.currentTarget);const values=Object.fromEntries(form);
+    event.preventDefault(); setMessage('');
+    if (!picked) { setMessage('Choose the resident or household member this card belongs to.'); return; }
+    const form=new FormData(event.currentTarget);
+    // One person per card: the picker decides which id the API receives.
+    const person = picked.kind === 'resident' ? { residentId: picked.id } : { householdMemberId: picked.id };
     try {
       if(mode==='device') {
-        const session=await api<Row>('/api/access/card-scan-sessions',{ method:'POST',body:JSON.stringify({ deviceId:form.get('deviceId'),residentId:form.get('residentId')||undefined,householdMemberId:form.get('householdMemberId')||undefined,cardLabel:form.get('cardLabel') }) });
-        setScanSession(session);setMessage('Waiting for the card to be tapped or scanned at the selected access-control device.');
+        const session=await api<Row>('/api/access/card-scan-sessions',{ method:'POST',body:JSON.stringify({ deviceId:form.get('deviceId'),...person,cardLabel:String(form.get('cardLabel') ?? '').trim() || undefined }) });
+        setScanSession(session);setMessage(`Waiting for ${picked.name} to tap or scan a card at the selected access-control device.`);
       } else {
-        await api('/api/access/cards', { method: 'POST', body: JSON.stringify(values) }); setShow(false);setMessage('Card issued and hardware actions queued.');list.reload();
+        await api('/api/access/cards', { method: 'POST', body: JSON.stringify({ ...person, cardUid:String(form.get('cardUid') ?? '').trim(), cardLabel:String(form.get('cardLabel') ?? '').trim() || undefined }) });
+        setShow(false);setPicked(null);setMessage(`Card issued to ${picked.name} and hardware actions queued.`);list.reload();
       }
     } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Failed'); }
   }
@@ -1103,7 +1373,7 @@ function Cards({ user }: { user: User }) {
   },[scanSession?.id,scanSession?.status]);
   async function completeScan() {
     if(!scanSession?.id)return;
-    try { const card=await api<Row>(`/api/access/card-scan-sessions/${scanSession.id}/complete`,{ method:'POST' });setMessage(`Card ${String(card.cardUid)} issued and synchronized to the hardware-action queue.`);setScanSession(null);setShow(false);list.reload(); }
+    try { const card=await api<Row>(`/api/access/card-scan-sessions/${scanSession.id}/complete`,{ method:'POST' });setMessage(`Card ${String(card.cardUid)} issued and synchronized to the hardware-action queue.`);setScanSession(null);setShow(false);setPicked(null);list.reload(); }
     catch(reason){setMessage(reason instanceof Error?reason.message:'Could not issue scanned card');}
   }
   async function cancelScan(){if(scanSession?.id)await api(`/api/access/card-scan-sessions/${scanSession.id}`,{ method:'DELETE' });setScanSession(null);setMessage('Card scan cancelled.');}
@@ -1112,9 +1382,9 @@ function Cards({ user }: { user: User }) {
     await api(`/api/access/cards/${id}`, { method: 'PATCH', body: JSON.stringify({ status, reason: 'Portal administrator action' }) }); list.reload();
   }
   const actions = operator ? (row: Row) => <div className="row-actions">{row.status === 'active' ? <button className="text danger" onClick={() => change(row.id, 'suspended')}>Suspend</button> : <button className="text" onClick={() => change(row.id, 'active')}>Activate</button>}</div> : undefined;
-  return <PagePanel title="Access cards" subtitle="Enroll by tapping a selected device, or enter a known card number manually" action={operator ? <button className="primary" onClick={() => setShow(!show)}>Issue card</button> : null}>
+  return <PagePanel title="Access cards" subtitle="Enroll by tapping a selected device, or enter a known card number manually" action={operator ? <button className="primary" onClick={() => { setShow(!show); setPicked(null); setMessage(''); }}>Issue card</button> : null}>
     {message && <Notice tone={message.includes('issued')?'success':message.includes('Waiting')?'info':'error'}>{message}</Notice>}
-    {show && <FormCard title="Issue a physical card" onSubmit={submit}><label>Enrollment method<select value={mode} onChange={(event)=>setMode(event.target.value as 'device'|'manual')}><option value="device">Tap/scan at selected device (recommended)</option><option value="manual">Enter card UID manually</option></select></label>{mode==='device'&&<label>Access-control device<select name="deviceId" required><option value="">Select device</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.model||device.vendor)} — {String(device.gate_name)}</option>)}</select></label>}<label>Main resident ID<input name="residentId" placeholder="Use this for a main resident" /></label><label>Household member ID<input name="householdMemberId" placeholder="Or use this for a dependant" /></label>{mode==='manual'&&<label>Card UID / number<input name="cardUid" required /></label>}<label>Label<input name="cardLabel" placeholder="Optional card label" /></label><button className="primary">{mode==='device'?'Start scan':'Issue card'}</button></FormCard>}
+    {show && <FormCard title="Issue a physical card" onSubmit={submit}><label>Enrollment method<select value={mode} onChange={(event)=>setMode(event.target.value as 'device'|'manual')}><option value="device">Tap/scan at selected device (recommended)</option><option value="manual">Enter card UID manually</option></select></label>{mode==='device'&&<label>Access-control device<select name="deviceId" required><option value="">Select device</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.model||device.vendor)} — {String(device.gate_name)}</option>)}</select></label>}<PersonPicker picked={picked} onPick={setPicked} />{mode==='manual'&&<label>Card UID / number<input name="cardUid" required /></label>}<label>Label<input name="cardLabel" placeholder="Optional card label" /></label><button className="primary">{mode==='device'?'Start scan':'Issue card'}</button></FormCard>}
     {scanSession&&<section className={`enrollment-session ${String(scanSession.status)}`}><p className="eyebrow">DEVICE CARD ENROLLMENT</p><h3>{scanSession.status==='captured'?'Card detected':'Waiting for a card…'}</h3>{Boolean(scanSession.captured_credential)&&<strong className="credential-number">{String(scanSession.captured_credential)}</strong>}<p>Present the card at the selected device. EstateMate captures the next card credential event, including a denied unknown-card event.</p><div className="row-actions">{scanSession.status==='captured'&&<button className="primary" onClick={completeScan}>Confirm and issue card</button>}<button className="secondary" onClick={cancelScan}>Cancel</button></div></section>}
     <ListState list={list}><DataTable exportTitle="Access Cards" rows={list.data?.items ?? []} columns={[['resident_name','Main resident'],['household_member_name','Card holder'],['relationship','Relationship'],['unit_number','Unit'],['card_uid','Card UID'],['card_label','Label'],['status','Status'],['deactivated_reason','Reason'],['updated_at','Updated','date']]} action={actions} /></ListState>
   </PagePanel>;
@@ -1317,6 +1587,128 @@ function Operations() {
   </PagePanel>;
 }
 
+/**
+ * Administrator control for the estate gate welcome photograph.
+ *
+ * The image itself is uploaded to the administrator-configured private GitHub
+ * repository (D1 stores metadata only); this card saves the resulting storage key
+ * plus the caption and on/off flag read by the login screen and dashboard hero.
+ */
+function GateImageCard({ config, onSaved }: { config: PortalConfig; onSaved: () => void }) {
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+  const enabled = config.portal_gate_image_enabled === 'true' && Boolean(config.portal_gate_image_key);
+
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setMessage('');
+    const form = event.currentTarget;
+    const input = form.elements.namedItem('gateImage') as HTMLInputElement | null;
+    const file = input?.files?.[0];
+    try {
+      const body: Record<string, string> = {
+        portal_gate_image_caption: String((form.elements.namedItem('portal_gate_image_caption') as HTMLInputElement | null)?.value ?? '').trim(),
+        portal_gate_image_enabled: (form.elements.namedItem('portal_gate_image_enabled') as HTMLInputElement | null)?.checked ? 'true' : 'false',
+      };
+      if (file) {
+        if (!/^image\/(jpeg|png|webp)$/.test(file.type)) throw new Error('Only JPEG, PNG or WebP photographs are accepted');
+        const uploaded = await api<{ key: string }>('/api/files', {
+          method: 'POST', body: file,
+          headers: { 'Content-Type': file.type, 'X-Filename': file.name, 'X-File-Category': 'portal-branding' },
+        });
+        body.portal_gate_image_key = uploaded.key;
+        body.portal_gate_image_enabled = 'true';
+      } else if (!config.portal_gate_image_key && body.portal_gate_image_enabled === 'true') {
+        throw new Error('Upload a photograph of the estate gate before turning the welcome image on');
+      }
+      await api('/api/portal-config', { method: 'PUT', body: JSON.stringify(body) });
+      setMessage('Estate gate welcome image saved. It shows behind the login welcome text and on the dashboard.');
+      form.reset();
+      onSaved();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not save the gate image'); }
+    finally { setBusy(false); }
+  }
+
+  async function remove() {
+    if (!confirm('Remove the estate gate welcome image? The uploaded photograph stays in your private repository.')) return;
+    setMessage('');
+    try {
+      await api('/api/portal-config', { method: 'PUT', body: JSON.stringify({ portal_gate_image_key: '', portal_gate_image_enabled: 'false' }) });
+      setMessage('Estate gate welcome image removed.');
+      onSaved();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not remove the gate image'); }
+  }
+
+  return <>
+    {message && <Notice tone={message.includes('saved') || message.includes('removed') ? 'success' : 'error'}>{message}</Notice>}
+    <FormCard title="Estate gate welcome image" onSubmit={save}>
+    <label className="span-2">Photograph of the estate gate
+      <input name="gateImage" type="file" accept="image/jpeg,image/png,image/webp" />
+      <small>JPEG, PNG or WebP, maximum 4 MB. Stored in your configured private GitHub repository. Shown behind the welcome text on the login screen and on every dashboard.</small>
+    </label>
+    <label className="span-2">Caption shown over the image
+      <input name="portal_gate_image_caption" defaultValue={config.portal_gate_image_caption ?? ''} placeholder="Welcome to the main gate of the estate" maxLength={200} />
+    </label>
+    <label className="check span-2"><input name="portal_gate_image_enabled" type="checkbox" defaultChecked={enabled} /> Show the gate image on the login page and dashboards</label>
+    {enabled && <div className="gate-image-preview span-2">
+      <p className="eyebrow">CURRENT IMAGE</p>
+      <img src="/api/portal-gate-image" alt="The configured estate gate welcome photograph" />
+    </div>}
+    <div className="row-actions span-2">
+      <button className="primary" disabled={busy}>{busy ? 'Saving…' : 'Save gate image'}</button>
+      {Boolean(config.portal_gate_image_key) && <button type="button" className="secondary danger" onClick={remove}>Remove image</button>}
+    </div>
+    </FormCard>
+  </>;
+}
+
+/**
+ * Posts Security officers at specific gates. Once an officer has at least one
+ * assignment, signing in requires them to choose which gate they are working, and
+ * that choice scopes their visitor queue, gate activity and device list.
+ */
+function SecurityGateAssignments() {
+  const officers = useAsync<ListResponse<Row>>(() => api('/api/users?role=security&limit=100'), []);
+  const devices = useAsync<{ items: Row[] }>(() => api('/api/access/device-options'), []);
+  const assignments = useList('/api/security/gate-assignments');
+  const [message, setMessage] = useState('');
+
+  async function assign(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setMessage('');
+    const form = new FormData(event.currentTarget);
+    try {
+      await api('/api/security/gate-assignments', {
+        method: 'POST',
+        body: JSON.stringify({ securityUserId: form.get('securityUserId'), deviceId: form.get('deviceId'), note: form.get('note') || undefined }),
+      });
+      setMessage('Gate assigned. The officer must select this gate when they next sign in.');
+      assignments.reload(); officers.reload();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not assign the gate'); }
+  }
+
+  async function unassign(id: unknown, label: string) {
+    if (!confirm(`Remove ${label}? An officer already signed in at that gate is asked to select again.`)) return;
+    try { await api(`/api/security/gate-assignments/${id}`, { method: 'DELETE' }); setMessage('Gate assignment removed.'); assignments.reload(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not remove the assignment'); }
+  }
+
+  return <>
+    {message && <Notice tone={message.includes('assigned') || message.includes('removed') ? 'success' : 'error'}>{message}</Notice>}
+    {officers.error && <Notice tone="error">{officers.error}</Notice>}
+    {devices.error && <Notice tone="error">{devices.error}</Notice>}
+    <FormCard title="Security gate assignments" onSubmit={assign}>
+      <label>Security officer<select name="securityUserId" required><option value="">Select officer</option>{(officers.data?.items ?? []).map((officer)=><option key={String(officer.id)} value={String(officer.id)}>{String(officer.name)} — {String(officer.email)}</option>)}</select></label>
+      <label>Gate (access-control device)<select name="deviceId" required><option value="">Select gate</option>{(devices.data?.items ?? []).map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.gate_name)} — {String(device.name)} ({String(device.direction)})</option>)}</select></label>
+      <label className="span-2">Note (shift or post detail)<input name="note" placeholder="Morning shift, Gate A pedestrian lane" maxLength={200} /></label>
+      <small className="span-2">An officer with at least one assignment must choose their gate when they sign in. That choice scopes their visitor queue, gate activity and device list to that post for the whole session, and is re-checked on every request — removing an assignment ends a live session at that gate.</small>
+      <button className="primary">Assign gate</button>
+    </FormCard>
+    <section className="panel">
+      <div className="panel-title"><div><p className="eyebrow">SHIFT POSTS</p><h3>Assigned gates</h3></div></div>
+      <ListState list={assignments}><DataTable exportTitle="Security Gate Assignments" rows={assignments.data?.items ?? []} columns={[['security_name','Officer'],['security_email','Email'],['gate_name','Gate'],['device_name','Device'],['direction','Direction'],['note','Note'],['active','Active'],['assigned_by_name','Assigned by'],['created_at','Assigned','date']]} action={(row)=><div className="row-actions">{Number(row.active)===1 && <button className="text danger" onClick={()=>unassign(row.id,`${String(row.security_name)} at ${String(row.gate_name)}`)}>Remove</button>}</div>} /></ListState>
+    </section>
+  </>;
+}
+
 function Settings() {
   const list = useList('/api/settings');
   const storage = useAsync<Row>(() => api('/api/storage-settings'), []);
@@ -1382,6 +1774,8 @@ function Settings() {
     </FormCard>}
     {portalMessage&&<Notice tone={portalMessage.includes('saved')?'success':'error'}>{portalMessage}</Notice>}
     {portal.data&&<FormCard title="Portal identity, theme and recommended defaults" onSubmit={savePortal}><label>Portal name<input name="portal_name" defaultValue={portal.data.portal_name||'EstateMate'} required /></label><label>Estate name<input name="estate_name" defaultValue={portal.data.estate_name||'EstateMate Estate'} required /></label><label>Short mark<input name="portal_short_name" maxLength={4} defaultValue={portal.data.portal_short_name||'EM'} required /></label><label>Tagline<input name="portal_tagline" defaultValue={portal.data.portal_tagline} /></label><label className="span-2">Welcome text<textarea name="portal_welcome_text" rows={3} defaultValue={portal.data.portal_welcome_text} /></label><label>Theme mode<select name="theme_mode" defaultValue={portal.data.theme_mode||'light'}><option value="light">Light (recommended)</option><option value="dark">Dark</option><option value="system">Follow device</option></select></label><label>Corner style<select name="theme_corner_style" defaultValue={portal.data.theme_corner_style||'comfortable'}><option value="comfortable">Comfortable (recommended)</option><option value="compact">Compact</option><option value="rounded">Rounded</option></select></label><label>Primary colour<input name="theme_primary_color" type="color" defaultValue={portal.data.theme_primary_color||'#1769e0'} /></label><label>Accent colour<input name="theme_accent_color" type="color" defaultValue={portal.data.theme_accent_color||'#35d07f'} /></label><label>Navigation colour<input name="theme_navigation_color" type="color" defaultValue={portal.data.theme_navigation_color||'#0d1b37'} /></label><label>Surface colour<input name="theme_surface_color" type="color" defaultValue={portal.data.theme_surface_color||'#ffffff'} /></label><label>Support email<input name="support_email" type="email" defaultValue={portal.data.support_email} /></label><label>Support phone<input name="support_phone" defaultValue={portal.data.support_phone} /></label><label>Timezone<input name="estate_timezone" defaultValue={portal.data.estate_timezone||'Africa/Lagos'} /></label><label>Currency<input name="currency" defaultValue={portal.data.currency||'NGN'} maxLength={3} /></label><label>Default visitor hours<input name="visitor_default_duration_hours" type="number" min="1" max="168" defaultValue={portal.data.visitor_default_duration_hours||'8'} /></label><label>Gate decision policy<select name="visitor_gate_policy" defaultValue="security_approval"><option value="security_approval">Show details, then Security approves (recommended)</option></select></label><label>Visitor credential format<select name="visitor_credential_format" defaultValue="qr_code128_pin"><option value="qr_code128_pin">QR + Code 128 + PIN (recommended)</option></select></label><label>Card scan timeout (minutes)<input name="card_scan_timeout_minutes" type="number" min="1" max="30" defaultValue={portal.data.card_scan_timeout_minutes||'5'} /></label><button className="primary">Save portal customisation</button></FormCard>}
+    {portal.data&&<GateImageCard config={portal.data} onSaved={portal.reload} />}
+    <SecurityGateAssignments />
     {storageMessage && <Notice tone={storageMessage.includes('updated') ? 'success' : 'error'}>{storageMessage}</Notice>}
     <Notice tone="warning"><strong>Private repository required.</strong> EstateMate encrypts the GitHub token before saving it and never displays it again. Use a fine-grained token limited to this repository’s Contents permission.</Notice>
     {storage.data && <FormCard title="Private GitHub upload storage" onSubmit={saveStorage}>
