@@ -64,7 +64,7 @@ It adds the Manager role and temporary-account expiry while preserving all exist
 - The Render relay health endpoint and event forwarding to the Worker passed locally.
 - ISUP control-plane relay integration test passed for adapter authentication, event forwarding, operation polling and result forwarding.
 - Local Worker machine API E2E passed for wrong-key rejection, header-based device authentication, operation claim/application and event acceptance.
-- Production currently remains at commit `b1128df` after successful GitHub Actions run `35938931205`; migration `0008` and the Manager/import/Hik-Connect work described above are local until pushed and deployed.
+- GitHub Actions run `35963135145` built commit `35c5d35`, applied migration `0008`, deployed successfully, and passed production health plus Manager/Import Centre/Hik-Connect/site-sync bundle smoke checks.
 - Android Manager visibility logic was updated, but Android remains uncompiled in this environment because JDK 17 and Android SDK are unavailable.
 
 ## Important hardware truth
