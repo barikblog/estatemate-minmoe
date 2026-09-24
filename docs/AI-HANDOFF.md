@@ -1,6 +1,6 @@
 # AI handoff — EstateMate
 
-Updated: 2026-09-24 (Africa/Lagos) — ISAPI Bridge & Windows Agent deployed; production domain corrected to `https://estatemate.estatemate.workers.dev`
+Updated: 2026-09-24 (Africa/Lagos) — ISAPI Bridge & Windows Agent deployed; production domain corrected to `https://estatemate.estatemate.workers.dev`; credential-free `CI` gate added for pull requests (`.github/workflows/ci.yml` + `scripts/ci-checks.sh`)
 
 
 
@@ -57,6 +57,14 @@ It adds Hikvision ISAPI bridge and Windows agent support:
 - New connection patterns supported: `isapi_bridge`, `windows_agent`, `isapi_windows_agent` (all treated as pending, not manual_action_required).
 
 The previous migration, `migrations/0010_maintenance_billing_and_verification.sql`, adds maintenance scope (personal/street/block/zone/estate), status workflow (in_progress, needs_verification), charging fields, gate ID verification for visitors, and bill_batches audience targeting.
+
+## Continuous integration
+
+- `.github/workflows/ci.yml` (`CI`) runs on `pull_request` against `main` and on `workflow_dispatch`. It is credential-free and cannot deploy.
+- Gates: `npm ci`, `npm run typecheck`, `npm test` (Vitest + ISUP gateway integration), `npm run build:web`, the whole migration chain replayed into an empty SQLite database, `bash scripts/ci-checks.sh`, and `npx wrangler deploy --dry-run` (offline bundle + binding/assets validation).
+- `scripts/ci-checks.sh` enforces the repository rules that were previously convention-only, diffed against `merge-base(origin/main, HEAD)` rather than the raw PR base so a branch lagging behind main is not blamed for other people's merged commits: no whitespace/conflict markers, no modification or deletion of deployed migrations, no committed credential files, and no `ghp_*`/`github_pat_*`/`vCP_*`/`AKIA*`/`xox*`/private-key-block shapes on added lines. Matched values are redacted before being printed, so a leak cannot be copied out of the Actions log by the check that reports it.
+- CI has no JDK or Android SDK; a PR touching `apps/android` emits a notice that Kotlin was not compiled.
+- Unchanged: `Deploy EstateMate` still owns remote migrations and deploys, and still fails before touching D1 if `npm run build` fails.
 
 ## Validation recorded for this phase
 
