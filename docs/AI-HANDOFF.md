@@ -28,19 +28,23 @@ Run `git log -1 --oneline` and check the latest GitHub Actions run before making
 - Optional proof uploads linked to ownership, transfer, tenancy, household, visitor, maintenance and payment records.
 - Administrator-editable portal identity, theme and operational defaults.
 - People administration with available-property selection, bulk CSV registration, generated one-time passwords, editing, reset, lifecycle guards and history-preserving deletion.
+- Operational Manager category with explicit separation from finance, private storage, global settings and elevated account management.
+- Private-storage-backed operational imports for properties, ownerships, tenancies and cards.
+- Encrypted Hik-Connect configuration and one-time generated on-site synchronization installer for the official-SDK gateway package.
+- Administrator-generated, one-time-download sample logins for every role with automatic 24-hour expiry.
 
 ## Most recent migration
 
-`migrations/0007_people_management_imports.sql`
+`migrations/0008_managers_operations_imports_hikconnect.sql`
 
-It expands import history to include private-storage-backed user CSV jobs. Migration `0006` contains device inventory metadata/soft deletion, visitor credentials, scan sessions, visitor decisions/device operations, visitor association on gate events, and recommended portal settings. Migrations are append-only after deployment.
+It adds the Manager role and temporary-account expiry while preserving all existing users and foreign-key relationships; expands import history for common operational CSVs; and adds encrypted Hik-Connect/site-sync metadata to access devices. To avoid rebuilding the heavily referenced `users` parent table, Manager rows use the compatibility representation `role='security', is_manager=1`; authentication and user APIs must continue returning the effective role through `CASE WHEN is_manager=1 THEN 'manager'`. Migrations are append-only after deployment.
 
 ## Validation recorded for this phase
 
 - Root and web TypeScript passed.
-- 26 Vitest tests plus the ISUP control-plane integration test passed.
+- 31 Vitest tests plus the ISUP control-plane integration test passed.
 - Web production build passed with QR/barcode/camera libraries lazy-loaded.
-- Fresh SQLite and local Wrangler D1 migration chains passed through `0007`; a populated `import_jobs` upgrade check preserved existing job/storage-key data and recreated the indexes.
+- Fresh SQLite and local Wrangler D1 migration chains passed through `0008`; a populated upgrade check preserved existing users, ownership, billing, import storage keys and foreign-key integrity.
 - Local API E2E passed:
   - DS-K1T808MFWX-B and DS-K2802 profile auto-detection;
   - device edit, secret rotation and soft deletion;
@@ -51,12 +55,17 @@ It expands import history to include private-storage-backed user CSV jobs. Migra
   - visitor/card hardware-action queues;
   - proof metadata linking and reviewer listing;
   - people creation with available-property assignment, editing, generated password reset, ownership lifecycle guards, card suspension, reactivation and history-preserving deletion;
-  - user-import row-limit and private-storage enforcement.
+  - user-import row-limit and private-storage enforcement;
+  - Manager login/role filtering, permitted operational actions and denial of elevated-account, finance, storage, settings and ingest-secret access;
+  - encrypted Hik-Connect persistence without list/audit disclosure;
+  - generated no-cache site-sync installer, machine authentication and prior-key invalidation;
+  - all five 24-hour sample-login categories and one-time credential response;
+  - operational import schema validation and private-storage enforcement.
 - The Render relay health endpoint and event forwarding to the Worker passed locally.
 - ISUP control-plane relay integration test passed for adapter authentication, event forwarding, operation polling and result forwarding.
 - Local Worker machine API E2E passed for wrong-key rejection, header-based device authentication, operation claim/application and event acceptance.
-- GitHub Actions run `35938773816` built commit `2ac4761`, applied migration `0007`, deployed the Worker/web assets and completed successfully. Production health, portal configuration, root HTML and people/gateway bundle markers passed immediately afterward.
-- Android source from the previous tenancy phase remains uncompiled in this environment because JDK 17 and Android SDK are unavailable.
+- Production currently remains at commit `b1128df` after successful GitHub Actions run `35938931205`; migration `0008` and the Manager/import/Hik-Connect work described above are local until pushed and deployed.
+- Android Manager visibility logic was updated, but Android remains uncompiled in this environment because JDK 17 and Android SDK are unavailable.
 
 ## Important hardware truth
 

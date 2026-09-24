@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import type { Context, MiddlewareHandler } from 'hono';
 import { moneyToMinor, parseCsv, requireHeaders, validDate } from './csv';
+import type { CsvTable } from './csv';
 import { AccessLiveFeed } from './live-feed';
 import { extractEventDocuments, normalizeHikvisionDocument } from './hikvision';
 import { HIKVISION_PROFILES, getHikvisionProfile, isConnectionSupported, resolveHikvisionProfile } from './hikvision-profiles';
@@ -14,6 +15,8 @@ import {
 import {
   bearerToken,
   cookieValue,
+  decryptSecret,
+  encryptSecret,
   hashPassword,
   randomToken,
   sha256,
@@ -82,7 +85,7 @@ const requireAuth: MiddlewareHandler<{ Bindings: Env; Variables: AppVariables }>
   const claims = await verifyJwt(c.env, token);
   if (!claims) return jsonError(c, 401, 'Session is invalid or expired');
   const user = await c.env.DB.prepare(
-    `SELECT id, name, email, role, property_id FROM users WHERE id = ? AND status = 'active' LIMIT 1`,
+    `SELECT id,name,email,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,property_id FROM users WHERE id=? AND status='active' AND (account_expires_at IS NULL OR datetime(account_expires_at)>datetime('now')) LIMIT 1`,
   ).bind(claims.sub).first<AuthUser>();
   if (!user) return jsonError(c, 401, 'User is inactive or no longer exists');
   c.set('user', user);
@@ -95,6 +98,11 @@ function requireRoles(...roles: Role[]): MiddlewareHandler<{ Bindings: Env; Vari
     await next();
   };
 }
+
+function isEstateOperator(role:Role):boolean { return role==='admin' || role==='manager'; }
+function canManageAccount(actor:Role,target:Role):boolean { return actor==='admin' || (actor==='manager' && !['admin','manager'].includes(target)); }
+function storedRole(role:Role):{ role:Exclude<Role,'manager'>;isManager:number } { return role==='manager'?{ role:'security',isManager:1 }:{ role,isManager:0 }; }
+function encryptionKey(env:Env):string { return env.STORAGE_ENCRYPTION_KEY || env.JWT_SECRET; }
 
 async function audit(c: AppContext, action: string, entityType: string, entityId: string | null, details?: unknown) {
   await c.env.DB.prepare(
@@ -278,7 +286,7 @@ app.post('/api/auth/login', async (c) => {
   const body = await c.req.json<{ email?: string; password?: string }>();
   if (!body.email || !body.password) return jsonError(c, 400, 'email and password are required');
   const user = await c.env.DB.prepare(
-    `SELECT id, name, email, role, property_id, password_hash FROM users WHERE email = ? AND status = 'active' LIMIT 1`,
+    `SELECT id,name,email,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,property_id,password_hash FROM users WHERE email=? AND status='active' AND (account_expires_at IS NULL OR datetime(account_expires_at)>datetime('now')) LIMIT 1`,
   ).bind(body.email.trim().toLowerCase()).first<AuthUser & { password_hash: string }>();
   if (!user || !(await verifyPassword(body.password, user.password_hash))) return jsonError(c, 401, 'Invalid email or password');
   const token = await signJwt(c.env, user);
@@ -368,7 +376,7 @@ app.get('/api/properties', async (c) => {
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
-app.get('/api/properties/available', requireRoles('resident', 'admin'), async (c) => {
+app.get('/api/properties/available', requireRoles('resident','admin','manager'), async (c) => {
   const search = `%${c.req.query('search')?.trim() ?? ''}%`;
   const result = await c.env.DB.prepare(
     `SELECT p.id,p.unit_number,p.street,p.address FROM properties p
@@ -379,7 +387,7 @@ app.get('/api/properties/available', requireRoles('resident', 'admin'), async (c
   return c.json({ items: result.results });
 });
 
-app.post('/api/properties', requireRoles('admin'), async (c) => {
+app.post('/api/properties', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{ unitNumber?: string; address?: string; street?: string; block?: string; zone?: string }>();
   if (!body.unitNumber?.trim() || !body.address?.trim() || !body.street?.trim()) return jsonError(c, 400, 'unitNumber, address and street are required');
   const id = crypto.randomUUID();
@@ -390,7 +398,7 @@ app.post('/api/properties', requireRoles('admin'), async (c) => {
   return c.json({ id }, 201);
 });
 
-app.patch('/api/properties/:id', requireRoles('admin'), async (c) => {
+app.patch('/api/properties/:id', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{ unitNumber?: string; address?: string; street?: string; block?: string; zone?: string }>();
   if (!body.unitNumber?.trim() || !body.address?.trim() || !body.street?.trim()) return jsonError(c, 400, 'unitNumber, address and street are required');
   const result = await c.env.DB.prepare(
@@ -401,7 +409,7 @@ app.patch('/api/properties/:id', requireRoles('admin'), async (c) => {
   return c.json({ ok: true });
 });
 
-app.get('/api/property-ownership-requests', requireRoles('resident', 'admin'), async (c) => {
+app.get('/api/property-ownership-requests', requireRoles('resident','admin','manager'), async (c) => {
   const user = c.get('user');
   const { limit, offset, page: pageNumber } = page(c);
   const residentId = user.role === 'resident' ? user.id : null;
@@ -455,7 +463,7 @@ app.post('/api/property-ownership-requests', requireRoles('resident'), async (c)
   return c.json({ id, status: 'pending' }, 201);
 });
 
-app.post('/api/property-ownerships', requireRoles('admin'), async (c) => {
+app.post('/api/property-ownerships', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{ propertyId?: string; residentId?: string; residentEmail?: string }>();
   if (!body.propertyId || (!body.residentId && !body.residentEmail?.trim())) return jsonError(c, 400, 'propertyId and residentId or residentEmail are required');
   const resident = await c.env.DB.prepare(
@@ -475,7 +483,7 @@ app.post('/api/property-ownerships', requireRoles('admin'), async (c) => {
   return c.json({ id }, 201);
 });
 
-app.patch('/api/property-ownership-requests/:id', requireRoles('admin'), async (c) => {
+app.patch('/api/property-ownership-requests/:id', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{ status?: 'approved'|'rejected'; reviewNote?: string }>();
   if (!body.status || !['approved','rejected'].includes(body.status)) return jsonError(c, 400, 'status must be approved or rejected');
   const request = await c.env.DB.prepare(
@@ -516,7 +524,7 @@ app.patch('/api/property-ownership-requests/:id', requireRoles('admin'), async (
   return c.json({ ok: true, status: 'approved', propertyId, ownershipId });
 });
 
-app.delete('/api/property-ownerships/:id', requireRoles('admin'), async (c) => {
+app.delete('/api/property-ownerships/:id', requireRoles('admin','manager'), async (c) => {
   const ownership = await c.env.DB.prepare(
     `SELECT id,property_id,resident_id FROM property_ownerships WHERE id=? AND status='active'`,
   ).bind(c.req.param('id')).first<{ id: string; property_id: string; resident_id: string }>();
@@ -535,7 +543,7 @@ app.delete('/api/property-ownerships/:id', requireRoles('admin'), async (c) => {
   return c.json({ ok: true });
 });
 
-app.get('/api/property-tenancies', requireRoles('resident', 'admin'), async (c) => {
+app.get('/api/property-tenancies', requireRoles('resident','admin','manager'), async (c) => {
   const user = c.get('user');
   const residentId = user.role === 'resident' ? user.id : null;
   const { limit, offset, page: pageNumber } = page(c);
@@ -556,7 +564,7 @@ app.get('/api/property-tenancies', requireRoles('resident', 'admin'), async (c) 
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
-app.post('/api/property-tenancies', requireRoles('resident', 'admin'), async (c) => {
+app.post('/api/property-tenancies', requireRoles('resident','admin','manager'), async (c) => {
   const body = await c.req.json<{
     propertyId?: string;
     tenantId?: string;
@@ -584,7 +592,7 @@ app.post('/api/property-tenancies', requireRoles('resident', 'admin'), async (c)
   const billing = body.billingResponsibility ?? 'owner';
   if (!['owner','tenant'].includes(billing)) return jsonError(c, 400, 'billingResponsibility must be owner or tenant');
   const id = crypto.randomUUID();
-  const direct = user.role === 'admin';
+  const direct = isEstateOperator(user.role);
   await c.env.DB.prepare(
     `INSERT INTO property_tenancies(id,property_id,tenant_id,status,start_date,end_date,billing_responsibility,request_note,requested_by,approved_by,approved_at)
      VALUES (?,?,?, ?,?,?,?,?,?,?,?)`,
@@ -598,7 +606,7 @@ app.post('/api/property-tenancies', requireRoles('resident', 'admin'), async (c)
   return c.json({ id, status: direct ? 'active' : 'pending' }, 201);
 });
 
-app.patch('/api/property-tenancies/:id', requireRoles('admin'), async (c) => {
+app.patch('/api/property-tenancies/:id', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{ action?: 'approve'|'reject'|'end'|'update'; billingResponsibility?: 'owner'|'tenant'; reviewNote?: string; endDate?: string }>();
   if (!body.action || !['approve','reject','end','update'].includes(body.action)) return jsonError(c, 400, 'Invalid tenancy action');
   const tenancy = await c.env.DB.prepare(`SELECT * FROM property_tenancies WHERE id=?`).bind(c.req.param('id')).first<Record<string,string|number|null>>();
@@ -641,7 +649,7 @@ app.patch('/api/property-tenancies/:id', requireRoles('admin'), async (c) => {
   return c.json({ ok: true, action: body.action });
 });
 
-app.get('/api/household-members', requireRoles('resident', 'admin'), async (c) => {
+app.get('/api/household-members', requireRoles('resident','admin','manager'), async (c) => {
   const user = c.get('user');
   const residentId = user.role === 'resident' ? user.id : null;
   const propertyId = c.req.query('propertyId') ?? null;
@@ -663,7 +671,7 @@ app.get('/api/household-members', requireRoles('resident', 'admin'), async (c) =
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
-app.post('/api/household-members', requireRoles('resident', 'admin'), async (c) => {
+app.post('/api/household-members', requireRoles('resident','admin','manager'), async (c) => {
   const body = await c.req.json<{
     propertyId?: string;
     primaryResidentId?: string;
@@ -682,7 +690,7 @@ app.post('/api/household-members', requireRoles('resident', 'admin'), async (c) 
   const user = c.get('user');
   let primaryResidentId = user.role === 'resident' ? user.id : body.primaryResidentId;
   if (user.role === 'resident' && !(await isPrimaryResident(c.env.DB,user.id,body.propertyId))) return jsonError(c, 403, 'Only the main owner-occupant or active tenant can add dependants');
-  if (!primaryResidentId && user.role === 'admin') {
+  if (!primaryResidentId && isEstateOperator(user.role)) {
     const primary = await c.env.DB.prepare(
       `SELECT COALESCE((SELECT tenant_id FROM property_tenancies WHERE property_id=? AND status='active' AND date(start_date)<=date('now') AND (end_date IS NULL OR date(end_date)>=date('now')) LIMIT 1),(SELECT resident_id FROM property_ownerships WHERE property_id=? AND status='active' LIMIT 1)) AS id`,
     ).bind(body.propertyId,body.propertyId).first<{ id: string|null }>();
@@ -690,7 +698,7 @@ app.post('/api/household-members', requireRoles('resident', 'admin'), async (c) 
   }
   if (!primaryResidentId || !(await isPrimaryResident(c.env.DB,primaryResidentId,body.propertyId))) return jsonError(c, 400, 'A valid main resident is required for this property');
   const id = crypto.randomUUID();
-  const direct = user.role === 'admin';
+  const direct = isEstateOperator(user.role);
   await c.env.DB.prepare(
     `INSERT INTO household_members(id,property_id,primary_resident_id,name,relationship,date_of_birth,phone,email,status,can_create_visitors,can_view_bills,request_note,requested_by,approved_by,approved_at)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
@@ -703,7 +711,7 @@ app.post('/api/household-members', requireRoles('resident', 'admin'), async (c) 
   return c.json({ id, status: direct ? 'active' : 'pending' }, 201);
 });
 
-app.patch('/api/household-members/:id', requireRoles('admin'), async (c) => {
+app.patch('/api/household-members/:id', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{ action?: 'approve'|'reject'|'deactivate'|'update'; canCreateVisitors?: boolean; canViewBills?: boolean; reviewNote?: string }>();
   if (!body.action || !['approve','reject','deactivate','update'].includes(body.action)) return jsonError(c, 400, 'Invalid household action');
   const member = await c.env.DB.prepare(`SELECT * FROM household_members WHERE id=?`).bind(c.req.param('id')).first<Record<string,string|number|null>>();
@@ -732,7 +740,7 @@ app.patch('/api/household-members/:id', requireRoles('admin'), async (c) => {
   return c.json({ ok: true, status });
 });
 
-app.post('/api/household-members/:id/login', requireRoles('admin'), async (c) => {
+app.post('/api/household-members/:id/login', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{ email?: string; temporaryPassword?: string; phone?: string }>();
   if (!body.email?.trim()) return jsonError(c, 400, 'email is required');
   const member = await c.env.DB.prepare(`SELECT * FROM household_members WHERE id=? AND status='active'`).bind(c.req.param('id')).first<Record<string,string|number|null>>();
@@ -753,7 +761,7 @@ app.post('/api/household-members/:id/login', requireRoles('admin'), async (c) =>
   return c.json({ ok: true, linkedUserId: linked.id });
 });
 
-app.get('/api/property-transfers', requireRoles('resident', 'admin'), async (c) => {
+app.get('/api/property-transfers', requireRoles('resident','admin','manager'), async (c) => {
   const user = c.get('user');
   const residentId = user.role === 'resident' ? user.id : null;
   const { limit, offset, page: pageNumber } = page(c);
@@ -770,7 +778,7 @@ app.get('/api/property-transfers', requireRoles('resident', 'admin'), async (c) 
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
-app.post('/api/property-transfers', requireRoles('resident', 'admin'), async (c) => {
+app.post('/api/property-transfers', requireRoles('resident','admin','manager'), async (c) => {
   const body = await c.req.json<{ propertyId?: string; newOwnerId?: string; newOwnerEmail?: string; effectiveDate?: string; requestNote?: string; approveNow?: boolean; proofKeys?: string[] }>();
   if (!body.propertyId || (!body.newOwnerId && !body.newOwnerEmail?.trim()) || !body.effectiveDate) return jsonError(c, 400, 'propertyId, new owner and effectiveDate are required');
   if (Number.isNaN(new Date(body.effectiveDate).valueOf())) return jsonError(c, 400, 'effectiveDate is invalid');
@@ -788,7 +796,7 @@ app.post('/api/property-transfers', requireRoles('resident', 'admin'), async (c)
      VALUES (?,?,?,?,?,'pending',?,?)`,
   ).bind(id,body.propertyId,owner.resident_id,nextOwner.id,body.effectiveDate,body.requestNote?.trim() ?? null,c.get('user').id).run();
   await linkProofFiles(c.env.DB,proofKeys(body.proofKeys),'property_transfer',id,c.get('user').id);
-  if (c.get('user').role === 'admin' && body.approveNow) {
+  if (isEstateOperator(c.get('user').role) && body.approveNow) {
     if (new Date(body.effectiveDate) <= new Date()) {
       await c.env.DB.prepare(`UPDATE property_transfer_requests SET approved_by=?,approved_at=datetime('now') WHERE id=?`).bind(c.get('user').id,id).run();
       await completePropertyTransfer(c.env,id,c.get('user').id);
@@ -800,7 +808,7 @@ app.post('/api/property-transfers', requireRoles('resident', 'admin'), async (c)
   return c.json({ id }, 201);
 });
 
-app.patch('/api/property-transfers/:id', requireRoles('admin'), async (c) => {
+app.patch('/api/property-transfers/:id', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{ action?: 'approve'|'reject'|'cancel'; reviewNote?: string }>();
   if (!body.action || !['approve','reject','cancel'].includes(body.action)) return jsonError(c, 400, 'Invalid transfer action');
   const transfer = await c.env.DB.prepare(`SELECT * FROM property_transfer_requests WHERE id=?`).bind(c.req.param('id')).first<Record<string,string|null>>();
@@ -932,12 +940,12 @@ async function suspendUserCards(env:Env,userId:string,actorId:string,reason:stri
   }
 }
 
-app.get('/api/users', requireRoles('admin', 'cashier', 'security'), async (c) => {
+app.get('/api/users', requireRoles('admin','manager','cashier','security'), async (c) => {
   const { limit, offset, page: pageNumber } = page(c);
   const role = c.req.query('role');
   const search = `%${c.req.query('search')?.trim() ?? ''}%`;
   const result = await c.env.DB.prepare(
-    `SELECT u.id,u.name,u.email,u.phone,u.role,u.status,u.property_id,u.created_at,
+    `SELECT u.id,u.name,u.email,u.phone,CASE WHEN u.is_manager=1 THEN 'manager' ELSE u.role END AS role,u.status,u.property_id,u.account_expires_at,u.created_at,
        GROUP_CONCAT(CASE WHEN po.status='active' THEN p.unit_number END, ', ') AS unit_numbers,
        COUNT(CASE WHEN po.status='active' THEN 1 END) AS property_count,
        (SELECT GROUP_CONCAT(tp.unit_number,', ') FROM property_tenancies t JOIN properties tp ON tp.id=t.property_id WHERE t.tenant_id=u.id AND t.status='active') AS rented_units,
@@ -945,19 +953,20 @@ app.get('/api/users', requireRoles('admin', 'cashier', 'security'), async (c) =>
      FROM users u
      LEFT JOIN property_ownerships po ON po.resident_id=u.id AND po.status='active'
      LEFT JOIN properties p ON p.id=po.property_id
-     WHERE (? IS NULL OR u.role=?) AND (u.name LIKE ? OR u.email LIKE ? OR u.phone LIKE ?)
+     WHERE (? IS NULL OR CASE WHEN u.is_manager=1 THEN 'manager' ELSE u.role END=?) AND (u.name LIKE ? OR u.email LIKE ? OR u.phone LIKE ?)
      GROUP BY u.id ORDER BY u.created_at DESC LIMIT ? OFFSET ?`,
   ).bind(role ?? null, role ?? null, search, search, search, limit, offset).all();
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
-app.post('/api/users', requireRoles('admin'), async (c) => {
+app.post('/api/users', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{ name?: string; email?: string; phone?: string; password?: string; role?: Role; propertyId?: string }>();
   const name=body.name?.trim();const email=body.email?.trim().toLowerCase();const phone=body.phone?.trim() || null;
   if (!name || !email || !body.password || !body.role) return jsonError(c, 400, 'name, email, password and role are required');
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return jsonError(c,400,'Enter a valid email address');
   if (body.password.length<12) return jsonError(c,400,'Temporary password must contain at least 12 characters');
-  if (!['admin','resident','security','cashier'].includes(body.role)) return jsonError(c, 400, 'Invalid role');
+  if (!['admin','manager','resident','security','cashier'].includes(body.role)) return jsonError(c, 400, 'Invalid role');
+  if (!canManageAccount(c.get('user').role,body.role)) return jsonError(c,403,'Managers cannot create administrator or manager accounts');
   const existingEmail=await c.env.DB.prepare(`SELECT id FROM users WHERE lower(email)=?`).bind(email).first();
   if (existingEmail) return jsonError(c,409,'An account with this email already exists');
   if (body.propertyId && body.role !== 'resident') return jsonError(c, 400, 'Only resident accounts can own a property');
@@ -967,10 +976,10 @@ app.post('/api/users', requireRoles('admin'), async (c) => {
     ).bind(body.propertyId).first();
     if (!available) return jsonError(c, 409, 'Selected property is already owned or was not found');
   }
-  const id = crypto.randomUUID();
+  const id = crypto.randomUUID();const persistedRole=storedRole(body.role);
   const statements = [c.env.DB.prepare(
-    `INSERT INTO users(id,name,email,phone,password_hash,role,property_id) VALUES (?,?,?,?,?,?,?)`,
-  ).bind(id,name,email,phone,await hashPassword(body.password),body.role,body.propertyId || null)];
+    `INSERT INTO users(id,name,email,phone,password_hash,role,is_manager,property_id) VALUES (?,?,?,?,?,?,?,?)`,
+  ).bind(id,name,email,phone,await hashPassword(body.password),persistedRole.role,persistedRole.isManager,body.propertyId || null)];
   let ownershipId: string | null = null;
   if (body.propertyId) {
     ownershipId = crypto.randomUUID();
@@ -983,9 +992,10 @@ app.post('/api/users', requireRoles('admin'), async (c) => {
   return c.json({ id, ownershipId }, 201);
 });
 
-app.patch('/api/users/:id', requireRoles('admin'), async (c) => {
-  const existing=await c.env.DB.prepare(`SELECT id,name,email,phone,role,status FROM users WHERE id=?`).bind(c.req.param('id')).first<{ id:string;name:string;email:string;phone:string|null;role:Role;status:'active'|'inactive' }>();
+app.patch('/api/users/:id', requireRoles('admin','manager'), async (c) => {
+  const existing=await c.env.DB.prepare(`SELECT id,name,email,phone,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,status FROM users WHERE id=?`).bind(c.req.param('id')).first<{ id:string;name:string;email:string;phone:string|null;role:Role;status:'active'|'inactive' }>();
   if (!existing) return jsonError(c,404,'User account not found');
+  if (!canManageAccount(c.get('user').role,existing.role)) return jsonError(c,403,'Managers cannot edit administrator or manager accounts');
   const body=await c.req.json<{ name?:string;email?:string;phone?:string|null;role?:Role;status?:'active'|'inactive';propertyId?:string }>();
   const name=body.name?.trim() || existing.name;const email=body.email?.trim().toLowerCase() || existing.email;
   const phone=body.phone === undefined ? existing.phone : body.phone?.trim() || null;
@@ -993,7 +1003,8 @@ app.patch('/api/users/:id', requireRoles('admin'), async (c) => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return jsonError(c,400,'Enter a valid email address');
   const emailOwner=await c.env.DB.prepare(`SELECT id FROM users WHERE lower(email)=? AND id<>?`).bind(email,existing.id).first();
   if (emailOwner) return jsonError(c,409,'An account with this email already exists');
-  if (!['admin','resident','security','cashier'].includes(role)) return jsonError(c,400,'Invalid role');
+  if (!['admin','manager','resident','security','cashier'].includes(role)) return jsonError(c,400,'Invalid role');
+  if (!canManageAccount(c.get('user').role,role)) return jsonError(c,403,'Managers cannot grant administrator or manager access');
   if (!['active','inactive'].includes(status)) return jsonError(c,400,'Invalid status');
   if (existing.id===c.get('user').id && (role!=='admin' || status!=='active')) return jsonError(c,409,'You cannot remove your own active administrator access');
   if (existing.role==='admin' && (role!=='admin' || status!=='active')) {
@@ -1021,7 +1032,8 @@ app.patch('/api/users/:id', requireRoles('admin'), async (c) => {
     if (property.resident_id && property.resident_id!==existing.id) return jsonError(c,409,'Selected property is already owned');
     if (!property.resident_id) ownershipId=crypto.randomUUID();
   }
-  const statements:D1PreparedStatement[]=[c.env.DB.prepare(`UPDATE users SET name=?,email=?,phone=?,role=?,status=?,property_id=COALESCE(property_id,?),updated_at=datetime('now') WHERE id=?`).bind(name,email,phone,role,status,body.propertyId || null,existing.id)];
+  const persistedRole=storedRole(role);
+  const statements:D1PreparedStatement[]=[c.env.DB.prepare(`UPDATE users SET name=?,email=?,phone=?,role=?,is_manager=?,status=?,property_id=COALESCE(property_id,?),updated_at=datetime('now') WHERE id=?`).bind(name,email,phone,persistedRole.role,persistedRole.isManager,status,body.propertyId || null,existing.id)];
   if (ownershipId && body.propertyId) statements.push(c.env.DB.prepare(`INSERT INTO property_ownerships(id,property_id,resident_id,status,approved_by) VALUES (?,?,?,'active',?)`).bind(ownershipId,body.propertyId,existing.id,c.get('user').id));
   await c.env.DB.batch(statements);
   if (status==='inactive' && existing.status==='active') await suspendUserCards(c.env,existing.id,c.get('user').id,'account deactivated');
@@ -1029,9 +1041,10 @@ app.patch('/api/users/:id', requireRoles('admin'), async (c) => {
   return c.json({ ok:true,id:existing.id,ownershipId });
 });
 
-app.post('/api/users/:id/reset-password', requireRoles('admin'), async (c) => {
-  const target=await c.env.DB.prepare(`SELECT id,email,status FROM users WHERE id=?`).bind(c.req.param('id')).first<{ id:string;email:string;status:string }>();
+app.post('/api/users/:id/reset-password', requireRoles('admin','manager'), async (c) => {
+  const target=await c.env.DB.prepare(`SELECT id,email,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,status FROM users WHERE id=?`).bind(c.req.param('id')).first<{ id:string;email:string;role:Role;status:string }>();
   if (!target) return jsonError(c,404,'User account not found');
+  if (!canManageAccount(c.get('user').role,target.role)) return jsonError(c,403,'Managers cannot reset administrator or manager passwords');
   let body:{ temporaryPassword?:string }={};
   try { body=await c.req.json<{ temporaryPassword?:string }>(); } catch { /* Generate one when no JSON body is supplied. */ }
   const generated=!body.temporaryPassword;
@@ -1043,10 +1056,11 @@ app.post('/api/users/:id/reset-password', requireRoles('admin'), async (c) => {
   return c.json({ ok:true,temporaryPassword:generated?temporaryPassword:undefined,message:'Share the temporary password securely and require the user to change it after sign-in.' });
 });
 
-app.delete('/api/users/:id', requireRoles('admin'), async (c) => {
-  const target=await c.env.DB.prepare(`SELECT id,name,role,status FROM users WHERE id=?`).bind(c.req.param('id')).first<{ id:string;name:string;role:Role;status:string }>();
+app.delete('/api/users/:id', requireRoles('admin','manager'), async (c) => {
+  const target=await c.env.DB.prepare(`SELECT id,name,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,status FROM users WHERE id=?`).bind(c.req.param('id')).first<{ id:string;name:string;role:Role;status:string }>();
   if (!target) return jsonError(c,404,'User account not found');
-  if (target.id===c.get('user').id) return jsonError(c,409,'You cannot delete your own administrator account');
+  if (!canManageAccount(c.get('user').role,target.role)) return jsonError(c,403,'Managers cannot delete administrator or manager accounts');
+  if (target.id===c.get('user').id) return jsonError(c,409,'You cannot delete your own account');
   if (target.role==='admin' && target.status==='active') {
     const admins=await c.env.DB.prepare(`SELECT COUNT(*) AS total FROM users WHERE role='admin' AND status='active'`).first<{ total:number }>();
     if ((admins?.total ?? 0)<=1) return jsonError(c,409,'At least one active administrator must remain');
@@ -1059,7 +1073,23 @@ app.delete('/api/users/:id', requireRoles('admin'), async (c) => {
   return c.json({ ok:true,historyPreserved:true });
 });
 
-app.get('/api/bills', async (c) => {
+app.post('/api/users/sample-logins', requireRoles('admin'), async (c) => {
+  const body=await c.req.json<{ confirmation?:string }>().catch(()=>({ confirmation:'' }));
+  if (body.confirmation!=='CREATE_24_HOUR_SAMPLE_LOGINS') return jsonError(c,400,'Explicit sample-login confirmation is required');
+  const stamp=`${new Date().toISOString().replace(/[-:TZ.]/g,'').slice(0,14).toLowerCase()}-${crypto.randomUUID().slice(0,6)}`;
+  const expiresAt=new Date(Date.now()+24*60*60*1000).toISOString();
+  const roles:Role[]=['admin','manager','resident','security','cashier'];
+  const credentials=roles.map((role)=>({ id:crypto.randomUUID(),role,name:`Sample ${role[0]!.toUpperCase()}${role.slice(1)}`,email:`sample.${role}.${stamp}@example.invalid`,temporaryPassword:`EM-${randomToken(12)}-aA1!` }));
+  const hashes=await Promise.all(credentials.map((item)=>hashPassword(item.temporaryPassword)));
+  await c.env.DB.batch(credentials.map((item,index)=>{const persisted=storedRole(item.role);return c.env.DB.prepare(
+    `INSERT INTO users(id,name,email,password_hash,role,is_manager,status,account_expires_at) VALUES (?,?,?,?,?,?,'active',?)`,
+  ).bind(item.id,item.name,item.email,hashes[index],persisted.role,persisted.isManager,expiresAt);}));
+  await audit(c,'create_sample_logins','user_set',null,{ roles,expiresAt });
+  c.header('Cache-Control','no-store');
+  return c.json({ expiresAt,credentials:credentials.map(({ role,name,email,temporaryPassword })=>({ role,name,email,temporaryPassword })),notice:'These accounts expire in 24 hours. Download the credentials now and deactivate them sooner when testing is complete.' },201);
+});
+
+app.get('/api/bills', requireRoles('resident','cashier','admin'), async (c) => {
   const user = c.get('user');
   const { limit, offset, page: pageNumber } = page(c);
   const residentId = user.role === 'resident' ? user.id : (c.req.query('residentId') ?? null);
@@ -1132,20 +1162,44 @@ app.patch('/api/payments/:id/review', requireRoles('cashier', 'admin'), async (c
   return c.json({ ok: true });
 });
 
-app.get('/api/imports', requireRoles('admin', 'cashier'), async (c) => {
-  const { limit, offset, page: pageNumber } = page(c);
-  const kind=c.req.query('kind');const scope=c.req.query('scope');const isAdmin=c.get('user').role==='admin';
-  if (kind==='users' && !isAdmin) return jsonError(c,403,'Only administrators can review user imports');
-  if (kind && !['bills','payments','users'].includes(kind)) return jsonError(c,400,'Invalid import kind');
-  const result = kind
+async function prepareCsvImport(c:AppContext,maxRows:number,required:string[],defaultFilename:string,category:string):Promise<Response|{ table:CsvTable;jobId:string;filename:string;storageKey:string }> {
+  const length=Number(c.req.header('Content-Length') ?? 0);
+  if (length>CSV_BODY_LIMIT) return jsonError(c,413,'CSV exceeds the 2 MB upload limit');
+  const text=await c.req.text();
+  if (!text || new TextEncoder().encode(text).byteLength>CSV_BODY_LIMIT) return jsonError(c,413,'CSV must be between 1 byte and 2 MB');
+  let table:CsvTable;
+  try {
+    table=parseCsv(text,maxRows);requireHeaders(table,required);
+    if (!table.rows.length) throw new Error('CSV must contain at least one data row');
+  } catch(error) { return jsonError(c,400,error instanceof Error?error.message:'Invalid CSV'); }
+  const jobId=crypto.randomUUID();const filename=(c.req.header('X-Filename') ?? defaultFilename).slice(0,200);
+  try {
+    const bytes=new TextEncoder().encode(text);
+    const archive=await uploadToPrivateGitHub(c.env,{ body:bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLength) as ArrayBuffer,originalName:filename,contentType:'text/csv',uploadedBy:c.get('user').id,category,linkedEntityType:'import_job',linkedEntityId:jobId });
+    return { table,jobId,filename,storageKey:archive.key };
+  } catch(error) { return jsonError(c,503,error instanceof Error?error.message:'Private GitHub storage is unavailable'); }
+}
+
+app.get('/api/imports', requireRoles('admin','manager','cashier'), async (c) => {
+  const { limit,offset,page:pageNumber }=page(c);
+  const kind=c.req.query('kind');const scope=c.req.query('scope');const actor=c.get('user').role;
+  const billingKinds=['bills','payments'];const operationsKinds=['users','properties','ownerships','tenancies','cards'];
+  const allKinds=[...billingKinds,...operationsKinds];
+  if (kind && !allKinds.includes(kind)) return jsonError(c,400,'Invalid import kind');
+  if (actor==='cashier' && kind && !billingKinds.includes(kind)) return jsonError(c,403,'Cashiers can review billing imports only');
+  if (actor==='manager' && kind && billingKinds.includes(kind)) return jsonError(c,403,'Managers do not have financial-import access');
+  const effectiveScope=actor==='cashier'?'billing':actor==='manager'?'operations':scope;
+  const result=kind
     ? await c.env.DB.prepare(`SELECT j.*,u.name AS uploaded_by_name FROM import_jobs j JOIN users u ON u.id=j.uploaded_by WHERE j.kind=? ORDER BY j.created_at DESC LIMIT ? OFFSET ?`).bind(kind,limit,offset).all()
-    : scope==='billing' || !isAdmin
+    : effectiveScope==='billing'
       ? await c.env.DB.prepare(`SELECT j.*,u.name AS uploaded_by_name FROM import_jobs j JOIN users u ON u.id=j.uploaded_by WHERE j.kind IN ('bills','payments') ORDER BY j.created_at DESC LIMIT ? OFFSET ?`).bind(limit,offset).all()
-      : await c.env.DB.prepare(`SELECT j.*,u.name AS uploaded_by_name FROM import_jobs j JOIN users u ON u.id=j.uploaded_by ORDER BY j.created_at DESC LIMIT ? OFFSET ?`).bind(limit,offset).all();
-  return c.json({ items: result.results, page: pageNumber, limit });
+      : effectiveScope==='operations'
+        ? await c.env.DB.prepare(`SELECT j.*,u.name AS uploaded_by_name FROM import_jobs j JOIN users u ON u.id=j.uploaded_by WHERE j.kind IN ('users','properties','ownerships','tenancies','cards') ORDER BY j.created_at DESC LIMIT ? OFFSET ?`).bind(limit,offset).all()
+        : await c.env.DB.prepare(`SELECT j.*,u.name AS uploaded_by_name FROM import_jobs j JOIN users u ON u.id=j.uploaded_by ORDER BY j.created_at DESC LIMIT ? OFFSET ?`).bind(limit,offset).all();
+  return c.json({ items:result.results,page:pageNumber,limit });
 });
 
-app.post('/api/imports/users', requireRoles('admin'), async (c) => {
+app.post('/api/imports/users', requireRoles('admin','manager'), async (c) => {
   const length=Number(c.req.header('Content-Length') ?? 0);
   if (length>CSV_BODY_LIMIT) return jsonError(c,413,'CSV exceeds the 2 MB upload limit');
   const text=await c.req.text();
@@ -1171,7 +1225,8 @@ app.post('/api/imports/users', requireRoles('admin'), async (c) => {
     let error='';
     if (!name) error='name is required';
     else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) error='a valid email is required';
-    else if (!['admin','resident','security','cashier'].includes(role)) error='role must be admin, resident, security or cashier';
+    else if (!['admin','manager','resident','security','cashier'].includes(role)) error='role must be admin, manager, resident, security or cashier';
+    else if (!canManageAccount(c.get('user').role,role)) error='managers cannot import administrator or manager accounts';
     else if (!['active','inactive'].includes(status)) error='status must be active or inactive';
     else if (unitNumber && role!=='resident') error='only resident rows can select a property';
     else if (unitNumber && status!=='active') error='a property cannot be assigned to an inactive account';
@@ -1207,7 +1262,8 @@ app.post('/api/imports/users', requireRoles('admin'), async (c) => {
     const hashes=await Promise.all(valid.map((candidate)=>hashPassword(candidate.temporaryPassword)));
     const statements:D1PreparedStatement[]=[];
     valid.forEach((candidate,index)=>{
-      statements.push(c.env.DB.prepare(`INSERT INTO users(id,name,email,phone,password_hash,role,property_id,status) VALUES (?,?,?,?,?,?,?,?)`).bind(candidate.id,candidate.name,candidate.email,candidate.phone,hashes[index],candidate.role,candidate.propertyId,candidate.status));
+      const persisted=storedRole(candidate.role);
+      statements.push(c.env.DB.prepare(`INSERT INTO users(id,name,email,phone,password_hash,role,is_manager,property_id,status) VALUES (?,?,?,?,?,?,?,?,?)`).bind(candidate.id,candidate.name,candidate.email,candidate.phone,hashes[index],persisted.role,persisted.isManager,candidate.propertyId,candidate.status));
       if (candidate.propertyId) statements.push(c.env.DB.prepare(`INSERT INTO property_ownerships(id,property_id,resident_id,status,approved_by) VALUES (?,?,?,'active',?)`).bind(crypto.randomUUID(),candidate.propertyId,candidate.id,c.get('user').id));
     });
     try {
@@ -1222,6 +1278,107 @@ app.post('/api/imports/users', requireRoles('admin'), async (c) => {
   await audit(c,'import','users',jobId,{ total:table.rows.length,successful,errors:errors.length });
   c.header('Cache-Control','no-store');
   return c.json({ id:jobId,totalRows:table.rows.length,successfulRows:successful,errorRows:errors.length,errors:errors.slice(0,100),credentials,credentialsNotice:'Temporary passwords are returned only in this response. Download them now and share them securely.' },errors.length?207:201);
+});
+
+app.post('/api/imports/properties', requireRoles('admin','manager'), async (c) => {
+  const prepared=await prepareCsvImport(c,500,['unit_number','address','street'],'properties.csv','operations-imports');
+  if (prepared instanceof Response) return prepared;
+  const errors:Array<{ row:number;error:string }>=[];let successful=0;const seen=new Set<string>();
+  for (const [index,row] of prepared.table.rows.entries()) {
+    try {
+      const unit=row.unit_number?.trim();const address=row.address?.trim();const street=row.street?.trim();
+      if (!unit || !address || !street) throw new Error('unit_number, address and street are required');
+      const key=unit.toLowerCase();if(seen.has(key))throw new Error('duplicate unit_number in this CSV');seen.add(key);
+      const existing=await c.env.DB.prepare(`SELECT id FROM properties WHERE lower(unit_number)=?`).bind(key).first();
+      if(existing)throw new Error('a property with this unit_number already exists');
+      await c.env.DB.prepare(`INSERT INTO properties(id,unit_number,address,street,block,zone) VALUES (?,?,?,?,?,?)`).bind(crypto.randomUUID(),unit,address,street,row.block?.trim() || null,row.zone?.trim() || null).run();
+      successful+=1;
+    } catch(error) { errors.push({ row:index+2,error:error instanceof Error?error.message:String(error) }); }
+  }
+  await saveImportJob(c.env.DB,prepared.jobId,'properties',prepared.filename,prepared.table.rows.length,successful,errors,c.get('user').id,prepared.storageKey);
+  await audit(c,'import','properties',prepared.jobId,{ total:prepared.table.rows.length,successful,errors:errors.length });
+  return c.json({ id:prepared.jobId,totalRows:prepared.table.rows.length,successfulRows:successful,errorRows:errors.length,errors:errors.slice(0,100) },errors.length?207:201);
+});
+
+app.post('/api/imports/ownerships', requireRoles('admin','manager'), async (c) => {
+  const prepared=await prepareCsvImport(c,500,['resident_email','unit_number'],'property-ownerships.csv','operations-imports');
+  if (prepared instanceof Response) return prepared;
+  const errors:Array<{ row:number;error:string }>=[];let successful=0;const seen=new Set<string>();
+  for (const [index,row] of prepared.table.rows.entries()) {
+    try {
+      const email=row.resident_email?.trim().toLowerCase();const unit=row.unit_number?.trim();
+      if (!email || !unit) throw new Error('resident_email and unit_number are required');
+      const key=unit.toLowerCase();if(seen.has(key))throw new Error('duplicate property in this CSV');seen.add(key);
+      const resident=await c.env.DB.prepare(`SELECT id FROM users WHERE lower(email)=? AND role='resident' AND status='active'`).bind(email).first<{ id:string }>();
+      if(!resident)throw new Error('active resident account was not found');
+      const property=await c.env.DB.prepare(`SELECT p.id,po.id AS ownership_id FROM properties p LEFT JOIN property_ownerships po ON po.property_id=p.id AND po.status='active' WHERE lower(p.unit_number)=?`).bind(key).first<{ id:string;ownership_id:string|null }>();
+      if(!property)throw new Error('property was not found');if(property.ownership_id)throw new Error('property already has an active owner');
+      await c.env.DB.batch([
+        c.env.DB.prepare(`INSERT INTO property_ownerships(id,property_id,resident_id,status,approved_by) VALUES (?,?,?,'active',?)`).bind(crypto.randomUUID(),property.id,resident.id,c.get('user').id),
+        c.env.DB.prepare(`UPDATE users SET property_id=COALESCE(property_id,?),updated_at=datetime('now') WHERE id=?`).bind(property.id,resident.id),
+      ]);
+      successful+=1;
+    } catch(error) { errors.push({ row:index+2,error:error instanceof Error?error.message:String(error) }); }
+  }
+  await saveImportJob(c.env.DB,prepared.jobId,'ownerships',prepared.filename,prepared.table.rows.length,successful,errors,c.get('user').id,prepared.storageKey);
+  await audit(c,'import','property_ownerships',prepared.jobId,{ total:prepared.table.rows.length,successful,errors:errors.length });
+  return c.json({ id:prepared.jobId,totalRows:prepared.table.rows.length,successfulRows:successful,errorRows:errors.length,errors:errors.slice(0,100) },errors.length?207:201);
+});
+
+app.post('/api/imports/tenancies', requireRoles('admin','manager'), async (c) => {
+  const prepared=await prepareCsvImport(c,500,['tenant_email','unit_number','start_date','billing_responsibility'],'tenancies.csv','operations-imports');
+  if (prepared instanceof Response) return prepared;
+  const errors:Array<{ row:number;error:string }>=[];let successful=0;const seen=new Set<string>();
+  for (const [index,row] of prepared.table.rows.entries()) {
+    try {
+      const email=row.tenant_email?.trim().toLowerCase();const unit=row.unit_number?.trim();const billing=row.billing_responsibility?.trim().toLowerCase();const status=(row.status?.trim().toLowerCase() || 'active');
+      if (!email || !unit) throw new Error('tenant_email and unit_number are required');
+      if (!billing || !['owner','tenant'].includes(billing)) throw new Error('billing_responsibility must be owner or tenant');
+      if (!['pending','active','ended','rejected','cancelled'].includes(status)) throw new Error('invalid tenancy status');
+      const key=unit.toLowerCase();if(seen.has(key) && ['pending','active'].includes(status))throw new Error('duplicate active/pending property in this CSV');if(['pending','active'].includes(status))seen.add(key);
+      const startDate=validDate(row.start_date!,'start_date');const endDate=row.end_date?validDate(row.end_date,'end_date'):null;
+      if(endDate && new Date(endDate)<new Date(startDate))throw new Error('end_date cannot be before start_date');
+      const tenant=await c.env.DB.prepare(`SELECT id FROM users WHERE lower(email)=? AND role='resident' AND status='active'`).bind(email).first<{ id:string }>();
+      if(!tenant)throw new Error('active resident tenant account was not found');
+      const property=await c.env.DB.prepare(`SELECT p.id,po.resident_id AS owner_id FROM properties p LEFT JOIN property_ownerships po ON po.property_id=p.id AND po.status='active' WHERE lower(p.unit_number)=?`).bind(key).first<{ id:string;owner_id:string|null }>();
+      if(!property)throw new Error('property was not found');if(!property.owner_id)throw new Error('property needs an approved owner before tenancy import');if(property.owner_id===tenant.id)throw new Error('the legal owner cannot also be the imported tenant');
+      const conflict=await c.env.DB.prepare(`SELECT id FROM property_tenancies WHERE property_id=? AND status IN ('pending','active')`).bind(property.id).first();
+      if(conflict && ['pending','active'].includes(status))throw new Error('property already has a pending or active tenancy');
+      const active=status==='active';
+      await c.env.DB.prepare(`INSERT INTO property_tenancies(id,property_id,tenant_id,status,start_date,end_date,billing_responsibility,can_manage_visitors,can_manage_maintenance,request_note,requested_by,approved_by,approved_at,ended_by,ended_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+        crypto.randomUUID(),property.id,tenant.id,status,startDate,endDate,billing,row.can_manage_visitors==='false'?0:1,row.can_manage_maintenance==='false'?0:1,row.note?.trim() || 'Imported tenancy',c.get('user').id,active?c.get('user').id:null,active?new Date().toISOString():null,status==='ended'?c.get('user').id:null,status==='ended'?(endDate || new Date().toISOString()):null,
+      ).run();
+      if(active)await c.env.DB.prepare(`UPDATE users SET property_id=COALESCE(property_id,?),updated_at=datetime('now') WHERE id=?`).bind(property.id,tenant.id).run();
+      successful+=1;
+    } catch(error) { errors.push({ row:index+2,error:error instanceof Error?error.message:String(error) }); }
+  }
+  await saveImportJob(c.env.DB,prepared.jobId,'tenancies',prepared.filename,prepared.table.rows.length,successful,errors,c.get('user').id,prepared.storageKey);
+  await audit(c,'import','tenancies',prepared.jobId,{ total:prepared.table.rows.length,successful,errors:errors.length });
+  return c.json({ id:prepared.jobId,totalRows:prepared.table.rows.length,successfulRows:successful,errorRows:errors.length,errors:errors.slice(0,100) },errors.length?207:201);
+});
+
+app.post('/api/imports/cards', requireRoles('admin','manager'), async (c) => {
+  const prepared=await prepareCsvImport(c,500,['resident_email','card_uid'],'access-cards.csv','operations-imports');
+  if (prepared instanceof Response) return prepared;
+  const errors:Array<{ row:number;error:string }>=[];let successful=0;const seen=new Set<string>();
+  for (const [index,row] of prepared.table.rows.entries()) {
+    try {
+      const email=row.resident_email?.trim().toLowerCase();const cardUid=row.card_uid?.trim();const status=(row.status?.trim().toLowerCase() || 'active');
+      if(!email || !cardUid)throw new Error('resident_email and card_uid are required');
+      const key=cardUid.toLowerCase();if(seen.has(key))throw new Error('duplicate card_uid in this CSV');seen.add(key);
+      if(!['active','expired','suspended','revoked'].includes(status))throw new Error('invalid card status');
+      const resident=await c.env.DB.prepare(`SELECT id FROM users WHERE lower(email)=? AND role='resident' AND status='active'`).bind(email).first<{ id:string }>();
+      if(!resident)throw new Error('active resident account was not found');
+      const existing=await c.env.DB.prepare(`SELECT id FROM access_cards WHERE lower(card_uid)=?`).bind(key).first();if(existing)throw new Error('card_uid already exists');
+      const expiresAt=row.expires_at?validDate(row.expires_at,'expires_at'):null;const id=crypto.randomUUID();
+      await c.env.DB.prepare(`INSERT INTO access_cards(id,resident_id,card_uid,card_label,status,expires_at) VALUES (?,?,?,?,?,?)`).bind(id,resident.id,cardUid,row.card_label?.trim() || null,status,expiresAt).run();
+      if(status==='active')await createDeviceOperations(c.env,id,'upsert_card',{ cardUid,residentId:resident.id,label:row.card_label?.trim() || null,expiresAt,enabled:true });
+      successful+=1;
+    } catch(error) { errors.push({ row:index+2,error:error instanceof Error?error.message:String(error) }); }
+  }
+  await saveImportJob(c.env.DB,prepared.jobId,'cards',prepared.filename,prepared.table.rows.length,successful,errors,c.get('user').id,prepared.storageKey);
+  await audit(c,'import','access_cards',prepared.jobId,{ total:prepared.table.rows.length,successful,errors:errors.length });
+  return c.json({ id:prepared.jobId,totalRows:prepared.table.rows.length,successfulRows:successful,errorRows:errors.length,errors:errors.slice(0,100) },errors.length?207:201);
 });
 
 app.post('/api/imports/bills', requireRoles('admin', 'cashier'), async (c) => {
@@ -1355,7 +1512,7 @@ app.get('/api/visitors', async (c) => {
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
-app.post('/api/visitors', requireRoles('resident', 'admin'), async (c) => {
+app.post('/api/visitors', requireRoles('resident','admin','manager'), async (c) => {
   const body = await c.req.json<{ visitorName?: string; visitorPhone?: string; validFrom?: string; validUntil?: string; residentId?: string; propertyId?: string; deviceId?: string; proofKeys?: string[] }>();
   if (!body.visitorName?.trim() || !body.validFrom || !body.validUntil) return jsonError(c, 400, 'visitorName, validFrom and validUntil are required');
   if (new Date(body.validUntil) <= new Date(body.validFrom)) return jsonError(c, 400, 'validUntil must be after validFrom');
@@ -1403,7 +1560,7 @@ app.post('/api/visitors', requireRoles('resident', 'admin'), async (c) => {
   return c.json({ id, propertyId, pin, qrToken, credentialNumber, barcodePayload:credentialNumber, credentialMode, requiresSecurityApproval:true }, 201);
 });
 
-app.post('/api/visitors/scan', requireRoles('security','admin'), async (c) => {
+app.post('/api/visitors/scan', requireRoles('security','admin','manager'), async (c) => {
   const body=await c.req.json<{ code?:string;source?:'phone_camera'|'device'|'manual' }>();
   const code=body.code?.trim();
   if (!code) return jsonError(c,400,'Visitor QR, barcode or PIN is required');
@@ -1425,7 +1582,7 @@ app.post('/api/visitors/scan', requireRoles('security','admin'), async (c) => {
   return c.json({ scanId,valid,reason:valid?null:'Pass is outside its validity window or no longer active',visitor });
 });
 
-app.post('/api/visitors/:id/decision', requireRoles('security','admin'), async (c) => {
+app.post('/api/visitors/:id/decision', requireRoles('security','admin','manager'), async (c) => {
   const body=await c.req.json<{ decision?:'accepted'|'rejected';action?:'in'|'out';scanId?:string;note?:string }>();
   if (!body.decision || !['accepted','rejected'].includes(body.decision)) return jsonError(c,400,'decision must be accepted or rejected');
   if (!body.scanId) return jsonError(c,400,'Preview the scanned visitor code before making a decision');
@@ -1448,7 +1605,7 @@ app.post('/api/visitors/:id/decision', requireRoles('security','admin'), async (
   return c.json({ ok:true,decision:body.decision,action:body.action ?? null });
 });
 
-app.post('/api/visitors/device-scan-sessions', requireRoles('security','admin'), async (c) => {
+app.post('/api/visitors/device-scan-sessions', requireRoles('security','admin','manager'), async (c) => {
   const body=await c.req.json<{ deviceId?:string }>();
   if (!body.deviceId) return jsonError(c,400,'deviceId is required');
   const device=await c.env.DB.prepare(`SELECT id FROM hikvision_devices WHERE id=? AND deleted_at IS NULL AND status!='disabled'`).bind(body.deviceId).first();
@@ -1462,7 +1619,7 @@ app.post('/api/visitors/device-scan-sessions', requireRoles('security','admin'),
   return c.json({ id,status:'waiting',expiresInMinutes:timeout?.minutes || 5 },201);
 });
 
-app.get('/api/visitors/device-scan-sessions/:id', requireRoles('security','admin'), async (c) => {
+app.get('/api/visitors/device-scan-sessions/:id', requireRoles('security','admin','manager'), async (c) => {
   const session=await c.env.DB.prepare(
     `SELECT s.*,v.visitor_name,v.visitor_phone,v.status AS visitor_status,v.valid_from,v.valid_until,u.name AS resident_name,p.unit_number,p.street
      FROM credential_scan_sessions s LEFT JOIN visitor_requests v ON v.id=s.visitor_request_id
@@ -1473,7 +1630,7 @@ app.get('/api/visitors/device-scan-sessions/:id', requireRoles('security','admin
   return c.json(session);
 });
 
-app.post('/api/visitors/check', requireRoles('security', 'admin'), async (c) => {
+app.post('/api/visitors/check', requireRoles('security','admin','manager'), async (c) => {
   const body = await c.req.json<{ pin?: string; action?: 'in'|'out' }>();
   if (!body.pin || !body.action) return jsonError(c, 400, 'pin and action are required');
   const visitor = await c.env.DB.prepare(`SELECT id FROM visitor_requests WHERE pin=? LIMIT 1`).bind(body.pin).first<{ id:string }>();
@@ -1495,7 +1652,7 @@ app.get('/api/maintenance', async (c) => {
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
-app.post('/api/maintenance', requireRoles('resident', 'admin'), async (c) => {
+app.post('/api/maintenance', requireRoles('resident','admin','manager'), async (c) => {
   const body = await c.req.json<{ description?: string; photoKey?: string; proofKeys?: string[]; residentId?: string; propertyId?: string }>();
   if (!body.description?.trim()) return jsonError(c, 400, 'description is required');
   const residentId = c.get('user').role === 'resident' ? c.get('user').id : body.residentId;
@@ -1525,7 +1682,7 @@ app.post('/api/maintenance', requireRoles('resident', 'admin'), async (c) => {
   return c.json({ id, propertyId }, 201);
 });
 
-app.patch('/api/maintenance/:id', requireRoles('admin'), async (c) => {
+app.patch('/api/maintenance/:id', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{ status?: string }>();
   if (!body.status || !['open','assigned','in_progress','resolved','closed'].includes(body.status)) return jsonError(c, 400, 'Invalid status');
   await c.env.DB.prepare(`UPDATE maintenance_requests SET status=?, updated_at=datetime('now') WHERE id=?`).bind(body.status, c.req.param('id')).run();
@@ -1548,7 +1705,7 @@ app.get('/api/notices/popup', async (c) => {
 app.get('/api/notices', async (c) => {
   const user = c.get('user');
   const { limit, offset, page: pageNumber } = page(c);
-  const includeAll = user.role === 'admin' && c.req.query('scope') === 'all';
+  const includeAll = isEstateOperator(user.role) && c.req.query('scope') === 'all';
   const result = await c.env.DB.prepare(
     `SELECT n.*,u.name AS author_name,CASE WHEN a.user_id IS NULL THEN 0 ELSE 1 END AS acknowledged
      FROM estate_notices n JOIN users u ON u.id=n.created_by
@@ -1559,7 +1716,7 @@ app.get('/api/notices', async (c) => {
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
-app.post('/api/notices', requireRoles('admin'), async (c) => {
+app.post('/api/notices', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{
     title?: string;
     body?: string;
@@ -1581,7 +1738,7 @@ app.post('/api/notices', requireRoles('admin'), async (c) => {
   return c.json({ id }, 201);
 });
 
-app.patch('/api/notices/:id', requireRoles('admin'), async (c) => {
+app.patch('/api/notices/:id', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{ status?: 'active'|'inactive' }>();
   if (!body.status || !['active','inactive'].includes(body.status)) return jsonError(c, 400, 'status must be active or inactive');
   await c.env.DB.prepare(`UPDATE estate_notices SET status=?,updated_at=datetime('now') WHERE id=?`).bind(body.status, c.req.param('id')).run();
@@ -1596,7 +1753,7 @@ app.post('/api/notices/:id/acknowledge', async (c) => {
   return c.json({ ok: true });
 });
 
-app.post('/api/incidents', requireRoles('security', 'admin'), async (c) => {
+app.post('/api/incidents', requireRoles('security','admin','manager'), async (c) => {
   const body = await c.req.json<{ description?: string; location?: string }>();
   if (!body.description?.trim()) return jsonError(c, 400, 'description is required');
   const id = crypto.randomUUID();
@@ -1639,7 +1796,7 @@ app.get('/api/files/*', async (c) => {
   }
 });
 
-app.get('/api/evidence/:entityType/:entityId', requireRoles('admin','cashier','resident'), async (c) => {
+app.get('/api/evidence/:entityType/:entityId', requireRoles('admin','manager','cashier','resident'), async (c) => {
   const user = c.get('user');
   const entityType = c.req.param('entityType').replace(/[^a-z_]/g,'');
   const entityId = c.req.param('entityId');
@@ -1651,7 +1808,7 @@ app.get('/api/evidence/:entityType/:entityId', requireRoles('admin','cashier','r
   return c.json({ items:result.results });
 });
 
-app.post('/api/access/card-scan-sessions', requireRoles('admin'), async (c) => {
+app.post('/api/access/card-scan-sessions', requireRoles('admin','manager'), async (c) => {
   const body=await c.req.json<{ deviceId?:string;residentId?:string;householdMemberId?:string;cardLabel?:string }>();
   if (!body.deviceId || (!body.residentId && !body.householdMemberId)) return jsonError(c,400,'deviceId and a main resident or household member are required');
   const device=await c.env.DB.prepare(`SELECT id FROM hikvision_devices WHERE id=? AND deleted_at IS NULL AND status!='disabled'`).bind(body.deviceId).first();
@@ -1678,7 +1835,7 @@ app.post('/api/access/card-scan-sessions', requireRoles('admin'), async (c) => {
   return c.json({ id,status:'waiting',expiresInMinutes:timeout?.minutes || 5 },201);
 });
 
-app.get('/api/access/card-scan-sessions/:id', requireRoles('admin'), async (c) => {
+app.get('/api/access/card-scan-sessions/:id', requireRoles('admin','manager'), async (c) => {
   const session=await c.env.DB.prepare(
     `SELECT s.*,d.name AS device_name,d.model,u.name AS resident_name,hm.name AS household_member_name
      FROM credential_scan_sessions s JOIN hikvision_devices d ON d.id=s.device_id
@@ -1689,7 +1846,7 @@ app.get('/api/access/card-scan-sessions/:id', requireRoles('admin'), async (c) =
   return c.json(session);
 });
 
-app.post('/api/access/card-scan-sessions/:id/complete', requireRoles('admin'), async (c) => {
+app.post('/api/access/card-scan-sessions/:id/complete', requireRoles('admin','manager'), async (c) => {
   const session=await c.env.DB.prepare(`SELECT * FROM credential_scan_sessions WHERE id=? AND requested_by=? AND purpose='card_enrollment' AND status='captured'`).bind(c.req.param('id'),c.get('user').id).first<Record<string,string|null>>();
   if (!session?.captured_credential || !session.resident_id) return jsonError(c,409,'No card credential has been captured yet');
   const cardId=crypto.randomUUID();
@@ -1702,7 +1859,7 @@ app.post('/api/access/card-scan-sessions/:id/complete', requireRoles('admin'), a
   return c.json({ id:cardId,cardUid:session.captured_credential,hardwareSync:'queued' },201);
 });
 
-app.delete('/api/access/card-scan-sessions/:id', requireRoles('admin'), async (c) => {
+app.delete('/api/access/card-scan-sessions/:id', requireRoles('admin','manager'), async (c) => {
   await c.env.DB.prepare(`UPDATE credential_scan_sessions SET status='cancelled',updated_at=datetime('now') WHERE id=? AND requested_by=? AND status IN ('waiting','captured')`).bind(c.req.param('id'),c.get('user').id).run();
   return c.json({ ok:true });
 });
@@ -1722,7 +1879,7 @@ app.get('/api/access/cards', async (c) => {
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
-app.post('/api/access/cards', requireRoles('admin'), async (c) => {
+app.post('/api/access/cards', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{ residentId?: string; householdMemberId?: string; cardUid?: string; cardLabel?: string }>();
   if ((!body.residentId && !body.householdMemberId) || !body.cardUid?.trim()) return jsonError(c, 400, 'residentId or householdMemberId, and cardUid are required');
   let residentId = body.residentId;
@@ -1745,7 +1902,7 @@ app.post('/api/access/cards', requireRoles('admin'), async (c) => {
   return c.json({ id, hardwareSync: 'manual_action_required' }, 201);
 });
 
-app.patch('/api/access/cards/:id', requireRoles('admin'), async (c) => {
+app.patch('/api/access/cards/:id', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{ status?: 'active'|'expired'|'suspended'|'revoked'; reason?: string }>();
   if (!body.status || !['active','expired','suspended','revoked'].includes(body.status)) return jsonError(c, 400, 'Invalid status');
   const card = await c.env.DB.prepare(`SELECT id,card_uid,status,resident_id FROM access_cards WHERE id=?`).bind(c.req.param('id')).first<Record<string,string>>();
@@ -1777,13 +1934,13 @@ app.get('/api/access/events', async (c) => {
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
-app.get('/api/access/events/stream', requireRoles('admin', 'security'), async (c) => {
+app.get('/api/access/events/stream', requireRoles('admin','manager','security'), async (c) => {
   if (c.req.header('Upgrade')?.toLowerCase() !== 'websocket') return jsonError(c, 400, 'WebSocket upgrade required');
   const id = c.env.LIVE_FEED.idFromName('global');
   return c.env.LIVE_FEED.get(id).fetch(c.req.raw);
 });
 
-app.get('/api/access/profiles', requireRoles('admin', 'security'), (c) => c.json({
+app.get('/api/access/profiles', requireRoles('admin','manager','security'), (c) => c.json({
   items: HIKVISION_PROFILES.map((profile) => ({
     key: profile.key,
     label: profile.label,
@@ -1812,16 +1969,19 @@ app.get('/api/access/device-options', async (c) => {
   }) });
 });
 
-app.get('/api/access/devices', requireRoles('admin', 'security'), async (c) => {
+app.get('/api/access/devices', requireRoles('admin','manager','security'), async (c) => {
   const devices = await c.env.DB.prepare(
-    `SELECT d.*, ap.id AS access_point_id, ap.name AS access_point_name,
+    `SELECT d.id,d.name,d.vendor,d.serial_number,d.model,d.firmware,d.mac_address,d.gate_name,d.direction,d.integration_mode,d.status,d.last_seen_at,d.profile_key,d.connection_pattern,d.listener_format,d.profile_config_json,d.capabilities_json,d.hikconnect_server_address,d.hikconnect_device_serial,
+      CASE WHEN d.hikconnect_verification_code_ciphertext IS NULL THEN 0 ELSE 1 END AS hikconnect_verification_code_configured,
+      CASE WHEN d.sync_agent_secret_hash IS NULL THEN 0 ELSE 1 END AS sync_agent_configured,d.sync_agent_generated_at,d.created_at,d.updated_at,
+      ap.id AS access_point_id,ap.name AS access_point_name,
       (SELECT COUNT(*) FROM device_operations o WHERE o.device_id=d.id AND o.status='manual_action_required') AS pending_operations
      FROM hikvision_devices d LEFT JOIN access_points ap ON ap.device_id=d.id WHERE d.deleted_at IS NULL ORDER BY d.created_at DESC`,
   ).all();
   return c.json({ items: devices.results, mode: c.env.HIKVISION_MODE });
 });
 
-app.post('/api/access/devices', requireRoles('admin'), async (c) => {
+app.post('/api/access/devices', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{
     name?: string;
     vendor?: string;
@@ -1833,6 +1993,9 @@ app.post('/api/access/devices', requireRoles('admin'), async (c) => {
     profileKey?: string;
     connectionPattern?: string;
     listenerFormat?: 'auto'|'json'|'xml'|'multipart';
+    hikconnectServerAddress?:string;
+    hikconnectDeviceSerial?:string;
+    hikconnectVerificationCode?:string;
   }>();
   if (!body.name?.trim() || !body.gateName?.trim() || !body.direction) return jsonError(c, 400, 'name, gateName and direction are required');
   const profile = resolveHikvisionProfile(body.model, body.profileKey ?? 'auto');
@@ -1842,6 +2005,12 @@ app.post('/api/access/devices', requireRoles('admin'), async (c) => {
   }
   const listenerFormat = body.listenerFormat ?? 'auto';
   if (!['auto','json','xml','multipart'].includes(listenerFormat)) return jsonError(c, 400, 'Invalid listenerFormat');
+  const hikconnectServerAddress=body.hikconnectServerAddress?.trim() || null;
+  const hikconnectDeviceSerial=body.hikconnectDeviceSerial?.trim() || body.serialNumber?.trim() || null;
+  const verificationCode=body.hikconnectVerificationCode?.trim() || null;
+  if (hikconnectServerAddress && (hikconnectServerAddress.length>255 || /\s/.test(hikconnectServerAddress))) return jsonError(c,400,'Hik-Connect access server must be a hostname or IP address without spaces');
+  if (verificationCode && !/^[A-Za-z0-9_-]{6,32}$/.test(verificationCode)) return jsonError(c,400,'Hik-Connect verification code must contain 6–32 letters, numbers, underscores or hyphens');
+  const encryptedVerification=verificationCode?await encryptSecret(encryptionKey(c.env),verificationCode):null;
   const legacyMode = ['direct_http_listener','render_http_bridge'].includes(connectionPattern) ? 'http_listener' : connectionPattern === 'offsite_isup_gateway' ? 'isup_bridge' : 'manual';
   const id = crypto.randomUUID();
   const pointId = crypto.randomUUID();
@@ -1851,12 +2020,13 @@ app.post('/api/access/devices', requireRoles('admin'), async (c) => {
   const keyHash = await sha256(`${secret}:${c.env.DEVICE_INGEST_PEPPER}`);
   await c.env.DB.batch([
     c.env.DB.prepare(
-      `INSERT INTO hikvision_devices(id,name,vendor,serial_number,model,firmware,gate_name,direction,integration_mode,profile_key,connection_pattern,listener_format,capabilities_json)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO hikvision_devices(id,name,vendor,serial_number,model,firmware,gate_name,direction,integration_mode,profile_key,connection_pattern,listener_format,capabilities_json,hikconnect_server_address,hikconnect_device_serial,hikconnect_verification_code_ciphertext,hikconnect_verification_code_iv)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).bind(
       id,body.name.trim(),body.vendor?.trim() || 'Hikvision',body.serialNumber?.trim() || null,body.model?.trim() || null,
       body.firmware?.trim() || null,body.gateName.trim(),body.direction,legacyMode,profile.key,connectionPattern,listenerFormat,
       JSON.stringify({ authenticationMethods:profile.authenticationMethods,devicePattern:profile.devicePattern }),
+      hikconnectServerAddress,hikconnectDeviceSerial,encryptedVerification?.ciphertext ?? null,encryptedVerification?.iv ?? null,
     ),
     c.env.DB.prepare(`INSERT INTO access_points(id,name,gate_name,direction,device_id) VALUES (?,?,?,?,?)`).bind(pointId, `${body.gateName.trim()} ${body.direction === 'both' ? 'Entry' : body.direction}`, body.gateName.trim(), body.direction === 'exit' ? 'exit' : 'entry', id),
     c.env.DB.prepare(`INSERT INTO device_credentials(id,device_id,username,api_key_hash) VALUES (?,?,?,?)`).bind(credentialId, id, username, keyHash),
@@ -1881,12 +2051,13 @@ app.post('/api/access/devices', requireRoles('admin'), async (c) => {
     workerEndpoint,
     profile: { key: profile.key, label: profile.label, httpListener: profile.httpListener },
     connectionPattern,
+    hikconnect:{ serverAddress:hikconnectServerAddress,deviceSerial:hikconnectDeviceSerial,verificationCodeConfigured:Boolean(verificationCode) },
     warning,
   }, 201);
 });
 
-app.patch('/api/access/devices/:id', requireRoles('admin'), async (c) => {
-  const body=await c.req.json<{ name?:string;vendor?:string;serialNumber?:string;model?:string;firmware?:string;gateName?:string;direction?:'entry'|'exit'|'both';profileKey?:string;connectionPattern?:string;listenerFormat?:'auto'|'json'|'xml'|'multipart';status?:'pending'|'online'|'offline'|'disabled' }>();
+app.patch('/api/access/devices/:id', requireRoles('admin','manager'), async (c) => {
+  const body=await c.req.json<{ name?:string;vendor?:string;serialNumber?:string;model?:string;firmware?:string;gateName?:string;direction?:'entry'|'exit'|'both';profileKey?:string;connectionPattern?:string;listenerFormat?:'auto'|'json'|'xml'|'multipart';status?:'pending'|'online'|'offline'|'disabled';hikconnectServerAddress?:string;hikconnectDeviceSerial?:string;hikconnectVerificationCode?:string }>();
   if (!body.name?.trim() || !body.gateName?.trim() || !body.direction) return jsonError(c,400,'name, gateName and direction are required');
   const existing=await c.env.DB.prepare(`SELECT id FROM hikvision_devices WHERE id=? AND deleted_at IS NULL`).bind(c.req.param('id')).first();
   if (!existing) return jsonError(c,404,'Access-control device not found');
@@ -1895,19 +2066,25 @@ app.patch('/api/access/devices/:id', requireRoles('admin'), async (c) => {
   if (!isConnectionSupported(profile,connectionPattern)) return jsonError(c,400,`${profile.label} does not offer ${connectionPattern} as a supported connection option`);
   const listenerFormat=body.listenerFormat ?? 'auto';
   if (!['auto','json','xml','multipart'].includes(listenerFormat)) return jsonError(c,400,'Invalid listenerFormat');
+  const hikconnectServerAddress=body.hikconnectServerAddress?.trim() || null;const hikconnectDeviceSerial=body.hikconnectDeviceSerial?.trim() || body.serialNumber?.trim() || null;
+  const verificationCode=body.hikconnectVerificationCode?.trim() || null;
+  if (hikconnectServerAddress && (hikconnectServerAddress.length>255 || /\s/.test(hikconnectServerAddress))) return jsonError(c,400,'Hik-Connect access server must be a hostname or IP address without spaces');
+  if (verificationCode && !/^[A-Za-z0-9_-]{6,32}$/.test(verificationCode)) return jsonError(c,400,'Hik-Connect verification code must contain 6–32 letters, numbers, underscores or hyphens');
+  const encryptedVerification=verificationCode?await encryptSecret(encryptionKey(c.env),verificationCode):null;
   const status=body.status ?? 'offline';
   const legacyMode=['direct_http_listener','render_http_bridge'].includes(connectionPattern)?'http_listener':connectionPattern==='offsite_isup_gateway'?'isup_bridge':'manual';
   await c.env.DB.batch([
     c.env.DB.prepare(
-      `UPDATE hikvision_devices SET name=?,vendor=?,serial_number=?,model=?,firmware=?,gate_name=?,direction=?,integration_mode=?,profile_key=?,connection_pattern=?,listener_format=?,status=?,capabilities_json=?,updated_at=datetime('now') WHERE id=?`,
-    ).bind(body.name.trim(),body.vendor?.trim() || 'Hikvision',body.serialNumber?.trim() || null,body.model?.trim() || null,body.firmware?.trim() || null,body.gateName.trim(),body.direction,legacyMode,profile.key,connectionPattern,listenerFormat,status,JSON.stringify({ authenticationMethods:profile.authenticationMethods,devicePattern:profile.devicePattern }),c.req.param('id')),
+      `UPDATE hikvision_devices SET name=?,vendor=?,serial_number=?,model=?,firmware=?,gate_name=?,direction=?,integration_mode=?,profile_key=?,connection_pattern=?,listener_format=?,status=?,capabilities_json=?,hikconnect_server_address=?,hikconnect_device_serial=?,hikconnect_verification_code_ciphertext=COALESCE(?,hikconnect_verification_code_ciphertext),hikconnect_verification_code_iv=COALESCE(?,hikconnect_verification_code_iv),updated_at=datetime('now') WHERE id=?`,
+    ).bind(body.name.trim(),body.vendor?.trim() || 'Hikvision',body.serialNumber?.trim() || null,body.model?.trim() || null,body.firmware?.trim() || null,body.gateName.trim(),body.direction,legacyMode,profile.key,connectionPattern,listenerFormat,status,JSON.stringify({ authenticationMethods:profile.authenticationMethods,devicePattern:profile.devicePattern }),hikconnectServerAddress,hikconnectDeviceSerial,encryptedVerification?.ciphertext ?? null,encryptedVerification?.iv ?? null,c.req.param('id')),
     c.env.DB.prepare(`UPDATE access_points SET name=?,gate_name=?,direction=?,updated_at=datetime('now') WHERE device_id=?`).bind(`${body.gateName.trim()} ${body.direction==='both'?'Entry':body.direction}`,body.gateName.trim(),body.direction==='exit'?'exit':'entry',c.req.param('id')),
   ]);
-  await audit(c,'update','access_device',c.req.param('id'),{ ...body,profileKey:profile.key,connectionPattern });
-  return c.json({ ok:true,profile:{ key:profile.key,label:profile.label } });
+  const { hikconnectVerificationCode:_,...safeBody }=body;
+  await audit(c,'update','access_device',c.req.param('id'),{ ...safeBody,verificationCodeUpdated:Boolean(verificationCode),profileKey:profile.key,connectionPattern });
+  return c.json({ ok:true,profile:{ key:profile.key,label:profile.label },verificationCodeConfigured:Boolean(verificationCode) });
 });
 
-app.delete('/api/access/devices/:id', requireRoles('admin'), async (c) => {
+app.delete('/api/access/devices/:id', requireRoles('admin','manager'), async (c) => {
   const existing=await c.env.DB.prepare(`SELECT id,name FROM hikvision_devices WHERE id=? AND deleted_at IS NULL`).bind(c.req.param('id')).first<{ id:string;name:string }>();
   if (!existing) return jsonError(c,404,'Access-control device not found');
   await c.env.DB.batch([
@@ -1918,6 +2095,49 @@ app.delete('/api/access/devices/:id', requireRoles('admin'), async (c) => {
   ]);
   await audit(c,'delete','access_device',existing.id,{ name:existing.name,mode:'soft-delete-history-preserved' });
   return c.json({ ok:true,historyPreserved:true });
+});
+
+app.post('/api/access/devices/:id/site-sync-installer', requireRoles('admin','manager'), async (c) => {
+  const device=await c.env.DB.prepare(
+    `SELECT id,name,serial_number,connection_pattern,hikconnect_server_address,hikconnect_device_serial,hikconnect_verification_code_ciphertext,hikconnect_verification_code_iv FROM hikvision_devices WHERE id=? AND deleted_at IS NULL`,
+  ).bind(c.req.param('id')).first<{ id:string;name:string;serial_number:string|null;connection_pattern:string;hikconnect_server_address:string|null;hikconnect_device_serial:string|null;hikconnect_verification_code_ciphertext:string|null;hikconnect_verification_code_iv:string|null }>();
+  if(!device)return jsonError(c,404,'Access-control device not found');
+  if(device.connection_pattern!=='offsite_isup_gateway')return jsonError(c,409,'Select Dedicated ISUP gateway for this device before generating the site synchronizer');
+  let verificationCode:string|null=null;
+  if(device.hikconnect_verification_code_ciphertext && device.hikconnect_verification_code_iv) {
+    try { verificationCode=await decryptSecret(encryptionKey(c.env),device.hikconnect_verification_code_ciphertext,device.hikconnect_verification_code_iv); }
+    catch { return jsonError(c,500,'Stored Hik-Connect verification code could not be decrypted'); }
+  }
+  const syncSecret=randomToken(32);const syncHash=await sha256(`${syncSecret}:${c.env.DEVICE_INGEST_PEPPER}`);
+  await c.env.DB.prepare(`UPDATE hikvision_devices SET sync_agent_secret_hash=?,sync_agent_generated_at=datetime('now'),updated_at=datetime('now') WHERE id=?`).bind(syncHash,device.id).run();
+  const origin=new URL(c.req.url).origin;const localDeviceId=(device.hikconnect_device_serial || device.serial_number || `device-${device.id.slice(0,8)}`).replace(/[^A-Za-z0-9._-]/g,'-').slice(0,80);
+  const deviceConfig=JSON.stringify({ devices:[{ localDeviceId,estateMateDeviceId:device.id,deviceKey:syncSecret }] },null,2);
+  const hikconnectProfile=JSON.stringify({ deviceName:device.name,deviceSerial:device.hikconnect_device_serial || device.serial_number || '',accessServer:device.hikconnect_server_address || '',verificationCode:verificationCode || '',note:'Hik-Connect details do not replace licensed ISUP/OpenAPI integration. Keep this root-only file private.' },null,2);
+  const script=`#!/usr/bin/env bash
+set -euo pipefail
+if [[ \${EUID} -ne 0 ]]; then echo "Run with sudo: sudo bash $0" >&2; exit 1; fi
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y git ca-certificates
+workdir="$(mktemp -d)"
+trap 'rm -rf "$workdir"' EXIT
+git clone --depth 1 https://github.com/barikblog/estatemate-minmoe.git "$workdir/estatemate"
+bash "$workdir/estatemate/isup-gateway/install-ubuntu.sh" install
+cat > /etc/estatemate/isup-devices.json <<'ESTATEMATE_DEVICE_CONFIG'
+${deviceConfig}
+ESTATEMATE_DEVICE_CONFIG
+cat > /etc/estatemate/hikconnect-device.json <<'ESTATEMATE_HIKCONNECT_CONFIG'
+${hikconnectProfile}
+ESTATEMATE_HIKCONNECT_CONFIG
+sed -i 's#^ESTATEMATE_WORKER_URL=.*#ESTATEMATE_WORKER_URL=${origin}#' /etc/estatemate/isup-gateway.env
+chmod 0600 /etc/estatemate/isup-devices.json /etc/estatemate/hikconnect-device.json /etc/estatemate/isup-gateway.env
+echo
+printf '%s\n' 'EstateMate site synchronization control plane installed.'
+printf '%s\n' 'Next: install the licensed Hikvision SDK adapter, configure /etc/estatemate/isup-adapter.json, then run:'
+printf '%s\n' '  sudo /opt/estatemate-isup-control/install-ubuntu.sh start'
+printf '%s\n' 'Do not expose the loopback control API or the Hik-Connect verification code.'
+`;
+  await audit(c,'generate_site_sync_installer','access_device',device.id,{ localDeviceId,serverAddressConfigured:Boolean(device.hikconnect_server_address),verificationCodeIncluded:Boolean(verificationCode) });
+  return new Response(script,{ status:200,headers:{ 'Content-Type':'text/x-shellscript; charset=utf-8','Content-Disposition':`attachment; filename="estatemate-site-sync-${device.id.slice(0,8)}.sh"`,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff' } });
 });
 
 app.post('/api/access/devices/:id/rotate-secret', requireRoles('admin'), async (c) => {
@@ -1932,7 +2152,7 @@ app.post('/api/access/devices/:id/rotate-secret', requireRoles('admin'), async (
   return c.json({ secret,endpoint,workerEndpoint,warning:'Shown once. Update the physical device immediately; the previous secret no longer works.' });
 });
 
-app.get('/api/access/operations', requireRoles('admin'), async (c) => {
+app.get('/api/access/operations', requireRoles('admin','manager'), async (c) => {
   const { limit, offset, page: pageNumber } = page(c);
   const result = await c.env.DB.prepare(
     `SELECT * FROM (
@@ -1948,7 +2168,7 @@ app.get('/api/access/operations', requireRoles('admin'), async (c) => {
   return c.json({ items: result.results, page: pageNumber, limit, note: 'HTTP Listening is upload-only. These operations require manual application or a supported ISUP/Hikvision cloud command bridge.' });
 });
 
-app.patch('/api/access/operations/:id', requireRoles('admin'), async (c) => {
+app.patch('/api/access/operations/:id', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{ status?: 'applied'|'failed'; errorMessage?: string }>();
   if (!body.status || !['applied','failed'].includes(body.status)) return jsonError(c, 400, 'status must be applied or failed');
   const cardOperation=await c.env.DB.prepare(`UPDATE device_operations SET status=?,error_message=?,updated_at=datetime('now') WHERE id=?`).bind(body.status,body.errorMessage ?? null,c.req.param('id')).run();
@@ -2047,7 +2267,7 @@ app.notFound((c) => c.json({ error: 'API route not found' }, 404));
 async function saveImportJob(
   db: D1Database,
   id: string,
-  kind: 'bills'|'payments'|'users',
+  kind: 'bills'|'payments'|'users'|'properties'|'ownerships'|'tenancies'|'cards',
   filename: string,
   total: number,
   successful: number,
@@ -2104,13 +2324,14 @@ async function authenticateDevice(request: Request, env: Env, deviceId: string):
   }
   if (!secret) return null;
   const credential = await env.DB.prepare(
-    `SELECT dc.username,dc.api_key_hash,d.id,d.name,d.direction,d.profile_key,d.connection_pattern,ap.id AS access_point_id
+    `SELECT dc.username,dc.api_key_hash,d.sync_agent_secret_hash,d.id,d.name,d.direction,d.profile_key,d.connection_pattern,ap.id AS access_point_id
      FROM device_credentials dc JOIN hikvision_devices d ON d.id=dc.device_id
      LEFT JOIN access_points ap ON ap.device_id=d.id AND ap.enabled=1
      WHERE d.id=? AND d.deleted_at IS NULL AND dc.revoked_at IS NULL AND (? IS NULL OR dc.username=?) LIMIT 1`,
   ).bind(deviceId, username, username).first<Record<string, string | null>>();
   if (!credential) return null;
-  if (await sha256(`${secret}:${env.DEVICE_INGEST_PEPPER}`) !== credential.api_key_hash) return null;
+  const presentedHash=await sha256(`${secret}:${env.DEVICE_INGEST_PEPPER}`);
+  if (presentedHash!==credential.api_key_hash && presentedHash!==credential.sync_agent_secret_hash) return null;
   return {
     id: credential.id!,
     name: credential.name!,
@@ -2272,6 +2493,7 @@ async function processPropertyLifecycle(env: Env): Promise<void> {
     try { await completePropertyTransfer(env,transfer.id,null); }
     catch (error) { console.error('Scheduled property transfer failed',transfer.id,error); }
   }
+  await env.DB.prepare(`UPDATE users SET status='inactive',updated_at=datetime('now') WHERE status='active' AND account_expires_at IS NOT NULL AND datetime(account_expires_at)<=datetime('now')`).run();
 }
 
 async function enforceFacilityFees(env: Env): Promise<void> {

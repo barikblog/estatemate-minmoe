@@ -157,9 +157,9 @@ class MainViewModel @Inject constructor(private val repository: EstateRepository
             val dashboard = repository.dashboard()
             val properties = repository.properties()
             val available = if (role == "resident") repository.availableProperties() else emptyList()
-            val requests = if (role == "resident" || role == "admin") repository.ownershipRequests() else emptyList()
-            val tenancies = if (role == "resident" || role == "admin") repository.tenancies() else emptyList()
-            val household = if (role == "resident" || role == "admin") repository.householdMembers() else emptyList()
+            val requests = if (role == "resident" || role == "admin" || role == "manager") repository.ownershipRequests() else emptyList()
+            val tenancies = if (role == "resident" || role == "admin" || role == "manager") repository.tenancies() else emptyList()
+            val household = if (role == "resident" || role == "admin" || role == "manager") repository.householdMembers() else emptyList()
             repository.refreshEvents()
             RefreshPayload(dashboard,properties,available,requests,tenancies,household)
         }.onSuccess { payload ->

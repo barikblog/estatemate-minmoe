@@ -231,7 +231,8 @@ export async function downloadFromPrivateGitHub(
     `SELECT storage_key,github_owner,github_repository,github_branch,github_path,original_name,content_type,size_bytes,uploaded_by,category FROM stored_files WHERE storage_key=? AND status='active'`,
   ).bind(storageKey).first<{ storage_key: string; github_owner: string; github_repository: string; github_branch: string; github_path: string; original_name: string; content_type: string; size_bytes: number; uploaded_by: string; category:string }>();
   if (!file) return null;
-  if (file.category==='user-imports' && requester.role!=='admin') throw new Error('FILE_ACCESS_DENIED');
+  if (file.category==='user-imports' && requester.role!=='admin' && !(requester.role==='manager' && file.uploaded_by===requester.id)) throw new Error('FILE_ACCESS_DENIED');
+  if (file.category==='operations-imports' && !['admin','manager'].includes(requester.role)) throw new Error('FILE_ACCESS_DENIED');
   if (requester.role === 'resident' && file.uploaded_by !== requester.id) throw new Error('FILE_ACCESS_DENIED');
   const config = await activeStorageConfig(env);
   const response = await fetch(`${repoUrl({ owner: file.github_owner, repository: file.github_repository }, `/contents/${contentPath(file.github_path)}`)}?ref=${encodeURIComponent(file.github_branch)}`, {

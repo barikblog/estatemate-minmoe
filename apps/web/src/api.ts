@@ -2,7 +2,7 @@ export interface User {
   id: string;
   name: string;
   email: string;
-  role: 'admin' | 'resident' | 'security' | 'cashier';
+  role: 'admin' | 'manager' | 'resident' | 'security' | 'cashier';
   property_id: string | null;
 }
 

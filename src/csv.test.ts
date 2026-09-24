@@ -26,6 +26,15 @@ describe('CSV import utilities', () => {
     expect(()=>parseCsv(`name,email,role\n${rows}`,25)).toThrow('25');
   });
 
+  it.each([
+    ['unit_number,address,street\nA-01,1 Palm Avenue,Palm Avenue',['unit_number','address','street']],
+    ['resident_email,unit_number\nresident@example.com,A-01',['resident_email','unit_number']],
+    ['tenant_email,unit_number,start_date,billing_responsibility\ntenant@example.com,A-01,2026-01-01,tenant',['tenant_email','unit_number','start_date','billing_responsibility']],
+    ['resident_email,card_uid\nresident@example.com,10000001',['resident_email','card_uid']],
+  ])('accepts an operational import template', (input,headers) => {
+    const table=parseCsv(input,500);expect(()=>requireHeaders(table,headers)).not.toThrow();expect(table.rows).toHaveLength(1);
+  });
+
   it.each([['100', 10_000], ['1,250.50', 125_050], ['₦75.5', 7_550]])('converts %s to minor units', (input, expected) => {
     expect(moneyToMinor(input)).toBe(expected);
   });

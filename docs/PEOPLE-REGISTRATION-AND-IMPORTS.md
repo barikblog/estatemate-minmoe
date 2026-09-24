@@ -6,7 +6,7 @@ Administrators open **People → Add person** and provide the name, email, phone
 
 When the role is **Resident**, the property field lists only properties currently available in the portal—properties without an active approved owner. Selecting one creates the resident account and approved single-owner relationship together. The field is optional because a resident can request or receive property ownership later.
 
-Security, Cashier and Administrator accounts cannot be assigned property ownership.
+Security, Cashier, Manager and Administrator accounts cannot be assigned property ownership. Managers may manage Resident, Security and Cashier accounts but cannot create or change Administrator/Manager accounts.
 
 ## Editing and account lifecycle
 
@@ -35,7 +35,7 @@ Gate Officer,security@example.com,+2348000000001,security,,active
 Rules:
 
 - Required columns: `name`, `email`, `role`.
-- Roles: `resident`, `security`, `cashier`, `admin`.
+- Roles: `resident`, `security`, `cashier`, `manager`, `admin`. A Manager upload cannot grant `manager` or `admin`; only an Administrator can.
 - Status defaults to `active`; accepted values are `active` and `inactive`.
 - `unit_number` is optional and valid only for an active resident.
 - A unit must already exist and have no active owner.

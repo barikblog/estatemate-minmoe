@@ -23,6 +23,24 @@ export async function sha256(value: string | Uint8Array): Promise<string> {
   return [...new Uint8Array(hash)].map((n) => n.toString(16).padStart(2, '0')).join('');
 }
 
+async function aesKey(secret: string): Promise<CryptoKey> {
+  if (!secret) throw new Error('A server encryption key is required');
+  const digest=await crypto.subtle.digest('SHA-256',encoder.encode(secret));
+  return crypto.subtle.importKey('raw',digest,{ name:'AES-GCM' },false,['encrypt','decrypt']);
+}
+
+export async function encryptSecret(secret: string, value: string): Promise<{ ciphertext:string;iv:string }> {
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const encrypted=await crypto.subtle.encrypt({ name:'AES-GCM',iv },await aesKey(secret),encoder.encode(value));
+  return { ciphertext:base64Url(new Uint8Array(encrypted)),iv:base64Url(iv) };
+}
+
+export async function decryptSecret(secret: string, ciphertext: string, iv: string): Promise<string> {
+  const ivBytes=Uint8Array.from(fromBase64Url(iv));const ciphertextBytes=Uint8Array.from(fromBase64Url(ciphertext));
+  const decrypted=await crypto.subtle.decrypt({ name:'AES-GCM',iv:ivBytes.buffer as ArrayBuffer },await aesKey(secret),ciphertextBytes.buffer as ArrayBuffer);
+  return new TextDecoder().decode(decrypted);
+}
+
 export async function hashPassword(password: string): Promise<string> {
   if (password.length < 10) throw new Error('Password must contain at least 10 characters');
   const salt = crypto.getRandomValues(new Uint8Array(16));

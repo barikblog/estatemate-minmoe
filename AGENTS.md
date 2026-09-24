@@ -9,7 +9,8 @@ This file is the starting point for any AI coding agent continuing EstateMate in
 3. `docs/MINMOE-NO-PC.md`
 4. `docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md`
 5. `docs/PEOPLE-REGISTRATION-AND-IMPORTS.md`
-6. Latest migrations in `migrations/`
+6. `docs/MANAGERS-IMPORTS-HIKCONNECT-SITE-SYNC.md`
+7. Latest migrations in `migrations/`
 
 Run `./scripts/ai-context.sh` to print a safe repository summary.
 
@@ -30,6 +31,7 @@ Run `./scripts/ai-context.sh` to print a safe repository summary.
 - No paid service is required. Do not add R2 or another paid dependency.
 - Files go to the administrator-configured private GitHub repository; D1 stores metadata only.
 - Never commit tokens, passwords, device secrets or production exports.
+- Manager is an operational role only: it must not gain billing/payment, private-storage, global-settings, Administrator/Manager account-control or ingest-secret rotation permissions.
 - Each property has one active legal owner. Tenancy never changes ownership.
 - Preserve ownership, tenancy, billing, card, visitor and access-event history.
 - Default visitor gate policy is preview first, then Admin/Security accepts or rejects.

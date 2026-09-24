@@ -71,15 +71,19 @@ The installer creates a random local adapter secret. It never creates fake traff
 
 ### 3. Add the access device in EstateMate
 
-In **Access → Devices**, choose the exact model/profile and select **Dedicated ISUP gateway (local appliance or off-site)**. Copy the returned device UUID and one-time secret into:
+In **Access → Devices**, choose the exact model/profile and select **Dedicated ISUP gateway (local appliance or off-site)**. The recommended path is **Download site sync**, which returns a no-cache Ubuntu installer containing a separate one-time synchronization key and writes the root-only device mapping automatically.
+
+For manual setup, copy the returned device UUID and one-time secret into:
 
 ```text
 /etc/estatemate/isup-devices.json
 ```
 
-Use `isup-devices.example.json` as the schema and keep the real file mode at `0600`.
+Use `isup-devices.example.json` as the schema and keep the real file mode at `0600`. Generating another site-sync installer invalidates the previous generated site-sync key without rotating the terminal event-ingest secret.
 
 Create `/etc/estatemate/isup-adapter.json` from `isup-adapter.example.json`. Give each terminal a unique SDK device ID, matching `localDeviceId`, and strong ISUP key. This file is readable by the native adapter but contains no EstateMate API secret.
+
+The generated installer also writes `/etc/estatemate/hikconnect-device.json` with mode `0600` when Hik-Connect server/serial/verification details were saved. Treat it as sensitive. Hik-Connect verification details are not interchangeable with the device's ISUP key and do not create an official command API by themselves.
 
 ### 4. Install the official SDK adapter
 
