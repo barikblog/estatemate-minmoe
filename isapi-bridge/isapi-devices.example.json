@@ -1,0 +1,24 @@
+{
+  "devices": [
+    {
+      "estateMateDeviceId": "11111111-1111-4111-8111-111111111111",
+      "name": "Main Gate MinMoe",
+      "isapiHost": "192.168.1.100",
+      "isapiPort": 80,
+      "isapiUsername": "admin",
+      "isapiPassword": "device-admin-password",
+      "protocol": "http",
+      "enabled": true
+    },
+    {
+      "estateMateDeviceId": "22222222-2222-4222-8222-222222222222",
+      "name": "Side Gate K1T808",
+      "isapiHost": "192.168.1.101",
+      "isapiPort": 80,
+      "isapiUsername": "admin",
+      "isapiPassword": "another-password",
+      "protocol": "http",
+      "enabled": true
+    }
+  ]
+}

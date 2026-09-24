@@ -1,0 +1,17 @@
+{
+  "name": "@estatemate/windows-isapi-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "EstateMate Windows Agent - Windows Service wrapper for Hikvision ISAPI Bridge",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node agent.mjs",
+    "install": "node install-windows.mjs",
+    "check": "node --check agent.mjs"
+  },
+  "os": ["win32"],
+  "keywords": ["windows", "service", "hikvision", "isapi", "estatemate"]
+}

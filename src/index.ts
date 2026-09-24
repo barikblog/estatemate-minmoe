@@ -1706,7 +1706,7 @@ app.post('/api/visitors', requireRoles('resident','admin','manager'), async (c) 
   ).bind(id,residentId,propertyId,body.visitorName.trim(),body.visitorPhone?.trim() ?? null,pin,qrToken,credentialNumber,credentialNumber,credentialMode,device?.id ?? null,gateScope,1,requireGateIdVerification,validFrom,validUntil).run();
   await linkProofFiles(c.env.DB,proofKeys(body.proofKeys),'visitor_request',id,requester.id);
   if (device) {
-    const status=['hikvision_cloud_openapi','offsite_isup_gateway'].includes(device.connection_pattern)?'pending':'manual_action_required';
+    const status=isPendingPattern(device.connection_pattern)?'pending':'manual_action_required';
     await c.env.DB.prepare(
       `INSERT INTO visitor_device_operations(id,visitor_request_id,device_id,operation,payload_json,status) VALUES (?,?,?,'upsert_visitor',?,?)`,
     ).bind(crypto.randomUUID(),id,device.id,JSON.stringify({ credentialNumber,visitorName:body.visitorName.trim(),validFrom,validUntil,enabled:false,requiresSecurityApproval:true }),status).run();
@@ -2290,9 +2290,14 @@ app.get('/api/access/devices', requireRoles('admin','manager','security'), async
   const devices = await c.env.DB.prepare(
     `SELECT d.id,d.name,d.vendor,d.serial_number,d.model,d.firmware,d.mac_address,d.gate_name,d.direction,d.integration_mode,d.status,d.last_seen_at,d.profile_key,d.connection_pattern,d.listener_format,d.profile_config_json,d.capabilities_json,d.hikconnect_server_address,d.hikconnect_device_serial,
       CASE WHEN d.hikconnect_verification_code_ciphertext IS NULL THEN 0 ELSE 1 END AS hikconnect_verification_code_configured,
-      CASE WHEN d.sync_agent_secret_hash IS NULL THEN 0 ELSE 1 END AS sync_agent_configured,d.sync_agent_generated_at,d.created_at,d.updated_at,
+      CASE WHEN d.sync_agent_secret_hash IS NULL THEN 0 ELSE 1 END AS sync_agent_configured,d.sync_agent_generated_at,
+      d.isapi_agent_id,d.isapi_sync_enabled,d.last_isapi_sync_at,d.last_isapi_sync_status,d.isapi_host,d.isapi_port,d.isapi_username,
+      CASE WHEN d.isapi_password_ciphertext IS NULL THEN 0 ELSE 1 END AS isapi_password_configured,d.isapi_protocol,
+      d.created_at,d.updated_at,
       ap.id AS access_point_id,ap.name AS access_point_name,
-      (SELECT COUNT(*) FROM device_operations o WHERE o.device_id=d.id AND o.status='manual_action_required') AS pending_operations
+      (SELECT COUNT(*) FROM device_operations o WHERE o.device_id=d.id AND o.status='manual_action_required') AS pending_operations,
+      (SELECT COUNT(*) FROM device_operations o WHERE o.device_id=d.id AND o.status IN ('pending','sent','failed')) AS queued_operations,
+      (SELECT a.name FROM isapi_agents a WHERE a.id=d.isapi_agent_id AND a.deleted_at IS NULL) AS isapi_agent_name
      FROM hikvision_devices d LEFT JOIN access_points ap ON ap.device_id=d.id WHERE d.deleted_at IS NULL ORDER BY d.created_at DESC`,
   ).all();
   return c.json({ items: devices.results, mode: c.env.HIKVISION_MODE });
@@ -2328,7 +2333,7 @@ app.post('/api/access/devices', requireRoles('admin','manager'), async (c) => {
   if (hikconnectServerAddress && (hikconnectServerAddress.length>255 || /\s/.test(hikconnectServerAddress))) return jsonError(c,400,'Hik-Connect access server must be a hostname or IP address without spaces');
   if (verificationCode && !/^[A-Za-z0-9_-]{6,32}$/.test(verificationCode)) return jsonError(c,400,'Hik-Connect verification code must contain 6–32 letters, numbers, underscores or hyphens');
   const encryptedVerification=verificationCode?await encryptSecret(encryptionKey(c.env),verificationCode):null;
-  const legacyMode = ['direct_http_listener','render_http_bridge'].includes(connectionPattern) ? 'http_listener' : connectionPattern === 'offsite_isup_gateway' ? 'isup_bridge' : 'manual';
+  const legacyMode = ['direct_http_listener','render_http_bridge'].includes(connectionPattern) ? 'http_listener' : ['offsite_isup_gateway','isapi_bridge','windows_agent','isapi_windows_agent'].includes(connectionPattern) ? 'isup_bridge' : 'manual';
   const id = crypto.randomUUID();
   const pointId = crypto.randomUUID();
   const credentialId = crypto.randomUUID();
@@ -2359,7 +2364,9 @@ app.post('/api/access/devices', requireRoles('admin','manager'), async (c) => {
     ? 'The secret is shown once. Direct HTTP Listening uploads events only; card commands still need a verified return channel.'
     : connectionPattern === 'manual_sync'
       ? 'No automatic device transport is enabled. Use the hardware action queue and acknowledge each applied change.'
-      : 'Complete the selected gateway/cloud integration before marking hardware operations as applied.';
+      : ['isapi_bridge','windows_agent','isapi_windows_agent'].includes(connectionPattern)
+        ? 'ISAPI bridge / Windows agent selected. Install the Windows agent on the device LAN, configure ISAPI host/credentials, and link this device to the agent. Card operations will be polled and applied via ISAPI.'
+        : 'Complete the selected gateway/cloud integration before marking hardware operations as applied.';
   return c.json({
     id,
     username,
@@ -2389,7 +2396,7 @@ app.patch('/api/access/devices/:id', requireRoles('admin','manager'), async (c) 
   if (verificationCode && !/^[A-Za-z0-9_-]{6,32}$/.test(verificationCode)) return jsonError(c,400,'Hik-Connect verification code must contain 6–32 letters, numbers, underscores or hyphens');
   const encryptedVerification=verificationCode?await encryptSecret(encryptionKey(c.env),verificationCode):null;
   const status=body.status ?? 'offline';
-  const legacyMode=['direct_http_listener','render_http_bridge'].includes(connectionPattern)?'http_listener':connectionPattern==='offsite_isup_gateway'?'isup_bridge':'manual';
+  const legacyMode=['direct_http_listener','render_http_bridge'].includes(connectionPattern)?'http_listener':['offsite_isup_gateway','isapi_bridge','windows_agent','isapi_windows_agent'].includes(connectionPattern)?'isup_bridge':'manual';
   await c.env.DB.batch([
     c.env.DB.prepare(
       `UPDATE hikvision_devices SET name=?,vendor=?,serial_number=?,model=?,firmware=?,gate_name=?,direction=?,integration_mode=?,profile_key=?,connection_pattern=?,listener_format=?,status=?,capabilities_json=?,hikconnect_server_address=?,hikconnect_device_serial=?,hikconnect_verification_code_ciphertext=COALESCE(?,hikconnect_verification_code_ciphertext),hikconnect_verification_code_iv=COALESCE(?,hikconnect_verification_code_iv),updated_at=datetime('now') WHERE id=?`,
@@ -2491,6 +2498,367 @@ app.patch('/api/access/operations/:id', requireRoles('admin','manager'), async (
   const cardOperation=await c.env.DB.prepare(`UPDATE device_operations SET status=?,error_message=?,updated_at=datetime('now') WHERE id=?`).bind(body.status,body.errorMessage ?? null,c.req.param('id')).run();
   if (!cardOperation.meta.changes) await c.env.DB.prepare(`UPDATE visitor_device_operations SET status=?,error_message=?,updated_at=datetime('now') WHERE id=?`).bind(body.status,body.errorMessage ?? null,c.req.param('id')).run();
   return c.json({ ok: true });
+});
+
+// ─────────────────────────────────────────────────────────────
+// Hikvision ISAPI bridge and Windows agent management
+// ─────────────────────────────────────────────────────────────
+
+app.get('/api/isapi/agents', requireRoles('admin','manager'), async (c) => {
+  const agents = await c.env.DB.prepare(
+    `SELECT a.id,a.name,a.hostname,a.platform,a.version,a.status,a.last_seen_at,a.last_ip,a.created_at,a.updated_at,
+       (SELECT COUNT(*) FROM isapi_device_configs cfg WHERE cfg.agent_id=a.id AND cfg.sync_enabled=1) AS linked_devices,
+       (SELECT COUNT(*) FROM device_operations o JOIN isapi_device_configs cfg ON cfg.device_id=o.device_id WHERE cfg.agent_id=a.id AND o.status IN ('pending','sent','failed')) +
+       (SELECT COUNT(*) FROM visitor_device_operations vo JOIN isapi_device_configs cfg ON cfg.device_id=vo.device_id WHERE cfg.agent_id=a.id AND vo.status IN ('pending','sent','failed')) AS pending_operations
+     FROM isapi_agents a WHERE a.deleted_at IS NULL ORDER BY a.created_at DESC`,
+  ).all();
+  return c.json({ items: agents.results });
+});
+
+app.post('/api/isapi/agents', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<{ name?: string; hostname?: string; platform?: string; version?: string }>();
+  if (!body.name?.trim()) return jsonError(c, 400, 'Agent name is required');
+  const platform = (body.platform?.trim().toLowerCase() || 'windows') as 'windows'|'linux'|'darwin'|'other';
+  if (!['windows','linux','darwin','other'].includes(platform)) return jsonError(c, 400, 'platform must be windows, linux, darwin or other');
+  const id = crypto.randomUUID();
+  const secret = randomToken(32);
+  const secretHash = await sha256(`${secret}:${c.env.DEVICE_INGEST_PEPPER}`);
+  await c.env.DB.prepare(
+    `INSERT INTO isapi_agents(id,name,hostname,platform,version,status,secret_hash,created_by) VALUES (?,?,?,?,?,?,?,?)`,
+  ).bind(id, body.name.trim(), body.hostname?.trim() || null, platform, body.version?.trim() || null, 'pending', secretHash, c.get('user').id).run();
+  await audit(c, 'create', 'isapi_agent', id, { name: body.name.trim(), platform, hostname: body.hostname?.trim() });
+  return c.json({ id, name: body.name.trim(), hostname: body.hostname?.trim() || null, platform, secret, warning: 'Secret is shown once. Store it securely on the Windows agent host.' }, 201);
+});
+
+app.get('/api/isapi/agents/:id', requireRoles('admin','manager'), async (c) => {
+  const agent = await c.env.DB.prepare(
+    `SELECT id,name,hostname,platform,version,status,last_seen_at,last_ip,created_at,updated_at FROM isapi_agents WHERE id=? AND deleted_at IS NULL`,
+  ).bind(c.req.param('id')).first();
+  if (!agent) return jsonError(c, 404, 'ISAPI agent not found');
+  const configs = await c.env.DB.prepare(
+    `SELECT cfg.*,d.name AS device_name,d.model,d.gate_name,d.connection_pattern
+     FROM isapi_device_configs cfg JOIN hikvision_devices d ON d.id=cfg.device_id
+     WHERE cfg.agent_id=? ORDER BY d.gate_name,d.name`,
+  ).bind(c.req.param('id')).all();
+  const logs = await c.env.DB.prepare(
+    `SELECT id,device_id,operation_type,status,message,duration_ms,created_at FROM isapi_sync_logs WHERE agent_id=? ORDER BY created_at DESC LIMIT 50`,
+  ).bind(c.req.param('id')).all();
+  return c.json({ agent, configs: configs.results, logs: logs.results });
+});
+
+app.patch('/api/isapi/agents/:id', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<{ name?: string; hostname?: string; platform?: string; version?: string; status?: string }>();
+  const existing = await c.env.DB.prepare(`SELECT id FROM isapi_agents WHERE id=? AND deleted_at IS NULL`).bind(c.req.param('id')).first();
+  if (!existing) return jsonError(c, 404, 'ISAPI agent not found');
+  const platform = body.platform ? body.platform.trim().toLowerCase() : null;
+  if (platform && !['windows','linux','darwin','other'].includes(platform)) return jsonError(c, 400, 'Invalid platform');
+  const status = body.status ? body.status.trim() : null;
+  if (status && !['pending','online','offline','disabled'].includes(status)) return jsonError(c, 400, 'Invalid status');
+  await c.env.DB.prepare(
+    `UPDATE isapi_agents SET name=COALESCE(?,name),hostname=COALESCE(?,hostname),platform=COALESCE(?,platform),version=COALESCE(?,version),status=COALESCE(?,status),updated_at=datetime('now') WHERE id=?`,
+  ).bind(body.name?.trim() || null, body.hostname?.trim() || null, platform, body.version?.trim() || null, status, c.req.param('id')).run();
+  await audit(c, 'update', 'isapi_agent', c.req.param('id'), body);
+  return c.json({ ok: true });
+});
+
+app.delete('/api/isapi/agents/:id', requireRoles('admin'), async (c) => {
+  const existing = await c.env.DB.prepare(`SELECT id,name FROM isapi_agents WHERE id=? AND deleted_at IS NULL`).bind(c.req.param('id')).first<{ id:string;name:string }>();
+  if (!existing) return jsonError(c, 404, 'ISAPI agent not found');
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE isapi_agents SET status='disabled',deleted_at=datetime('now'),updated_at=datetime('now') WHERE id=?`).bind(existing.id),
+    c.env.DB.prepare(`UPDATE isapi_device_configs SET agent_id=NULL,updated_at=datetime('now') WHERE agent_id=?`).bind(existing.id),
+    c.env.DB.prepare(`UPDATE hikvision_devices SET isapi_agent_id=NULL,isapi_sync_enabled=0,updated_at=datetime('now') WHERE isapi_agent_id=?`).bind(existing.id),
+  ]);
+  await audit(c, 'delete', 'isapi_agent', existing.id);
+  return c.json({ ok: true });
+});
+
+app.post('/api/isapi/agents/:id/rotate-secret', requireRoles('admin'), async (c) => {
+  const agent = await c.env.DB.prepare(`SELECT id FROM isapi_agents WHERE id=? AND deleted_at IS NULL`).bind(c.req.param('id')).first();
+  if (!agent) return jsonError(c, 404, 'ISAPI agent not found');
+  const secret = randomToken(32);
+  const secretHash = await sha256(`${secret}:${c.env.DEVICE_INGEST_PEPPER}`);
+  await c.env.DB.prepare(`UPDATE isapi_agents SET secret_hash=?,updated_at=datetime('now') WHERE id=?`).bind(secretHash, c.req.param('id')).run();
+  await audit(c, 'rotate_secret', 'isapi_agent', c.req.param('id'));
+  return c.json({ secret, warning: 'Shown once. Update the Windows agent configuration immediately.' });
+});
+
+app.post('/api/isapi/agents/:id/installer', requireRoles('admin','manager'), async (c) => {
+  const agent = await c.env.DB.prepare(`SELECT id,name,platform FROM isapi_agents WHERE id=? AND deleted_at IS NULL`).bind(c.req.param('id')).first<{ id:string;name:string;platform:string }>();
+  if (!agent) return jsonError(c, 404, 'ISAPI agent not found');
+  const secret = randomToken(32);
+  const secretHash = await sha256(`${secret}:${c.env.DEVICE_INGEST_PEPPER}`);
+  const installerKey = randomToken(32);
+  const installerHash = await sha256(`${installerKey}:${c.env.DEVICE_INGEST_PEPPER}`);
+  const installerId = crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE isapi_agents SET secret_hash=?,updated_at=datetime('now') WHERE id=?`).bind(secretHash, agent.id),
+    c.env.DB.prepare(`INSERT INTO isapi_agent_installers(id,agent_id,installer_key_hash,created_by,expires_at) VALUES (?,?,?,?,datetime('now','+1 day'))`).bind(installerId, agent.id, installerHash, c.get('user').id),
+  ]);
+  const origin = new URL(c.req.url).origin;
+  const psScript = `# EstateMate Windows ISAPI Agent Installer
+# Agent: ${agent.name} (${agent.id})
+# Generated: ${new Date().toISOString()}
+# This script is one-time use and expires in 24 hours.
+
+$ErrorActionPreference = "Stop"
+Write-Host "Installing EstateMate ISAPI Bridge Agent..." -ForegroundColor Cyan
+Write-Host "Agent: ${agent.name}" -ForegroundColor Yellow
+Write-Host "Platform: ${agent.platform}" -ForegroundColor Yellow
+
+$agentId = "${agent.id}"
+$agentSecret = "${secret}"
+$installerKey = "${installerKey}"
+$workerUrl = "${origin}"
+
+# Create directories
+$installDir = "C:\\EstateMate\\ISAPI-Agent"
+$serviceName = "EstateMateISAPIAgent"
+New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+Write-Host "Created $installDir" -ForegroundColor Green
+
+# Save configuration (restricted ACL)
+$configPath = Join-Path $installDir "agent-config.json"
+$config = @{
+  agentId = $agentId
+  agentSecret = $agentSecret
+  installerKey = $installerKey
+  workerUrl = $workerUrl
+  syncIntervalSeconds = 30
+  logLevel = "info"
+} | ConvertTo-Json -Depth 4
+Set-Content -Path $configPath -Value $config -Encoding UTF8
+# Restrict to Administrators and SYSTEM
+$acl = Get-Acl $configPath
+$acl.SetAccessRuleProtection($true,$false)
+$adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\\Administrators","FullControl","Allow")
+$systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule("NT AUTHORITY\\SYSTEM","FullControl","Allow")
+$acl.SetAccessRule($adminRule)
+$acl.SetAccessRule($systemRule)
+Set-Acl $configPath $acl
+Write-Host "Configuration saved to $configPath (restricted)" -ForegroundColor Green
+
+# Download agent binary (placeholder - replace with real release URL)
+Write-Host "Downloading agent binary..." -ForegroundColor Cyan
+Write-Host "NOTE: Replace this URL with your published Windows agent release." -ForegroundColor Yellow
+# Invoke-WebRequest -Uri "$workerUrl/api/isapi/agent-binary" -OutFile "$installDir\\estatemate-isapi-agent.exe"
+
+# Create example device mapping file
+$devicesPath = Join-Path $installDir "isapi-devices.json"
+@"
+{
+  "devices": [
+    {
+      "estateMateDeviceId": "DEVICE_UUID_FROM_PORTAL",
+      "isapiHost": "192.168.1.100",
+      "isapiPort": 80,
+      "isapiUsername": "admin",
+      "isapiPassword": "device-admin-password",
+      "protocol": "http"
+    }
+  ]
+}
+"@ | Set-Content -Path $devicesPath -Encoding UTF8
+Write-Host "Example device mapping created at $devicesPath - EDIT IT!" -ForegroundColor Yellow
+
+# NSSM or native service installation placeholder
+Write-Host @"
+Next steps:
+1. Edit $devicesPath with your Hikvision device ISAPI details (host, port, credentials).
+2. Download the Windows agent binary from your release artifacts to $installDir\\estatemate-isapi-agent.exe
+3. Install as Windows Service:
+   sc.exe create $serviceName binPath= \\"$installDir\\estatemate-isapi-agent.exe --config $configPath\\" start= auto
+   sc.exe description $serviceName "EstateMate ISAPI Bridge - Syncs access cards via ISAPI"
+   sc.exe start $serviceName
+4. Check logs in $installDir\\logs\\
+
+Security:
+- Do not expose ISAPI ports to the Internet. Keep devices and agent on same VLAN.
+- The config file contains secrets - ACL is restricted to Administrators.
+- This installer key expires in 24 hours.
+
+Troubleshooting:
+- Test ISAPI: curl http://DEVICE_IP/ISAPI/System/deviceInfo --digest -u admin:password
+- Agent health: GET $workerUrl/api/isapi/v1/agents/$agentId/health (with X-EstateMate-Agent-Key header)
+"@ -ForegroundColor Cyan
+
+Write-Host "Installer completed for ${agent.name}" -ForegroundColor Green
+`;
+
+  const shScript = `#!/bin/bash
+# EstateMate ISAPI Bridge Agent Installer (Linux/macOS)
+# Agent: ${agent.name} (${agent.id})
+set -euo pipefail
+echo "Installing EstateMate ISAPI Bridge Agent..."
+echo "Agent: ${agent.name}"
+echo "Platform: ${agent.platform}"
+
+AGENT_ID="${agent.id}"
+AGENT_SECRET="${secret}"
+INSTALLER_KEY="${installerKey}"
+WORKER_URL="${origin}"
+INSTALL_DIR="/opt/estatemate/isapi-agent"
+
+sudo mkdir -p "$INSTALL_DIR"
+sudo tee "$INSTALL_DIR/agent-config.json" > /dev/null <<EOF
+{
+  "agentId": "$AGENT_ID",
+  "agentSecret": "$AGENT_SECRET",
+  "installerKey": "$INSTALLER_KEY",
+  "workerUrl": "$WORKER_URL",
+  "syncIntervalSeconds": 30,
+  "logLevel": "info"
+}
+EOF
+sudo chmod 0600 "$INSTALL_DIR/agent-config.json"
+echo "Config saved to $INSTALL_DIR/agent-config.json (0600)"
+
+cat <<'NEXT'
+Next steps:
+1. Edit /opt/estatemate/isapi-agent/isapi-devices.json with device ISAPI hosts and credentials.
+2. Download the agent binary to /opt/estatemate/isapi-agent/estatemate-isapi-agent
+3. sudo systemctl enable --now estatemate-isapi-agent
+
+Security: Keep ISAPI devices and agent on same LAN. Do not expose ISAPI to Internet.
+NEXT
+
+echo "Installer completed for ${agent.name}"
+`;
+
+  const installerContent = agent.platform === 'windows' ? psScript : shScript;
+  const contentType = agent.platform === 'windows' ? 'application/x-powershell' : 'text/x-shellscript; charset=utf-8';
+  const ext = agent.platform === 'windows' ? 'ps1' : 'sh';
+  await audit(c, 'generate_installer', 'isapi_agent', agent.id, { platform: agent.platform });
+  return new Response(installerContent, {
+    status: 200,
+    headers: {
+      'Content-Type': contentType,
+      'Content-Disposition': `attachment; filename="estatemate-isapi-agent-${agent.id.slice(0,8)}.${ext}"`,
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
+});
+
+app.get('/api/isapi/device-configs', requireRoles('admin','manager'), async (c) => {
+  const result = await c.env.DB.prepare(
+    `SELECT cfg.id,cfg.device_id,cfg.agent_id,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol,cfg.sync_enabled,cfg.last_sync_at,cfg.last_sync_status,cfg.last_error,cfg.created_at,
+       d.name AS device_name,d.model,d.gate_name,d.connection_pattern,d.status AS device_status,
+       a.name AS agent_name,a.platform AS agent_platform,a.status AS agent_status
+     FROM isapi_device_configs cfg
+     JOIN hikvision_devices d ON d.id=cfg.device_id
+     LEFT JOIN isapi_agents a ON a.id=cfg.agent_id
+     ORDER BY d.gate_name,d.name`,
+  ).all();
+  return c.json({ items: result.results });
+});
+
+app.post('/api/isapi/device-configs', requireRoles('admin','manager'), async (c) => {
+  const body = await c.req.json<{
+    deviceId?: string;
+    agentId?: string;
+    isapiHost?: string;
+    isapiPort?: number;
+    isapiUsername?: string;
+    isapiPassword?: string;
+    protocol?: 'http'|'https';
+    syncEnabled?: boolean;
+  }>();
+  if (!body.deviceId?.trim() || !body.isapiHost?.trim()) return jsonError(c, 400, 'deviceId and isapiHost are required');
+  const device = await c.env.DB.prepare(`SELECT id,connection_pattern FROM hikvision_devices WHERE id=? AND deleted_at IS NULL`).bind(body.deviceId).first<{ id:string;connection_pattern:string }>();
+  if (!device) return jsonError(c, 404, 'Device not found');
+  if (body.agentId) {
+    const agent = await c.env.DB.prepare(`SELECT id FROM isapi_agents WHERE id=? AND deleted_at IS NULL`).bind(body.agentId).first();
+    if (!agent) return jsonError(c, 404, 'ISAPI agent not found');
+  }
+  const port = Number(body.isapiPort ?? 80);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return jsonError(c, 400, 'Invalid ISAPI port');
+  const protocol = body.protocol === 'https' ? 'https' : 'http';
+  const syncEnabled = body.syncEnabled === false ? 0 : 1;
+  let encrypted: { ciphertext:string;iv:string } | null = null;
+  if (body.isapiPassword?.trim()) {
+    encrypted = await encryptSecret(encryptionKey(c.env), body.isapiPassword.trim());
+  }
+  const id = crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `INSERT INTO isapi_device_configs(id,device_id,agent_id,isapi_host,isapi_port,isapi_username,isapi_password_ciphertext,isapi_password_iv,protocol,sync_enabled)
+       VALUES (?,?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(device_id) DO UPDATE SET agent_id=excluded.agent_id,isapi_host=excluded.isapi_host,isapi_port=excluded.isapi_port,isapi_username=excluded.isapi_username,isapi_password_ciphertext=COALESCE(excluded.isapi_password_ciphertext,isapi_password_ciphertext),isapi_password_iv=COALESCE(excluded.isapi_password_iv,isapi_password_iv),protocol=excluded.protocol,sync_enabled=excluded.sync_enabled,updated_at=datetime('now')`,
+    ).bind(id, body.deviceId, body.agentId || null, body.isapiHost.trim(), port, body.isapiUsername?.trim() || null, encrypted?.ciphertext || null, encrypted?.iv || null, protocol, syncEnabled),
+    c.env.DB.prepare(
+      `UPDATE hikvision_devices SET isapi_agent_id=?,isapi_sync_enabled=?,isapi_host=?,isapi_port=?,isapi_username=?,isapi_password_ciphertext=COALESCE(?,isapi_password_ciphertext),isapi_password_iv=COALESCE(?,isapi_password_iv),isapi_protocol=?,updated_at=datetime('now') WHERE id=?`,
+    ).bind(body.agentId || null, syncEnabled, body.isapiHost.trim(), port, body.isapiUsername?.trim() || null, encrypted?.ciphertext || null, encrypted?.iv || null, protocol, body.deviceId),
+  ]);
+  await audit(c, 'upsert', 'isapi_device_config', id, { deviceId: body.deviceId, agentId: body.agentId, host: body.isapiHost.trim(), port, protocol, syncEnabled });
+  return c.json({ ok: true, id });
+});
+
+app.get('/api/isapi/device-configs/:deviceId', requireRoles('admin','manager','security'), async (c) => {
+  const config = await c.env.DB.prepare(
+    `SELECT cfg.*,d.name AS device_name,d.gate_name FROM isapi_device_configs cfg JOIN hikvision_devices d ON d.id=cfg.device_id WHERE cfg.device_id=?`,
+  ).bind(c.req.param('deviceId')).first();
+  if (!config) return jsonError(c, 404, 'ISAPI config not found for device');
+  return c.json({ config, hasPassword: Boolean((config as Record<string,unknown>).isapi_password_ciphertext) });
+});
+
+app.patch('/api/isapi/device-configs/:id', requireRoles('admin','manager'), async (c) => {
+  const body = await c.req.json<{
+    agentId?: string|null;
+    isapiHost?: string;
+    isapiPort?: number;
+    isapiUsername?: string;
+    isapiPassword?: string;
+    protocol?: 'http'|'https';
+    syncEnabled?: boolean;
+  }>();
+  const existing = await c.env.DB.prepare(`SELECT id,device_id FROM isapi_device_configs WHERE id=?`).bind(c.req.param('id')).first<{ id:string;device_id:string }>();
+  if (!existing) return jsonError(c, 404, 'ISAPI config not found');
+  if (body.agentId) {
+    const agent = await c.env.DB.prepare(`SELECT id FROM isapi_agents WHERE id=? AND deleted_at IS NULL`).bind(body.agentId).first();
+    if (!agent) return jsonError(c, 404, 'Agent not found');
+  }
+  let encrypted: { ciphertext:string;iv:string } | null = null;
+  if (body.isapiPassword?.trim()) encrypted = await encryptSecret(encryptionKey(c.env), body.isapiPassword.trim());
+  const updates: string[] = [];
+  const bindings: unknown[] = [];
+  if (body.agentId !== undefined) { updates.push('agent_id=?'); bindings.push(body.agentId || null); }
+  if (body.isapiHost?.trim()) { updates.push('isapi_host=?'); bindings.push(body.isapiHost.trim()); }
+  if (body.isapiPort !== undefined) { updates.push('isapi_port=?'); bindings.push(Number(body.isapiPort)); }
+  if (body.isapiUsername !== undefined) { updates.push('isapi_username=?'); bindings.push(body.isapiUsername?.trim() || null); }
+  if (encrypted) { updates.push('isapi_password_ciphertext=?,isapi_password_iv=?'); bindings.push(encrypted.ciphertext, encrypted.iv); }
+  if (body.protocol) { updates.push('protocol=?'); bindings.push(body.protocol === 'https' ? 'https' : 'http'); }
+  if (body.syncEnabled !== undefined) { updates.push('sync_enabled=?'); bindings.push(body.syncEnabled ? 1 : 0); }
+  if (!updates.length) return jsonError(c, 400, 'No fields to update');
+  updates.push("updated_at=datetime('now')");
+  await c.env.DB.prepare(`UPDATE isapi_device_configs SET ${updates.join(',')} WHERE id=?`).bind(...bindings, c.req.param('id')).run();
+  await audit(c, 'update', 'isapi_device_config', c.req.param('id'), body);
+  return c.json({ ok: true });
+});
+
+app.delete('/api/isapi/device-configs/:id', requireRoles('admin','manager'), async (c) => {
+  const existing = await c.env.DB.prepare(`SELECT id,device_id FROM isapi_device_configs WHERE id=?`).bind(c.req.param('id')).first<{ id:string;device_id:string }>();
+  if (!existing) return jsonError(c, 404, 'ISAPI config not found');
+  await c.env.DB.batch([
+    c.env.DB.prepare(`DELETE FROM isapi_device_configs WHERE id=?`).bind(existing.id),
+    c.env.DB.prepare(`UPDATE hikvision_devices SET isapi_agent_id=NULL,isapi_sync_enabled=0,last_isapi_sync_status=NULL,updated_at=datetime('now') WHERE id=?`).bind(existing.device_id),
+  ]);
+  await audit(c, 'delete', 'isapi_device_config', existing.id);
+  return c.json({ ok: true });
+});
+
+app.get('/api/isapi/sync-logs', requireRoles('admin','manager'), async (c) => {
+  const { limit, offset, page: pageNumber } = page(c);
+  const deviceId = c.req.query('deviceId');
+  const agentId = c.req.query('agentId');
+  let query = `SELECT l.*,d.name AS device_name,a.name AS agent_name FROM isapi_sync_logs l LEFT JOIN hikvision_devices d ON d.id=l.device_id LEFT JOIN isapi_agents a ON a.id=l.agent_id WHERE 1=1`;
+  const bindings: unknown[] = [];
+  if (deviceId) { query += ` AND l.device_id=?`; bindings.push(deviceId); }
+  if (agentId) { query += ` AND l.agent_id=?`; bindings.push(agentId); }
+  query += ` ORDER BY l.created_at DESC LIMIT ? OFFSET ?`;
+  bindings.push(limit, offset);
+  const result = await c.env.DB.prepare(query).bind(...bindings).all();
+  return c.json({ items: result.results, page: pageNumber, limit });
 });
 
 app.get('/api/storage-settings', requireRoles('admin'), async (c) => {
@@ -2609,6 +2977,19 @@ async function reconcileBill(db: D1Database, billId: string): Promise<void> {
   await db.prepare(`UPDATE bills SET status=? WHERE id=?`).bind(status, billId).run();
 }
 
+const PENDING_OPERATION_PATTERNS = [
+  'hikvision_cloud_openapi',
+  'offsite_isup_gateway',
+  'isapi_bridge',
+  'windows_agent',
+  'isapi_windows_agent',
+];
+
+function isPendingPattern(pattern: string | null | undefined): boolean {
+  if (!pattern) return false;
+  return PENDING_OPERATION_PATTERNS.includes(pattern);
+}
+
 async function createDeviceOperations(
   env: Env,
   cardId: string,
@@ -2618,7 +2999,7 @@ async function createDeviceOperations(
   const devices = await env.DB.prepare(`SELECT id,connection_pattern FROM hikvision_devices WHERE status != 'disabled' AND deleted_at IS NULL`).all<{ id: string; connection_pattern: string }>();
   if (!devices.results.length) return;
   await env.DB.batch(devices.results.map((device) => {
-    const status = ['hikvision_cloud_openapi','offsite_isup_gateway'].includes(device.connection_pattern)
+    const status = isPendingPattern(device.connection_pattern)
       ? 'pending'
       : 'manual_action_required';
     return env.DB.prepare(
@@ -2658,6 +3039,176 @@ async function authenticateDevice(request: Request, env: Env, deviceId: string):
     profileKey: credential.profile_key ?? 'generic_isapi',
     connectionPattern: credential.connection_pattern ?? 'direct_http_listener',
   };
+}
+
+interface IsapiAgentIdentity {
+  id: string;
+  name: string;
+  platform: string;
+  status: string;
+}
+
+async function authenticateIsapiAgent(request: Request, env: Env, agentId: string): Promise<IsapiAgentIdentity | null> {
+  let secret: string | null = request.headers.get('X-EstateMate-Agent-Key') ?? request.headers.get('X-EstateMate-Device-Key') ?? new URL(request.url).searchParams.get('key');
+  const auth = request.headers.get('Authorization');
+  if (auth?.startsWith('Bearer ')) {
+    secret = auth.slice(7).trim() || secret;
+  } else if (auth?.startsWith('Basic ')) {
+    try {
+      const decoded = atob(auth.slice(6));
+      const sep = decoded.indexOf(':');
+      secret = sep >= 0 ? decoded.slice(sep + 1) : decoded;
+    } catch { return null; }
+  }
+  if (!secret) return null;
+  const row = await env.DB.prepare(
+    `SELECT id,name,platform,status,secret_hash FROM isapi_agents WHERE id=? AND deleted_at IS NULL LIMIT 1`,
+  ).bind(agentId).first<{ id:string;name:string;platform:string;status:string;secret_hash:string }>();
+  if (!row) return null;
+  const presented = await sha256(`${secret}:${env.DEVICE_INGEST_PEPPER}`);
+  if (presented !== row.secret_hash) return null;
+  return { id: row.id, name: row.name, platform: row.platform, status: row.status };
+}
+
+async function handleIsapiAgentHeartbeat(request: Request, env: Env, agentId: string): Promise<Response> {
+  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'POST' } });
+  const agent = await authenticateIsapiAgent(request, env, agentId);
+  if (!agent) return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Bearer realm="EstateMate ISAPI agent"' } });
+  let body: { version?: string; hostname?: string; ip?: string; stats?: unknown } = {};
+  try { body = await request.json(); } catch { body = {}; }
+  const ip = request.headers.get('CF-Connecting-IP') || body.ip || null;
+  await env.DB.prepare(
+    `UPDATE isapi_agents SET status='online',last_seen_at=datetime('now'),last_ip=?,hostname=COALESCE(?,hostname),version=COALESCE(?,version),updated_at=datetime('now') WHERE id=?`,
+  ).bind(ip, body.hostname?.trim() || null, body.version?.trim() || null, agentId).run();
+  return Response.json({ ok: true, agentId, serverTime: new Date().toISOString() }, { headers: { 'Cache-Control': 'no-store' } });
+}
+
+async function handleIsapiAgentDevices(request: Request, env: Env, agentId: string): Promise<Response> {
+  if (request.method !== 'GET') return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET' } });
+  const agent = await authenticateIsapiAgent(request, env, agentId);
+  if (!agent) return new Response('Unauthorized', { status: 401 });
+  const result = await env.DB.prepare(
+    `SELECT cfg.device_id,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol,cfg.sync_enabled,
+       d.name AS device_name,d.model,d.gate_name,d.connection_pattern,d.status AS device_status
+     FROM isapi_device_configs cfg JOIN hikvision_devices d ON d.id=cfg.device_id
+     WHERE cfg.agent_id=? AND cfg.sync_enabled=1 AND d.deleted_at IS NULL AND d.status!='disabled'
+     ORDER BY d.gate_name,d.name`,
+  ).bind(agentId).all();
+  return Response.json({ agentId, serverTime: new Date().toISOString(), items: result.results }, { headers: { 'Cache-Control': 'no-store' } });
+}
+
+async function handleIsapiAgentOperations(request: Request, env: Env, agentId: string): Promise<Response> {
+  if (request.method !== 'GET') return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET' } });
+  const agent = await authenticateIsapiAgent(request, env, agentId);
+  if (!agent) return new Response('Unauthorized', { status: 401 });
+  const requestedLimit = Number(new URL(request.url).searchParams.get('limit') ?? 20);
+  const limit = Math.min(100, Math.max(1, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : 20));
+  const result = await env.DB.prepare(
+    `SELECT * FROM (
+       SELECT o.id,'card' AS kind,o.device_id,o.operation,o.payload_json,o.attempts,o.created_at,o.updated_at,d.name AS device_name,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol
+       FROM device_operations o
+       JOIN isapi_device_configs cfg ON cfg.device_id=o.device_id
+       JOIN hikvision_devices d ON d.id=o.device_id
+       WHERE cfg.agent_id=? AND cfg.sync_enabled=1 AND (o.status='pending' OR (o.status='sent' AND o.updated_at<datetime('now','-2 minutes')))
+       UNION ALL
+       SELECT vo.id,'visitor' AS kind,vo.device_id,vo.operation,vo.payload_json,vo.attempts,vo.created_at,vo.updated_at,d.name AS device_name,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol
+       FROM visitor_device_operations vo
+       JOIN isapi_device_configs cfg ON cfg.device_id=vo.device_id
+       JOIN hikvision_devices d ON d.id=vo.device_id
+       JOIN visitor_requests v ON v.id=vo.visitor_request_id
+       WHERE cfg.agent_id=? AND cfg.sync_enabled=1 AND (vo.status='pending' OR (vo.status='sent' AND vo.updated_at<datetime('now','-2 minutes')))
+     ) ORDER BY created_at LIMIT ?`,
+  ).bind(agentId, agentId, limit).all<GatewayOperationRow & { device_id:string; device_name:string; isapi_host:string; isapi_port:number; isapi_username:string|null; protocol:string }>();
+
+  let claimed = result.results;
+  if (result.results.length) {
+    const claims = await env.DB.batch(result.results.map((op) =>
+      env.DB.prepare(
+        op.kind === 'card'
+          ? `UPDATE device_operations SET status='sent',attempts=attempts+1,agent_id=?,updated_at=datetime('now') WHERE id=? AND device_id=? AND (status='pending' OR (status='sent' AND updated_at<datetime('now','-2 minutes')))`
+          : `UPDATE visitor_device_operations SET status='sent',attempts=attempts+1,agent_id=?,updated_at=datetime('now') WHERE id=? AND device_id=? AND (status='pending' OR (status='sent' AND updated_at<datetime('now','-2 minutes')))`,
+      ).bind(agentId, op.id, op.device_id),
+    ));
+    claimed = result.results.filter((_, i) => Number(claims[i]?.meta.changes ?? 0) > 0);
+  }
+
+  return Response.json({
+    agentId,
+    serverTime: new Date().toISOString(),
+    retryAfterSeconds: claimed.length ? 1 : 10,
+    items: claimed.map((op) => {
+      let payload: unknown;
+      try { payload = JSON.parse(op.payload_json); } catch { payload = {}; }
+      return {
+        id: op.id,
+        kind: op.kind,
+        deviceId: op.device_id,
+        deviceName: op.device_name,
+        operation: op.operation,
+        payload,
+        attempt: op.attempts + 1,
+        createdAt: op.created_at,
+        isapi: { host: (op as Record<string,unknown>).isapi_host, port: (op as Record<string,unknown>).isapi_port, username: (op as Record<string,unknown>).isapi_username, protocol: (op as Record<string,unknown>).protocol },
+      };
+    }),
+  }, { headers: { 'Cache-Control': 'no-store' } });
+}
+
+async function handleIsapiAgentOperationResult(request: Request, env: Env, agentId: string, operationId: string): Promise<Response> {
+  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'POST' } });
+  const agent = await authenticateIsapiAgent(request, env, agentId);
+  if (!agent) return new Response('Unauthorized', { status: 401 });
+  let body: { kind?: GatewayOperationKind; status?: 'applied'|'failed'; errorMessage?: string; durationMs?: number };
+  try { body = await request.json(); } catch { return Response.json({ error: 'JSON body required' }, { status: 400 }); }
+  if (!body.kind || !['card','visitor'].includes(body.kind) || !body.status || !['applied','failed'].includes(body.status)) {
+    return Response.json({ error: 'kind must be card or visitor and status must be applied or failed' }, { status: 400 });
+  }
+  const errorMessage = body.status === 'failed' ? (body.errorMessage?.trim().slice(0, 1000) || 'ISAPI agent reported failure') : null;
+  const duration = body.durationMs && Number.isFinite(body.durationMs) ? Math.max(0, Math.floor(body.durationMs)) : null;
+
+  // Try card first, then visitor
+  let updated = await env.DB.prepare(
+    `UPDATE device_operations SET status=?,error_message=?,agent_id=?,isapi_synced_at=datetime('now'),updated_at=datetime('now') WHERE id=? AND status IN ('pending','sent','failed') AND device_id IN (SELECT device_id FROM isapi_device_configs WHERE agent_id=?)`,
+  ).bind(body.status, errorMessage, agentId, operationId, agentId).run();
+  if (!updated.meta.changes) {
+    updated = await env.DB.prepare(
+      `UPDATE visitor_device_operations SET status=?,error_message=?,agent_id=?,isapi_synced_at=datetime('now'),updated_at=datetime('now') WHERE id=? AND status IN ('pending','sent','failed') AND device_id IN (SELECT device_id FROM isapi_device_configs WHERE agent_id=?)`,
+    ).bind(body.status, errorMessage, agentId, operationId, agentId).run();
+  }
+  if (!updated.meta.changes) return Response.json({ error: 'Operation not found or not assigned to this agent' }, { status: 404 });
+
+  // Log sync
+  try {
+    const opInfo = await env.DB.prepare(
+      `SELECT device_id FROM device_operations WHERE id=? UNION ALL SELECT device_id FROM visitor_device_operations WHERE id=? LIMIT 1`,
+    ).bind(operationId, operationId).first<{ device_id:string }>();
+    if (opInfo) {
+      await env.DB.prepare(
+        `INSERT INTO isapi_sync_logs(id,device_id,agent_id,operation_id,operation_type,status,message,duration_ms) VALUES (?,?,?,?,?,?,?,?)`,
+      ).bind(crypto.randomUUID(), opInfo.device_id, agentId, operationId, body.kind, body.status === 'applied' ? 'success' : 'failed', errorMessage, duration).run();
+      await env.DB.prepare(
+        `UPDATE isapi_device_configs SET last_sync_at=datetime('now'),last_sync_status=?,last_error=?,updated_at=datetime('now') WHERE device_id=?`,
+      ).bind(body.status === 'applied' ? 'ok' : 'failed', errorMessage, opInfo.device_id).run();
+      await env.DB.prepare(
+        `UPDATE hikvision_devices SET last_isapi_sync_at=datetime('now'),last_isapi_sync_status=?,updated_at=datetime('now') WHERE id=?`,
+      ).bind(body.status === 'applied' ? 'ok' : 'failed', opInfo.device_id).run();
+    }
+  } catch { /* best effort */ }
+
+  return Response.json({ ok: true, id: operationId, status: body.status }, { headers: { 'Cache-Control': 'no-store' } });
+}
+
+async function handleIsapiAgentSyncLog(request: Request, env: Env, agentId: string): Promise<Response> {
+  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'POST' } });
+  const agent = await authenticateIsapiAgent(request, env, agentId);
+  if (!agent) return new Response('Unauthorized', { status: 401 });
+  let body: { deviceId?: string; operationType?: string; status?: string; message?: string; durationMs?: number };
+  try { body = await request.json(); } catch { return Response.json({ error: 'JSON required' }, { status: 400 }); }
+  if (!body.deviceId || !body.operationType || !body.status) return Response.json({ error: 'deviceId, operationType and status required' }, { status: 400 });
+  await env.DB.prepare(
+    `INSERT INTO isapi_sync_logs(id,device_id,agent_id,operation_type,status,message,duration_ms) VALUES (?,?,?,?,?,?,?)`,
+  ).bind(crypto.randomUUID(), body.deviceId, agentId, body.operationType, body.status, body.message?.slice(0,1000) || null, body.durationMs ?? null).run();
+  return Response.json({ ok: true }, { headers: { 'Cache-Control': 'no-store' } });
 }
 
 async function handleDeviceEvent(request: Request, env: Env, deviceId: string): Promise<Response> {
@@ -2862,6 +3413,24 @@ export default {
     }
     const operationListMatch = /^\/api\/hikvision\/v1\/operations\/([^/]+)$/.exec(url.pathname);
     if (operationListMatch?.[1]) return handleGatewayOperationList(request, env, decodeURIComponent(operationListMatch[1]));
+
+    // ISAPI bridge and Windows agent endpoints (machine-authenticated, no user session)
+    const isapiHeartbeat = /^\/api\/isapi\/v1\/agents\/([^/]+)\/heartbeat$/.exec(url.pathname);
+    if (isapiHeartbeat?.[1]) return handleIsapiAgentHeartbeat(request, env, decodeURIComponent(isapiHeartbeat[1]));
+    const isapiDevices = /^\/api\/isapi\/v1\/agents\/([^/]+)\/devices$/.exec(url.pathname);
+    if (isapiDevices?.[1]) return handleIsapiAgentDevices(request, env, decodeURIComponent(isapiDevices[1]));
+    const isapiOpsResult = /^\/api\/isapi\/v1\/agents\/([^/]+)\/operations\/([^/]+)\/result$/.exec(url.pathname);
+    if (isapiOpsResult?.[1] && isapiOpsResult[2]) return handleIsapiAgentOperationResult(request, env, decodeURIComponent(isapiOpsResult[1]), decodeURIComponent(isapiOpsResult[2]));
+    const isapiOps = /^\/api\/isapi\/v1\/agents\/([^/]+)\/operations$/.exec(url.pathname);
+    if (isapiOps?.[1]) return handleIsapiAgentOperations(request, env, decodeURIComponent(isapiOps[1]));
+    const isapiLog = /^\/api\/isapi\/v1\/agents\/([^/]+)\/sync-logs$/.exec(url.pathname);
+    if (isapiLog?.[1]) return handleIsapiAgentSyncLog(request, env, decodeURIComponent(isapiLog[1]));
+    // Legacy compatibility: /api/isapi/v1/operations/:agentId and /api/isapi/v1/operations/:agentId/:operationId/result
+    const isapiLegacyOps = /^\/api\/isapi\/v1\/operations\/([^/]+)$/.exec(url.pathname);
+    if (isapiLegacyOps?.[1]) return handleIsapiAgentOperations(request, env, decodeURIComponent(isapiLegacyOps[1]));
+    const isapiLegacyResult = /^\/api\/isapi\/v1\/operations\/([^/]+)\/([^/]+)\/result$/.exec(url.pathname);
+    if (isapiLegacyResult?.[1] && isapiLegacyResult[2]) return handleIsapiAgentOperationResult(request, env, decodeURIComponent(isapiLegacyResult[1]), decodeURIComponent(isapiLegacyResult[2]));
+
     return app.fetch(request, env, executionCtx);
   },
   async queue(batch: MessageBatch<NormalizedAccessEvent>, env: Env): Promise<void> {

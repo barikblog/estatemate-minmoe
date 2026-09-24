@@ -1,0 +1,17 @@
+{
+  "name": "@estatemate/isapi-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "EstateMate Hikvision ISAPI Bridge - polls Cloudflare for card operations and applies them via ISAPI",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node agent.mjs",
+    "check": "node --check agent.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {},
+  "keywords": ["hikvision", "isapi", "estatemate", "access-control"]
+}
