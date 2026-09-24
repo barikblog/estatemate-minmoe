@@ -1,6 +1,8 @@
 # AI handoff — EstateMate
 
-Updated: 2026-09-24 (Africa/Lagos)
+Updated: 2026-09-24 (Africa/Lagos) — ISAPI Bridge & Windows Agent deployed
+
+
 
 Repository: https://github.com/barikblog/estatemate-minmoe
 
@@ -25,12 +27,14 @@ Run `git log -1 --oneline` and check the latest GitHub Actions run before making
 - Profiles for MinMoe, QR K1T807/K1T502 variants, DS-K1T808MFWX-B, DS-K2600, DS-K2700/K2800 including DS-K2802, and a conservative vendor-neutral option.
 - Optional stateless Render Free HTTPS relay Blueprint; it is not an ISUP/TCP server.
 - Dedicated Ubuntu ISUP gateway package for a small LAN appliance or off-site host, with machine-authenticated event and operation APIs; the licensed official SDK adapter remains an external required build input.
+- **Hikvision ISAPI bridge and Windows agent**: `isapi-bridge/` cross-platform Node agent (ISAPI Digest, no SDK) + `windows-agent/` Windows Service wrapper, with portal UI for agent registry, device ISAPI configs, PowerShell/shell installer generation (one-time secret, 24h expiry), heartbeat, operation polling (`isapi_bridge`, `windows_agent`, `isapi_windows_agent` connection patterns), result reporting and sync logs.
 - Optional proof uploads linked to ownership, transfer, tenancy, household, visitor, maintenance and payment records.
 - Administrator-editable portal identity, theme and operational defaults.
 - People administration with available-property selection, bulk CSV registration, generated one-time passwords, editing, reset, lifecycle guards and history-preserving deletion.
 - Operational Manager category with explicit separation from finance, private storage, global settings and elevated account management.
 - Private-storage-backed operational imports for properties, ownerships, tenancies and cards.
 - Encrypted Hik-Connect configuration and one-time generated on-site synchronization installer for the official-SDK gateway package.
+- Encrypted ISAPI device credentials and agent secrets (STORAGE_ENCRYPTION_KEY + DEVICE_INGEST_PEPPER).
 - Administrator-generated, one-time-download sample logins for every role with automatic 24-hour expiry.
 - Initiate-payment flow with POS at office, cash at office and bank transfer; the estate bank account is Administrator-editable and read-only for Residents/Cashiers. Online collection is removed from the portal and rejected by `POST /api/payments`.
 - Visitor passes shareable as a locally rendered PNG image or one-page A4 PDF, with a native share sheet where the device supports files.
@@ -39,29 +43,40 @@ Run `git log -1 --oneline` and check the latest GitHub Actions run before making
 
 ## Most recent migration
 
-`migrations/0010_maintenance_billing_and_verification.sql`
+`migrations/0011_hikvision_isapi_sync.sql`
 
-It adds:
-- `maintenance_requests.scope_type` ('personal', 'street', 'block', 'zone', 'estate') and `scope_target` for scoped facility issues.
-- `maintenance_requests.status` workflow expansion to include `in_progress` and `needs_verification`.
-- `maintenance_requests.proof_key`, `completion_proof_key`, `charge_amount_minor`, `charge_target`, `charge_bill_id`, `status_note` for maintenance duties charging and resolution verification.
-- `visitor_requests.require_gate_id_verification`, `gate_proof_key`, `gate_verified_at`, `gate_verified_by` to enforce security gate ID/invitation inspection and photo proof upload before entry check-in.
-- `bill_batches.audience` ('all_owners_and_tenants', 'only_owners', 'only_tenants') to support landlord-per-property charging and tenant-specific levies.
+It adds Hikvision ISAPI bridge and Windows agent support:
 
-The previous migration, `migrations/0009_visitor_gate_scope_payment_channels.sql`, adds `visitor_requests.gate_scope` (`both` default, `gate` when an Administrator or Manager attaches one device) and seeds the five `bank_account_*` settings keys used by the payment-channel API.
+- `isapi_agents` — registry of Windows/Linux bridge agents: id, name, hostname, platform (windows/linux/darwin/other), version, status (pending/online/offline/disabled), secret_hash, last_seen_at, last_ip, created_by.
+- `isapi_device_configs` — per-device ISAPI mapping: device_id (FK hikvision_devices), agent_id (FK isapi_agents), isapi_host (LAN IP), isapi_port, isapi_username, isapi_password_ciphertext/iv (encrypted with STORAGE_ENCRYPTION_KEY), protocol http/https, sync_enabled, last_sync_at/status/error.
+- `isapi_sync_logs` — audit of sync attempts: device_id, agent_id, operation_id, operation_type, status (started/success/failed/pending), message, duration_ms.
+- `isapi_agent_installers` — one-time installer keys (24h expiry) for PowerShell/shell installers that contain new secret + installer key.
+- Extends `hikvision_devices` with isapi_agent_id, isapi_sync_enabled, last_isapi_sync_at/status, isapi_host/port/username/password_ciphertext/iv/protocol.
+- Extends `device_operations` and `visitor_device_operations` with agent_id, isapi_synced_at, sync_source (isup_gateway, isapi_bridge, windows_agent, manual).
+- Seeds settings: isapi_bridge_enabled, windows_agent_enabled, isapi_default_port, isapi_sync_interval_seconds, isapi_retry_interval_seconds.
+- New connection patterns supported: `isapi_bridge`, `windows_agent`, `isapi_windows_agent` (all treated as pending, not manual_action_required).
+
+The previous migration, `migrations/0010_maintenance_billing_and_verification.sql`, adds maintenance scope (personal/street/block/zone/estate), status workflow (in_progress, needs_verification), charging fields, gate ID verification for visitors, and bill_batches audience targeting.
 
 ## Validation recorded for this phase
 
 - Root and web TypeScript passed (`tsc --noEmit` plus `tsc -b` in `apps/web`).
-- 67 Vitest tests passed across 9 files, including new suite `test/maintenance-and-billing.test.ts`:
-  - Verified batch billing audience targeting (`only_owners`, `only_tenants`, `all_owners_and_tenants`) and estate-wide (`all`) scope;
-  - Verified maintenance scope creation (`street`, `zone`, `personal`), status transitions (`in_progress`, `needs_verification`, `completed`, `rejected`) by managers and admins;
-  - Verified maintenance direct charging for residences/tenants/streets/all with automatic bill generation;
-  - Verified mandatory gate ID verification for visitor passes, rejecting entry until security staff uploads photo proof.
-- `npm run build:web` passed cleanly with records export features (`records-export.ts` for Excel .xls XML and canvas-to-PDF).
-- Cloudflare deployment run `35986189896` succeeded on `main`, successfully applying migration `0010` to Cloudflare D1 `estatemate-db` and deploying the Worker and web assets to production `https://estatemate.barikblog.workers.dev`.
-- Production health check verified live at `https://estatemate.barikblog.workers.dev/api/health`.
-- Not executed here: the browser canvas path in `apps/web/src/pass-export.ts` (`renderVisitorPassCanvas`, `sharePassFile`). No headless browser could be installed in this sandbox, so the share-as-image/PDF buttons are verified by production build, typecheck and the PDF-writer tests rather than by clicking them in a browser.
+- 73 Vitest tests passed across 10 files, including new suite `test/isapi-bridge.test.ts` (6 tests):
+  - Creates ISAPI agent and returns one-time secret, lists agents
+  - Rejects agent creation without name
+  - Creates device ISAPI config linked to agent, verifies device has isapi_agent_id and isapi_host
+  - Agent can heartbeat, poll operations (pending), report applied, creates isapi_sync_logs and updates device_operations status to applied
+  - Supports new connection patterns isapi_bridge, windows_agent, isapi_windows_agent in profile registry
+  - Device creation with isapi_bridge sets visitor operation status to pending (not manual)
+- `npm run build:web` passed cleanly (416 modules, 358kB + 412kB chunks).
+- Migration chain validated via Python sqlite3 through 0011.
+- Cloudflare deployment run `35991657930` succeeded on `main`, successfully applying migration `0011_hikvision_isapi_sync.sql` to Cloudflare D1 `estatemate-db` and deploying Worker + web assets to production `https://estatemate.barikblog.workers.dev`.
+- Production health check attempted (DNS not resolvable from sandbox, but GitHub Actions deploy succeeded with 42s build).
+- Frontend UI: new section **ISAPI Bridge & Windows Agent** with agent registration, device linking, installer download (PowerShell .ps1 for Windows, shell .sh for Linux), sync logs, and quick reference; updated **Access-control devices** form to include isapi_bridge/windows_agent/isapi_windows_agent and shows isapi_agent_name, isapi_host, last_isapi_sync_status, queued ops.
+- Backend: new endpoints `/api/isapi/agents`, `/api/isapi/device-configs`, `/api/isapi/sync-logs`, `/api/isapi/agents/:id/installer`, `/api/isapi/agents/:id/rotate-secret` plus machine endpoints `/api/isapi/v1/agents/:id/heartbeat`, `/devices`, `/operations`, `/operations/:id/result`, `/sync-logs` with X-EstateMate-Agent-Key / Bearer auth.
+- Windows agent: `windows-agent/` with service wrapper, Node installer, README; `isapi-bridge/` with cross-platform Node agent implementing ISAPI Digest, operation polling, result reporting, and example configs.
+- Docs: `docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md` details architecture, schema, endpoints, security, and installation.
+- Not executed here: browser canvas path in `apps/web/src/pass-export.ts` (share-as-image/PDF) — verified by build/typecheck/PDF tests.
 
 ### Earlier phase
 
