@@ -86,6 +86,7 @@ The previous migration, `migrations/0008_managers_operations_imports_hikconnect.
 - ISUP control-plane relay integration test passed for adapter authentication, event forwarding, operation polling and result forwarding.
 - Local Worker machine API E2E passed for wrong-key rejection, header-based device authentication, operation claim/application and event acceptance.
 - GitHub Actions run `35963135145` built commit `35c5d35`, applied migration `0008`, deployed successfully, and passed production health plus Manager/Import Centre/Hik-Connect/site-sync bundle smoke checks.
+- GitHub Actions run `35973010739` built commit `a19681c` (PR #1), applied migration `0009`, and deployed successfully to Cloudflare production at `https://estatemate.barikblog.workers.dev`.
 - Android Manager visibility logic was updated, but Android remains uncompiled in this environment because JDK 17 and Android SDK are unavailable.
 
 ## Important hardware truth

@@ -368,7 +368,7 @@ app.get('/api/dashboard', async (c) => {
   const results = await c.env.DB.batch([
     c.env.DB.prepare(`SELECT COUNT(*) AS count FROM users WHERE role = 'resident' AND status = 'active'`),
     c.env.DB.prepare(`SELECT COUNT(*) AS count FROM visitor_requests WHERE status IN ('active','checked_in')`),
-    c.env.DB.prepare(`SELECT COUNT(*) AS count FROM maintenance_requests WHERE status IN ('open','assigned','in_progress')`),
+    c.env.DB.prepare(`SELECT COUNT(*) AS count FROM maintenance_requests WHERE status IN ('open','assigned','in_progress','needs_verification')`),
     c.env.DB.prepare(`SELECT COUNT(*) AS count FROM access_events WHERE device_timestamp >= datetime('now','start of day')`),
     c.env.DB.prepare(`SELECT COUNT(DISTINCT b.resident_id) AS count FROM bills b, settings s WHERE s.key='facility_fee_grace_period_days' AND b.bill_type='facility_fee' AND b.status IN ('unpaid','partial') AND date('now') > date(b.due_date) AND date('now') <= date(b.due_date, '+' || CAST(s.value AS INTEGER) || ' days')`),
   ]);
@@ -910,45 +910,101 @@ app.post('/api/bills/batch', requireRoles('admin', 'cashier'), async (c) => {
   const body = await c.req.json<{
     name?: string;
     streets?: string[];
-    targetType?: 'street'|'block'|'zone';
+    targetType?: 'all'|'street'|'block'|'zone';
     targets?: string[];
+    audience?: 'all_owners_and_tenants'|'only_owners'|'only_tenants'|'standard';
     amountMinor?: number;
     dueDate?: string;
     billType?: string;
     description?: string;
   }>();
   const targetType = body.targetType ?? 'street';
-  if (!['street','block','zone'].includes(targetType)) return jsonError(c, 400, 'targetType must be street, block or zone');
-  const targets = [...new Set((body.targets ?? body.streets ?? []).map((value) => value.trim()).filter(Boolean))];
-  if (!body.name?.trim() || !targets.length || !body.amountMinor || !body.dueDate || !body.billType?.trim()) {
-    return jsonError(c, 400, 'name, targets, amountMinor, dueDate and billType are required');
+  if (!['all','street','block','zone'].includes(targetType)) return jsonError(c, 400, 'targetType must be all, street, block or zone');
+  const audience = body.audience ?? 'all_owners_and_tenants';
+  if (!['all_owners_and_tenants','only_owners','only_tenants','standard'].includes(audience)) {
+    return jsonError(c, 400, 'audience must be all_owners_and_tenants, only_owners, only_tenants, or standard');
+  }
+  const targets = targetType === 'all'
+    ? []
+    : [...new Set((body.targets ?? body.streets ?? []).map((value) => value.trim()).filter(Boolean))];
+  if (!body.name?.trim() || (targetType !== 'all' && !targets.length) || !body.amountMinor || !body.dueDate || !body.billType?.trim()) {
+    return jsonError(c, 400, 'name, targets (unless all), amountMinor, dueDate and billType are required');
   }
   const amountMinor = Math.round(body.amountMinor);
   if (amountMinor <= 0) return jsonError(c, 400, 'amountMinor must be greater than zero');
   if (Number.isNaN(new Date(body.dueDate).valueOf())) return jsonError(c, 400, 'dueDate is invalid');
-  const placeholders = targets.map(() => '?').join(',');
-  const column = targetType === 'block' ? 'block' : targetType === 'zone' ? 'zone' : 'street';
+
   const batchId = crypto.randomUUID();
   await c.env.DB.prepare(
-    `INSERT INTO bill_batches(id,name,street_filter_json,target_type,target_filter_json,amount_minor,due_date,bill_type,description,created_by)
-     VALUES (?,?,?,?,?,?,?,?,?,?)`,
-  ).bind(batchId,body.name.trim(),JSON.stringify(targets),targetType,JSON.stringify(targets),amountMinor,body.dueDate,body.billType.trim(),body.description?.trim() ?? null,c.get('user').id).run();
-  const inserted = await c.env.DB.prepare(
-    `INSERT INTO bills(id,property_id,resident_id,amount_minor,due_date,bill_type,description,batch_id)
-     SELECT lower(hex(randomblob(16))),p.id,
-       CASE WHEN t.id IS NOT NULL AND t.billing_responsibility='tenant' THEN t.tenant_id ELSE po.resident_id END,
-       ?,?,?,?,?
-     FROM properties p
-     JOIN property_ownerships po ON po.property_id=p.id AND po.status='active'
-     LEFT JOIN property_tenancies t ON t.property_id=p.id AND t.status='active'
-       AND date(t.start_date)<=date('now') AND (t.end_date IS NULL OR date(t.end_date)>=date('now'))
-     JOIN users payer ON payer.id=CASE WHEN t.id IS NOT NULL AND t.billing_responsibility='tenant' THEN t.tenant_id ELSE po.resident_id END
-     WHERE payer.role='resident' AND payer.status='active' AND p.${column} IN (${placeholders})`,
-  ).bind(amountMinor,body.dueDate,body.billType.trim(),body.description?.trim() ?? null,batchId,...targets).run();
-  const count = inserted.meta.changes ?? 0;
+    `INSERT INTO bill_batches(id,name,street_filter_json,target_type,target_filter_json,audience,amount_minor,due_date,bill_type,description,created_by)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+  ).bind(batchId,body.name.trim(),JSON.stringify(targets),targetType,JSON.stringify(targets),audience,amountMinor,body.dueDate,body.billType.trim(),body.description?.trim() ?? null,c.get('user').id).run();
+
+  const column = targetType === 'block' ? 'block' : targetType === 'zone' ? 'zone' : 'street';
+  const filterClause = targetType === 'all' ? '' : `AND p.${column} IN (${targets.map(() => '?').join(',')})`;
+  const filterParams = targetType === 'all' ? [] : targets;
+
+  let count = 0;
+  if (audience === 'only_owners') {
+    const inserted = await c.env.DB.prepare(
+      `INSERT INTO bills(id,property_id,resident_id,amount_minor,due_date,bill_type,description,batch_id)
+       SELECT lower(hex(randomblob(16))),p.id,po.resident_id,?,?,?,?,?
+       FROM properties p
+       JOIN property_ownerships po ON po.property_id=p.id AND po.status='active'
+       JOIN users payer ON payer.id=po.resident_id
+       WHERE payer.role='resident' AND payer.status='active' ${filterClause}`,
+    ).bind(amountMinor,body.dueDate,body.billType.trim(),body.description?.trim() ?? null,batchId,...filterParams).run();
+    count = inserted.meta.changes ?? 0;
+  } else if (audience === 'only_tenants') {
+    const inserted = await c.env.DB.prepare(
+      `INSERT INTO bills(id,property_id,resident_id,amount_minor,due_date,bill_type,description,batch_id)
+       SELECT lower(hex(randomblob(16))),p.id,t.tenant_id,?,?,?,?,?
+       FROM properties p
+       JOIN property_tenancies t ON t.property_id=p.id AND t.status='active'
+         AND date(t.start_date)<=date('now') AND (t.end_date IS NULL OR date(t.end_date)>=date('now'))
+       JOIN users payer ON payer.id=t.tenant_id
+       WHERE payer.role='resident' AND payer.status='active' ${filterClause}`,
+    ).bind(amountMinor,body.dueDate,body.billType.trim(),body.description?.trim() ?? null,batchId,...filterParams).run();
+    count = inserted.meta.changes ?? 0;
+  } else if (audience === 'all_owners_and_tenants') {
+    const owners = await c.env.DB.prepare(
+      `INSERT INTO bills(id,property_id,resident_id,amount_minor,due_date,bill_type,description,batch_id)
+       SELECT lower(hex(randomblob(16))),p.id,po.resident_id,?,?,?,?,?
+       FROM properties p
+       JOIN property_ownerships po ON po.property_id=p.id AND po.status='active'
+       JOIN users payer ON payer.id=po.resident_id
+       WHERE payer.role='resident' AND payer.status='active' ${filterClause}`,
+    ).bind(amountMinor,body.dueDate,body.billType.trim(),body.description?.trim() ?? null,batchId,...filterParams).run();
+    const tenants = await c.env.DB.prepare(
+      `INSERT INTO bills(id,property_id,resident_id,amount_minor,due_date,bill_type,description,batch_id)
+       SELECT lower(hex(randomblob(16))),p.id,t.tenant_id,?,?,?,?,?
+       FROM properties p
+       JOIN property_tenancies t ON t.property_id=p.id AND t.status='active'
+         AND date(t.start_date)<=date('now') AND (t.end_date IS NULL OR date(t.end_date)>=date('now'))
+       JOIN users payer ON payer.id=t.tenant_id
+       WHERE payer.role='resident' AND payer.status='active' ${filterClause}`,
+    ).bind(amountMinor,body.dueDate,body.billType.trim(),body.description?.trim() ?? null,batchId,...filterParams).run();
+    count = (owners.meta.changes ?? 0) + (tenants.meta.changes ?? 0);
+  } else {
+    // standard (tenant if responsible, else owner)
+    const inserted = await c.env.DB.prepare(
+      `INSERT INTO bills(id,property_id,resident_id,amount_minor,due_date,bill_type,description,batch_id)
+       SELECT lower(hex(randomblob(16))),p.id,
+         CASE WHEN t.id IS NOT NULL AND t.billing_responsibility='tenant' THEN t.tenant_id ELSE po.resident_id END,
+         ?,?,?,?,?
+       FROM properties p
+       JOIN property_ownerships po ON po.property_id=p.id AND po.status='active'
+       LEFT JOIN property_tenancies t ON t.property_id=p.id AND t.status='active'
+         AND date(t.start_date)<=date('now') AND (t.end_date IS NULL OR date(t.end_date)>=date('now'))
+       JOIN users payer ON payer.id=CASE WHEN t.id IS NOT NULL AND t.billing_responsibility='tenant' THEN t.tenant_id ELSE po.resident_id END
+       WHERE payer.role='resident' AND payer.status='active' ${filterClause}`,
+    ).bind(amountMinor,body.dueDate,body.billType.trim(),body.description?.trim() ?? null,batchId,...filterParams).run();
+    count = inserted.meta.changes ?? 0;
+  }
+
   await c.env.DB.prepare(`UPDATE bill_batches SET bill_count=? WHERE id=?`).bind(count,batchId).run();
-  await audit(c, 'create_property_group_bill_batch', 'bill_batch', batchId, { targetType, targets, billCount: count, amountMinor });
-  return c.json({ id:batchId,billCount:count,targetType,targets,streets:targetType === 'street' ? targets : [] },201);
+  await audit(c, 'create_property_group_bill_batch', 'bill_batch', batchId, { targetType, targets, audience, billCount: count, amountMinor });
+  return c.json({ id:batchId,billCount:count,targetType,targets,audience,streets:targetType === 'street' ? targets : [] },201);
 });
 
 async function userDeactivationBlocker(db:D1Database,userId:string):Promise<string|null> {
@@ -1601,7 +1657,7 @@ app.get('/api/visitors', async (c) => {
 });
 
 app.post('/api/visitors', requireRoles('resident','admin','manager'), async (c) => {
-  const body = await c.req.json<{ visitorName?: string; visitorPhone?: string; validFrom?: string; validUntil?: string; residentId?: string; propertyId?: string; deviceId?: string; proofKeys?: string[] }>();
+  const body = await c.req.json<{ visitorName?: string; visitorPhone?: string; validFrom?: string; validUntil?: string; residentId?: string; propertyId?: string; deviceId?: string; proofKeys?: string[]; requireGateIdVerification?: boolean|number|string }>();
   if (!body.visitorName?.trim() || !body.validFrom || !body.validUntil) return jsonError(c, 400, 'visitorName, validFrom and validUntil are required');
   const timeZone=await estateTimeZone(c.env.DB);
   const validFromMs=parseEstateInstantMs(body.validFrom,timeZone,'start');
@@ -1643,10 +1699,11 @@ app.post('/api/visitors', requireRoles('resident','admin','manager'), async (c) 
   const credentialNumber=await newVisitorCredential(c.env.DB);
   const profile=device?getHikvisionProfile(device.profile_key):null;
   const credentialMode=profile?.authenticationMethods.some((method)=>method==='QR')?'qr':profile?.authenticationMethods.includes('PIN')?'pin':'hybrid';
+  const requireGateIdVerification = (body.requireGateIdVerification === true || body.requireGateIdVerification === 1 || body.requireGateIdVerification === '1' || body.requireGateIdVerification === 'mandatory') ? 1 : 0;
   await c.env.DB.prepare(
-    `INSERT INTO visitor_requests(id,resident_id,property_id,visitor_name,visitor_phone,pin,qr_token,credential_number,barcode_payload,credential_mode,device_id,gate_scope,requires_security_approval,status,valid_from,valid_until)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'active',?,?)`,
-  ).bind(id,residentId,propertyId,body.visitorName.trim(),body.visitorPhone?.trim() ?? null,pin,qrToken,credentialNumber,credentialNumber,credentialMode,device?.id ?? null,gateScope,1,validFrom,validUntil).run();
+    `INSERT INTO visitor_requests(id,resident_id,property_id,visitor_name,visitor_phone,pin,qr_token,credential_number,barcode_payload,credential_mode,device_id,gate_scope,requires_security_approval,require_gate_id_verification,status,valid_from,valid_until)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'active',?,?)`,
+  ).bind(id,residentId,propertyId,body.visitorName.trim(),body.visitorPhone?.trim() ?? null,pin,qrToken,credentialNumber,credentialNumber,credentialMode,device?.id ?? null,gateScope,1,requireGateIdVerification,validFrom,validUntil).run();
   await linkProofFiles(c.env.DB,proofKeys(body.proofKeys),'visitor_request',id,requester.id);
   if (device) {
     const status=['hikvision_cloud_openapi','offsite_isup_gateway'].includes(device.connection_pattern)?'pending':'manual_action_required';
@@ -1654,8 +1711,8 @@ app.post('/api/visitors', requireRoles('resident','admin','manager'), async (c) 
       `INSERT INTO visitor_device_operations(id,visitor_request_id,device_id,operation,payload_json,status) VALUES (?,?,?,'upsert_visitor',?,?)`,
     ).bind(crypto.randomUUID(),id,device.id,JSON.stringify({ credentialNumber,visitorName:body.visitorName.trim(),validFrom,validUntil,enabled:false,requiresSecurityApproval:true }),status).run();
   }
-  await audit(c,'create','visitor_request',id,{ propertyId,deviceId:device?.id ?? null,gateScope,credentialMode });
-  return c.json({ id, propertyId, pin, qrToken, credentialNumber, barcodePayload:credentialNumber, credentialMode, gateScope, validFrom, validUntil, requiresSecurityApproval:true }, 201);
+  await audit(c,'create','visitor_request',id,{ propertyId,deviceId:device?.id ?? null,gateScope,credentialMode,requireGateIdVerification });
+  return c.json({ id, propertyId, pin, qrToken, credentialNumber, barcodePayload:credentialNumber, credentialMode, gateScope, validFrom, validUntil, requiresSecurityApproval:true, requireGateIdVerification }, 201);
 });
 
 app.post('/api/visitors/scan', requireRoles('security','admin','manager'), async (c) => {
@@ -1663,7 +1720,8 @@ app.post('/api/visitors/scan', requireRoles('security','admin','manager'), async
   const code=body.code?.trim();
   if (!code) return jsonError(c,400,'Visitor QR, barcode or PIN is required');
   const visitor=await c.env.DB.prepare(
-    `SELECT v.*,u.name AS resident_name,u.phone AS resident_phone,p.unit_number,p.street,p.address,d.name AS device_name
+    `SELECT v.*,u.name AS resident_name,u.phone AS resident_phone,p.unit_number,p.street,p.address,d.name AS device_name,
+       (SELECT COUNT(*) FROM stored_files sf WHERE sf.linked_entity_type='visitor_request' AND sf.linked_entity_id=v.id AND sf.status='active') AS proof_count
      FROM visitor_requests v JOIN users u ON u.id=v.resident_id
      LEFT JOIN properties p ON p.id=v.property_id LEFT JOIN hikvision_devices d ON d.id=v.device_id
      WHERE v.pin=? OR v.qr_token=? OR v.credential_number=? OR v.barcode_payload=? LIMIT 1`,
@@ -1677,12 +1735,15 @@ app.post('/api/visitors/scan', requireRoles('security','admin','manager'), async
   const evaluation=evaluateVisitorPass(visitor,timeZone);
   const valid=evaluation.valid;
   await c.env.DB.prepare(`INSERT INTO visitor_code_scans(id,visitor_request_id,scanned_by,source,scanned_value_masked,decision) VALUES (?,?,?,?,?,'previewed')`).bind(scanId,visitor.id,c.get('user').id,body.source ?? 'manual',maskedCredential(code)).run();
+  const visitorProofs = await c.env.DB.prepare(
+    `SELECT storage_key,original_name,content_type,size_bytes FROM stored_files WHERE linked_entity_type='visitor_request' AND linked_entity_id=? AND status='active' ORDER BY created_at`,
+  ).bind(visitor.id).all();
   await audit(c,'preview','visitor_pass',String(visitor.id),{ scanId,source:body.source ?? 'manual',valid,reason:evaluation.reason });
-  return c.json({ scanId,valid,reason:evaluation.reason,validFrom:visitor.valid_from,validUntil:visitor.valid_until,timeZone,visitor });
+  return c.json({ scanId,valid,reason:evaluation.reason,validFrom:visitor.valid_from,validUntil:visitor.valid_until,timeZone,visitor,proofs:visitorProofs.results });
 });
 
 app.post('/api/visitors/:id/decision', requireRoles('security','admin','manager'), async (c) => {
-  const body=await c.req.json<{ decision?:'accepted'|'rejected';action?:'in'|'out';scanId?:string;note?:string }>();
+  const body=await c.req.json<{ decision?:'accepted'|'rejected';action?:'in'|'out';scanId?:string;note?:string;gateProofKeys?:string[];gateProofKey?:string }>();
   if (!body.decision || !['accepted','rejected'].includes(body.decision)) return jsonError(c,400,'decision must be accepted or rejected');
   if (!body.scanId) return jsonError(c,400,'Preview the scanned visitor code before making a decision');
   const scan=await c.env.DB.prepare(`SELECT id FROM visitor_code_scans WHERE id=? AND visitor_request_id=? AND scanned_by=? AND decision='previewed'`).bind(body.scanId,c.req.param('id'),c.get('user').id).first();
@@ -1696,14 +1757,29 @@ app.post('/api/visitors/:id/decision', requireRoles('security','admin','manager'
   if (body.decision==='accepted' && !evaluation.valid && !releasingCheckedInVisitor) {
     return jsonError(c,403,evaluation.reason ?? 'Visitor pass is not valid now');
   }
+
+  const gateProofs = proofKeys(body.gateProofKeys ?? (body.gateProofKey ? [body.gateProofKey] : []));
+  const requireGateIdVerification = Number(visitor.require_gate_id_verification ?? 0) === 1;
+  if (body.decision === 'accepted' && action === 'in' && requireGateIdVerification && !gateProofs.length) {
+    return jsonError(c, 400, 'Gate verification photo/ID image must be uploaded before granting entry for this visitor pass');
+  }
+
   if (body.decision==='accepted') {
-    if (action==='in') await c.env.DB.prepare(`UPDATE visitor_requests SET status='checked_in',checked_in_at=datetime('now'),checked_in_by=?,rejected_at=NULL,rejected_by=NULL,rejection_note=NULL WHERE id=?`).bind(c.get('user').id,visitor.id).run();
-    else await c.env.DB.prepare(`UPDATE visitor_requests SET status='checked_out',checked_out_at=datetime('now') WHERE id=?`).bind(visitor.id).run();
+    if (gateProofs.length) {
+      await linkProofFiles(c.env.DB, gateProofs, 'visitor_request', String(visitor.id), c.get('user').id);
+    }
+    if (action==='in') {
+      await c.env.DB.prepare(
+        `UPDATE visitor_requests SET status='checked_in',checked_in_at=datetime('now'),checked_in_by=?,gate_proof_key=COALESCE(?,gate_proof_key),gate_verified_at=CASE WHEN ? IS NOT NULL THEN datetime('now') ELSE gate_verified_at END,gate_verified_by=CASE WHEN ? IS NOT NULL THEN ? ELSE gate_verified_by END,rejected_at=NULL,rejected_by=NULL,rejection_note=NULL WHERE id=?`,
+      ).bind(c.get('user').id, gateProofs[0] ?? null, gateProofs[0] ?? null, gateProofs[0] ?? null, c.get('user').id, visitor.id).run();
+    } else {
+      await c.env.DB.prepare(`UPDATE visitor_requests SET status='checked_out',checked_out_at=datetime('now') WHERE id=?`).bind(visitor.id).run();
+    }
   } else {
     await c.env.DB.prepare(`UPDATE visitor_requests SET rejected_at=datetime('now'),rejected_by=?,rejection_note=? WHERE id=?`).bind(c.get('user').id,body.note?.trim() ?? 'Rejected by gate security',visitor.id).run();
   }
   await c.env.DB.prepare(`UPDATE visitor_code_scans SET decision=?,action=?,note=? WHERE id=? AND scanned_by=?`).bind(body.decision,body.action ?? null,body.note?.trim() ?? null,body.scanId,c.get('user').id).run();
-  await audit(c,body.decision,'visitor_pass',String(visitor.id),{ action:body.action,note:body.note });
+  await audit(c,body.decision,'visitor_pass',String(visitor.id),{ action:body.action,note:body.note,gateProofsCount:gateProofs.length });
   return c.json({ ok:true,decision:body.decision,action:body.action ?? null });
 });
 
@@ -1745,25 +1821,39 @@ app.get('/api/maintenance', async (c) => {
   const { limit, offset, page: pageNumber } = page(c);
   const residentId = user.role === 'resident' ? user.id : null;
   const result = await c.env.DB.prepare(
-    `SELECT m.*,u.name AS resident_name,p.unit_number,p.street,
+    `SELECT m.*,u.name AS resident_name,p.unit_number,p.street,p.block,p.zone,charger.name AS charged_by_name,
        (SELECT COUNT(*) FROM stored_files sf WHERE sf.linked_entity_type='maintenance_request' AND sf.linked_entity_id=m.id AND sf.status='active') AS proof_count
      FROM maintenance_requests m
      JOIN users u ON u.id=m.resident_id LEFT JOIN properties p ON p.id=COALESCE(m.property_id,u.property_id)
+     LEFT JOIN users charger ON charger.id=m.charged_by
      WHERE (? IS NULL OR m.resident_id=?) ORDER BY m.created_at DESC LIMIT ? OFFSET ?`,
   ).bind(residentId, residentId, limit, offset).all();
   return c.json({ items: result.results, page: pageNumber, limit });
 });
 
 app.post('/api/maintenance', requireRoles('resident','admin','manager'), async (c) => {
-  const body = await c.req.json<{ description?: string; photoKey?: string; proofKeys?: string[]; residentId?: string; propertyId?: string }>();
+  const body = await c.req.json<{
+    description?: string;
+    photoKey?: string;
+    proofKeys?: string[];
+    residentId?: string;
+    propertyId?: string;
+    scopeType?: 'personal'|'street'|'block'|'zone'|'estate';
+    scopeTarget?: string;
+  }>();
   if (!body.description?.trim()) return jsonError(c, 400, 'description is required');
+  const scopeType = body.scopeType ?? 'personal';
+  if (!['personal','street','block','zone','estate'].includes(scopeType)) {
+    return jsonError(c, 400, 'Invalid scopeType');
+  }
+  const scopeTarget = body.scopeTarget?.trim() ?? null;
   const residentId = c.get('user').role === 'resident' ? c.get('user').id : body.residentId;
   if (!residentId) return jsonError(c, 400, 'residentId is required');
   let propertyId = body.propertyId;
   if (propertyId) {
     const relationship = await propertyRelationship(c.env.DB,residentId,propertyId);
     if (!relationship || !relationship.can_manage_maintenance) return jsonError(c, 403, 'This resident cannot create maintenance requests for the selected property');
-  } else {
+  } else if (scopeType === 'personal') {
     const matches = await c.env.DB.prepare(
       `SELECT property_id FROM (
          SELECT property_id FROM property_ownerships WHERE resident_id=? AND status='active'
@@ -1778,17 +1868,142 @@ app.post('/api/maintenance', requireRoles('resident','admin','manager'), async (
   const id = crypto.randomUUID();
   const maintenanceProofs = proofKeys(body.proofKeys ?? (body.photoKey ? [body.photoKey] : []));
   await c.env.DB.prepare(
-    `INSERT INTO maintenance_requests(id,resident_id,property_id,description,photo_key) VALUES (?,?,?,?,?)`,
-  ).bind(id, residentId, propertyId, body.description.trim(), maintenanceProofs[0] ?? null).run();
+    `INSERT INTO maintenance_requests(id,resident_id,property_id,description,scope_type,scope_target,photo_key) VALUES (?,?,?,?,?,?,?)`,
+  ).bind(id, residentId, propertyId ?? null, body.description.trim(), scopeType, scopeTarget, maintenanceProofs[0] ?? null).run();
   await linkProofFiles(c.env.DB,maintenanceProofs,'maintenance_request',id,c.get('user').id);
-  return c.json({ id, propertyId }, 201);
+  await audit(c, 'create', 'maintenance_request', id, { scopeType, scopeTarget, propertyId });
+  return c.json({ id, propertyId, scopeType, scopeTarget }, 201);
 });
 
 app.patch('/api/maintenance/:id', requireRoles('admin','manager'), async (c) => {
-  const body = await c.req.json<{ status?: string }>();
-  if (!body.status || !['open','assigned','in_progress','resolved','closed'].includes(body.status)) return jsonError(c, 400, 'Invalid status');
-  await c.env.DB.prepare(`UPDATE maintenance_requests SET status=?, updated_at=datetime('now') WHERE id=?`).bind(body.status, c.req.param('id')).run();
-  return c.json({ ok: true });
+  const body = await c.req.json<{ status?: string; statusNote?: string; proofKeys?: string[] }>();
+  if (!body.status || !['open','assigned','in_progress','needs_verification','rejected','completed','resolved','closed'].includes(body.status)) return jsonError(c, 400, 'Invalid status');
+  const existing = await c.env.DB.prepare(`SELECT id,status FROM maintenance_requests WHERE id=?`).bind(c.req.param('id')).first<{ id:string;status:string }>();
+  if (!existing) return jsonError(c, 404, 'Maintenance request not found');
+
+  await c.env.DB.prepare(
+    `UPDATE maintenance_requests SET status=?, status_note=COALESCE(?, status_note), updated_at=datetime('now') WHERE id=?`,
+  ).bind(body.status, body.statusNote?.trim() ?? null, c.req.param('id')).run();
+
+  const proofs = proofKeys(body.proofKeys);
+  if (proofs.length) {
+    await linkProofFiles(c.env.DB, proofs, 'maintenance_request', c.req.param('id'), c.get('user').id);
+  }
+  await audit(c, 'update_status', 'maintenance_request', c.req.param('id'), { oldStatus: existing.status, newStatus: body.status, proofsCount: proofs.length });
+  return c.json({ ok: true, status: body.status });
+});
+
+app.post('/api/maintenance/:id/charge', requireRoles('admin','manager'), async (c) => {
+  const body = await c.req.json<{
+    target?: 'residence'|'resident'|'tenant'|'owner'|'street'|'block'|'zone'|'all';
+    amountMinor?: number;
+    dueDate?: string;
+    billType?: string;
+    description?: string;
+  }>();
+  const target = body.target ?? 'residence';
+  if (!['residence','resident','tenant','owner','street','block','zone','all'].includes(target)) {
+    return jsonError(c, 400, 'target must be residence, tenant, owner, street, block, zone, or all');
+  }
+  const amountMinor = Math.round(Number(body.amountMinor ?? 0));
+  if (amountMinor <= 0) return jsonError(c, 400, 'amountMinor must be greater than zero');
+  if (!body.dueDate || Number.isNaN(new Date(body.dueDate).valueOf())) return jsonError(c, 400, 'Valid dueDate is required');
+
+  const req = await c.env.DB.prepare(
+    `SELECT m.*, p.unit_number, p.street, p.block, p.zone FROM maintenance_requests m LEFT JOIN properties p ON p.id=m.property_id WHERE m.id=?`,
+  ).bind(c.req.param('id')).first<Record<string, unknown>>();
+  if (!req) return jsonError(c, 404, 'Maintenance request not found');
+
+  const billType = body.billType?.trim() || 'maintenance_duty';
+  const desc = body.description?.trim() || `Maintenance charge: ${String(req.description).slice(0, 80)}`;
+  let billsCreated = 0;
+  let chargeBillId: string | null = null;
+  let chargeBatchId: string | null = null;
+
+  if (target === 'residence' || target === 'resident') {
+    let residentId = String(req.resident_id);
+    const propId = req.property_id ? String(req.property_id) : null;
+    if (propId) {
+      const payer = await c.env.DB.prepare(
+        `SELECT CASE WHEN t.id IS NOT NULL AND t.billing_responsibility='tenant' THEN t.tenant_id ELSE po.resident_id END AS payer_id
+         FROM properties p
+         JOIN property_ownerships po ON po.property_id=p.id AND po.status='active'
+         LEFT JOIN property_tenancies t ON t.property_id=p.id AND t.status='active' AND date(t.start_date)<=date('now') AND (t.end_date IS NULL OR date(t.end_date)>=date('now'))
+         WHERE p.id=?`,
+      ).bind(propId).first<{ payer_id: string }>();
+      if (payer?.payer_id) residentId = payer.payer_id;
+    }
+    const billId = crypto.randomUUID();
+    await c.env.DB.prepare(
+      `INSERT INTO bills(id,property_id,resident_id,amount_minor,due_date,bill_type,description)
+       VALUES (?,?,?,?,?,?,?)`,
+    ).bind(billId, propId, residentId, amountMinor, body.dueDate, billType, desc).run();
+    billsCreated = 1;
+    chargeBillId = billId;
+  } else if (target === 'tenant') {
+    if (!req.property_id) return jsonError(c, 400, 'This maintenance request has no linked property with a tenant');
+    const tenant = await c.env.DB.prepare(
+      `SELECT tenant_id FROM property_tenancies WHERE property_id=? AND status='active' AND date(start_date)<=date('now') AND (end_date IS NULL OR date(end_date)>=date('now')) LIMIT 1`,
+    ).bind(req.property_id).first<{ tenant_id: string }>();
+    if (!tenant?.tenant_id) return jsonError(c, 400, 'No active tenant found for this property');
+    const billId = crypto.randomUUID();
+    await c.env.DB.prepare(
+      `INSERT INTO bills(id,property_id,resident_id,amount_minor,due_date,bill_type,description)
+       VALUES (?,?,?,?,?,?,?)`,
+    ).bind(billId, req.property_id, tenant.tenant_id, amountMinor, body.dueDate, billType, desc).run();
+    billsCreated = 1;
+    chargeBillId = billId;
+  } else if (target === 'owner') {
+    if (!req.property_id) return jsonError(c, 400, 'This maintenance request has no linked property');
+    const owner = await c.env.DB.prepare(
+      `SELECT resident_id FROM property_ownerships WHERE property_id=? AND status='active' LIMIT 1`,
+    ).bind(req.property_id).first<{ resident_id: string }>();
+    if (!owner?.resident_id) return jsonError(c, 400, 'No active owner found for this property');
+    const billId = crypto.randomUUID();
+    await c.env.DB.prepare(
+      `INSERT INTO bills(id,property_id,resident_id,amount_minor,due_date,bill_type,description)
+       VALUES (?,?,?,?,?,?,?)`,
+    ).bind(billId, req.property_id, owner.resident_id, amountMinor, body.dueDate, billType, desc).run();
+    billsCreated = 1;
+    chargeBillId = billId;
+  } else {
+    const targetScope = target === 'street' ? (req.street ? String(req.street) : req.scope_target ? String(req.scope_target) : null)
+      : target === 'block' ? (req.block ? String(req.block) : req.scope_target ? String(req.scope_target) : null)
+      : target === 'zone' ? (req.zone ? String(req.zone) : req.scope_target ? String(req.scope_target) : null)
+      : 'all';
+    if (target !== 'all' && !targetScope) return jsonError(c, 400, `Cannot determine ${target} for this maintenance request`);
+
+    chargeBatchId = crypto.randomUUID();
+    await c.env.DB.prepare(
+      `INSERT INTO bill_batches(id,name,street_filter_json,target_type,target_filter_json,audience,amount_minor,due_date,bill_type,description,created_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    ).bind(chargeBatchId, `Maintenance charge: ${target} ${targetScope || ''}`.trim(), JSON.stringify(targetScope ? [targetScope] : []), target, JSON.stringify(targetScope ? [targetScope] : []), 'all_owners_and_tenants', amountMinor, body.dueDate, billType, desc, c.get('user').id).run();
+
+    const column = target === 'block' ? 'block' : target === 'zone' ? 'zone' : 'street';
+    const filterClause = target === 'all' ? '' : `AND p.${column}=?`;
+    const filterParam = target === 'all' ? [] : [targetScope];
+
+    const inserted = await c.env.DB.prepare(
+      `INSERT INTO bills(id,property_id,resident_id,amount_minor,due_date,bill_type,description,batch_id)
+       SELECT lower(hex(randomblob(16))), p.id,
+         CASE WHEN t.id IS NOT NULL AND t.billing_responsibility='tenant' THEN t.tenant_id ELSE po.resident_id END,
+         ?,?,?,?,?
+       FROM properties p
+       JOIN property_ownerships po ON po.property_id=p.id AND po.status='active'
+       LEFT JOIN property_tenancies t ON t.property_id=p.id AND t.status='active' AND date(t.start_date)<=date('now') AND (t.end_date IS NULL OR date(t.end_date)>=date('now'))
+       JOIN users payer ON payer.id=CASE WHEN t.id IS NOT NULL AND t.billing_responsibility='tenant' THEN t.tenant_id ELSE po.resident_id END
+       WHERE payer.role='resident' AND payer.status='active' ${filterClause}`,
+    ).bind(amountMinor, body.dueDate, billType, desc, chargeBatchId, ...filterParam).run();
+    billsCreated = inserted.meta.changes ?? 0;
+    await c.env.DB.prepare(`UPDATE bill_batches SET bill_count=? WHERE id=?`).bind(billsCreated, chargeBatchId).run();
+  }
+
+  await c.env.DB.prepare(
+    `UPDATE maintenance_requests SET charge_amount_minor=?, charge_target=?, charge_bill_id=?, charge_batch_id=?, charged_at=datetime('now'), charged_by=?, updated_at=datetime('now') WHERE id=?`,
+  ).bind(amountMinor, target, chargeBillId, chargeBatchId, c.get('user').id, req.id).run();
+
+  await audit(c, 'charge_maintenance_request', 'maintenance_request', String(req.id), { target, amountMinor, billsCreated, chargeBillId, chargeBatchId });
+  return c.json({ ok: true, billsCreated, amountMinor, chargeBillId, chargeBatchId });
 });
 
 app.get('/api/notices/popup', async (c) => {
