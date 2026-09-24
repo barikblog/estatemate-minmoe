@@ -69,6 +69,12 @@ Extends `isapi-bridge/agent.mjs` to v1.1.0 and the Worker so a Hikvision termina
 - **Tests:** `test/agent-event-stream.test.ts` (9 tests) covers auth, agent-scoped device checks, batch normalization, one-message batching, legacy single-event consumer shape, multipart direct-post batching, kill switch, 413 batch cap and retention pruning; `test/harness.ts` now records queue sends and live-feed broadcasts. `isapi-bridge/agent.integration.mjs` (wired into `npm run test:isapi-bridge` inside `npm test`) unit-checks both stream parsers and streams a fake terminal end-to-end into a fake Worker.
 - **Docs:** `docs/device-profiles/DS-K1T808MFWX-B.md` records the datasheet evidence and the on-site verification checklist; `docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md`, `isapi-bridge/README.md` and both example configs document streaming; `AGENTS.md` names alertStream an event-upload path.
 
+### Production deployment (2026-09-24)
+
+- PR #9 merged to `main` (`3d9f08e`); Deploy EstateMate run `36019689067` succeeded — migrations `0012_agent_event_stream_retention.sql` and `0013_agent_only_transports.sql` applied to D1 `estatemate-db`, Worker + web assets deployed.
+- Post-deploy smoke tests: `GET /api/health` → `{"ok":true,...}`; `GET /api/hikvision/v1/events/:id` now falls through to session auth (old raw device-ingest dispatch gone); `GET /api/isapi/v1/agents/:id/events` returns 405 (new machine handler live); SPA sign-in renders at `https://estatemate.estatemate.workers.dev`.
+- Operator follow-up: re-link any device showing `manual_sync` in **ISAPI Bridge & Windows Agent** (LAN ISAPI host/credentials + agent) to restore real-time events and automatic card operations. Per-device ingest endpoints/secrets no longer exist.
+
 ### Agent-only transport phase (2026-09-24, after streaming)
 
 - Removed all non-agent transports per `migrations/0013_agent_only_transports.sql`: deleted `bridge/`, `render.yaml`, `isup-gateway/`; removed device ingest + ISUP gateway operation endpoints, site-sync installer, device secret rotation and per-device credential creation; reduced connection patterns to agent patterns + `manual_sync`; dropped Hik-Connect fields and Render relay URL from APIs and portal UI; updated README/AGENTS/MINMOE-NO-PC/VISITOR-CREDENTIALS/MANAGERS/QUESTIONNAIRE/device-profile docs.
