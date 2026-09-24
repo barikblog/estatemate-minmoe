@@ -35,7 +35,7 @@ Run `./scripts/ai-context.sh` to print a safe repository summary.
 - Each property has one active legal owner. Tenancy never changes ownership.
 - Preserve ownership, tenancy, billing, card, visitor and access-event history.
 - Default visitor gate policy is preview first, then Admin/Security accepts or rejects.
-- Direct HTTP Listening and the Render relay are event-upload paths, not command channels.
+- Direct HTTP Listening, the Render relay, and the ISAPI bridge agent's alertStream streaming are event-upload paths, not command channels.
 - Render Free cannot be made into public raw ISUP/TCP by a keep-alive script; use `isup-gateway/` on a small LAN appliance or another eligible TCP-capable host.
 - The ISUP host/control package is not a functioning protocol engine until compiled with the licensed official SDK for the exact architecture/model/firmware.
 - Never claim a model supports QR, HTTP Listening, ISUP or remote commands without model/firmware evidence.

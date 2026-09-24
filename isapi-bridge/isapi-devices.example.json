@@ -8,7 +8,8 @@
       "isapiUsername": "admin",
       "isapiPassword": "device-admin-password",
       "protocol": "http",
-      "enabled": true
+      "enabled": true,
+      "eventStream": true
     },
     {
       "estateMateDeviceId": "22222222-2222-4222-8222-222222222222",
@@ -18,7 +19,8 @@
       "isapiUsername": "admin",
       "isapiPassword": "another-password",
       "protocol": "http",
-      "enabled": true
+      "enabled": true,
+      "eventStream": true
     }
   ]
 }

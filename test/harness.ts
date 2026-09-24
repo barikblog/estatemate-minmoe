@@ -125,10 +125,23 @@ export async function createTestDatabase(): Promise<TestDatabase> {
 }
 
 export function createTestEnv(db: D1Database): Env {
-  return {
+  const queueSends: Array<{ kind: 'send' | 'sendBatch'; body?: unknown; messages?: unknown[] }> = [];
+  const broadcasts: Array<Record<string, unknown>> = [];
+  const env = {
     DB: db,
-    ACCESS_EVENTS: { send: async () => undefined, sendBatch: async () => undefined } as unknown as Env['ACCESS_EVENTS'],
-    LIVE_FEED: {} as unknown as Env['LIVE_FEED'],
+    ACCESS_EVENTS: {
+      send: async (body: unknown) => { queueSends.push({ kind: 'send', body }); },
+      sendBatch: async (messages: unknown[]) => { queueSends.push({ kind: 'sendBatch', messages }); },
+    } as unknown as Env['ACCESS_EVENTS'],
+    LIVE_FEED: {
+      idFromName: (name: string) => ({ name }),
+      get: () => ({
+        fetch: async (_url: string | URL, init?: { body?: string }) => {
+          broadcasts.push(JSON.parse(init?.body ?? '{}') as Record<string, unknown>);
+          return new Response(null, { status: 204 });
+        },
+      }),
+    } as unknown as Env['LIVE_FEED'],
     ASSETS: { fetch: async () => new Response('not found', { status: 404 }) } as unknown as Env['ASSETS'],
     APP_NAME: 'EstateMate Test',
     ALLOWED_ORIGINS: '',
@@ -136,7 +149,19 @@ export function createTestEnv(db: D1Database): Env {
     JWT_SECRET: 'test-secret-value-0123456789abcdef',
     BOOTSTRAP_TOKEN: 'test-bootstrap-token',
     DEVICE_INGEST_PEPPER: 'test-device-ingest-pepper',
-  };
+  } as Env;
+  // Test observation handles (not part of the production Env contract).
+  (env as unknown as Record<string, unknown>).queueSends = queueSends;
+  (env as unknown as Record<string, unknown>).liveBroadcasts = broadcasts;
+  return env;
+}
+
+export function queueSendsOf(env: Env): Array<{ kind: 'send' | 'sendBatch'; body?: unknown; messages?: unknown[] }> {
+  return (env as unknown as Record<string, unknown>).queueSends as Array<{ kind: 'send' | 'sendBatch'; body?: unknown; messages?: unknown[] }>;
+}
+
+export function liveBroadcastsOf(env: Env): Array<Record<string, unknown>> {
+  return (env as unknown as Record<string, unknown>).liveBroadcasts as Array<Record<string, unknown>>;
 }
 
 export interface SeededEstate {

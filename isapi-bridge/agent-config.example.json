@@ -4,6 +4,10 @@
   "workerUrl": "https://estatemate.estatemate.workers.dev",
   "syncIntervalSeconds": 30,
   "heartbeatIntervalSeconds": 60,
+  "eventStream": true,
+  "eventFlushCount": 25,
+  "eventFlushSeconds": 5,
+  "eventBufferLimit": 500,
   "logLevel": "info",
   "isapiTimeoutMs": 15000,
   "maxRetries": 3

@@ -15,7 +15,7 @@ Included:
 
 - One Cloudflare Worker serving the SPA and `/api/*`.
 - D1 schema for users, multi-property ownership and approval requests, streets/properties, billing, historical bill/payment imports, visitors, maintenance, general estate notices, access cards, access events, devices, operations, settings, and audit records.
-- Direct or optional Render-relayed JSON/XML/multipart HTTP Listening ingestion for compatible Internet-connected access devices.
+- Direct, optional Render-relayed, or LAN-agent-relayed (ISAPI bridge alertStream) JSON/XML/multipart event ingestion for compatible Internet-connected access devices.
 - Per-device one-time credentials; editable/soft-deletable device inventory; Queue buffering; D1 event persistence; Durable Object live WebSocket feed.
 - Device-tap card enrollment, phone/device visitor-code scanning, QR + Code 128 visitor passes, and preview-before-entry Security decisions.
 - Hourly facility-fee expiry/reactivation job and hardware-action audit queue.
@@ -51,7 +51,8 @@ See [`docs/MINMOE-NO-PC.md`](docs/MINMOE-NO-PC.md), [`docs/VISITOR-CREDENTIALS-A
 
 ```text
 Access device ── outbound HTTPS event POST ──────────────┐
-              └── optional Render Free HTTPS relay ──────┤
+              ├── optional Render Free HTTPS relay ──────┤
+              └── ISAPI bridge agent (LAN alertStream) ──┤
 React portal / Android ── HTTPS REST ────────────────────▶ Cloudflare Worker
                                                    ├── D1
                                                    ├── private GitHub repository API
@@ -61,6 +62,7 @@ React portal / Android ── HTTPS REST ─────────────
 
 Cloud-to-terminal card/visitor action
   ├── HTTP Listening mode: audit queue → authorized operator applies on device
+  ├── ISAPI bridge mode: Worker operation queue → LAN agent polls → ISAPI Digest
   └── Dedicated ISUP mode: Worker operation endpoint → small Ubuntu gateway
       → licensed official Hikvision SDK adapter → supported terminal/controller
 ```
@@ -100,6 +102,8 @@ The generic parser retains unknown values rather than inventing a grant result. 
 apps/web/                  React + Vite portal
 apps/android/              Android Studio Kotlin/Compose project
 bridge/                    Optional stateless Render Free HTTPS event relay
+isapi-bridge/              Cross-platform LAN agent: card ops + real-time alertStream events
+windows-agent/             Windows Service wrapper for the ISAPI bridge agent
 isup-gateway/               Always-on Ubuntu/official-SDK gateway host package
 src/                       Worker/API, parser, auth, Queue and Durable Object
 migrations/                Versioned D1 schema

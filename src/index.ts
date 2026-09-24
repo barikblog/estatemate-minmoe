@@ -26,7 +26,8 @@ import {
   verifyJwt,
   verifyPassword,
 } from './security';
-import type { AppVariables, AuthUser, DeviceIdentity, Env, NormalizedAccessEvent, Role } from './types';
+import type { AccessEventQueuePayload, AppVariables, AuthUser, DeviceIdentity, Env, NormalizedAccessEvent, Role } from './types';
+import { flattenQueuePayload } from './types';
 
 export { AccessLiveFeed };
 
@@ -3097,6 +3098,104 @@ async function handleIsapiAgentDevices(request: Request, env: Env, agentId: stri
   return Response.json({ agentId, serverTime: new Date().toISOString(), items: result.results }, { headers: { 'Cache-Control': 'no-store' } });
 }
 
+const AGENT_EVENT_BATCH_LIMIT = 50;
+const AGENT_EVENT_DOCUMENT_LIMIT = 512 * 1024;
+
+interface AgentEventItem {
+  deviceId?: unknown;
+  contentType?: unknown;
+  document?: unknown;
+}
+
+/**
+ * Machine endpoint for the ISAPI bridge / Windows agent: forwards device event
+ * documents captured from a real-time ISAPI alertStream (or HTTP Listening
+ * fallback) in batches. Documents go through the same normalization pipeline as
+ * direct device posts, and the whole batch is queued as ONE Queue message so a
+ * busy estate stays inside the Workers Free plan Queues allowance.
+ */
+async function handleIsapiAgentEvents(request: Request, env: Env, agentId: string): Promise<Response> {
+  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'POST' } });
+  const agent = await authenticateIsapiAgent(request, env, agentId);
+  if (!agent) return new Response('Unauthorized', { status: 401 });
+  const length = Number(request.headers.get('Content-Length') ?? 0);
+  if (length > DEVICE_BODY_LIMIT) return new Response('Payload too large', { status: 413 });
+  const streamSetting = await env.DB.prepare(
+    `SELECT value FROM settings WHERE key='agent_event_stream_enabled'`,
+  ).first<{ value: string }>();
+  if (streamSetting && ['false', '0', 'off', 'disabled'].includes(String(streamSetting.value).trim().toLowerCase())) {
+    return Response.json({ error: 'Agent event streaming is disabled in settings' }, { status: 409 });
+  }
+  let body: { items?: AgentEventItem[] };
+  try { body = await request.json(); } catch { return Response.json({ error: 'JSON required' }, { status: 400 }); }
+  const items = Array.isArray(body.items) ? body.items : [];
+  if (!items.length) return Response.json({ error: 'items array is required' }, { status: 400 });
+  if (items.length > AGENT_EVENT_BATCH_LIMIT) {
+    return Response.json({ error: `A maximum of ${AGENT_EVENT_BATCH_LIMIT} items per request` }, { status: 413 });
+  }
+
+  // device id -> identity (null marks a device this agent may not ingest for)
+  const identityCache = new Map<string, DeviceIdentity | null>();
+  const resolveIdentity = async (deviceId: string): Promise<DeviceIdentity | null> => {
+    if (identityCache.has(deviceId)) return identityCache.get(deviceId) ?? null;
+    const row = await env.DB.prepare(
+      `SELECT d.id,d.name,d.direction,d.profile_key,d.connection_pattern,d.isapi_agent_id,ap.id AS access_point_id
+       FROM hikvision_devices d LEFT JOIN access_points ap ON ap.device_id=d.id AND ap.enabled=1
+       WHERE d.id=? AND d.deleted_at IS NULL AND d.status!='disabled' LIMIT 1`,
+    ).bind(deviceId).first<Record<string, string | null>>();
+    let identity: DeviceIdentity | null = null;
+    if (row) {
+      const ownedByAgent = row.isapi_agent_id === agentId;
+      const linkedByConfig = ownedByAgent ? true : Boolean(await env.DB.prepare(
+        `SELECT 1 FROM isapi_device_configs WHERE device_id=? AND agent_id=? LIMIT 1`,
+      ).bind(deviceId, agentId).first());
+      if (ownedByAgent || linkedByConfig) {
+        identity = {
+          id: row.id!,
+          name: row.name!,
+          username: `agent:${agentId}`,
+          direction: (row.direction === 'exit' ? 'exit' : row.direction === 'both' ? 'both' : 'entry'),
+          accessPointId: row.access_point_id ?? null,
+          profileKey: row.profile_key ?? 'generic_isapi',
+          connectionPattern: row.connection_pattern ?? 'manual_sync',
+        };
+      }
+    }
+    identityCache.set(deviceId, identity);
+    return identity;
+  };
+
+  const events: NormalizedAccessEvent[] = [];
+  const seenDevices = new Set<string>();
+  let rejected = 0;
+  for (const item of items.slice(0, AGENT_EVENT_BATCH_LIMIT)) {
+    const deviceId = typeof item?.deviceId === 'string' ? item.deviceId.trim() : '';
+    const document = typeof item?.document === 'string' ? item.document : '';
+    if (!deviceId || !document || document.length > AGENT_EVENT_DOCUMENT_LIMIT) { rejected++; continue; }
+    const identity = await resolveIdentity(deviceId);
+    if (!identity) { rejected++; continue; }
+    seenDevices.add(identity.id);
+    const event = await normalizeHikvisionDocument(document, identity);
+    if (event) events.push(event); else rejected++;
+  }
+
+  if (seenDevices.size) {
+    await env.DB.batch([...seenDevices].map((deviceId) => env.DB.prepare(
+      `UPDATE hikvision_devices SET status='online',last_seen_at=datetime('now'),updated_at=datetime('now') WHERE id=?`,
+    ).bind(deviceId)));
+  }
+  if (events.length === 1) await env.ACCESS_EVENTS.send(events[0]!);
+  else if (events.length) await env.ACCESS_EVENTS.send({ batch: events });
+
+  return Response.json({
+    ok: true,
+    agentId,
+    accepted: events.length,
+    rejected,
+    serverTime: new Date().toISOString(),
+  }, { headers: { 'Cache-Control': 'no-store' } });
+}
+
 async function handleIsapiAgentOperations(request: Request, env: Env, agentId: string): Promise<Response> {
   if (request.method !== 'GET') return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET' } });
   const agent = await authenticateIsapiAgent(request, env, agentId);
@@ -3225,7 +3324,7 @@ async function handleDeviceEvent(request: Request, env: Env, deviceId: string): 
     const event = await normalizeHikvisionDocument(document, device);
     if (event) events.push(event);
   }
-  if (events.length) await env.ACCESS_EVENTS.sendBatch(events.map((event) => ({ body: event })));
+  if (events.length) await env.ACCESS_EVENTS.send(events.length === 1 ? events[0]! : { batch: events });
   await env.DB.batch([
     env.DB.prepare(`UPDATE hikvision_devices SET status='online',last_seen_at=datetime('now'),updated_at=datetime('now') WHERE id=?`).bind(device.id),
     env.DB.prepare(`UPDATE device_credentials SET last_seen_at=datetime('now') WHERE device_id=? AND username=?`).bind(device.id, device.username),
@@ -3309,8 +3408,13 @@ async function handleGatewayOperationResult(request: Request, env: Env, deviceId
   return Response.json({ ok:true,id:operationId,kind:body.kind,status:body.status }, { headers: { 'Cache-Control':'no-store' } });
 }
 
-async function consumeAccessEvents(batch: MessageBatch<NormalizedAccessEvent>, env: Env): Promise<void> {
-  const statements = batch.messages.map(({ body: event }) => env.DB.prepare(
+async function consumeAccessEvents(batch: MessageBatch<AccessEventQueuePayload>, env: Env): Promise<void> {
+  const events = batch.messages.flatMap((message) => flattenQueuePayload(message.body));
+  if (!events.length) {
+    batch.ackAll();
+    return;
+  }
+  const statements = events.map((event) => env.DB.prepare(
     `INSERT OR IGNORE INTO access_events(
       id,vendor_event_id,device_id,access_point_id,card_id,resident_id,household_member_id,visitor_request_id,card_uid,employee_no,person_name,credential_type,door_no,direction,result,event_type,device_timestamp,profile_key,raw_summary
      ) VALUES (?,?,?,?,
@@ -3323,20 +3427,46 @@ async function consumeAccessEvents(batch: MessageBatch<NormalizedAccessEvent>, e
     event.cardUid,event.employeeNo,event.personName,event.credentialType,event.doorNo,event.direction,event.result,
     event.eventType,event.deviceTimestamp,event.profileKey,event.rawSummary,
   ));
-  if (statements.length) await env.DB.batch(statements);
-  const captured = batch.messages.filter((message) => Boolean(message.body.cardUid)).map(({ body:event }) => env.DB.prepare(
+  await env.DB.batch(statements);
+  const captured = events.filter((event) => Boolean(event.cardUid)).map((event) => env.DB.prepare(
     `UPDATE credential_scan_sessions SET captured_credential=?,
        visitor_request_id=CASE WHEN purpose='visitor_validation' THEN (SELECT id FROM visitor_requests WHERE credential_number=? OR pin=? LIMIT 1) ELSE visitor_request_id END,
        status='captured',captured_at=datetime('now'),updated_at=datetime('now')
      WHERE device_id=? AND status='waiting' AND datetime(expires_at)>datetime('now')`,
   ).bind(event.cardUid,event.cardUid,event.cardUid,event.deviceId));
   if (captured.length) await env.DB.batch(captured);
-  const live = env.LIVE_FEED.get(env.LIVE_FEED.idFromName('global'));
-  await live.fetch('https://internal/broadcast', {
-    method: 'POST',
-    body: JSON.stringify({ type: 'access_events', events: batch.messages.map((message) => message.body) }),
-  });
+  try {
+    const live = env.LIVE_FEED.get(env.LIVE_FEED.idFromName('global'));
+    await live.fetch('https://internal/broadcast', {
+      method: 'POST',
+      body: JSON.stringify({ type: 'access_events', events }),
+    });
+  } catch (error) {
+    // Persistence already succeeded; a live-feed outage must not requeue the whole batch.
+    console.error('Live feed broadcast failed', error);
+  }
   batch.ackAll();
+}
+
+/**
+ * Free-tier retention: D1 is capped at 500 MB per database on the Workers Free
+ * plan, so the hourly cron prunes old access events and ISAPI sync logs in
+ * small indexed batches. Administrators tune this with the
+ * access_event_retention_days setting (minimum enforced: 30 days).
+ */
+async function pruneAccessEvents(env: Env): Promise<void> {
+  const setting = await env.DB.prepare(
+    `SELECT CAST(value AS INTEGER) AS days FROM settings WHERE key='access_event_retention_days'`,
+  ).first<{ days: number | null }>();
+  const days = setting?.days ?? 365;
+  if (!Number.isFinite(days) || days < 30) return;
+  const eventCutoff = new Date(Date.now() - days * 86_400_000).toISOString();
+  await env.DB.prepare(
+    `DELETE FROM access_events WHERE id IN (SELECT id FROM access_events WHERE device_timestamp < ? LIMIT 500)`,
+  ).bind(eventCutoff).run();
+  await env.DB.prepare(
+    `DELETE FROM isapi_sync_logs WHERE id IN (SELECT id FROM isapi_sync_logs WHERE created_at < datetime('now','-' || ? || ' days') LIMIT 500)`,
+  ).bind(Math.floor(days)).run();
 }
 
 async function processPropertyLifecycle(env: Env): Promise<void> {
@@ -3419,6 +3549,8 @@ export default {
     if (isapiHeartbeat?.[1]) return handleIsapiAgentHeartbeat(request, env, decodeURIComponent(isapiHeartbeat[1]));
     const isapiDevices = /^\/api\/isapi\/v1\/agents\/([^/]+)\/devices$/.exec(url.pathname);
     if (isapiDevices?.[1]) return handleIsapiAgentDevices(request, env, decodeURIComponent(isapiDevices[1]));
+    const isapiEvents = /^\/api\/isapi\/v1\/agents\/([^/]+)\/events$/.exec(url.pathname);
+    if (isapiEvents?.[1]) return handleIsapiAgentEvents(request, env, decodeURIComponent(isapiEvents[1]));
     const isapiOpsResult = /^\/api\/isapi\/v1\/agents\/([^/]+)\/operations\/([^/]+)\/result$/.exec(url.pathname);
     if (isapiOpsResult?.[1] && isapiOpsResult[2]) return handleIsapiAgentOperationResult(request, env, decodeURIComponent(isapiOpsResult[1]), decodeURIComponent(isapiOpsResult[2]));
     const isapiOps = /^\/api\/isapi\/v1\/agents\/([^/]+)\/operations$/.exec(url.pathname);
@@ -3433,10 +3565,10 @@ export default {
 
     return app.fetch(request, env, executionCtx);
   },
-  async queue(batch: MessageBatch<NormalizedAccessEvent>, env: Env): Promise<void> {
+  async queue(batch: MessageBatch<AccessEventQueuePayload>, env: Env): Promise<void> {
     await consumeAccessEvents(batch, env);
   },
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(Promise.all([processPropertyLifecycle(env),enforceFacilityFees(env)]).then(() => undefined));
+    ctx.waitUntil(Promise.all([processPropertyLifecycle(env),enforceFacilityFees(env),pruneAccessEvents(env)]).then(() => undefined));
   },
 };

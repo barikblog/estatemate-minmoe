@@ -66,6 +66,7 @@ Indexes added for agent status, device lookups, and sync logs.
 - `GET /api/isapi/v1/agents/:id/operations?limit=20` — poll pending operations (claims them as sent)
 - `POST /api/isapi/v1/agents/:id/operations/:opId/result` — report applied/failed
 - `POST /api/isapi/v1/agents/:id/sync-logs` — manual log entry
+- `POST /api/isapi/v1/agents/:id/events` — **batched real-time event documents** captured from the device's ISAPI alertStream. Body `{ items: [{ deviceId, contentType?, document }] }`, max 50 items / 2 MB per request. Each document (JSON or XML string) goes through the same normalization pipeline as direct device posts; the whole batch is queued as one Queue message. Guarded by the `agent_event_stream_enabled` setting (`409` when disabled). Devices must be linked to the calling agent (`hikvision_devices.isapi_agent_id` or `isapi_device_configs`).
 
 Legacy compatibility endpoints also available: `/api/isapi/v1/operations/:agentId`.
 
@@ -114,6 +115,27 @@ Updated `isPendingPattern` to include:
 - `isapi_windows_agent`
 
 When device uses these patterns, `createDeviceOperations` and visitor creation set status `pending` (agent will poll) instead of `manual_action_required`.
+
+## Real-time event streaming (agent 1.1.0)
+
+The agent now covers the event half of the problem as well as the command half. One persistent
+`GET /ISAPI/Event/notification/alertStream?format=json` connection is held per device; documents
+are buffered client-side and flushed as batched `POST /api/isapi/v1/agents/:id/events` requests
+(up to 50 items, or every 5 s). This is an **event-upload** path like HTTP Listening — it carries
+no commands — but it keeps Gate activity real-time (seconds, not polling intervals) on terminals
+whose firmware lacks HTTP Listening push, which is why the DS-K1T808MFWX-B
+(see [`device-profiles/DS-K1T808MFWX-B.md`](device-profiles/DS-K1T808MFWX-B.md)) can run fully
+automatic with only this agent on the LAN.
+
+Free-tier behaviour:
+
+- One batch = one Queue message = ~3 Queue operations (Workers Free: 10,000/day). At a busy
+  3,000 events/day this is roughly 200–600 operations/day, well inside the allowance.
+- The hourly cron prunes `access_events` and `isapi_sync_logs` older than
+  `access_event_retention_days` (default 365, minimum 30) in indexed 500-row batches to stay
+  inside the 500 MB free D1 limit.
+- The consumer accepts both single-event messages and `{ batch: [...] }` messages, and a
+  live-feed Durable Object outage no longer requeues persisted events.
 
 ## Testing locally
 
