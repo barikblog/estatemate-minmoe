@@ -1,0 +1,68 @@
+# Pull-request quality gate for EstateMate.
+#
+# This workflow deploys nothing and holds no Cloudflare or GitHub credentials.
+# It runs the checks `AGENTS.md` requires before a commit, so a pull request is
+# already proven green before it can reach `main`, where
+# `.github/workflows/deploy.yml` applies D1 migrations and ships the Worker.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Typecheck, test, build, validate config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the PR-relative hygiene checks can find the merge base.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck Worker and portal
+        run: npm run typecheck
+
+      - name: Unit tests and ISUP gateway integration test
+        run: npm test
+
+      - name: Build portal assets
+        run: npm run build:web
+
+      - name: Apply the whole D1 migration chain to an empty database
+        run: |
+          python3 - <<'PY'
+          import pathlib, sqlite3
+          con = sqlite3.connect(':memory:')
+          applied = 0
+          for migration in sorted(pathlib.Path('migrations').glob('*.sql')):
+              con.executescript(migration.read_text())
+              applied += 1
+          print(f'migration chain OK ({applied} migrations applied from an empty schema)')
+          PY
+
+      - name: PR hygiene (diff cleanliness, append-only migrations, no secrets)
+        run: bash scripts/ci-checks.sh
+
+      # Bundles the Worker and resolves every binding without contacting Cloudflare,
+      # so a broken wrangler.jsonc or a missing portal build fails here instead of in
+      # the production deploy. Runs after the portal build because it also asserts the
+      # assets directory exists and is populated.
+      - name: Validate Worker bundle and wrangler.jsonc without credentials
+        run: npx wrangler deploy --dry-run --outdir /tmp/wrangler-dry

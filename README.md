@@ -216,7 +216,10 @@ Production builds require your own signing key. Do not commit a keystore or its 
 npm run typecheck
 npm test
 npm run build
+bash scripts/ci-checks.sh
 ```
+
+`.github/workflows/ci.yml` runs these checks on every pull request targeting `main`, without any Cloudflare or GitHub credentials. The `Deploy EstateMate` workflow keeps deploying on pushes to `main`.
 
 ## GitHub publication
 

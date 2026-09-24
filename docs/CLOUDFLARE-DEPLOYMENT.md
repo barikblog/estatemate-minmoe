@@ -111,6 +111,8 @@ The included workflow expects repository secrets:
 
 The workflow builds, tests, applies D1 migrations, and deploys after a push to `main`. Use a long-lived, narrowly scoped token only if automatic deployments are desired. Otherwise omit repository secrets and deploy manually.
 
+A separate `CI` workflow (`.github/workflows/ci.yml`) runs on every pull request targeting `main` and on manual dispatch. It needs no secrets: typecheck, Vitest plus the ISUP integration test, the portal build, the full migration chain against an empty SQLite database, `scripts/ci-checks.sh` (clean diff, append-only migrations, no committed credentials) and `wrangler deploy --dry-run`, which bundles the Worker and resolves D1, Queue, Durable Object and asset bindings offline. Deployments remain gated by `npm run build` inside the deploy workflow, so CI shortens the feedback loop rather than adding a new authority.
+
 ## Rollback
 
 List deployments and roll back the Worker code with Wrangler or the dashboard. D1 migrations are forward-only; take an export before destructive schema changes.

@@ -24,6 +24,7 @@ Run `./scripts/ai-context.sh` to print a safe repository summary.
 - Private GitHub upload storage: `src/github-storage.ts`
 - Optional stateless Render HTTPS relay: `bridge/` and `render.yaml`
 - Dedicated local-appliance/off-site official-SDK ISUP gateway package: `isup-gateway/`
+- Pull-request quality gate (no deploy, no credentials): `.github/workflows/ci.yml`, backed by `scripts/ci-checks.sh` for the PR-relative checks
 - CI deployment: `.github/workflows/deploy.yml`
 
 ## Non-negotiable project rules
@@ -59,10 +60,14 @@ print('migration chain OK')
 PY
 ```
 
-Android requires JDK 17 and an Android SDK. If unavailable, state clearly that Kotlin changes were not compiled.
+`bash scripts/ci-checks.sh` reruns the PR-relative gates locally: whitespace/conflict-marker damage, edits or deletions of already-deployed migrations, and committed credential files or token-shaped secrets on added lines. `.github/workflows/ci.yml` runs the same commands plus a credential-free `wrangler deploy --dry-run` on every pull request targeting `main`.
+
+Android requires JDK 17 and an Android SDK. If unavailable, state clearly that Kotlin changes were not compiled. CI has neither.
 
 ## Deployment workflow
 
-Push to `main`. GitHub Actions applies pending D1 migrations and deploys the Worker/web portal. Check the Actions run and smoke-test `/api/health` plus any changed API. Do not run remote migrations twice manually.
+Only a push to `main` (or a manual run) ships: the deployed Worker is `estatemate` on the `estatemate` account subdomain, i.e. `https://estatemate.estatemate.workers.dev`, and the hostname comes from the Cloudflare account rather than the repository, so a different account yields `estatemate.<their-subdomain>.workers.dev`. Feature-branch pushes never deploy; their pull requests are validated by `CI`. Push to `main`. GitHub Actions builds and tests first, then applies pending D1 migrations and deploys the Worker/web portal. Check the Actions run and smoke-test `/api/health` plus any changed API. Do not run remote migrations twice manually.
+
+A Cloudflare Builds integration (GitHub App `cloudflare-workers-and-pages`) is also wired to the same `estatemate` Worker service and built `main` on 2026-09-24 alongside the Actions deploy, so production currently has two ship paths. Its build/deploy commands live in the Cloudflare dashboard rather than this repository, which means `wrangler.jsonc` changes are not automatically matched there, and it reports a red check on branches that are not `main`. Verify this before relying on a single source of truth: either keep `deploy.yml` authoritative and disable the Cloudflare build, or move to Cloudflare Builds alone and delete the deploy steps here. Never let both apply migrations.
 
 Update `docs/AI-HANDOFF.md` whenever architecture, deployment state or unfinished work changes.
