@@ -55,7 +55,7 @@ It expands import history to include private-storage-backed user CSV jobs. Migra
 - The Render relay health endpoint and event forwarding to the Worker passed locally.
 - ISUP control-plane relay integration test passed for adapter authentication, event forwarding, operation polling and result forwarding.
 - Local Worker machine API E2E passed for wrong-key rejection, header-based device authentication, operation claim/application and event acceptance.
-- Production currently remains at commit `ef5765e`; the dedicated-gateway and people-management commits described here are local until they are pushed and their deployment workflow succeeds. Earlier GitHub Actions run `35934290140` applied migration `0006` and passed the recorded production smoke checks.
+- GitHub Actions run `35938773816` built commit `2ac4761`, applied migration `0007`, deployed the Worker/web assets and completed successfully. Production health, portal configuration, root HTML and people/gateway bundle markers passed immediately afterward.
 - Android source from the previous tenancy phase remains uncompiled in this environment because JDK 17 and Android SDK are unavailable.
 
 ## Important hardware truth
