@@ -38,7 +38,7 @@ Import bills first when payments use old-system bill references.
 | `external_reference` | Recommended | Unique payment ID from the old system. |
 | `bill_reference` | Yes | A bill's EstateMate UUID or imported `external_reference`. |
 | `amount` | Yes | Major currency units. |
-| `payment_method` | Yes | `cash`, `pos`, `bank_transfer`, or `online`. |
+| `payment_method` | Yes | `cash`, `pos`, `bank_transfer`, or `online`. `online` is accepted for historical rows only — the portal no longer offers online collection, and `POST /api/payments` rejects it. |
 | `receipt_number` | Yes | Must be unique. |
 | `status` | No | `pending`, `approved`, or `rejected`; defaults to `approved`. |
 | `type` | No | `payment`, `refund`, or `adjustment`; defaults to `payment`. |

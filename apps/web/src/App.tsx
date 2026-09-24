@@ -1,5 +1,6 @@
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, ListResponse, User, api, money, readableDate } from './api';
+import type { PassShareSource } from './pass-export';
 
 type Row = Record<string, unknown>;
 type Section = 'dashboard' | 'residents' | 'properties' | 'residency' | 'imports' | 'bills' | 'visitors' | 'maintenance' | 'notices' | 'cards' | 'events' | 'devices' | 'operations' | 'settings';
@@ -55,6 +56,23 @@ function useAsync<T>(loader: () => Promise<T>, dependencies: unknown[]) {
   return { data, error, loading, reload };
 }
 
+function PasswordField({ value,onChange,name='password',label='Password',autoComplete='current-password',minLength }: { value:string;onChange:(value:string)=>void;name?:string;label?:string;autoComplete?:string;minLength?:number }) {
+  const [revealed,setRevealed]=useState(false);
+  return <label>{label}
+    <span className="password-field">
+      <input name={name} type={revealed?'text':'password'} value={value} onChange={(event)=>onChange(event.target.value)} autoComplete={autoComplete} minLength={minLength} required />
+      <button type="button" className="reveal-toggle" onClick={()=>setRevealed((current)=>!current)} aria-pressed={revealed} title={revealed?'Hide password':'Show password'}>{revealed?'Hide':'Show'}</button>
+    </span>
+  </label>;
+}
+
+function PortalFooter({ portalName }: { portalName?:string }) {
+  return <footer className="portal-footer">
+    {portalName && <span className="footer-portal">{portalName}</span>}
+    <span>Powered by <a href="http://sornix.com.ng" target="_blank" rel="noreferrer noopener">sornix.com.ng</a></span>
+  </footer>;
+}
+
 function Login({ onLogin, config }: { onLogin: (user: User) => void; config:PortalConfig }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -87,10 +105,11 @@ function Login({ onLogin, config }: { onLogin: (user: User) => void; config:Port
         <p>Use the account issued by your estate administrator.</p>
         {error && <Notice tone="error">{error}</Notice>}
         <label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" required /></label>
-        <label>Password<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" required /></label>
+        <PasswordField value={password} onChange={setPassword} label="Password" />
         <button className="primary wide" disabled={loading}>{loading ? 'Signing in…' : 'Continue'}</button>
         <small>Protected by an encrypted, role-based session.</small>
       </form>
+      <PortalFooter portalName={config.portal_name} />
     </section>
   </main>;
 }
@@ -162,7 +181,7 @@ function App() {
     {menuOpen && <button className="scrim" aria-label="Close menu" onClick={() => setMenuOpen(false)} />}
     <main className="workspace">
       <header className="topbar"><button className="icon-button mobile-menu" onClick={() => setMenuOpen(true)}>☰</button><div><p className="eyebrow">{user.role} workspace</p><h1>{current.label}</h1></div><div className="top-status"><span className="pulse-dot" /> System online</div></header>
-      <div className="content"><SectionView section={section} user={user} /></div>
+      <div className="content"><SectionView section={section} user={user} /><PortalFooter portalName={portalConfig.portal_name} /></div>
     </main>
     {popupNotices[0] && <EstateNoticePopup notice={popupNotices[0]} remaining={popupNotices.length - 1} onAcknowledge={acknowledgePopup} />}
   </div>;
@@ -465,15 +484,44 @@ function ImportCentre() {
   </PagePanel>;
 }
 
+interface PaymentMethodOption { id: string; label: string; detail: string; proofLabel: string }
+interface PaymentChannels { methods: PaymentMethodOption[]; bankAccount: Record<string, string>; bankAccountConfigured: boolean; editable: boolean }
+
+function BankAccountCard({ channels }: { channels: PaymentChannels }) {
+  const [copied, setCopied] = useState('');
+  const account = channels.bankAccount;
+  if (!channels.bankAccountConfigured) {
+    return <Notice tone="warning"><strong>No bank account published yet.</strong> The Administrator has not added the estate account. Pay at the office, or ask them to publish it under Settings.</Notice>;
+  }
+  async function copyDetails() {
+    const lines = [account.bankName, account.accountName, account.accountNumber, account.sortCode && `Sort code: ${account.sortCode}`].filter(Boolean).join('\n');
+    try { await navigator.clipboard.writeText(lines); setCopied('Account details copied.'); }
+    catch { setCopied('Copy is blocked by this browser — write the details down instead.'); }
+  }
+  return <div className="bank-card span-2">
+    <p className="eyebrow">TRANSFER TO THIS ESTATE ACCOUNT</p>
+    <dl>
+      <div><dt>Bank</dt><dd>{account.bankName}</dd></div>
+      <div><dt>Account name</dt><dd>{account.accountName || '—'}</dd></div>
+      <div><dt>Account number</dt><dd className="account-number">{account.accountNumber}</dd></div>
+      {Boolean(account.sortCode) && <div><dt>Sort code</dt><dd>{account.sortCode}</dd></div>}
+    </dl>
+    {Boolean(account.referenceNote) && <small>{account.referenceNote}</small>}
+    <div className="row-actions"><button type="button" className="secondary" onClick={copyDetails}>Copy account details</button>{copied && <small>{copied}</small>}</div>
+  </div>;
+}
+
 function Bills({ user }: { user: User }) {
   const list = useList('/api/bills?limit=50');
   const payments = useList('/api/payments?limit=50');
   const groups = useAsync<{ streets:Row[];blocks:Row[];zones:Row[] }>(() => user.role === 'resident' ? Promise.resolve({ streets:[],blocks:[],zones:[] }) : api('/api/property-groups'), [user.role]);
   const imports = useAsync<ListResponse<Row>>(() => user.role === 'resident' ? Promise.resolve({ items: [], page: 1, limit: 20 }) : api('/api/imports?scope=billing&limit=20'), [user.role]);
+  const channels = useAsync<PaymentChannels>(() => api('/api/payment-channels'), []);
   const [showBatch, setShowBatch] = useState(false);
   const [targetType, setTargetType] = useState<'street'|'block'|'zone'>('street');
   const [showImport, setShowImport] = useState(false);
   const [showPayment,setShowPayment]=useState(false);
+  const [paymentMethod,setPaymentMethod]=useState('');
   const [message, setMessage] = useState('');
 
   async function submitPayment(event:FormEvent<HTMLFormElement>) {
@@ -481,7 +529,7 @@ function Bills({ user }: { user: User }) {
     try {
       const proofKeys=await uploadProofFiles(event.currentTarget,'payment-proofs');
       const result=await api<{ receiptNumber:string;status:string }>('/api/payments',{ method:'POST',body:JSON.stringify({ billId:form.get('billId'),amountMinor:Math.round(Number(form.get('amount'))*100),paymentMethod:form.get('paymentMethod'),proofKeys }) });
-      setMessage(`Payment ${result.receiptNumber} submitted with status ${result.status}.`);setShowPayment(false);list.reload();payments.reload();
+      setMessage(`Payment ${result.receiptNumber} submitted with status ${result.status}.`);setShowPayment(false);setPaymentMethod('');list.reload();payments.reload();
     } catch(reason) { setMessage(reason instanceof Error?reason.message:'Payment submission failed'); }
   }
 
@@ -507,9 +555,27 @@ function Bills({ user }: { user: User }) {
 
   const staff = user.role === 'admin' || user.role === 'cashier';
   const targetRows = targetType === 'block' ? groups.data?.blocks : targetType === 'zone' ? groups.data?.zones : groups.data?.streets;
-  return <PagePanel title="Bills & payments" subtitle={user.role === 'resident' ? 'Your charges and payment status' : 'Estate receivables, grouped billing and historical imports'} action={<div className="row-actions"><button className="secondary" onClick={() => setShowPayment(!showPayment)}>Record payment</button>{staff&&<><button className="secondary" onClick={() => setShowImport(!showImport)}>Import CSV</button><button className="primary" onClick={() => setShowBatch(!showBatch)}>Create grouped bills</button></>}</div>}>
+  const selectedMethod = channels.data?.methods.find((method) => method.id === paymentMethod);
+  const methodLabels: Record<string,string> = { pos: 'POS at office', cash: 'Cash at office', bank_transfer: 'Bank transfer' };
+  return <PagePanel title="Bills & payments" subtitle={user.role === 'resident' ? 'Your charges and payment status' : 'Estate receivables, grouped billing and historical imports'} action={<div className="row-actions"><button className="secondary" onClick={() => { setShowPayment(!showPayment); setPaymentMethod(''); }}>Initiate payment</button>{staff&&<><button className="secondary" onClick={() => setShowImport(!showImport)}>Import CSV</button><button className="primary" onClick={() => setShowBatch(!showBatch)}>Create grouped bills</button></>}</div>}>
     {message && <Notice tone={message.includes('created') || message.includes('submitted') ? 'success' : 'error'}>{message}</Notice>}
-    {showPayment&&<FormCard title={user.role==='resident'?'Submit payment proof':'Record a payment'} onSubmit={submitPayment}><label>Bill<select name="billId" required><option value="">Select bill</option>{list.data?.items.filter((bill)=>!['paid','void'].includes(String(bill.status))).map((bill)=><option key={String(bill.id)} value={String(bill.id)}>{String(bill.unit_number)} — {String(bill.bill_type)} — {money(bill.amount_minor)}</option>)}</select></label><label>Amount (NGN)<input name="amount" type="number" min="0.01" step="0.01" required /></label><label>Method<select name="paymentMethod"><option value="bank_transfer">Bank transfer</option><option value="pos">POS</option><option value="online">Online</option><option value="cash">Cash</option></select></label><ProofFilesField label="Receipt or payment proof (recommended; required by estate policy where applicable)" /><button className="primary">Submit payment</button></FormCard>}
+    {showPayment&&<FormCard title={user.role==='resident'?'Initiate a payment':'Record a payment received'} onSubmit={submitPayment}>
+      <label>Bill<select name="billId" required><option value="">Select bill</option>{list.data?.items.filter((bill)=>!['paid','void'].includes(String(bill.status))).map((bill)=><option key={String(bill.id)} value={String(bill.id)}>{String(bill.unit_number)} — {String(bill.bill_type)} — {money(bill.amount_minor)}</option>)}</select></label>
+      <label>Amount (NGN)<input name="amount" type="number" min="0.01" step="0.01" required /></label>
+      <fieldset className="method-picker span-2"><legend>Payment option</legend>
+        {channels.loading && <small>Loading payment options…</small>}
+        {channels.error && <Notice tone="error">{channels.error}</Notice>}
+        {(channels.data?.methods ?? []).map((method)=>(
+          <label className="check" key={method.id}>
+            <input type="radio" name="paymentMethod" value={method.id} checked={paymentMethod===method.id} onChange={()=>setPaymentMethod(method.id)} required />
+            <span>{method.label}<small>{method.detail}</small></span>
+          </label>
+        ))}
+      </fieldset>
+      {paymentMethod==='bank_transfer'&&channels.data&&<BankAccountCard channels={channels.data} />}
+      <ProofFilesField label={selectedMethod?`${selectedMethod.proofLabel} (recommended; required by estate policy where applicable)`:'Receipt or payment proof (recommended; required by estate policy where applicable)'} />
+      <button className="primary">Submit payment</button>
+    </FormCard>}
     {showBatch && <FormCard title="Create bills for selected property groups" onSubmit={createStreetBatch}>
       <label>Batch name<input name="name" placeholder="2026 facility fee" required /></label>
       <label>Amount (NGN)<input name="amount" type="number" min="0.01" step="0.01" required /></label>
@@ -525,7 +591,7 @@ function Bills({ user }: { user: User }) {
       <CsvImporter kind="payments" title="Import resident payments" onDone={() => { list.reload(); imports.reload(); }} />
     </section>}
     <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['bill_type','Type'],['batch_name','Batch'],['external_reference','External ref.'],['amount_minor','Amount','money'],['paid_minor','Paid','money'],['due_date','Due'],['status','Status']]} /></ListState>
-    <section className="request-history"><h3>Payment submissions</h3><ListState list={payments}><DataTable rows={payments.data?.items ?? []} columns={[['receipt_number','Receipt'],['resident_name','Resident'],['unit_number','Unit'],['amount_minor','Amount','money'],['payment_method','Method'],['status','Status'],['submitted_at','Submitted','date']]} action={(row)=><div className="row-actions"><EvidenceButton entityType="payment" entityId={row.id} count={row.proof_count} />{staff&&row.status==='pending'&&<><button className="text" onClick={()=>reviewPayment(row.id,'approved')}>Approve</button><button className="text danger" onClick={()=>reviewPayment(row.id,'rejected')}>Reject</button></>}</div>} /></ListState></section>
+    <section className="request-history"><h3>Payment submissions</h3><ListState list={payments}><DataTable rows={(payments.data?.items ?? []).map((row)=>({ ...row,payment_method:methodLabels[String(row.payment_method)] ?? String(row.payment_method ?? '—') }))} columns={[['receipt_number','Receipt'],['resident_name','Resident'],['unit_number','Unit'],['amount_minor','Amount','money'],['payment_method','Method'],['status','Status'],['submitted_at','Submitted','date']]} action={(row)=><div className="row-actions"><EvidenceButton entityType="payment" entityId={row.id} count={row.proof_count} />{staff&&row.status==='pending'&&<><button className="text" onClick={()=>reviewPayment(row.id,'approved')}>Approve</button><button className="text danger" onClick={()=>reviewPayment(row.id,'rejected')}>Reject</button></>}</div>} /></ListState></section>
     {staff && imports.data && imports.data.items.length > 0 && <section className="import-history"><h3>Recent imports</h3><DataTable rows={imports.data.items} columns={[['kind','Type'],['filename','File'],['status','Status'],['total_rows','Rows'],['successful_rows','Imported'],['error_rows','Errors'],['created_at','Uploaded','date']]} action={(row) => row.storage_key ? <a className="text" href={`/api/files/${encodeURIComponent(String(row.storage_key))}`}>Download source</a> : null} /></section>}
   </PagePanel>;
 }
@@ -570,11 +636,39 @@ function CameraCodeScanner({ onCode,onClose }: { onCode:(code:string)=>void;onCl
   return <div className="scanner-box"><video ref={video} muted playsInline /><p>Point the camera at the visitor QR code or Code 128 barcode.</p>{error&&<Notice tone="error">{error}</Notice>}<button type="button" className="secondary" onClick={onClose}>Close camera</button></div>;
 }
 
-function VisitorPass({ pass,onClose }: { pass:Row;onClose:()=>void }) {
+function VisitorPass({ pass,onClose,branding }: { pass:Row;onClose:()=>void;branding:{ portalName:string;shortName:string } }) {
   const [qr,setQr]=useState('');const barcode=useRef<SVGSVGElement>(null);
+  const [shareState,setShareState]=useState('');
   const credential=String(pass.credential_number ?? pass.credentialNumber ?? pass.pin ?? '');
   useEffect(()=>{ if (!credential) return;let cancelled=false;Promise.all([import('qrcode'),import('jsbarcode')]).then(([qrModule,barcodeModule])=>{if(cancelled)return;qrModule.default.toDataURL(credential,{ width:280,margin:2,errorCorrectionLevel:'M' }).then((value)=>!cancelled&&setQr(value));if(barcode.current)barcodeModule.default(barcode.current,credential,{ format:'CODE128',displayValue:true,fontSize:16,height:64,margin:8 });});return()=>{cancelled=true;}; },[credential]);
-  return <div className="modal-backdrop" role="dialog" aria-modal="true"><section className="notice-modal visitor-pass-modal"><div className="visitor-pass printable-pass"><p className="eyebrow">ESTATE VISITOR PASS</p><h2>{String(pass.visitor_name ?? pass.visitorName ?? 'Visitor')}</h2><p>Host: <strong>{String(pass.resident_name ?? pass.residentName ?? 'Estate resident')}</strong></p><p>Property: <strong>{String(pass.unit_number ?? pass.propertyId ?? 'Selected property')} {pass.street?`— ${String(pass.street)}`:''}</strong></p>{qr&&<img className="pass-qr" src={qr} alt={`Visitor QR ${credential}`} />}<svg className="pass-barcode" ref={barcode} /><strong className="credential-number">{credential}</strong><small>Unique visitor number</small>{Boolean(pass.pin)&&<p className="pass-pin">Keypad PIN: <strong>{String(pass.pin)}</strong></p>}<div className="pass-dates"><span>From {readableDate(pass.valid_from ?? pass.validFrom)}</span><span>Until {readableDate(pass.valid_until ?? pass.validUntil)}</span></div><p className="pass-policy">Security must scan and review this pass before accepting entry. Device recognition requires a compatible, configured reader.</p></div><div className="row-actions no-print"><button className="primary" onClick={()=>window.print()}>Print pass</button><button className="secondary" onClick={onClose}>Close</button></div></section></div>;
+  const host=String(pass.resident_name ?? pass.residentName ?? 'Estate resident');
+  const propertyText=`${String(pass.unit_number ?? pass.propertyId ?? 'Selected property')}${pass.street?` — ${String(pass.street)}`:''}`;
+  const gateText=String(pass.gate_scope ?? pass.gateScope ?? 'both')==='gate'
+    ? `Gate device: ${String(pass.device_name ?? 'Selected device')}`
+    : 'Valid at every gate — entry and exit';
+
+  async function share(format:'image'|'pdf') {
+    if (!credential) { setShareState('This pass has no credential to share.'); return; }
+    setShareState('Preparing the pass file…');
+    try {
+      const exporter=await import('./pass-export');
+      const source: PassShareSource={
+        credential,
+        visitorName:String(pass.visitor_name ?? pass.visitorName ?? 'Visitor'),
+        host, property:propertyText,
+        pin:String(pass.pin ?? ''),
+        fromText:readableDate(pass.valid_from ?? pass.validFrom),
+        untilText:readableDate(pass.valid_until ?? pass.validUntil),
+        gateText, portalName:branding.portalName, shortName:branding.shortName,
+      };
+      const blob=format==='image'?await exporter.visitorPassImageBlob(source):await exporter.visitorPassPdfBlob(source);
+      const filename=`visitor-pass-${credential}.${format==='image'?'png':'pdf'}`;
+      const outcome=await exporter.sharePassFile(blob,filename,`Visitor pass ${credential}`);
+      setShareState(outcome==='shared'?'Pass shared.':outcome==='cancelled'?'Share cancelled.':`${format==='image'?'Image':'PDF'} saved to your downloads.`);
+    } catch(reason) { setShareState(reason instanceof Error?reason.message:'Could not prepare the pass file'); }
+  }
+
+  return <div className="modal-backdrop" role="dialog" aria-modal="true"><section className="notice-modal visitor-pass-modal"><div className="visitor-pass printable-pass"><p className="eyebrow">ESTATE VISITOR PASS</p><h2>{String(pass.visitor_name ?? pass.visitorName ?? 'Visitor')}</h2><p>Host: <strong>{host}</strong></p><p>Property: <strong>{propertyText}</strong></p>{qr&&<img className="pass-qr" src={qr} alt={`Visitor QR ${credential}`} />}<svg className="pass-barcode" ref={barcode} /><strong className="credential-number">{credential}</strong><small>Unique visitor number</small>{Boolean(pass.pin)&&<p className="pass-pin">Keypad PIN: <strong>{String(pass.pin)}</strong></p>}<div className="pass-dates"><span>From {readableDate(pass.valid_from ?? pass.validFrom)}</span><span>Until {readableDate(pass.valid_until ?? pass.validUntil)}</span></div><p className="pass-gates">{gateText}</p><p className="pass-policy">Security must scan and review this pass before accepting entry. Device recognition requires a compatible, configured reader.</p></div>{shareState&&<p className="share-status no-print">{shareState}</p>}<div className="row-actions no-print"><button className="primary" onClick={()=>window.print()}>Print pass</button><button className="secondary" onClick={()=>share('image')}>Share as image</button><button className="secondary" onClick={()=>share('pdf')}>Share as PDF</button><button className="secondary" onClick={onClose}>Close</button></div></section></div>;
 }
 
 function Visitors({ user }: { user: User }) {
@@ -597,7 +691,7 @@ function Visitors({ user }: { user: User }) {
       const proofKeys=await uploadProofFiles(form,'visitor-proofs');
       const created = await api<Row>('/api/visitors', { method: 'POST', body: JSON.stringify({ ...raw,proofKeys }) });
       const property=properties.data?.items.find((item)=>item.id===raw.propertyId);
-      setSelectedPass({ ...raw,...created,visitor_name:raw.visitorName,valid_from:raw.validFrom,valid_until:raw.validUntil,resident_name:user.role==='resident'?user.name:raw.residentId,unit_number:property?.unit_number,street:property?.street });
+      setSelectedPass({ ...raw,...created,visitor_name:raw.visitorName,valid_from:created.validFrom ?? raw.validFrom,valid_until:created.validUntil ?? raw.validUntil,resident_name:user.role==='resident'?user.name:raw.residentId,unit_number:property?.unit_number,street:property?.street });
       setResult('Pass created. Share the QR/barcode and unique number with the visitor.');setShow(false);list.reload();
     } catch (reason) { setResult(reason instanceof Error ? reason.message : 'Failed'); }
   }
@@ -629,11 +723,11 @@ function Visitors({ user }: { user: User }) {
   return <PagePanel title="Visitors" subtitle="QR/barcode passes, preview-before-entry decisions and auditable arrivals" action={(user.role === 'resident' || user.role === 'admin' || user.role === 'manager') ? <button className="primary" onClick={() => setShow(!show)}>New pass</button> : null}>
     {result && <Notice tone={result.includes('created')||result.includes('Accepted')?'success':result.includes('Waiting')?'info':'error'}>{result}</Notice>}
     <Notice tone="info"><strong>Recommended:</strong> use the QR code for phones and QR-capable readers, Code 128 as a second scanner format, and the written unique number or six-digit PIN on terminals such as DS-K1T808MFWX-B. DS-K2802 needs a compatible Wiegand reader.</Notice>
-    {show && <FormCard title="Create visitor pass" onSubmit={create}><label>Visitor name<input name="visitorName" required /></label><label>Phone<input name="visitorPhone" /></label>{(user.role==='admin'||user.role==='manager')&&<label>Resident ID<input name="residentId" required /></label>}{user.role === 'resident' ? <label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}</option>)}</select></label> : <label>Property ID<input name="propertyId" required /></label>}<label>Preferred gate device<select name="deviceId"><option value="">Phone/security scan only</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.model||device.vendor)} {device.supportsQr?'(QR)':'(PIN/card)'}</option>)}</select></label><label>Valid from<input name="validFrom" type="datetime-local" defaultValue={localDateTime(defaultStart)} required /></label><label>Valid until<input name="validUntil" type="datetime-local" defaultValue={localDateTime(defaultEnd)} required /></label><ProofFilesField label="Visitor identity or invitation proof (optional)" /><button className="primary">Issue secure pass</button></FormCard>}
+    {show && <FormCard title="Create visitor pass" onSubmit={create}><label>Visitor name<input name="visitorName" required /></label><label>Phone<input name="visitorPhone" /></label>{(user.role==='admin'||user.role==='manager')&&<label>Resident ID<input name="residentId" required /></label>}{user.role === 'resident' ? <label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}</option>)}</select></label> : <label>Property ID<input name="propertyId" required /></label>}{(user.role==='admin'||user.role==='manager')&&<label>Preferred gate device<select name="deviceId"><option value="">Every gate, entry and exit</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.model||device.vendor)} {device.supportsQr?'(QR)':'(PIN/card)'}</option>)}</select></label>}<label>Valid from<input name="validFrom" type="datetime-local" defaultValue={localDateTime(defaultStart)} required /></label><label>Valid until<input name="validUntil" type="datetime-local" defaultValue={localDateTime(defaultEnd)} required /></label><ProofFilesField label="Visitor identity or invitation proof (optional)" /><button className="primary">Issue secure pass</button></FormCard>}
     {staff&&<section className="scan-grid"><form className="form-card" onSubmit={manualPreview}><h3>Phone or manual scan</h3><label>QR, barcode, unique number or PIN<input name="code" required /></label><div className="row-actions"><button className="primary">Preview details</button><button type="button" className="secondary" onClick={()=>setCamera(!camera)}>Use phone camera</button></div>{camera&&<CameraCodeScanner onCode={(code)=>previewCode(code,'phone_camera')} onClose={()=>setCamera(false)} />}</form><form className="form-card" onSubmit={startDeviceScan}><h3>Scan at an access-control device</h3><label>Device<select name="deviceId" required><option value="">Select device</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.gate_name)}</option>)}</select></label><button className="primary">Start device scan</button><small>The next credential event from this device is captured for review. No entry is accepted automatically.</small></form></section>}
-    {preview&&<section className={`visitor-preview ${preview.valid?'valid':'invalid'}`}><p className="eyebrow">VISITOR PASS PREVIEW — NO ENTRY ACCEPTED YET</p><h3>{String(preview.visitor_name)}</h3><dl><div><dt>Host</dt><dd>{String(preview.resident_name)}</dd></div><div><dt>Property</dt><dd>{String(preview.unit_number)} — {String(preview.street)}</dd></div><div><dt>Phone</dt><dd>{String(preview.visitor_phone??'—')}</dd></div><div><dt>Valid</dt><dd>{readableDate(preview.valid_from)} to {readableDate(preview.valid_until)}</dd></div><div><dt>Status</dt><dd>{String(preview.status)}</dd></div></dl>{!preview.valid&&<Notice tone="error">{String(preview.invalid_reason||'This pass is not valid.')}</Notice>}<div className="row-actions">{Boolean(preview.valid)&&<><button className="primary" onClick={()=>decide('accepted','in')}>Accept check-in</button>{preview.status==='checked_in'&&<button className="secondary" onClick={()=>decide('accepted','out')}>Accept check-out</button>}</>}<button className="secondary" onClick={()=>decide('rejected')}>Reject</button></div></section>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['visitor_name','Visitor'],['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['credential_number','Unique number'],['device_name','Preferred device'],['status','Status'],['valid_until','Valid until','date']]} action={(row)=><div className="row-actions"><button className="text" onClick={()=>setSelectedPass(row)}>View pass</button><EvidenceButton entityType="visitor_request" entityId={row.id} count={row.proof_count} /></div>} /></ListState>
-    {selectedPass&&<VisitorPass pass={selectedPass} onClose={()=>setSelectedPass(null)} />}
+    {preview&&<section className={`visitor-preview ${preview.valid?'valid':'invalid'}`}><p className="eyebrow">VISITOR PASS PREVIEW — NO ENTRY ACCEPTED YET</p><h3>{String(preview.visitor_name)}</h3><dl><div><dt>Host</dt><dd>{String(preview.resident_name)}</dd></div><div><dt>Property</dt><dd>{String(preview.unit_number)} — {String(preview.street)}</dd></div><div><dt>Phone</dt><dd>{String(preview.visitor_phone??'—')}</dd></div><div><dt>Valid</dt><dd>{readableDate(preview.valid_from)} to {readableDate(preview.valid_until)}</dd></div><div><dt>Gates</dt><dd>{String(preview.gate_scope ?? 'both')==='gate'?String(preview.device_name ?? 'Selected device'):'Every gate, entry and exit'}</dd></div><div><dt>Status</dt><dd>{String(preview.status)}</dd></div></dl>{!preview.valid&&<Notice tone="error">{String(preview.invalid_reason||'This pass is not valid.')}</Notice>}<div className="row-actions">{Boolean(preview.valid)&&<><button className="primary" onClick={()=>decide('accepted','in')}>Accept check-in</button>{preview.status==='checked_in'&&<button className="secondary" onClick={()=>decide('accepted','out')}>Accept check-out</button>}</>}<button className="secondary" onClick={()=>decide('rejected')}>Reject</button></div></section>}
+    <ListState list={list}><DataTable rows={(list.data?.items ?? []).map((row)=>({ ...row,gates:String(row.gate_scope ?? 'both')==='gate'?'Selected gate only':'Every gate, entry and exit' }))} columns={[['visitor_name','Visitor'],['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['credential_number','Unique number'],...(staff?[['gates','Gates'],['device_name','Preferred device']] as Column[]:[]),['status','Status'],['valid_until','Valid until','date']]} action={(row)=><div className="row-actions"><button className="text" onClick={()=>setSelectedPass(row)}>View pass</button><EvidenceButton entityType="visitor_request" entityId={row.id} count={row.proof_count} /></div>} /></ListState>
+    {selectedPass&&<VisitorPass pass={selectedPass} onClose={()=>setSelectedPass(null)} branding={{ portalName:portal.data?.portal_name||'EstateMate',shortName:portal.data?.portal_short_name||'EM' }} />}
   </PagePanel>;
 }
 
@@ -814,14 +908,24 @@ function Settings() {
   const list = useList('/api/settings');
   const storage = useAsync<Row>(() => api('/api/storage-settings'), []);
   const portal=useAsync<PortalConfig>(()=>api('/api/portal-config'),[]);
+  const channels=useAsync<PaymentChannels>(()=>api('/api/payment-channels'),[]);
   const [message, setMessage] = useState('');
   const [portalMessage,setPortalMessage]=useState('');
+  const [bankMessage,setBankMessage]=useState('');
   const [passwordMessage, setPasswordMessage] = useState('');
   const [storageMessage, setStorageMessage] = useState('');
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = new FormData(event.currentTarget); const value = String(form.get('value') ?? '');
     try { await api('/api/settings/facility_fee_grace_period_days', { method: 'PUT', body: JSON.stringify({ value }) }); setMessage('Grace period updated.'); list.reload(); }
     catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Failed'); }
+  }
+  async function saveBankAccount(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBankMessage('');
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    try {
+      await api('/api/payment-channels', { method: 'PUT', body: JSON.stringify(values) });
+      setBankMessage('Bank account details saved. Residents can now initiate a bank transfer.'); channels.reload();
+    } catch (reason) { setBankMessage(reason instanceof Error ? reason.message : 'Could not save the bank account'); }
   }
   async function saveStorage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setStorageMessage(''); const storageForm = event.currentTarget; const form = new FormData(storageForm);
@@ -852,6 +956,17 @@ function Settings() {
   return <PagePanel title="Settings" subtitle="Estate-wide operational rules and private storage">
     {message && <Notice tone={message.includes('updated') ? 'success' : 'error'}>{message}</Notice>}
     <FormCard title="Facility-fee enforcement" onSubmit={submit}><label>Grace period (days)<input name="value" type="number" min="0" max="365" defaultValue={String(list.data?.items.find((item) => item.key === 'facility_fee_grace_period_days')?.value ?? '7')} required /></label><button className="primary">Save rule</button></FormCard>
+    {bankMessage&&<Notice tone={bankMessage.includes('saved')?'success':'error'}>{bankMessage}</Notice>}
+    {channels.error&&<Notice tone="error">{channels.error}</Notice>}
+    {channels.data&&<FormCard title="Estate bank account for transfers" onSubmit={saveBankAccount}>
+      <label>Bank name<input name="bankName" defaultValue={channels.data.bankAccount.bankName} required /></label>
+      <label>Account name<input name="accountName" defaultValue={channels.data.bankAccount.accountName} required /></label>
+      <label>Account number<input name="accountNumber" defaultValue={channels.data.bankAccount.accountNumber} inputMode="numeric" required /></label>
+      <label>Sort code (optional)<input name="sortCode" defaultValue={channels.data.bankAccount.sortCode} /></label>
+      <label className="span-2">Reference note shown to residents<input name="referenceNote" defaultValue={channels.data.bankAccount.referenceNote} placeholder="Use your unit number as the transfer reference" /></label>
+      <small className="span-2">Residents and Cashiers see these details when they choose Bank transfer. Only an Administrator can change them.</small>
+      <button className="primary">Save bank account</button>
+    </FormCard>}
     {portalMessage&&<Notice tone={portalMessage.includes('saved')?'success':'error'}>{portalMessage}</Notice>}
     {portal.data&&<FormCard title="Portal identity, theme and recommended defaults" onSubmit={savePortal}><label>Portal name<input name="portal_name" defaultValue={portal.data.portal_name||'EstateMate'} required /></label><label>Estate name<input name="estate_name" defaultValue={portal.data.estate_name||'EstateMate Estate'} required /></label><label>Short mark<input name="portal_short_name" maxLength={4} defaultValue={portal.data.portal_short_name||'EM'} required /></label><label>Tagline<input name="portal_tagline" defaultValue={portal.data.portal_tagline} /></label><label className="span-2">Welcome text<textarea name="portal_welcome_text" rows={3} defaultValue={portal.data.portal_welcome_text} /></label><label>Theme mode<select name="theme_mode" defaultValue={portal.data.theme_mode||'light'}><option value="light">Light (recommended)</option><option value="dark">Dark</option><option value="system">Follow device</option></select></label><label>Corner style<select name="theme_corner_style" defaultValue={portal.data.theme_corner_style||'comfortable'}><option value="comfortable">Comfortable (recommended)</option><option value="compact">Compact</option><option value="rounded">Rounded</option></select></label><label>Primary colour<input name="theme_primary_color" type="color" defaultValue={portal.data.theme_primary_color||'#1769e0'} /></label><label>Accent colour<input name="theme_accent_color" type="color" defaultValue={portal.data.theme_accent_color||'#35d07f'} /></label><label>Navigation colour<input name="theme_navigation_color" type="color" defaultValue={portal.data.theme_navigation_color||'#0d1b37'} /></label><label>Surface colour<input name="theme_surface_color" type="color" defaultValue={portal.data.theme_surface_color||'#ffffff'} /></label><label>Support email<input name="support_email" type="email" defaultValue={portal.data.support_email} /></label><label>Support phone<input name="support_phone" defaultValue={portal.data.support_phone} /></label><label>Timezone<input name="estate_timezone" defaultValue={portal.data.estate_timezone||'Africa/Lagos'} /></label><label>Currency<input name="currency" defaultValue={portal.data.currency||'NGN'} maxLength={3} /></label><label>Default visitor hours<input name="visitor_default_duration_hours" type="number" min="1" max="168" defaultValue={portal.data.visitor_default_duration_hours||'8'} /></label><label>Gate decision policy<select name="visitor_gate_policy" defaultValue="security_approval"><option value="security_approval">Show details, then Security approves (recommended)</option></select></label><label>Visitor credential format<select name="visitor_credential_format" defaultValue="qr_code128_pin"><option value="qr_code128_pin">QR + Code 128 + PIN (recommended)</option></select></label><label>Card scan timeout (minutes)<input name="card_scan_timeout_minutes" type="number" min="1" max="30" defaultValue={portal.data.card_scan_timeout_minutes||'5'} /></label><label className="span-2">Render bridge HTTPS origin<input name="render_bridge_url" type="url" placeholder="https://estatemate-access-bridge.onrender.com" defaultValue={portal.data.render_bridge_url} /><small>Optional HTTPS event relay only. It sleeps after 15 idle minutes and cannot host ISUP/TCP; use the dedicated Linux gateway package for two-way ISUP.</small></label><button className="primary">Save portal customisation</button></FormCard>}
     {storageMessage && <Notice tone={storageMessage.includes('updated') ? 'success' : 'error'}>{storageMessage}</Notice>}

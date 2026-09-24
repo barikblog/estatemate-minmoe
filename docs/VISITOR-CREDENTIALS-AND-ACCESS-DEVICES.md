@@ -12,6 +12,16 @@ A separate six-digit PIN remains available for keypad terminals. Admin and Secur
 
 The phone camera scanner supports QR and common one-dimensional barcode formats. Manual entry remains available when camera permission is unavailable.
 
+## Sharing a pass as an image or PDF
+
+The pass dialog offers **Share as image** and **Share as PDF**. Both are rendered locally in the browser from the same credential, so no service is called and nothing is uploaded. Where the device supports sharing files, the native share sheet opens (WhatsApp, Mail, Drive and similar); otherwise the file is saved to downloads as `visitor-pass-<unique number>.png` or `.pdf`. The PDF is a single A4 page written by `apps/web/src/pdf.ts`, which embeds the rendered pass as a JPEG.
+
+## Validity window and gate scope
+
+The portal submits wall-clock times with no offset, so the Worker resolves them against the `estate_timezone` setting (default `Africa/Lagos`) and stores absolute UTC instants. Comparing the raw string as UTC shifted every window by the estate's offset and reported live passes as "outside its validity window"; `src/datetime.ts` is the single place that parses these values, and `/api/visitors/scan` now returns the specific blocking reason — not active yet, expired, revoked, or already checked out — instead of one generic message. Legacy rows stored without an offset are still read in the estate timezone.
+
+Residents never choose a gate. Their passes are stored with `gate_scope='both'`, meaning every gate, entry and exit, and the gate picker is not shown to them. Only an Administrator or Manager may attach a pass to one saved device, which stores `gate_scope='gate'`. A visitor who overstays can still be checked out; an ended window blocks check-in only.
+
 ## Using an access-control device as a scanner
 
 Admin or Security selects a saved device and starts a short visitor-validation session. EstateMate captures the next credential event uploaded by that device, resolves the credential to a visitor pass, and displays the pass before a decision. The same mechanism lets an administrator issue a physical resident/dependant card:

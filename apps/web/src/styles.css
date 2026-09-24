@@ -193,3 +193,34 @@ tbody tr:hover { background: #fafcff; }
   .stat-grid { grid-template-columns: repeat(2, 1fr); gap: 9px; }.stat-card { padding: 14px; min-height: 120px; }.stat-card strong { font-size: 23px; }.hero-card { padding: 28px 22px; }.hero-orb { right: -160px; }
   .form-grid,.people-filters { grid-template-columns: 1fr; }.span-2 { grid-column: span 1; }.visitor-preview dl,.pass-dates { grid-template-columns: 1fr; }.street-picker { grid-template-columns: 1fr; }.live-event { grid-template-columns: 10px 1fr 65px; }.live-event small { display: none; }
 }
+
+.password-field { position: relative; display: block; }
+.password-field input { padding-right: 78px; }
+.reveal-toggle { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); border: 0; border-radius: 8px; padding: 7px 12px; background: #e9f1fe; color: var(--blue); font-size: 11px; font-weight: 750; letter-spacing: .04em; }
+.reveal-toggle:hover { background: #d9e8fd; }
+:root[data-theme="dark"] .reveal-toggle { background: #24344f; color: #9cc4ff; }
+
+.portal-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px 18px; margin: 34px auto 6px; padding: 18px 12px 4px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+.portal-footer .footer-portal { font-weight: 700; color: var(--ink); }
+.portal-footer a { color: var(--blue); font-weight: 750; text-decoration: none; }
+.portal-footer a:hover { text-decoration: underline; }
+.form-panel .portal-footer { width: min(420px, 100%); border-top: 0; margin-top: 22px; }
+:root[data-theme="dark"] .portal-footer { border-color: #26364e; }
+
+.method-picker { border: 1px solid #dbe5f1; border-radius: 11px; padding: 13px; display: grid; gap: 8px; }
+.method-picker legend { color: #354259; font-size: 13px; font-weight: 700; padding: 0 6px; }
+.method-picker .check { padding: 10px 12px; align-items: flex-start; }
+.method-picker .check span small { display: block; color: var(--muted); font-weight: 450; line-height: 1.45; margin-top: 3px; }
+:root[data-theme="dark"] .method-picker { border-color: #30415c; }
+
+.bank-card { border: 1px solid #cfe1fc; border-left: 4px solid var(--blue); border-radius: 11px; padding: 16px; background: #f4f8ff; }
+.bank-card .eyebrow { margin-bottom: 12px; }
+.bank-card dl { display: grid; grid-template-columns: repeat(2, minmax(140px, 1fr)); gap: 10px; margin: 0 0 10px; }
+.bank-card dt { color: var(--muted); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .1em; }
+.bank-card dd { margin: 4px 0 0; font-size: 15px; font-weight: 750; color: var(--ink); }
+.bank-card .account-number { font-size: 20px; letter-spacing: .12em; }
+.bank-card > small { display: block; color: var(--muted); font-size: 12px; line-height: 1.5; margin-bottom: 10px; }
+:root[data-theme="dark"] .bank-card { background: #17253a; border-color: #30415c; }
+
+.pass-gates { margin: 12px auto 0; padding: 8px 12px; width: fit-content; border-radius: 8px; background: #eef9f2; color: #167343; font-size: 11px; font-weight: 700; letter-spacing: .04em; }
+.share-status { margin: 14px 0 0; text-align: center; color: var(--muted); font-size: 12px; }
