@@ -1,6 +1,6 @@
 # AI handoff — EstateMate
 
-Updated: 2026-09-24 (Africa/Lagos) — Portal UX phase (migration `0014`): administrator-published estate gate welcome image on the login screen and dashboard, searchable card-holder picker, and gate-scoped Security login sessions. Previous phase retired every access-device transport except the EstateMate agent; production domain is `https://estatemate.estatemate.workers.dev`
+Updated: 2026-09-24 (Africa/Lagos) — Portal UX phase (migration `0014`) **deployed to production** via PR #11 (`f4e543d`), Deploy EstateMate run `36074600948`: administrator-published estate gate welcome image on the login screen and dashboard, searchable card-holder picker, and gate-scoped Security login sessions. Post-deploy HTTP smoke test still owed (see below). Previous phase retired every access-device transport except the EstateMate agent; production domain is `https://estatemate.estatemate.workers.dev`
 
 
 
@@ -111,6 +111,17 @@ Officers switch posts mid-shift from the gate chip in the topbar (`SwitchGateDia
 - `card-recipients` returned both a resident (`Owns A-01`) and a dependant (`Dependant (child) of Rita Resident`) from one query.
 - **Not verified end-to-end:** the gate image bytes themselves. `downloadPortalBrandingImage` fetches from GitHub, which needs configured private storage plus a token; this environment has neither, so only the negative paths were exercised (non-branding category, non-image content type, unset/disabled key → all `404` before any network call). Upload and display against a real private repository should be smoke-tested after deployment.
 - Android/Kotlin **was** touched and **was not compiled**: this environment has no JDK, Gradle or Android SDK (`java` is absent), so the Kotlin edits are reviewed by inspection only and must be compiled before any Android release.
+
+### Production deployment (2026-09-24, portal UX phase)
+
+- PR #11 merged to `main` (`f4e543d`); Deploy EstateMate run `36074600948` **succeeded**. All eleven job steps are green, including `npm run build` (typecheck + 105 vitest tests + `build:web` in CI), `Apply D1 migrations` (`0014_gate_image_and_security_gate_sessions.sql` applied to D1 `estatemate-db`) and `Deploy Worker and web assets`.
+- **Post-deploy HTTP smoke test is still owed.** The deploying environment had no TLS egress to `*.workers.dev`, so `GET /api/health` and the changed APIs could not be exercised against production from there. Verify from a normal browser/curl: `GET /api/health`; `GET /api/portal-config` now returns `portal_gate_image_key`/`portal_gate_image_caption`/`portal_gate_image_enabled`; `GET /api/portal-gate-image` answers `404` until an image is published; `GET /api/access/card-recipients` and `GET /api/security/gate-assignments` respond for an Administrator; and a Security officer with an assignment is offered gate selection at sign-in.
+- The gate image cannot be verified until private GitHub storage is configured in production (**Settings → Private GitHub upload storage**), because the upload path depends on it.
+- Operator follow-up: post each Security officer at their gates under **Settings → Security gate assignments**. Until an officer has at least one assignment they sign in unscoped and see every gate, by design.
+
+### Pre-existing failure: Cloudflare Workers Builds
+
+The `Workers Builds: estatemate` commit check has been **red since `e550d64`** and is still red on `05060b8` and `f4e543d` — that is, it fails on commits that deployed to production successfully through GitHub Actions. It is not a required check and does not block merges. The authoritative deploy path is `.github/workflows/deploy.yml`, which is green. Root cause was not established: the build logs live in the Cloudflare dashboard, which was unreachable from the environment that recorded this. Treat this check as noise until someone reads the Cloudflare build log, but do not assume a red Workers Build means production is broken — and do not "fix" a deploy by changing the Actions workflow because of it.
 
 ### Unfinished work
 
