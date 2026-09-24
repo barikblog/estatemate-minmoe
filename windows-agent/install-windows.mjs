@@ -19,7 +19,7 @@ function arg(name, fallback = null) {
 
 const agentId = arg('agentId') || arg('agent-id');
 const agentSecret = arg('agentSecret') || arg('agent-secret');
-const workerUrl = arg('workerUrl', 'https://estatemate.barikblog.workers.dev');
+const workerUrl = arg('workerUrl', 'https://estatemate.estatemate.workers.dev');
 const installDir = arg('installDir', 'C:\\EstateMate\\ISAPI-Agent');
 
 if (!agentId || !agentSecret) {

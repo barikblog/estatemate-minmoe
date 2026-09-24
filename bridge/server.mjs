@@ -1,7 +1,7 @@
 import http from 'node:http';
 
 const port = Number(process.env.PORT || 10000);
-const workerOrigin = String(process.env.ESTATEMATE_WORKER_URL || 'https://estatemate.barikblog.workers.dev').replace(/\/$/, '');
+const workerOrigin = String(process.env.ESTATEMATE_WORKER_URL || 'https://estatemate.estatemate.workers.dev').replace(/\/$/, '');
 const maxBody = 2 * 1024 * 1024;
 
 function json(response, status, value) {

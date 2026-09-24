@@ -12,4 +12,4 @@ services:
       - key: NODE_VERSION
         value: 22
       - key: ESTATEMATE_WORKER_URL
-        value: https://estatemate.barikblog.workers.dev
+        value: https://estatemate.estatemate.workers.dev
