@@ -4,7 +4,7 @@ import type { PassShareSource } from './pass-export';
 import { exportRecordsToExcel, exportRecordsToPdf } from './records-export';
 
 type Row = Record<string, unknown>;
-type Section = 'dashboard' | 'residents' | 'properties' | 'residency' | 'imports' | 'bills' | 'visitors' | 'maintenance' | 'notices' | 'cards' | 'events' | 'devices' | 'operations' | 'settings';
+type Section = 'dashboard' | 'residents' | 'properties' | 'residency' | 'imports' | 'bills' | 'visitors' | 'maintenance' | 'notices' | 'cards' | 'events' | 'devices' | 'isapi' | 'operations' | 'settings';
 
 interface NavItem { id: Section; label: string; roles?: User['role'][] }
 type PortalConfig = Record<string,string>;
@@ -39,6 +39,7 @@ const navItems: NavItem[] = [
   { id: 'cards', label: 'Access cards', roles: ['admin','manager','cashier','resident'] },
   { id: 'events', label: 'Gate activity', roles: ['admin','manager','security','resident'] },
   { id: 'devices', label: 'Access-control devices', roles: ['admin','manager','security'] },
+  { id: 'isapi', label: 'ISAPI Bridge & Windows Agent', roles: ['admin','manager'] },
   { id: 'operations', label: 'Hardware actions', roles: ['admin','manager'] },
   { id: 'settings', label: 'Settings', roles: ['admin'] },
 ];
@@ -211,6 +212,7 @@ function SectionView({ section, user, onNavigate }: { section: Section; user: Us
     case 'cards': return <Cards user={user} />;
     case 'events': return <AccessEvents user={user} />;
     case 'devices': return <Devices user={user} />;
+    case 'isapi': return <IsapiBridge user={user} />;
     case 'operations': return <Operations />;
     case 'settings': return <Settings />;
   }
@@ -1176,11 +1178,136 @@ function Devices({ user }: { user: User }) {
       <label>Firmware<input name="firmware" placeholder="Full version and build" /></label><label>Serial number<input name="serialNumber" /></label>
       <label>Hik-Connect access server<input name="hikconnectServerAddress" placeholder="dev.hik-connect.com or server IP" /></label><label>Hik-Connect device serial<input name="hikconnectDeviceSerial" /></label><label>Hik-Connect verification code<input name="hikconnectVerificationCode" type="password" minLength={6} maxLength={32} autoComplete="new-password" /><small>Encrypted at rest and never returned by the API.</small></label>
       <label>Series profile<select name="profileKey"><option value="auto">Auto-detect from model (recommended)</option>{profiles.data?.items.map((profile) => <option key={String(profile.key)} value={String(profile.key)}>{String(profile.label)}</option>)}</select></label>
-      <label>Connection pattern<select name="connectionPattern"><option value="">Use profile recommendation (recommended)</option><option value="direct_http_listener">Direct Cloudflare HTTP Listening</option><option value="render_http_bridge">Render free HTTPS relay (optional; sleeps)</option><option value="hikvision_cloud_openapi">Hikvision cloud/OpenAPI</option><option value="offsite_isup_gateway">Dedicated ISUP gateway (local appliance or off-site)</option><option value="manual_sync">Manual synchronization</option></select></label>
+      <label>Connection pattern<select name="connectionPattern"><option value="">Use profile recommendation (recommended)</option><option value="direct_http_listener">Direct Cloudflare HTTP Listening</option><option value="render_http_bridge">Render free HTTPS relay (optional; sleeps)</option><option value="hikvision_cloud_openapi">Hikvision cloud/OpenAPI</option><option value="offsite_isup_gateway">Dedicated ISUP gateway (local appliance or off-site)</option><option value="isapi_bridge">ISAPI bridge (cross-platform)</option><option value="windows_agent">Windows agent (ISAPI)</option><option value="isapi_windows_agent">ISAPI Windows agent (combined)</option><option value="manual_sync">Manual synchronization</option></select></label>
       <label>Listener format<select name="listenerFormat"><option value="auto">Auto-detect</option><option value="json">JSON</option><option value="xml">XML</option><option value="multipart">Multipart</option></select></label>
       <button className="primary">Register</button>
     </FormCard>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Device'],['vendor','Vendor'],['model','Model'],['profile_key','Series profile'],['connection_pattern','Connection'],['hikconnect_server_address','Hik-Connect server'],['hikconnect_verification_code_configured','Verification code'],['sync_agent_configured','Site sync'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['last_seen_at','Last event','date'],['pending_operations','Pending actions']]} action={operator?(row)=><div className="row-actions"><button className="text" onClick={()=>edit(row)}>Edit</button>{row.connection_pattern==='offsite_isup_gateway'&&<button className="text" onClick={()=>downloadSiteSync(row)}>Download site sync</button>}{user.role==='admin'&&<button className="text" onClick={()=>rotate(row)}>Rotate ingest secret</button>}<button className="text danger" onClick={()=>remove(row)}>Delete</button></div>:undefined} /></ListState>
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Device'],['vendor','Vendor'],['model','Model'],['profile_key','Series profile'],['connection_pattern','Connection'],['hikconnect_server_address','Hik-Connect server'],['hikconnect_verification_code_configured','Verification code'],['sync_agent_configured','Site sync'],['isapi_agent_name','ISAPI agent'],['isapi_host','ISAPI host'],['last_isapi_sync_status','ISAPI sync'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['last_seen_at','Last event','date'],['pending_operations','Manual pending'],['queued_operations','Queued ops']]} action={operator?(row)=><div className="row-actions"><button className="text" onClick={()=>edit(row)}>Edit</button>{row.connection_pattern==='offsite_isup_gateway'&&<button className="text" onClick={()=>downloadSiteSync(row)}>Download site sync</button>}{user.role==='admin'&&<button className="text" onClick={()=>rotate(row)}>Rotate ingest secret</button>}<button className="text danger" onClick={()=>remove(row)}>Delete</button></div>:undefined} /></ListState>
+  </PagePanel>;
+}
+
+function IsapiBridge({ user }: { user: User }) {
+  const operator = user.role === 'admin' || user.role === 'manager';
+  const agents = useList('/api/isapi/agents');
+  const deviceConfigs = useList('/api/isapi/device-configs');
+  const devices = useAsync<{ items: Row[] }>(() => api('/api/access/device-options'), []);
+  const logs = useList('/api/isapi/sync-logs?limit=50');
+  const [showAgent, setShowAgent] = useState(false);
+  const [showLink, setShowLink] = useState(false);
+  const [credentials, setCredentials] = useState<Row | null>(null);
+  const [error, setError] = useState('');
+
+  async function submitAgent(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setError('');
+    const values = Object.fromEntries(new FormData(event.currentTarget)) as Record<string,string>;
+    try {
+      const result = await api<Row>('/api/isapi/agents', { method: 'POST', body: JSON.stringify(values) });
+      setCredentials(result); setShowAgent(false); agents.reload();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Failed to create agent'); }
+  }
+
+  async function rotateAgent(row: Row) {
+    if (!confirm(`Rotate secret for agent ${String(row.name)}? Old secret stops working immediately.`)) return;
+    try { setCredentials(await api<Row>(`/api/isapi/agents/${row.id}/rotate-secret`, { method: 'POST' })); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : 'Rotate failed'); }
+  }
+
+  async function downloadInstaller(row: Row) {
+    if (!confirm(`Generate new installer for ${String(row.name)}? Previous installer keys will be invalidated and secret rotated.`)) return;
+    setError('');
+    try {
+      const response = await fetch(`/api/isapi/agents/${row.id}/installer`, { method: 'POST', credentials: 'include' });
+      if (!response.ok) { const data = await response.json().catch(() => ({ error: `Request failed (${response.status})` })) as { error?: string }; throw new Error(data.error || `Request failed (${response.status})`); }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      const ext = String(row.platform) === 'windows' ? 'ps1' : 'sh';
+      link.download = `estatemate-isapi-agent-${String(row.id).slice(0,8)}.${ext}`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not generate installer'); }
+  }
+
+  async function removeAgent(row: Row) {
+    if (!confirm(`Delete agent ${String(row.name)}? Linked devices will be unlinked.`)) return;
+    try { await api(`/api/isapi/agents/${row.id}`, { method: 'DELETE' }); agents.reload(); deviceConfigs.reload(); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : 'Delete failed'); }
+  }
+
+  async function submitLink(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setError('');
+    const values = Object.fromEntries(new FormData(event.currentTarget)) as Record<string,string>;
+    const body = {
+      deviceId: values.deviceId,
+      agentId: values.agentId || null,
+      isapiHost: values.isapiHost,
+      isapiPort: values.isapiPort ? Number(values.isapiPort) : 80,
+      isapiUsername: values.isapiUsername || 'admin',
+      isapiPassword: values.isapiPassword || undefined,
+      protocol: values.protocol || 'http',
+      syncEnabled: values.syncEnabled === 'on',
+    };
+    try {
+      await api('/api/isapi/device-configs', { method: 'POST', body: JSON.stringify(body) });
+      setShowLink(false); deviceConfigs.reload();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Link failed'); }
+  }
+
+  async function removeLink(row: Row) {
+    if (!confirm(`Remove ISAPI config for ${String(row.device_name)}?`)) return;
+    try { await api(`/api/isapi/device-configs/${row.id}`, { method: 'DELETE' }); deviceConfigs.reload(); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : 'Delete failed'); }
+  }
+
+  return <PagePanel title="ISAPI Bridge & Windows Agent" subtitle="Windows service and cross-platform ISAPI bridge for automatic card provisioning" action={operator ? <div className="row-actions"><button className="primary" onClick={() => setShowAgent(!showAgent)}>Register agent</button><button className="secondary" onClick={() => setShowLink(!showLink)}>Link device to agent</button></div> : null}>
+    <Notice tone="info"><strong>What this does:</strong> Install a small agent on a Windows PC (or Linux) on the same LAN as Hikvision devices. The agent polls Cloudflare for pending card operations (facility-fee expiry, new cards) and applies them via ISAPI (HTTP Digest) directly to the device. No SDK required. Keep ISAPI devices and agent on same VLAN; never expose ISAPI to the Internet.</Notice>
+    <Notice tone="warning"><strong>Connection patterns:</strong> For devices managed by this bridge, set connection pattern to <code>isapi_bridge</code>, <code>windows_agent</code>, or <code>isapi_windows_agent</code>. Operations will then be queued as <code>pending</code> instead of <code>manual_action_required</code> and picked up by the linked agent.</Notice>
+    {error && <Notice tone="error">{error}</Notice>}
+    {credentials && <section className="credential-box"><p className="eyebrow">COPY NOW — SHOWN ONCE</p><h3>ISAPI Agent Secret</h3><p>Name: <code>{String(credentials.name)}</code></p><p>Platform: <code>{String(credentials.platform)}</code></p>{Boolean(credentials.secret) && <p>Secret: <code>{String(credentials.secret)}</code></p>}<p>{String(credentials.warning ?? '')}</p><button className="secondary" onClick={() => navigator.clipboard.writeText(String(credentials.secret))}>Copy secret</button></section>}
+    {showAgent && <FormCard title="Register ISAPI bridge / Windows agent" onSubmit={submitAgent}>
+      <label>Agent name<input name="name" placeholder="Estate Office Windows PC" required /></label>
+      <label>Hostname<input name="hostname" placeholder="WIN-OFFICE-01 or 192.168.1.10" /></label>
+      <label>Platform<select name="platform"><option value="windows">Windows (recommended)</option><option value="linux">Linux</option><option value="darwin">macOS</option><option value="other">Other</option></select></label>
+      <label>Version<input name="version" placeholder="1.0.0" /></label>
+      <button className="primary">Register agent</button>
+    </FormCard>}
+    {showLink && <FormCard title="Link device to ISAPI agent" onSubmit={submitLink}>
+      <label>Device<select name="deviceId" required><option value="">Select device</option>{devices.data?.items.map((d) => <option key={String(d.id)} value={String(d.id)}>{String(d.gate_name)} — {String(d.name)} ({String(d.model)}) [{String(d.connection_pattern)}]</option>)}</select></label>
+      <label>Agent<select name="agentId"><option value="">Select agent (optional - can set later)</option>{agents.data?.items.map((a) => <option key={String(a.id)} value={String(a.id)}>{String(a.name)} — {String(a.platform)} ({String(a.status)})</option>)}</select></label>
+      <label>ISAPI host (LAN IP)<input name="isapiHost" placeholder="192.168.1.100" required /></label>
+      <label>ISAPI port<input name="isapiPort" type="number" min={1} max={65535} defaultValue={80} /></label>
+      <label>ISAPI username<input name="isapiUsername" defaultValue="admin" /></label>
+      <label>ISAPI password<input name="isapiPassword" type="password" placeholder="Device admin password" /><small>Encrypted at rest, never returned.</small></label>
+      <label>Protocol<select name="protocol"><option value="http">HTTP (port 80)</option><option value="https">HTTPS (port 443)</option></select></label>
+      <label>Sync enabled<input name="syncEnabled" type="checkbox" defaultChecked /></label>
+      <button className="primary">Link device</button>
+    </FormCard>}
+
+    <section className="panel"><div className="panel-title"><div><p className="eyebrow">Registered agents</p><h3>ISAPI bridge agents</h3></div><button className="secondary sm" onClick={() => agents.reload()}>Refresh</button></div>
+      <ListState list={agents}><DataTable rows={agents.data?.items ?? []} columns={[['name','Agent'],['hostname','Hostname'],['platform','Platform'],['status','Status'],['last_seen_at','Last heartbeat','date'],['last_ip','Last IP'],['linked_devices','Linked devices'],['pending_operations','Pending ops']]} action={operator ? (row) => <div className="row-actions"><button className="text" onClick={() => downloadInstaller(row)}>Download installer</button>{user.role==='admin' && <button className="text" onClick={() => rotateAgent(row)}>Rotate secret</button>}<button className="text danger" onClick={() => removeAgent(row)}>Delete</button></div> : undefined} /></ListState>
+    </section>
+
+    <section className="panel"><div className="panel-title"><div><p className="eyebrow">Device mappings</p><h3>ISAPI device configs</h3></div><button className="secondary sm" onClick={() => deviceConfigs.reload()}>Refresh</button></div>
+      <ListState list={deviceConfigs}><DataTable rows={deviceConfigs.data?.items ?? []} columns={[['device_name','Device'],['gate_name','Gate'],['connection_pattern','Connection'],['device_status','Device status'],['isapi_host','ISAPI host'],['isapi_port','Port'],['isapi_username','ISAPI user'],['protocol','Protocol'],['sync_enabled','Sync enabled'],['agent_name','Agent'],['agent_status','Agent status'],['last_sync_at','Last sync','date'],['last_sync_status','Sync status'],['last_error','Last error']]} action={operator ? (row) => <div className="row-actions"><button className="text danger" onClick={() => removeLink(row)}>Remove</button></div> : undefined} /></ListState>
+    </section>
+
+    <section className="panel"><div className="panel-title"><div><p className="eyebrow">Audit trail</p><h3>ISAPI sync logs (recent 50)</h3></div><button className="secondary sm" onClick={() => logs.reload()}>Refresh</button></div>
+      <ListState list={logs}><DataTable rows={logs.data?.items ?? []} columns={[['created_at','Time','date'],['device_name','Device'],['agent_name','Agent'],['operation_type','Operation'],['status','Status'],['message','Message'],['duration_ms','Duration ms']]} /></ListState>
+    </section>
+
+    <section className="panel callout"><p className="eyebrow">Windows agent quick reference</p><h3>Install on Windows (Administrator PowerShell)</h3>
+      <ol>
+        <li>Register agent above and <strong>Download installer</strong> (PowerShell <code>.ps1</code>).</li>
+        <li>Run installer as Administrator: <code>powershell -ExecutionPolicy Bypass -File .\estatemate-isapi-agent-xxxx.ps1</code></li>
+        <li>Edit <code>C:\EstateMate\ISAPI-Agent\isapi-devices.json</code> with LAN IPs and ISAPI passwords.</li>
+        <li>Install Node.js 22+ and copy <code>isapi-bridge/agent.mjs</code> to agent folder, or use compiled exe.</li>
+        <li>Create service: <code>sc.exe create EstateMateISAPIAgent binPath= &quot;C:\Program Files\nodejs\node.exe C:\EstateMate\ISAPI-Agent\agent.mjs --config C:\EstateMate\ISAPI-Agent\agent-config.json&quot; start= auto</code></li>
+        <li><code>sc.exe start EstateMateISAPIAgent</code> and verify in portal that agent shows <code>online</code>.</li>
+      </ol>
+      <p><strong>Test ISAPI manually:</strong> <code>curl --digest -u admin:password http://192.168.1.100/ISAPI/System/deviceInfo</code></p>
+      <p><strong>Security:</strong> Keep agent and devices on same VLAN, no port forwarding. Config ACL restricted to Administrators.</p>
+    </section>
   </PagePanel>;
 }
 
@@ -1353,7 +1480,7 @@ function nested(source: Row | null, objectKey: string, key: string): unknown {
 function localDateTime(date:Date):string { const offset=date.getTimezoneOffset()*60000;return new Date(date.valueOf()-offset).toISOString().slice(0,16); }
 function initials(name: string): string { return name.split(/\s+/).slice(0,2).map((part) => part[0]).join('').toUpperCase(); }
 function navIcon(section: Section): string {
-  return ({ dashboard: '◫', residents: '●', properties: '⌂', residency: '♙', imports: '⇩', bills: '₦', visitors: '↔', maintenance: '◇', notices: '!', cards: '▤', events: '⌁', devices: '▣', operations: '↻', settings: '⚙' })[section];
+  return ({ dashboard: '◫', residents: '●', properties: '⌂', residency: '♙', imports: '⇩', bills: '₦', visitors: '↔', maintenance: '◇', notices: '!', cards: '▤', events: '⌁', devices: '▣', isapi: '⧉', operations: '↻', settings: '⚙' })[section] ?? '•';
 }
 
 export default App;

@@ -1,0 +1,10 @@
+{
+  "agentId": "00000000-0000-4000-a000-000000000000",
+  "agentSecret": "replace-with-agent-secret-from-portal",
+  "workerUrl": "https://estatemate.barikblog.workers.dev",
+  "syncIntervalSeconds": 30,
+  "heartbeatIntervalSeconds": 60,
+  "logLevel": "info",
+  "isapiTimeoutMs": 15000,
+  "maxRetries": 3
+}
