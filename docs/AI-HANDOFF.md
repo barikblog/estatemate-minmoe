@@ -39,25 +39,28 @@ Run `git log -1 --oneline` and check the latest GitHub Actions run before making
 
 ## Most recent migration
 
-`migrations/0009_visitor_gate_scope_payment_channels.sql`
+`migrations/0010_maintenance_billing_and_verification.sql`
 
-It adds `visitor_requests.gate_scope` (`both` default, `gate` when an Administrator or Manager attaches one device) and seeds the five `bank_account_*` settings keys used by the payment-channel API. Existing visitor rows keep their history and default to every gate.
+It adds:
+- `maintenance_requests.scope_type` ('personal', 'street', 'block', 'zone', 'estate') and `scope_target` for scoped facility issues.
+- `maintenance_requests.status` workflow expansion to include `in_progress` and `needs_verification`.
+- `maintenance_requests.proof_key`, `completion_proof_key`, `charge_amount_minor`, `charge_target`, `charge_bill_id`, `status_note` for maintenance duties charging and resolution verification.
+- `visitor_requests.require_gate_id_verification`, `gate_proof_key`, `gate_verified_at`, `gate_verified_by` to enforce security gate ID/invitation inspection and photo proof upload before entry check-in.
+- `bill_batches.audience` ('all_owners_and_tenants', 'only_owners', 'only_tenants') to support landlord-per-property charging and tenant-specific levies.
 
-The previous migration, `migrations/0008_managers_operations_imports_hikconnect.sql`, adds the Manager role and temporary-account expiry while preserving all existing users and foreign-key relationships; expands import history for common operational CSVs; and adds encrypted Hik-Connect/site-sync metadata to access devices. To avoid rebuilding the heavily referenced `users` parent table, Manager rows use the compatibility representation `role='security', is_manager=1`; authentication and user APIs must continue returning the effective role through `CASE WHEN is_manager=1 THEN 'manager'`. Migrations are append-only after deployment.
+The previous migration, `migrations/0009_visitor_gate_scope_payment_channels.sql`, adds `visitor_requests.gate_scope` (`both` default, `gate` when an Administrator or Manager attaches one device) and seeds the five `bank_account_*` settings keys used by the payment-channel API.
 
 ## Validation recorded for this phase
 
 - Root and web TypeScript passed (`tsc --noEmit` plus `tsc -b` in `apps/web`).
-- 60 Vitest tests passed across 8 files, including new suites that drive the real Worker `fetch` against an in-process SQLite database shaped like D1:
-  - `test/visitor-pass-validity.test.ts` reproduces the reported "Pass is outside its validity window" false negative for a pass that is inside the window the resident entered, and pins the fixed behaviour for not-yet-active, expired, checked-out and legacy naive rows;
-  - `test/payment-channels.test.ts` pins the three payment options, the absence of `online`, Administrator-only bank-account editing and `gate_scope` defaults;
-  - `test/pdf.test.ts` validates the generated PDF structure, xref offsets and the untouched DCTDecode stream;
-  - `src/datetime.test.ts` pins estate-timezone parsing, explicit offsets, date-only boundaries and DST handling.
-- A PDF produced by the real `imageToPdfBlob` was independently parsed with `pypdf`: 1 page, A4 MediaBox, correct title/producer, embedded JPEG recovered byte-for-byte.
-- `npm run build:web` passed; `pass-export` stays a lazy chunk (6.12 kB) so the QR/barcode/PDF export code is out of the initial bundle.
-- `wrangler d1 migrations apply --local` applied `0001`–`0009` cleanly, and the fresh-SQLite chain check confirmed `visitor_requests.gate_scope` defaults to `both` plus the five `bank_account_*` settings keys.
-- Local live API E2E against `wrangler dev`: a resident-issued Lagos wall-clock pass stored as `2026-09-24T07:12:23.000Z` scanned as `valid=true`; expired and not-yet-active passes returned specific estate-time reasons; Security accepted the previewed pass; `/api/payment-channels` returned POS/cash/bank transfer with `editable=false` for a Resident, a Security-role bank edit was rejected with 403, and an Administrator edit was then readable by the Resident.
-- Android remains uncompiled in this environment because JDK 17 and the Android SDK are unavailable.
+- 67 Vitest tests passed across 9 files, including new suite `test/maintenance-and-billing.test.ts`:
+  - Verified batch billing audience targeting (`only_owners`, `only_tenants`, `all_owners_and_tenants`) and estate-wide (`all`) scope;
+  - Verified maintenance scope creation (`street`, `zone`, `personal`), status transitions (`in_progress`, `needs_verification`, `completed`, `rejected`) by managers and admins;
+  - Verified maintenance direct charging for residences/tenants/streets/all with automatic bill generation;
+  - Verified mandatory gate ID verification for visitor passes, rejecting entry until security staff uploads photo proof.
+- `npm run build:web` passed cleanly with records export features (`records-export.ts` for Excel .xls XML and canvas-to-PDF).
+- Cloudflare deployment run `35986189896` succeeded on `main`, successfully applying migration `0010` to Cloudflare D1 `estatemate-db` and deploying the Worker and web assets to production `https://estatemate.barikblog.workers.dev`.
+- Production health check verified live at `https://estatemate.barikblog.workers.dev/api/health`.
 - Not executed here: the browser canvas path in `apps/web/src/pass-export.ts` (`renderVisitorPassCanvas`, `sharePassFile`). No headless browser could be installed in this sandbox, so the share-as-image/PDF buttons are verified by production build, typecheck and the PDF-writer tests rather than by clicking them in a browser.
 
 ### Earlier phase
