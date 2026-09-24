@@ -32,14 +32,35 @@ Run `git log -1 --oneline` and check the latest GitHub Actions run before making
 - Private-storage-backed operational imports for properties, ownerships, tenancies and cards.
 - Encrypted Hik-Connect configuration and one-time generated on-site synchronization installer for the official-SDK gateway package.
 - Administrator-generated, one-time-download sample logins for every role with automatic 24-hour expiry.
+- Initiate-payment flow with POS at office, cash at office and bank transfer; the estate bank account is Administrator-editable and read-only for Residents/Cashiers. Online collection is removed from the portal and rejected by `POST /api/payments`.
+- Visitor passes shareable as a locally rendered PNG image or one-page A4 PDF, with a native share sheet where the device supports files.
+- Estate-timezone-aware visitor validity windows (`src/datetime.ts`); resident passes default to `gate_scope='both'` and the gate picker is hidden from Residents.
+- Show/hide password on sign-in and a `Powered by sornix.com.ng` portal footer.
 
 ## Most recent migration
 
-`migrations/0008_managers_operations_imports_hikconnect.sql`
+`migrations/0009_visitor_gate_scope_payment_channels.sql`
 
-It adds the Manager role and temporary-account expiry while preserving all existing users and foreign-key relationships; expands import history for common operational CSVs; and adds encrypted Hik-Connect/site-sync metadata to access devices. To avoid rebuilding the heavily referenced `users` parent table, Manager rows use the compatibility representation `role='security', is_manager=1`; authentication and user APIs must continue returning the effective role through `CASE WHEN is_manager=1 THEN 'manager'`. Migrations are append-only after deployment.
+It adds `visitor_requests.gate_scope` (`both` default, `gate` when an Administrator or Manager attaches one device) and seeds the five `bank_account_*` settings keys used by the payment-channel API. Existing visitor rows keep their history and default to every gate.
+
+The previous migration, `migrations/0008_managers_operations_imports_hikconnect.sql`, adds the Manager role and temporary-account expiry while preserving all existing users and foreign-key relationships; expands import history for common operational CSVs; and adds encrypted Hik-Connect/site-sync metadata to access devices. To avoid rebuilding the heavily referenced `users` parent table, Manager rows use the compatibility representation `role='security', is_manager=1`; authentication and user APIs must continue returning the effective role through `CASE WHEN is_manager=1 THEN 'manager'`. Migrations are append-only after deployment.
 
 ## Validation recorded for this phase
+
+- Root and web TypeScript passed (`tsc --noEmit` plus `tsc -b` in `apps/web`).
+- 60 Vitest tests passed across 8 files, including new suites that drive the real Worker `fetch` against an in-process SQLite database shaped like D1:
+  - `test/visitor-pass-validity.test.ts` reproduces the reported "Pass is outside its validity window" false negative for a pass that is inside the window the resident entered, and pins the fixed behaviour for not-yet-active, expired, checked-out and legacy naive rows;
+  - `test/payment-channels.test.ts` pins the three payment options, the absence of `online`, Administrator-only bank-account editing and `gate_scope` defaults;
+  - `test/pdf.test.ts` validates the generated PDF structure, xref offsets and the untouched DCTDecode stream;
+  - `src/datetime.test.ts` pins estate-timezone parsing, explicit offsets, date-only boundaries and DST handling.
+- A PDF produced by the real `imageToPdfBlob` was independently parsed with `pypdf`: 1 page, A4 MediaBox, correct title/producer, embedded JPEG recovered byte-for-byte.
+- `npm run build:web` passed; `pass-export` stays a lazy chunk (6.12 kB) so the QR/barcode/PDF export code is out of the initial bundle.
+- `wrangler d1 migrations apply --local` applied `0001`–`0009` cleanly, and the fresh-SQLite chain check confirmed `visitor_requests.gate_scope` defaults to `both` plus the five `bank_account_*` settings keys.
+- Local live API E2E against `wrangler dev`: a resident-issued Lagos wall-clock pass stored as `2026-09-24T07:12:23.000Z` scanned as `valid=true`; expired and not-yet-active passes returned specific estate-time reasons; Security accepted the previewed pass; `/api/payment-channels` returned POS/cash/bank transfer with `editable=false` for a Resident, a Security-role bank edit was rejected with 403, and an Administrator edit was then readable by the Resident.
+- Android remains uncompiled in this environment because JDK 17 and the Android SDK are unavailable.
+- Not executed here: the browser canvas path in `apps/web/src/pass-export.ts` (`renderVisitorPassCanvas`, `sharePassFile`). No headless browser could be installed in this sandbox, so the share-as-image/PDF buttons are verified by production build, typecheck and the PDF-writer tests rather than by clicking them in a browser.
+
+### Earlier phase
 
 - Root and web TypeScript passed.
 - 31 Vitest tests plus the ISUP control-plane integration test passed.

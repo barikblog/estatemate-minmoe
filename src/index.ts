@@ -2,7 +2,9 @@ import { Hono } from 'hono';
 import type { Context, MiddlewareHandler } from 'hono';
 import { moneyToMinor, parseCsv, requireHeaders, validDate } from './csv';
 import type { CsvTable } from './csv';
+import { DEFAULT_ESTATE_TIMEZONE, normalizeTimeZone, parseEstateInstantMs } from './datetime';
 import { AccessLiveFeed } from './live-feed';
+import { evaluateVisitorPass } from './visitor-pass';
 import { extractEventDocuments, normalizeHikvisionDocument } from './hikvision';
 import { HIKVISION_PROFILES, getHikvisionProfile, isConnectionSupported, resolveHikvisionProfile } from './hikvision-profiles';
 import {
@@ -108,6 +110,19 @@ async function audit(c: AppContext, action: string, entityType: string, entityId
   await c.env.DB.prepare(
     `INSERT INTO audit_log(id, actor_id, action, entity_type, entity_id, details_json) VALUES (?, ?, ?, ?, ?, ?)`,
   ).bind(crypto.randomUUID(), c.get('user')?.id ?? null, action, entityType, entityId, details ? JSON.stringify(details) : null).run();
+}
+
+/**
+ * Wall-clock values submitted by the portal carry no offset, so every visitor
+ * window has to be resolved against the estate's own IANA timezone.
+ */
+async function estateTimeZone(db: D1Database): Promise<string> {
+  try {
+    const row = await db.prepare(`SELECT value FROM settings WHERE key='estate_timezone'`).first<{ value: string }>();
+    return normalizeTimeZone(row?.value);
+  } catch {
+    return DEFAULT_ESTATE_TIMEZONE;
+  }
 }
 
 type PropertyRelationship = {
@@ -237,6 +252,24 @@ const PORTAL_SETTING_KEYS = [
   'theme_primary_color','theme_accent_color','theme_navigation_color','theme_surface_color','theme_corner_style',
   'support_email','support_phone','estate_timezone','currency','visitor_default_duration_hours',
   'visitor_gate_policy','visitor_credential_format','card_scan_timeout_minutes','render_bridge_url',
+] as const;
+
+/**
+ * Accepted ways to initiate a payment. Online card collection is deliberately
+ * excluded: EstateMate adds no paid payment provider.
+ */
+const PAYMENT_METHOD_OPTIONS = [
+  { id: 'pos', label: 'POS payment at office', detail: 'Pay by card on the estate office POS terminal, then upload or hand over the receipt.', proofLabel: 'POS receipt' },
+  { id: 'cash', label: 'Cash payment at office', detail: 'Pay cash at the estate office and collect the cashier-issued receipt.', proofLabel: 'Cash receipt' },
+  { id: 'bank_transfer', label: 'Bank transfer', detail: 'Transfer to the estate account below, then submit the transfer reference as proof.', proofLabel: 'Transfer receipt or screenshot' },
+] as const;
+
+type PaymentMethodId = typeof PAYMENT_METHOD_OPTIONS[number]['id'];
+const PAYMENT_METHOD_IDS: readonly string[] = PAYMENT_METHOD_OPTIONS.map((method) => method.id);
+
+/** Estate bank account. Only an Administrator may change these values. */
+const BANK_ACCOUNT_SETTING_KEYS = [
+  'bank_account_name','bank_account_number','bank_account_bank','bank_account_sort_code','bank_account_reference_note',
 ] as const;
 
 app.get('/api/health', async (c) => {
@@ -1116,9 +1149,64 @@ app.post('/api/bills', requireRoles('admin', 'cashier'), async (c) => {
   return c.json({ id }, 201);
 });
 
+const BANK_ACCOUNT_FIELD_MAP = {
+  accountName: 'bank_account_name',
+  accountNumber: 'bank_account_number',
+  bankName: 'bank_account_bank',
+  sortCode: 'bank_account_sort_code',
+  referenceNote: 'bank_account_reference_note',
+} as const;
+
+type BankAccountField = keyof typeof BANK_ACCOUNT_FIELD_MAP;
+
+async function bankAccountSettings(db: D1Database): Promise<Record<BankAccountField, string>> {
+  const placeholders = BANK_ACCOUNT_SETTING_KEYS.map(() => '?').join(',');
+  const rows = await db.prepare(`SELECT key,value FROM settings WHERE key IN (${placeholders})`).bind(...BANK_ACCOUNT_SETTING_KEYS).all<{ key:string;value:string }>();
+  const stored = Object.fromEntries(rows.results.map((row) => [row.key, row.value])) as Record<string,string>;
+  const read = (key: typeof BANK_ACCOUNT_SETTING_KEYS[number]): string => stored[key] ?? '';
+  return {
+    accountName: read('bank_account_name'),
+    accountNumber: read('bank_account_number'),
+    bankName: read('bank_account_bank'),
+    sortCode: read('bank_account_sort_code'),
+    referenceNote: read('bank_account_reference_note'),
+  };
+}
+
+app.get('/api/payment-channels', requireRoles('resident','cashier','admin'), async (c) => {
+  const bankAccount = await bankAccountSettings(c.env.DB);
+  return c.json({
+    methods: PAYMENT_METHOD_OPTIONS,
+    bankAccount,
+    bankAccountConfigured: Boolean(bankAccount.bankName.trim() && bankAccount.accountNumber.trim()),
+    editable: c.get('user').role === 'admin',
+  });
+});
+
+app.put('/api/payment-channels', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<Partial<Record<BankAccountField, unknown>>>();
+  const fields = (Object.keys(BANK_ACCOUNT_FIELD_MAP) as BankAccountField[]).filter((field) => field in body);
+  if (!fields.length) return jsonError(c, 400, 'No bank account details were supplied');
+  const entries: Array<[string, string]> = [];
+  for (const field of fields) {
+    const value = String(body[field] ?? '').trim();
+    if (value.length > 200) return jsonError(c, 400, `${field} is too long`);
+    if (field === 'accountNumber' && value && !/^[0-9 -]{4,34}$/.test(value)) return jsonError(c, 400, 'accountNumber may only contain digits, spaces or hyphens');
+    if (field === 'sortCode' && value && !/^[0-9 -]{3,20}$/.test(value)) return jsonError(c, 400, 'sortCode may only contain digits, spaces or hyphens');
+    entries.push([BANK_ACCOUNT_FIELD_MAP[field], value]);
+  }
+  await c.env.DB.batch(entries.map(([key, value]) => c.env.DB.prepare(
+    `INSERT INTO settings(key,value,updated_by,updated_at) VALUES (?,?,?,datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_by=excluded.updated_by,updated_at=excluded.updated_at`,
+  ).bind(key, value, c.get('user').id)));
+  await audit(c, 'update', 'payment_channels', 'default', Object.fromEntries(fields.map((field) => [field, field === 'accountNumber' ? 'redacted' : String(body[field] ?? '')])));
+  return c.json({ ok: true, bankAccount: await bankAccountSettings(c.env.DB) });
+});
+
 app.post('/api/payments', requireRoles('resident', 'cashier', 'admin'), async (c) => {
-  const body = await c.req.json<{ billId?: string; amountMinor?: number; paymentMethod?: 'cash'|'pos'|'bank_transfer'|'online'; proofImageKey?: string; proofKeys?: string[] }>();
+  const body = await c.req.json<{ billId?: string; amountMinor?: number; paymentMethod?: PaymentMethodId; proofImageKey?: string; proofKeys?: string[] }>();
   if (!body.billId || !body.amountMinor || !body.paymentMethod) return jsonError(c, 400, 'billId, amountMinor and paymentMethod are required');
+  if (!PAYMENT_METHOD_IDS.includes(body.paymentMethod)) return jsonError(c, 400, 'paymentMethod must be one of: POS payment at office, cash payment at office or bank transfer');
   const user = c.get('user');
   if (user.role === 'resident') {
     const own = await c.env.DB.prepare(`SELECT id FROM bills WHERE id=? AND resident_id=?`).bind(body.billId, user.id).first();
@@ -1515,8 +1603,16 @@ app.get('/api/visitors', async (c) => {
 app.post('/api/visitors', requireRoles('resident','admin','manager'), async (c) => {
   const body = await c.req.json<{ visitorName?: string; visitorPhone?: string; validFrom?: string; validUntil?: string; residentId?: string; propertyId?: string; deviceId?: string; proofKeys?: string[] }>();
   if (!body.visitorName?.trim() || !body.validFrom || !body.validUntil) return jsonError(c, 400, 'visitorName, validFrom and validUntil are required');
-  if (new Date(body.validUntil) <= new Date(body.validFrom)) return jsonError(c, 400, 'validUntil must be after validFrom');
-  const residentId = c.get('user').role === 'resident' ? c.get('user').id : body.residentId;
+  const timeZone=await estateTimeZone(c.env.DB);
+  const validFromMs=parseEstateInstantMs(body.validFrom,timeZone,'start');
+  const validUntilMs=parseEstateInstantMs(body.validUntil,timeZone,'end');
+  if (validFromMs===null || validUntilMs===null) return jsonError(c,400,'validFrom and validUntil must be readable dates');
+  if (validUntilMs<=validFromMs) return jsonError(c,400,'validUntil must be after validFrom');
+  // Stored as absolute UTC instants so scans, SQL and the portal all agree.
+  const validFrom=new Date(validFromMs).toISOString();
+  const validUntil=new Date(validUntilMs).toISOString();
+  const requester = c.get('user');
+  const residentId = requester.role === 'resident' ? requester.id : body.residentId;
   if (!residentId) return jsonError(c, 400, 'residentId is required');
   let propertyId = body.propertyId;
   if (propertyId) {
@@ -1535,10 +1631,12 @@ app.post('/api/visitors', requireRoles('resident','admin','manager'), async (c) 
     propertyId = matches.results[0]!.property_id;
   }
   let device: { id:string;name:string;model:string|null;profile_key:string;connection_pattern:string }|null=null;
-  if (body.deviceId) {
+  // Residents never choose a gate. Their pass defaults to every gate, entry and exit.
+  if (body.deviceId && requester.role !== 'resident') {
     device=await c.env.DB.prepare(`SELECT id,name,model,profile_key,connection_pattern FROM hikvision_devices WHERE id=? AND deleted_at IS NULL AND status!='disabled'`).bind(body.deviceId).first<{ id:string;name:string;model:string|null;profile_key:string;connection_pattern:string }>();
     if (!device) return jsonError(c,404,'Selected access-control device is unavailable');
   }
+  const gateScope=device?'gate':'both';
   const id = crypto.randomUUID();
   const pin = String(crypto.getRandomValues(new Uint32Array(1))[0]! % 1_000_000).padStart(6, '0');
   const qrToken = randomToken(24);
@@ -1546,18 +1644,18 @@ app.post('/api/visitors', requireRoles('resident','admin','manager'), async (c) 
   const profile=device?getHikvisionProfile(device.profile_key):null;
   const credentialMode=profile?.authenticationMethods.some((method)=>method==='QR')?'qr':profile?.authenticationMethods.includes('PIN')?'pin':'hybrid';
   await c.env.DB.prepare(
-    `INSERT INTO visitor_requests(id,resident_id,property_id,visitor_name,visitor_phone,pin,qr_token,credential_number,barcode_payload,credential_mode,device_id,requires_security_approval,status,valid_from,valid_until)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'active',?,?)`,
-  ).bind(id,residentId,propertyId,body.visitorName.trim(),body.visitorPhone?.trim() ?? null,pin,qrToken,credentialNumber,credentialNumber,credentialMode,device?.id ?? null,1,body.validFrom,body.validUntil).run();
-  await linkProofFiles(c.env.DB,proofKeys(body.proofKeys),'visitor_request',id,c.get('user').id);
+    `INSERT INTO visitor_requests(id,resident_id,property_id,visitor_name,visitor_phone,pin,qr_token,credential_number,barcode_payload,credential_mode,device_id,gate_scope,requires_security_approval,status,valid_from,valid_until)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'active',?,?)`,
+  ).bind(id,residentId,propertyId,body.visitorName.trim(),body.visitorPhone?.trim() ?? null,pin,qrToken,credentialNumber,credentialNumber,credentialMode,device?.id ?? null,gateScope,1,validFrom,validUntil).run();
+  await linkProofFiles(c.env.DB,proofKeys(body.proofKeys),'visitor_request',id,requester.id);
   if (device) {
     const status=['hikvision_cloud_openapi','offsite_isup_gateway'].includes(device.connection_pattern)?'pending':'manual_action_required';
     await c.env.DB.prepare(
       `INSERT INTO visitor_device_operations(id,visitor_request_id,device_id,operation,payload_json,status) VALUES (?,?,?,'upsert_visitor',?,?)`,
-    ).bind(crypto.randomUUID(),id,device.id,JSON.stringify({ credentialNumber,visitorName:body.visitorName.trim(),validFrom:body.validFrom,validUntil:body.validUntil,enabled:false,requiresSecurityApproval:true }),status).run();
+    ).bind(crypto.randomUUID(),id,device.id,JSON.stringify({ credentialNumber,visitorName:body.visitorName.trim(),validFrom,validUntil,enabled:false,requiresSecurityApproval:true }),status).run();
   }
-  await audit(c,'create','visitor_request',id,{ propertyId,deviceId:device?.id ?? null,credentialMode });
-  return c.json({ id, propertyId, pin, qrToken, credentialNumber, barcodePayload:credentialNumber, credentialMode, requiresSecurityApproval:true }, 201);
+  await audit(c,'create','visitor_request',id,{ propertyId,deviceId:device?.id ?? null,gateScope,credentialMode });
+  return c.json({ id, propertyId, pin, qrToken, credentialNumber, barcodePayload:credentialNumber, credentialMode, gateScope, validFrom, validUntil, requiresSecurityApproval:true }, 201);
 });
 
 app.post('/api/visitors/scan', requireRoles('security','admin','manager'), async (c) => {
@@ -1575,11 +1673,12 @@ app.post('/api/visitors/scan', requireRoles('security','admin','manager'), async
     await c.env.DB.prepare(`INSERT INTO visitor_code_scans(id,scanned_by,source,scanned_value_masked,decision) VALUES (?,?,?,?,'invalid')`).bind(scanId,c.get('user').id,body.source ?? 'manual',maskedCredential(code)).run();
     return jsonError(c,404,'Visitor pass not found');
   }
-  const now=Date.now();
-  const valid=now>=new Date(String(visitor.valid_from)).valueOf() && now<=new Date(String(visitor.valid_until)).valueOf() && !['revoked','expired','checked_out'].includes(String(visitor.status));
+  const timeZone=await estateTimeZone(c.env.DB);
+  const evaluation=evaluateVisitorPass(visitor,timeZone);
+  const valid=evaluation.valid;
   await c.env.DB.prepare(`INSERT INTO visitor_code_scans(id,visitor_request_id,scanned_by,source,scanned_value_masked,decision) VALUES (?,?,?,?,?,'previewed')`).bind(scanId,visitor.id,c.get('user').id,body.source ?? 'manual',maskedCredential(code)).run();
-  await audit(c,'preview','visitor_pass',String(visitor.id),{ scanId,source:body.source ?? 'manual',valid });
-  return c.json({ scanId,valid,reason:valid?null:'Pass is outside its validity window or no longer active',visitor });
+  await audit(c,'preview','visitor_pass',String(visitor.id),{ scanId,source:body.source ?? 'manual',valid,reason:evaluation.reason });
+  return c.json({ scanId,valid,reason:evaluation.reason,validFrom:visitor.valid_from,validUntil:visitor.valid_until,timeZone,visitor });
 });
 
 app.post('/api/visitors/:id/decision', requireRoles('security','admin','manager'), async (c) => {
@@ -1590,11 +1689,14 @@ app.post('/api/visitors/:id/decision', requireRoles('security','admin','manager'
   if (!scan) return jsonError(c,409,'This visitor scan is missing, already decided, or belongs to another security user');
   const visitor=await c.env.DB.prepare(`SELECT * FROM visitor_requests WHERE id=?`).bind(c.req.param('id')).first<Record<string,string|number|null>>();
   if (!visitor) return jsonError(c,404,'Visitor pass not found');
-  const now=new Date();
-  const valid=now>=new Date(String(visitor.valid_from)) && now<=new Date(String(visitor.valid_until)) && !['revoked','expired','checked_out'].includes(String(visitor.status));
-  if (body.decision==='accepted' && !valid) return jsonError(c,403,'Visitor pass is not valid now');
+  const evaluation=evaluateVisitorPass(visitor,await estateTimeZone(c.env.DB));
+  const action=body.action ?? 'in';
+  // A visitor who overstayed must still be checked out, so an ended window only blocks entry.
+  const releasingCheckedInVisitor=action==='out' && String(visitor.status)==='checked_in';
+  if (body.decision==='accepted' && !evaluation.valid && !releasingCheckedInVisitor) {
+    return jsonError(c,403,evaluation.reason ?? 'Visitor pass is not valid now');
+  }
   if (body.decision==='accepted') {
-    const action=body.action ?? 'in';
     if (action==='in') await c.env.DB.prepare(`UPDATE visitor_requests SET status='checked_in',checked_in_at=datetime('now'),checked_in_by=?,rejected_at=NULL,rejected_by=NULL,rejection_note=NULL WHERE id=?`).bind(c.get('user').id,visitor.id).run();
     else await c.env.DB.prepare(`UPDATE visitor_requests SET status='checked_out',checked_out_at=datetime('now') WHERE id=?`).bind(visitor.id).run();
   } else {

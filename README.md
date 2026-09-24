@@ -24,6 +24,9 @@ Included:
 - Private-GitHub-backed operational imports for properties, ownerships, tenancies and access cards, in addition to people, bills and payments.
 - General estate notices with priority, scheduling, read acknowledgements, and login popups; the former Community posting feature is removed.
 - Street-targeted batch billing and audited CSV imports for pre-existing bills and resident payments (500 rows/2 MB per upload).
+- Initiate-payment flow with three options — POS payment at office, cash payment at office, and bank transfer against an Administrator-published estate account. Online card collection is deliberately absent because no paid payment provider is used.
+- Visitor passes that can be shared as a PNG image or a one-page A4 PDF, rendered entirely in the browser; resident passes default to every gate (entry and exit) and never expose a gate picker.
+- Estate-timezone-aware visitor validity windows, so a pass issued for "10:00" local time is not shifted by the Worker's UTC clock.
 - Residents can own multiple administrator-approved properties; they can request an existing unowned unit or propose a new property, while each property retains one active owner.
 - Rented-apartment workflows with owner nomination or direct administrator assignment, approval dates, one active main tenant, and owner/tenant billing responsibility.
 - Approved dependant and household profiles, optional separate logins, delegated visitor/bill permissions, and dependant access cards tied to the main resident.
