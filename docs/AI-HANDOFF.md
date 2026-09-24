@@ -70,6 +70,7 @@ The previous migration, `migrations/0010_maintenance_billing_and_verification.sq
   - Device creation with isapi_bridge sets visitor operation status to pending (not manual)
 - `npm run build:web` passed cleanly (416 modules, 358kB + 412kB chunks).
 - Migration chain validated via Python sqlite3 through 0011.
+- Cloudflare deployment run `36008576004` succeeded on `main` (commit `53f6d29`), successfully applying remote D1 checks and deploying Worker + web assets to production `https://estatemate.estatemate.workers.dev` with React hook ordering fixes and ErrorBoundary protection.
 - Cloudflare deployment run `35991657930` succeeded on `main`, successfully applying migration `0011_hikvision_isapi_sync.sql` to Cloudflare D1 `estatemate-db` and deploying Worker + web assets to production `https://estatemate.estatemate.workers.dev`.
 - Production health check attempted (DNS not resolvable from sandbox, but GitHub Actions deploy succeeded with 42s build).
 - **Production domain corrected.** The live Worker is `https://estatemate.estatemate.workers.dev` (account `workers.dev` subdomain `estatemate`, Worker name `estatemate`). Verified externally: `GET /api/health` returns `{"ok":true,...}`, the SPA sign-in page renders, and served asset hashes (`index-CNQVCKox.js`, `pass-export-GRQJmxO5.js`) match the local `main` build. The previously documented `estatemate.barikblog.workers.dev` hostname never resolved and has been replaced in `docs/`, `scripts/ai-context.sh`, `render.yaml`, `bridge/server.mjs`, `isup-gateway/`, `isapi-bridge/` and `windows-agent/` defaults.
