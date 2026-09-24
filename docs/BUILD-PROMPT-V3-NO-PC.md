@@ -7,7 +7,7 @@ This document amends `EstateMate_Build_Prompt_v2` for estates where supported Hi
 Remove the mandatory on-site Edge Sync Agent from the default architecture. Use two explicitly different channels:
 
 1. **Event channel (implemented):** MinMoe HTTP Listening sends outbound HTTPS event uploads directly to a Cloudflare Worker endpoint. The Worker authenticates the terminal, parses JSON/XML/multipart event notifications, normalizes the metadata, enqueues it, stores it in D1, and broadcasts it through a Durable Object.
-2. **Command channel (must be verified per model/firmware):** HTTP Listening cannot be assumed to receive person/card commands. Default to an auditable `manual_action_required` queue. Automatic physical card enforcement may be enabled only through a tested Hikvision cloud/OpenAPI proxy or an off-site ISUP 5.0 gateway. Never expose a terminal’s ISAPI/admin ports publicly.
+2. **Command channel (must be verified per model/firmware):** HTTP Listening cannot be assumed to receive person/card commands. Default to an auditable `manual_action_required` queue. Automatic physical card enforcement may be enabled only through a tested Hikvision cloud/OpenAPI proxy or a dedicated ISUP 5.0 gateway on a small headless Linux appliance (or off-site host). Arduino/ESP32 is not an official-SDK host; use ARM only when Hikvision supplies matching ARM64 libraries. Never expose a terminal’s ISAPI/admin ports publicly.
 
 The app must never display “synced to hardware” merely because D1 card status changed. Store cloud state and per-device operation state separately.
 
@@ -23,7 +23,7 @@ MinMoe ── outbound HTTPS POST ──────┤
 D1 card status change ──▶ device_operations
   ├── events-only mode: manual_action_required
   ├── approved cloud API mode: sent → applied/failed
-  └── off-site ISUP mode: HTTPS command request → gateway → terminal
+  └── dedicated ISUP mode: HTTPS command request → LAN appliance/off-site gateway → terminal
 ```
 
 ## New/changed data requirements

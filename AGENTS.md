@@ -8,7 +8,8 @@ This file is the starting point for any AI coding agent continuing EstateMate in
 2. `docs/AI-HANDOFF.md`
 3. `docs/MINMOE-NO-PC.md`
 4. `docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md`
-5. Latest migrations in `migrations/`
+5. `docs/PEOPLE-REGISTRATION-AND-IMPORTS.md`
+6. Latest migrations in `migrations/`
 
 Run `./scripts/ai-context.sh` to print a safe repository summary.
 
@@ -21,7 +22,7 @@ Run `./scripts/ai-context.sh` to print a safe repository summary.
 - Access-device event normalisation: `src/hikvision.ts` and `src/hikvision-profiles.ts`
 - Private GitHub upload storage: `src/github-storage.ts`
 - Optional stateless Render HTTPS relay: `bridge/` and `render.yaml`
-- Off-site official-SDK ISUP gateway host/control package: `isup-gateway/`
+- Dedicated local-appliance/off-site official-SDK ISUP gateway package: `isup-gateway/`
 - CI deployment: `.github/workflows/deploy.yml`
 
 ## Non-negotiable project rules
@@ -33,7 +34,7 @@ Run `./scripts/ai-context.sh` to print a safe repository summary.
 - Preserve ownership, tenancy, billing, card, visitor and access-event history.
 - Default visitor gate policy is preview first, then Admin/Security accepts or rejects.
 - Direct HTTP Listening and the Render relay are event-upload paths, not command channels.
-- Render Free cannot be made into public raw ISUP/TCP by a keep-alive script; use `isup-gateway/` on an eligible TCP-capable host.
+- Render Free cannot be made into public raw ISUP/TCP by a keep-alive script; use `isup-gateway/` on a small LAN appliance or another eligible TCP-capable host.
 - The ISUP host/control package is not a functioning protocol engine until compiled with the licensed official SDK for the exact architecture/model/firmware.
 - Never claim a model supports QR, HTTP Listening, ISUP or remote commands without model/firmware evidence.
 - DS-K1T808MFWX-B is card/fingerprint/PIN oriented; DS-K2802 is a controller and needs a reader.

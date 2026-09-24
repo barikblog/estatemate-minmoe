@@ -910,6 +910,28 @@ app.post('/api/bills/batch', requireRoles('admin', 'cashier'), async (c) => {
   return c.json({ id:batchId,billCount:count,targetType,targets,streets:targetType === 'street' ? targets : [] },201);
 });
 
+async function userDeactivationBlocker(db:D1Database,userId:string):Promise<string|null> {
+  const links=await db.prepare(
+    `SELECT
+       EXISTS(SELECT 1 FROM property_ownerships WHERE resident_id=? AND status='active') AS owns_property,
+       EXISTS(SELECT 1 FROM property_tenancies WHERE tenant_id=? AND status IN ('pending','active')) AS has_tenancy`,
+  ).bind(userId,userId).first<{ owns_property:number;has_tenancy:number }>();
+  if (links?.owns_property) return 'Transfer or remove this user’s active property ownership before deactivating the account';
+  if (links?.has_tenancy) return 'Reject or end this user’s pending/active tenancy before deactivating the account';
+  return null;
+}
+
+async function suspendUserCards(env:Env,userId:string,actorId:string,reason:string):Promise<void> {
+  const cards=await env.DB.prepare(`SELECT id,card_uid FROM access_cards WHERE resident_id=? AND status='active'`).bind(userId).all<{ id:string;card_uid:string }>();
+  for (const card of cards.results) {
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE access_cards SET status='suspended',deactivated_at=datetime('now'),deactivated_reason=?,updated_at=datetime('now') WHERE id=? AND status='active'`).bind(reason,card.id),
+      env.DB.prepare(`INSERT INTO card_status_changes(id,card_id,old_status,new_status,reason,changed_by) VALUES (?,?,'active','suspended',?,?)`).bind(crypto.randomUUID(),card.id,reason,actorId),
+    ]);
+    await createDeviceOperations(env,card.id,'disable_card',{ cardUid:card.card_uid,enabled:false,reason });
+  }
+}
+
 app.get('/api/users', requireRoles('admin', 'cashier', 'security'), async (c) => {
   const { limit, offset, page: pageNumber } = page(c);
   const role = c.req.query('role');
@@ -931,8 +953,13 @@ app.get('/api/users', requireRoles('admin', 'cashier', 'security'), async (c) =>
 
 app.post('/api/users', requireRoles('admin'), async (c) => {
   const body = await c.req.json<{ name?: string; email?: string; phone?: string; password?: string; role?: Role; propertyId?: string }>();
-  if (!body.name?.trim() || !body.email?.trim() || !body.password || !body.role) return jsonError(c, 400, 'name, email, password and role are required');
+  const name=body.name?.trim();const email=body.email?.trim().toLowerCase();const phone=body.phone?.trim() || null;
+  if (!name || !email || !body.password || !body.role) return jsonError(c, 400, 'name, email, password and role are required');
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return jsonError(c,400,'Enter a valid email address');
+  if (body.password.length<12) return jsonError(c,400,'Temporary password must contain at least 12 characters');
   if (!['admin','resident','security','cashier'].includes(body.role)) return jsonError(c, 400, 'Invalid role');
+  const existingEmail=await c.env.DB.prepare(`SELECT id FROM users WHERE lower(email)=?`).bind(email).first();
+  if (existingEmail) return jsonError(c,409,'An account with this email already exists');
   if (body.propertyId && body.role !== 'resident') return jsonError(c, 400, 'Only resident accounts can own a property');
   if (body.propertyId) {
     const available = await c.env.DB.prepare(
@@ -943,7 +970,7 @@ app.post('/api/users', requireRoles('admin'), async (c) => {
   const id = crypto.randomUUID();
   const statements = [c.env.DB.prepare(
     `INSERT INTO users(id,name,email,phone,password_hash,role,property_id) VALUES (?,?,?,?,?,?,?)`,
-  ).bind(id, body.name.trim(), body.email.trim().toLowerCase(), body.phone?.trim() ?? null, await hashPassword(body.password), body.role, body.propertyId ?? null)];
+  ).bind(id,name,email,phone,await hashPassword(body.password),body.role,body.propertyId || null)];
   let ownershipId: string | null = null;
   if (body.propertyId) {
     ownershipId = crypto.randomUUID();
@@ -952,8 +979,84 @@ app.post('/api/users', requireRoles('admin'), async (c) => {
     ).bind(ownershipId, body.propertyId, id, c.get('user').id));
   }
   await c.env.DB.batch(statements);
-  await audit(c, 'create', 'user', id, { role: body.role, email: body.email, ownershipId });
+  await audit(c, 'create', 'user', id, { role: body.role, email, ownershipId });
   return c.json({ id, ownershipId }, 201);
+});
+
+app.patch('/api/users/:id', requireRoles('admin'), async (c) => {
+  const existing=await c.env.DB.prepare(`SELECT id,name,email,phone,role,status FROM users WHERE id=?`).bind(c.req.param('id')).first<{ id:string;name:string;email:string;phone:string|null;role:Role;status:'active'|'inactive' }>();
+  if (!existing) return jsonError(c,404,'User account not found');
+  const body=await c.req.json<{ name?:string;email?:string;phone?:string|null;role?:Role;status?:'active'|'inactive';propertyId?:string }>();
+  const name=body.name?.trim() || existing.name;const email=body.email?.trim().toLowerCase() || existing.email;
+  const phone=body.phone === undefined ? existing.phone : body.phone?.trim() || null;
+  const role=body.role ?? existing.role;const status=body.status ?? existing.status;
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return jsonError(c,400,'Enter a valid email address');
+  const emailOwner=await c.env.DB.prepare(`SELECT id FROM users WHERE lower(email)=? AND id<>?`).bind(email,existing.id).first();
+  if (emailOwner) return jsonError(c,409,'An account with this email already exists');
+  if (!['admin','resident','security','cashier'].includes(role)) return jsonError(c,400,'Invalid role');
+  if (!['active','inactive'].includes(status)) return jsonError(c,400,'Invalid status');
+  if (existing.id===c.get('user').id && (role!=='admin' || status!=='active')) return jsonError(c,409,'You cannot remove your own active administrator access');
+  if (existing.role==='admin' && (role!=='admin' || status!=='active')) {
+    const admins=await c.env.DB.prepare(`SELECT COUNT(*) AS total FROM users WHERE role='admin' AND status='active'`).first<{ total:number }>();
+    if ((admins?.total ?? 0)<=1) return jsonError(c,409,'At least one active administrator must remain');
+  }
+  if (existing.role==='resident' && role!=='resident') {
+    const blocker=await userDeactivationBlocker(c.env.DB,existing.id);
+    if (blocker) return jsonError(c,409,blocker);
+    const cards=await c.env.DB.prepare(`SELECT 1 AS ok FROM access_cards WHERE resident_id=? AND status IN ('active','suspended') LIMIT 1`).bind(existing.id).first();
+    if (cards) return jsonError(c,409,'Revoke this resident’s access cards before changing the account role');
+  }
+  if (status==='inactive' && existing.status==='active') {
+    const blocker=await userDeactivationBlocker(c.env.DB,existing.id);
+    if (blocker) return jsonError(c,409,blocker);
+  }
+  if (body.propertyId && role!=='resident') return jsonError(c,400,'Only resident accounts can own a property');
+  if (body.propertyId && status!=='active') return jsonError(c,400,'Reactivate the resident before assigning a property');
+  let ownershipId:string|null=null;
+  if (body.propertyId) {
+    const property=await c.env.DB.prepare(
+      `SELECT p.id,po.resident_id FROM properties p LEFT JOIN property_ownerships po ON po.property_id=p.id AND po.status='active' WHERE p.id=?`,
+    ).bind(body.propertyId).first<{ id:string;resident_id:string|null }>();
+    if (!property) return jsonError(c,404,'Selected property was not found');
+    if (property.resident_id && property.resident_id!==existing.id) return jsonError(c,409,'Selected property is already owned');
+    if (!property.resident_id) ownershipId=crypto.randomUUID();
+  }
+  const statements:D1PreparedStatement[]=[c.env.DB.prepare(`UPDATE users SET name=?,email=?,phone=?,role=?,status=?,property_id=COALESCE(property_id,?),updated_at=datetime('now') WHERE id=?`).bind(name,email,phone,role,status,body.propertyId || null,existing.id)];
+  if (ownershipId && body.propertyId) statements.push(c.env.DB.prepare(`INSERT INTO property_ownerships(id,property_id,resident_id,status,approved_by) VALUES (?,?,?,'active',?)`).bind(ownershipId,body.propertyId,existing.id,c.get('user').id));
+  await c.env.DB.batch(statements);
+  if (status==='inactive' && existing.status==='active') await suspendUserCards(c.env,existing.id,c.get('user').id,'account deactivated');
+  await audit(c,'update','user',existing.id,{ name,email,role,status,propertyAssigned:body.propertyId || null,ownershipId });
+  return c.json({ ok:true,id:existing.id,ownershipId });
+});
+
+app.post('/api/users/:id/reset-password', requireRoles('admin'), async (c) => {
+  const target=await c.env.DB.prepare(`SELECT id,email,status FROM users WHERE id=?`).bind(c.req.param('id')).first<{ id:string;email:string;status:string }>();
+  if (!target) return jsonError(c,404,'User account not found');
+  let body:{ temporaryPassword?:string }={};
+  try { body=await c.req.json<{ temporaryPassword?:string }>(); } catch { /* Generate one when no JSON body is supplied. */ }
+  const generated=!body.temporaryPassword;
+  const temporaryPassword=body.temporaryPassword || `EM-${randomToken(12)}-aA1!`;
+  if (temporaryPassword.length<12) return jsonError(c,400,'Temporary password must contain at least 12 characters');
+  await c.env.DB.prepare(`UPDATE users SET password_hash=?,updated_at=datetime('now') WHERE id=?`).bind(await hashPassword(temporaryPassword),target.id).run();
+  await audit(c,'reset_password','user',target.id,{ generated });
+  c.header('Cache-Control','no-store');
+  return c.json({ ok:true,temporaryPassword:generated?temporaryPassword:undefined,message:'Share the temporary password securely and require the user to change it after sign-in.' });
+});
+
+app.delete('/api/users/:id', requireRoles('admin'), async (c) => {
+  const target=await c.env.DB.prepare(`SELECT id,name,role,status FROM users WHERE id=?`).bind(c.req.param('id')).first<{ id:string;name:string;role:Role;status:string }>();
+  if (!target) return jsonError(c,404,'User account not found');
+  if (target.id===c.get('user').id) return jsonError(c,409,'You cannot delete your own administrator account');
+  if (target.role==='admin' && target.status==='active') {
+    const admins=await c.env.DB.prepare(`SELECT COUNT(*) AS total FROM users WHERE role='admin' AND status='active'`).first<{ total:number }>();
+    if ((admins?.total ?? 0)<=1) return jsonError(c,409,'At least one active administrator must remain');
+  }
+  const blocker=await userDeactivationBlocker(c.env.DB,target.id);
+  if (blocker) return jsonError(c,409,blocker);
+  await c.env.DB.prepare(`UPDATE users SET status='inactive',updated_at=datetime('now') WHERE id=?`).bind(target.id).run();
+  await suspendUserCards(c.env,target.id,c.get('user').id,'account deleted by administrator');
+  await audit(c,'delete','user',target.id,{ name:target.name,mode:'soft-delete-history-preserved' });
+  return c.json({ ok:true,historyPreserved:true });
 });
 
 app.get('/api/bills', async (c) => {
@@ -1031,10 +1134,94 @@ app.patch('/api/payments/:id/review', requireRoles('cashier', 'admin'), async (c
 
 app.get('/api/imports', requireRoles('admin', 'cashier'), async (c) => {
   const { limit, offset, page: pageNumber } = page(c);
-  const result = await c.env.DB.prepare(
-    `SELECT j.*,u.name AS uploaded_by_name FROM import_jobs j JOIN users u ON u.id=j.uploaded_by ORDER BY j.created_at DESC LIMIT ? OFFSET ?`,
-  ).bind(limit, offset).all();
+  const kind=c.req.query('kind');const scope=c.req.query('scope');const isAdmin=c.get('user').role==='admin';
+  if (kind==='users' && !isAdmin) return jsonError(c,403,'Only administrators can review user imports');
+  if (kind && !['bills','payments','users'].includes(kind)) return jsonError(c,400,'Invalid import kind');
+  const result = kind
+    ? await c.env.DB.prepare(`SELECT j.*,u.name AS uploaded_by_name FROM import_jobs j JOIN users u ON u.id=j.uploaded_by WHERE j.kind=? ORDER BY j.created_at DESC LIMIT ? OFFSET ?`).bind(kind,limit,offset).all()
+    : scope==='billing' || !isAdmin
+      ? await c.env.DB.prepare(`SELECT j.*,u.name AS uploaded_by_name FROM import_jobs j JOIN users u ON u.id=j.uploaded_by WHERE j.kind IN ('bills','payments') ORDER BY j.created_at DESC LIMIT ? OFFSET ?`).bind(limit,offset).all()
+      : await c.env.DB.prepare(`SELECT j.*,u.name AS uploaded_by_name FROM import_jobs j JOIN users u ON u.id=j.uploaded_by ORDER BY j.created_at DESC LIMIT ? OFFSET ?`).bind(limit,offset).all();
   return c.json({ items: result.results, page: pageNumber, limit });
+});
+
+app.post('/api/imports/users', requireRoles('admin'), async (c) => {
+  const length=Number(c.req.header('Content-Length') ?? 0);
+  if (length>CSV_BODY_LIMIT) return jsonError(c,413,'CSV exceeds the 2 MB upload limit');
+  const text=await c.req.text();
+  if (!text || new TextEncoder().encode(text).byteLength>CSV_BODY_LIMIT) return jsonError(c,413,'CSV must be between 1 byte and 2 MB');
+  let table;
+  try {
+    table=parseCsv(text,25);requireHeaders(table,['name','email','role']);
+    if (!table.rows.length) throw new Error('CSV must contain at least one user row');
+  }
+  catch(error) { return jsonError(c,400,error instanceof Error?error.message:'Invalid CSV'); }
+  const jobId=crypto.randomUUID();const filename=(c.req.header('X-Filename') ?? 'users.csv').slice(0,200);
+  let archive:{ key:string };
+  try {
+    const bytes=new TextEncoder().encode(text);
+    archive=await uploadToPrivateGitHub(c.env,{ body:bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLength) as ArrayBuffer,originalName:filename,contentType:'text/csv',uploadedBy:c.get('user').id,category:'user-imports',linkedEntityType:'import_job',linkedEntityId:jobId });
+  } catch(error) { return jsonError(c,503,error instanceof Error?error.message:'Private GitHub storage is unavailable'); }
+
+  type Candidate={ row:number;name:string;email:string;phone:string|null;role:Role;status:'active'|'inactive';unitNumber:string|null;propertyId:string|null;id:string;temporaryPassword:string };
+  const errors:Array<{ row:number;error:string }>=[];const preliminary:Candidate[]=[];const seenEmails=new Set<string>();const seenUnits=new Set<string>();
+  for (const [index,row] of table.rows.entries()) {
+    const rowNumber=index+2;const name=row.name?.trim() ?? '';const email=row.email?.trim().toLowerCase() ?? '';const role=row.role?.trim().toLowerCase() as Role;
+    const status=(row.status?.trim().toLowerCase() || 'active') as 'active'|'inactive';const unitNumber=row.unit_number?.trim() || null;
+    let error='';
+    if (!name) error='name is required';
+    else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) error='a valid email is required';
+    else if (!['admin','resident','security','cashier'].includes(role)) error='role must be admin, resident, security or cashier';
+    else if (!['active','inactive'].includes(status)) error='status must be active or inactive';
+    else if (unitNumber && role!=='resident') error='only resident rows can select a property';
+    else if (unitNumber && status!=='active') error='a property cannot be assigned to an inactive account';
+    else if (seenEmails.has(email)) error='duplicate email in this CSV';
+    else if (unitNumber && seenUnits.has(unitNumber.toLowerCase())) error='the same property appears more than once in this CSV';
+    if (error) { errors.push({ row:rowNumber,error });continue; }
+    seenEmails.add(email);if(unitNumber)seenUnits.add(unitNumber.toLowerCase());
+    preliminary.push({ row:rowNumber,name,email,phone:row.phone?.trim() || null,role,status,unitNumber,propertyId:null,id:crypto.randomUUID(),temporaryPassword:`EM-${randomToken(12)}-aA1!` });
+  }
+
+  if (preliminary.length) {
+    const emailPlaceholders=preliminary.map(()=>'?').join(',');
+    const existing=await c.env.DB.prepare(`SELECT lower(email) AS email FROM users WHERE lower(email) IN (${emailPlaceholders})`).bind(...preliminary.map((candidate)=>candidate.email)).all<{ email:string }>();
+    const existingEmails=new Set(existing.results.map((item)=>item.email));
+    const units=[...new Set(preliminary.map((candidate)=>candidate.unitNumber?.toLowerCase()).filter((value):value is string=>Boolean(value)))];
+    const properties=units.length
+      ? await c.env.DB.prepare(`SELECT p.id,p.unit_number,po.resident_id FROM properties p LEFT JOIN property_ownerships po ON po.property_id=p.id AND po.status='active' WHERE lower(p.unit_number) IN (${units.map(()=>'?').join(',')})`).bind(...units).all<{ id:string;unit_number:string;resident_id:string|null }>()
+      : { results:[] as Array<{ id:string;unit_number:string;resident_id:string|null }> };
+    const propertiesByUnit=new Map(properties.results.map((property)=>[property.unit_number.toLowerCase(),property]));
+    for (const candidate of preliminary) {
+      if (existingEmails.has(candidate.email)) { errors.push({ row:candidate.row,error:'an account with this email already exists' });continue; }
+      if (candidate.unitNumber) {
+        const property=propertiesByUnit.get(candidate.unitNumber.toLowerCase());
+        if (!property) { errors.push({ row:candidate.row,error:`property ${candidate.unitNumber} was not found` });continue; }
+        if (property.resident_id) { errors.push({ row:candidate.row,error:`property ${candidate.unitNumber} already has an owner` });continue; }
+        candidate.propertyId=property.id;
+      }
+    }
+  }
+  const failedRows=new Set(errors.map((error)=>error.row));const valid=preliminary.filter((candidate)=>!failedRows.has(candidate.row));
+  let successful=0;let credentials:Array<{ name:string;email:string;temporaryPassword:string }>=[];
+  if (valid.length) {
+    const hashes=await Promise.all(valid.map((candidate)=>hashPassword(candidate.temporaryPassword)));
+    const statements:D1PreparedStatement[]=[];
+    valid.forEach((candidate,index)=>{
+      statements.push(c.env.DB.prepare(`INSERT INTO users(id,name,email,phone,password_hash,role,property_id,status) VALUES (?,?,?,?,?,?,?,?)`).bind(candidate.id,candidate.name,candidate.email,candidate.phone,hashes[index],candidate.role,candidate.propertyId,candidate.status));
+      if (candidate.propertyId) statements.push(c.env.DB.prepare(`INSERT INTO property_ownerships(id,property_id,resident_id,status,approved_by) VALUES (?,?,?,'active',?)`).bind(crypto.randomUUID(),candidate.propertyId,candidate.id,c.get('user').id));
+    });
+    try {
+      await c.env.DB.batch(statements);successful=valid.length;
+      credentials=valid.map(({ name,email,temporaryPassword })=>({ name,email,temporaryPassword }));
+    } catch(error) {
+      console.error('Bulk user insert failed',error);
+      for (const candidate of valid) errors.push({ row:candidate.row,error:'No account was created because the user-import batch was rolled back' });
+    }
+  }
+  await saveImportJob(c.env.DB,jobId,'users',filename,table.rows.length,successful,errors,c.get('user').id,archive.key);
+  await audit(c,'import','users',jobId,{ total:table.rows.length,successful,errors:errors.length });
+  c.header('Cache-Control','no-store');
+  return c.json({ id:jobId,totalRows:table.rows.length,successfulRows:successful,errorRows:errors.length,errors:errors.slice(0,100),credentials,credentialsNotice:'Temporary passwords are returned only in this response. Download them now and share them securely.' },errors.length?207:201);
 });
 
 app.post('/api/imports/bills', requireRoles('admin', 'cashier'), async (c) => {
@@ -1860,7 +2047,7 @@ app.notFound((c) => c.json({ error: 'API route not found' }, 404));
 async function saveImportJob(
   db: D1Database,
   id: string,
-  kind: 'bills'|'payments',
+  kind: 'bills'|'payments'|'users',
   filename: string,
   total: number,
   successful: number,
@@ -1974,7 +2161,7 @@ async function handleGatewayOperationList(request: Request, env: Env, deviceId: 
   const device = await authenticateDevice(request, env, deviceId);
   if (!device) return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Basic realm="EstateMate ISUP gateway"' } });
   if (device.connectionPattern !== 'offsite_isup_gateway') {
-    return Response.json({ error: 'This device is not configured for the off-site ISUP gateway' }, { status: 409 });
+    return Response.json({ error: 'This device is not configured for the dedicated ISUP gateway' }, { status: 409 });
   }
   const requestedLimit = Number(new URL(request.url).searchParams.get('limit') ?? 20);
   const limit = Math.min(50, Math.max(1, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : 20));
@@ -2015,7 +2202,7 @@ async function handleGatewayOperationResult(request: Request, env: Env, deviceId
   const device = await authenticateDevice(request, env, deviceId);
   if (!device) return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Basic realm="EstateMate ISUP gateway"' } });
   if (device.connectionPattern !== 'offsite_isup_gateway') {
-    return Response.json({ error: 'This device is not configured for the off-site ISUP gateway' }, { status: 409 });
+    return Response.json({ error: 'This device is not configured for the dedicated ISUP gateway' }, { status: 409 });
   }
   let body: { kind?:GatewayOperationKind;status?:'applied'|'failed';errorMessage?:string };
   try { body = await request.json(); }

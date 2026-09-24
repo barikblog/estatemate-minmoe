@@ -14,6 +14,18 @@ describe('CSV import utilities', () => {
     expect(() => requireHeaders(table, ['unit_number', 'due_date'])).toThrow('due_date');
   });
 
+  it('parses the bulk-user template without storing passwords', () => {
+    const table=parseCsv('name,email,phone,role,unit_number,status\nAda Resident,ada@example.com,+2348000000000,resident,A-01,active',25);
+    requireHeaders(table,['name','email','role']);
+    expect(table.rows[0]).toMatchObject({ name:'Ada Resident',email:'ada@example.com',role:'resident',unit_number:'A-01' });
+    expect(table.headers).not.toContain('temporary_password');
+  });
+
+  it('enforces the safer 25-row user import batch limit', () => {
+    const rows=Array.from({ length:26 },(_,index)=>`User ${index},user${index}@example.com,resident`).join('\n');
+    expect(()=>parseCsv(`name,email,role\n${rows}`,25)).toThrow('25');
+  });
+
   it.each([['100', 10_000], ['1,250.50', 125_050], ['₦75.5', 7_550]])('converts %s to minor units', (input, expected) => {
     expect(moneyToMinor(input)).toBe(expected);
   });

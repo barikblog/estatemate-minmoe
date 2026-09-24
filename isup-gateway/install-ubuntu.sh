@@ -57,7 +57,7 @@ install_gateway() {
   systemctl daemon-reload
   echo
   echo "Host files installed. Before starting:"
-  echo "  1. Create an EstateMate device using the off-site ISUP gateway connection pattern."
+  echo "  1. Create an EstateMate device using the dedicated ISUP gateway connection pattern."
   echo "  2. Put its UUID and one-time device secret in $DEVICE_FILE, then chmod 600 that file."
   echo "  3. Put each terminal's SDK device ID, matching localDeviceId and ISUP key in $ADAPTER_DEVICE_FILE."
   echo "  4. Install the licensed adapter executable at /opt/hikvision-isup/bin/estatemate-isup-adapter."
@@ -101,13 +101,18 @@ start_gateway() {
   docker compose -f "$INSTALL_DIR/compose.yaml" up -d
   systemctl enable --now estatemate-isup-adapter.service
 
+  allowed_cidr="${ISUP_ALLOWED_CIDR:-}"
   if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
-    ufw allow "${registration_port}/tcp" comment 'Hikvision ISUP registration'
-    ufw allow "${alarm_port}/tcp" comment 'Hikvision ISUP alarms'
+    if [[ -n "$allowed_cidr" ]]; then
+      ufw allow from "$allowed_cidr" to any port "$registration_port" proto tcp comment 'Hikvision ISUP registration'
+      ufw allow from "$allowed_cidr" to any port "$alarm_port" proto tcp comment 'Hikvision ISUP alarms'
+    else
+      echo "WARNING: ISUP_ALLOWED_CIDR is empty; no broad UFW rule was added. Restrict the ports to the device subnet manually." >&2
+    fi
   else
-    echo "UFW is not active. Open TCP ${registration_port} and ${alarm_port} in the VM firewall/security list."
+    echo "UFW is not active. Allow TCP ${registration_port} and ${alarm_port} only from the access-device subnet or known estate address."
   fi
-  echo "Gateway started. The SDK adapter owns public TCP ports; the control API remains loopback-only."
+  echo "Gateway started. The SDK adapter owns the ISUP TCP ports; the control API remains loopback-only."
   echo "Check: sudo $0 status"
 }
 

@@ -2,7 +2,7 @@
 
 The proprietary Hikvision Linux ISUP SDK and its redistributable native libraries are **not** committed to this public repository. Obtain the correct SDK from Hikvision's Technology Partner Portal or your distributor, confirm its licence, architecture and supported firmware, and compile a small native executable named `estatemate-isup-adapter`.
 
-The native executable owns the public raw-TCP listeners. The Node control plane binds only to loopback and connects the adapter to EstateMate over authenticated HTTPS.
+The native executable owns the ISUP raw-TCP listeners on the device LAN (or a deliberately restricted public host). The Node control plane binds only to loopback and connects the adapter to EstateMate over authenticated outbound HTTPS.
 
 ## Required executable interface
 

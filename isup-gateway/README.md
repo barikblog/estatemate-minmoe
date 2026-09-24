@@ -1,26 +1,26 @@
-# EstateMate always-on Hikvision ISUP/TCP gateway
+# EstateMate dedicated Hikvision ISUP/TCP gateway
 
-This package replaces the **transport role** of the optional Render HTTPS relay when a device requires genuine public raw TCP and two-way commands. It does not try to keep Render Free awake. Render enforces idle spin-down outside the application and publicly routes HTTP/WebSocket rather than arbitrary ISUP TCP.
+This package replaces the **transport role** of the optional Render HTTPS relay when a device requires genuine raw TCP and two-way commands. It does not try to keep Render Free awake. Render enforces idle spin-down outside the application and publicly routes HTTP/WebSocket rather than arbitrary ISUP TCP.
 
-## Selected hosting pattern
+## Recommended hardware pattern
 
-Use a small, public **x86_64 Ubuntu VM** because official Hikvision Linux SDK packages are commonly architecture-specific. An OCI Always Free-eligible AMD micro VM can be attempted when capacity is available and the SDK fits its memory. Use Ampere A1 only when the supplied SDK explicitly includes ARM64 libraries.
+For an estate installation, use a small fanless **x86_64 Linux gateway appliance** (for example, an Intel N100-class mini appliance or supported thin client) with Ethernet, 4 GB or more RAM, reliable storage and a small UPS. It runs headless with no monitor or keyboard. The terminals connect to its LAN address and it makes outbound HTTPS requests to EstateMate, so no Render service, public ISUP port or router port-forward is required.
 
-No provider can be made reliable by a script beyond its service terms. OCI documents possible reclamation of under-utilized Always Free compute, so this is the closest free-only option, not an uptime guarantee. Do not generate artificial load to evade reclamation. Keep the configuration backed up and monitor the real device connection.
+An Arduino/ESP32 is not suitable for the official Hikvision Linux ISUP SDK, proprietary session/authentication callbacks and two-way person/card commands. A Raspberry Pi can be used only if Hikvision supplies a matching ARM64 SDK for the selected devices and firmware. Do not attempt x86 SDK emulation at a production gate.
 
-For production gates that require guaranteed uptime, a supported paid VM or Hikvision-hosted/partner gateway is required.
+A public x86_64 Ubuntu VM remains an alternative for estates that cannot host a local appliance. An OCI Always Free-eligible AMD micro VM can be attempted when capacity is available and the SDK fits its memory, but free compute can be unavailable or reclaimed and is not an uptime guarantee.
 
 ## Architecture
 
 ```text
 Hikvision terminal/controller
-    │ ISUP registration/alarm TCP (typically configured ports 7660/7332)
+    │ local-LAN ISUP registration/alarm TCP (commonly configured ports 7660/7332)
     ▼
-Official Hikvision Linux ISUP SDK adapter on Ubuntu
+Small Ubuntu x86_64 gateway appliance + official Hikvision Linux ISUP SDK adapter
     │ authenticated loopback HTTP
     ▼
 EstateMate gateway control plane (this directory)
-    │ authenticated HTTPS using the EstateMate per-device secret
+    │ outbound authenticated HTTPS using the EstateMate per-device secret
     ▼
 Cloudflare Worker + D1 operation/event system of record
 ```
@@ -51,12 +51,12 @@ Then compile `/opt/hikvision-isup/bin/estatemate-isup-adapter` against `SDK-ADAP
 
 ## Installation
 
-### 1. Prepare the VM
+### 1. Prepare the gateway host
 
-- Choose Ubuntu 22.04 or 24.04 with a public static/reserved IP.
-- Point a DNS-only hostname at it if desired. Do not place ISUP ports behind Cloudflare's normal HTTP proxy.
-- At the cloud firewall/security-list layer, allow SSH only from your administration IP.
-- Allow the configured ISUP registration and alarm TCP ports only from the estate's known public addresses where possible.
+- Recommended: install Ubuntu 22.04 or 24.04 amd64 on the dedicated LAN appliance and reserve its LAN IP in DHCP.
+- Do not forward the ISUP ports from the estate router to the public Internet. Restrict them to the access-device VLAN/subnet.
+- If using a cloud VM instead, assign a static/reserved public IP and permit the configured ISUP ports only from known estate public addresses where possible.
+- Do not place ISUP ports behind Cloudflare's normal HTTP proxy.
 - Do not expose port `8788`; it must remain loopback-only.
 
 ### 2. Install host files
@@ -71,7 +71,7 @@ The installer creates a random local adapter secret. It never creates fake traff
 
 ### 3. Add the access device in EstateMate
 
-In **Access → Devices**, choose the exact model/profile and select **Off-site ISUP gateway**. Copy the returned device UUID and one-time secret into:
+In **Access → Devices**, choose the exact model/profile and select **Dedicated ISUP gateway (local appliance or off-site)**. Copy the returned device UUID and one-time secret into:
 
 ```text
 /etc/estatemate/isup-devices.json
@@ -99,7 +99,7 @@ sudo ./isup-gateway/install-ubuntu.sh start
 sudo ./isup-gateway/install-ubuntu.sh status
 ```
 
-Also open the same TCP ports in the provider's network security list. A host firewall rule alone is not enough on OCI and most cloud platforms.
+For a LAN appliance, permit the ports only from the access-device subnet and do not add WAN port forwarding. For a cloud VM, also open the same restricted TCP ports in the provider's network security list; a host firewall rule alone is not enough.
 
 ### 6. Configure each Hikvision device
 

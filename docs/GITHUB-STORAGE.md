@@ -34,7 +34,7 @@ EstateMate calls the GitHub repository API before enabling the configuration and
 
 - Accepted generic file types: JPEG, PNG, WebP, PDF, and CSV.
 - Maximum generic file size: 4 MB.
-- Billing CSV imports retain their original source file in the private repository and expose an authenticated **Download source** action in import history.
+- Billing and bulk-user CSV imports retain their original source file in the private repository and expose an authenticated **Download source** action in import history. User-import source files never contain generated passwords.
 - Ownership, transfer, tenancy, household, visitor, maintenance and payment forms accept up to five proof files and link them to the submitted record for authorized review.
 - Files are stored below the configured base folder, grouped by category and UTC date.
 - D1 stores file metadata, ownership, GitHub path, Git object identifier, content type, size, and links to related records.

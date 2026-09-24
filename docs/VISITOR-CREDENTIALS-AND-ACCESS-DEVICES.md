@@ -69,11 +69,11 @@ Deploying the Blueprint:
 
 Official Render free-tier documentation: https://render.com/docs/free
 
-### Always-on off-site ISUP/TCP gateway
+### Dedicated ISUP/TCP gateway appliance
 
-`isup-gateway/` is the separate raw-TCP hosting package. It targets a public Ubuntu VM, restarts the services automatically, forwards SDK events to the Worker, polls per-device card/visitor operations, and reports confirmed results. It does not self-ping Render or attempt to bypass a provider limit.
+`isup-gateway/` is the separate raw-TCP hosting package. The recommended deployment is a small headless x86_64 Ubuntu appliance on the access-device LAN. It restarts automatically, forwards SDK events to the Worker over outbound HTTPS, polls per-device card/visitor operations, and reports confirmed results. No public ISUP port or Render service is needed. A public Ubuntu VM remains an alternative.
 
-The raw ISUP listener must be implemented with the licensed official Hikvision Linux SDK for the exact SDK version, CPU architecture, model and firmware. The SDK is not committed to the public repository. A TCP socket that merely accepts bytes is not a valid ISUP server.
+Arduino/ESP32 hardware cannot run the official Hikvision Linux SDK. Raspberry Pi is suitable only when Hikvision provides matching ARM64 SDK libraries. The raw ISUP listener must use the licensed official SDK for the exact SDK version, CPU architecture, model and firmware; a generic TCP socket is not a valid ISUP server.
 
 A free VM may still be reclaimed or unavailable under the provider's free-tier policy; free-only hosting cannot provide an uptime guarantee. See [`../isup-gateway/README.md`](../isup-gateway/README.md) and its SDK adapter contract.
 

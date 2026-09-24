@@ -5,7 +5,7 @@ EstateMate is a residential-estate operations platform with a responsive React p
 This repository replaces the original on-site Edge Sync Agent with direct **Hikvision HTTP Listening** event upload. A supported MinMoe terminal sends access events over outbound HTTPS to the Worker, so no PC is required at the estate for event collection.
 
 > [!IMPORTANT]
-> **HTTP Listening is an event-upload channel, not a bidirectional device-management channel.** It can deliver card/face/access events to EstateMate, but it normally cannot receive add/enable/disable-card commands from Cloudflare. The platform therefore records required card changes in a visible, auditable **Hardware actions** queue. Fully automatic fee-linked card disable/enable without an on-site agent requires one model-specific command path: an approved Hikvision cloud/OpenAPI proxy, an ISUP 5.0 gateway hosted off-site, or a verified firmware capability that polls a command endpoint. Do not expose ISAPI or the terminal admin interface directly to the public Internet.
+> **HTTP Listening is an event-upload channel, not a bidirectional device-management channel.** It can deliver card/face/access events to EstateMate, but it normally cannot receive add/enable/disable-card commands from Cloudflare. The platform therefore records required card changes in a visible, auditable **Hardware actions** queue. Fully automatic fee-linked card disable/enable requires one model-specific command path: an approved Hikvision cloud/OpenAPI proxy, a small headless Linux appliance (or off-site VM) running the licensed ISUP 5.0 SDK, or a verified firmware capability that polls a command endpoint. Do not expose ISAPI or the terminal admin interface directly to the public Internet.
 
 ## Repository status
 
@@ -20,6 +20,7 @@ Included:
 - Device-tap card enrollment, phone/device visitor-code scanning, QR + Code 128 visitor passes, and preview-before-entry Security decisions.
 - Hourly facility-fee expiry/reactivation job and hardware-action audit queue.
 - Role-aware React portal for Administrator, Resident, Cashier, and Security.
+- People management with available-property selection, validated account creation, CSV bulk registration, generated one-time passwords, editing, password reset, safe deactivation/reactivation and history-preserving deletion.
 - General estate notices with priority, scheduling, read acknowledgements, and login popups; the former Community posting feature is removed.
 - Street-targeted batch billing and audited CSV imports for pre-existing bills and resident payments (500 rows/2 MB per upload).
 - Residents can own multiple administrator-approved properties; they can request an existing unowned unit or propose a new property, while each property retains one active owner.
@@ -40,7 +41,7 @@ Still model/account dependent:
 - Gemini enrichment, FCM delivery, large GitHub exports, and full accounting/reconciliation UI.
 - Android production signing, push configuration, and Play distribution.
 
-See [`docs/MINMOE-NO-PC.md`](docs/MINMOE-NO-PC.md), [`docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md`](docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md), and [`isup-gateway/README.md`](isup-gateway/README.md) before installing a device. Property workflows are in [`docs/MULTI-PROPERTY-OWNERSHIP.md`](docs/MULTI-PROPERTY-OWNERSHIP.md) and [`docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md`](docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md). Proof uploads and theming are documented in [`docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md`](docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md). Private upload setup is in [`docs/GITHUB-STORAGE.md`](docs/GITHUB-STORAGE.md). AI agents should begin with [`AGENTS.md`](AGENTS.md).
+See [`docs/MINMOE-NO-PC.md`](docs/MINMOE-NO-PC.md), [`docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md`](docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md), and [`isup-gateway/README.md`](isup-gateway/README.md) before installing a device. Property workflows are in [`docs/MULTI-PROPERTY-OWNERSHIP.md`](docs/MULTI-PROPERTY-OWNERSHIP.md) and [`docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md`](docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md). Proof uploads and theming are documented in [`docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md`](docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md). Private upload setup is in [`docs/GITHUB-STORAGE.md`](docs/GITHUB-STORAGE.md), and people administration is in [`docs/PEOPLE-REGISTRATION-AND-IMPORTS.md`](docs/PEOPLE-REGISTRATION-AND-IMPORTS.md). AI agents should begin with [`AGENTS.md`](AGENTS.md).
 
 ## Architecture
 
@@ -56,7 +57,7 @@ React portal / Android ── HTTPS REST ─────────────
 
 Cloud-to-terminal card/visitor action
   ├── HTTP Listening mode: audit queue → authorized operator applies on device
-  └── Off-site ISUP mode: Worker operation endpoint → Ubuntu control plane
+  └── Dedicated ISUP mode: Worker operation endpoint → small Ubuntu gateway
       → licensed official Hikvision SDK adapter → supported terminal/controller
 ```
 
@@ -84,7 +85,7 @@ Each profile carries model patterns, event-field aliases, grant/deny mappings, c
 - **Direct HTTP Listening:** outbound event upload, no assumed return command channel.
 - **Render free HTTPS relay:** optional stateless event forwarding for HTTP-capable devices; subject to free-tier sleep/cold starts and not an ISUP/TCP server.
 - **Hikvision cloud/OpenAPI:** pending adapter; enable only with approved API documentation and credentials.
-- **Off-site ISUP gateway:** bidirectional option hosted away from the estate using `isup-gateway/`; it becomes operational only after compiling the wrapper against the licensed official SDK for the exact hardware/firmware.
+- **Dedicated ISUP gateway:** bidirectional option using `isup-gateway/` on a small local x86_64 Ubuntu appliance (recommended) or off-site VM; it becomes operational only after compiling the wrapper against the licensed official SDK for the exact hardware/firmware.
 - **Manual synchronization:** event/audit platform with operator-applied hardware changes.
 
 The generic parser retains unknown values rather than inventing a grant result. Add firmware-specific evidence in `docs/device-profiles/` before marking a combination production-supported.

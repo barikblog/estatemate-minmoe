@@ -65,5 +65,5 @@ Choose one:
 
 - `events-only`: deploy now with audited manual terminal changes.
 - `Hikvision cloud/OpenAPI`: provide the product name, region, approved API documentation, AppKey/AppSecret via a secret channel, and test tenant.
-- `off-site ISUP bridge`: approve a small Internet VM/container in addition to Cloudflare and provide licensing/SDK details.
+- `dedicated ISUP gateway`: approve a small headless x86_64 Ubuntu appliance on the estate LAN (recommended) or an Internet VM, and provide licensing/SDK details. Raspberry Pi requires vendor ARM64 libraries; Arduino/ESP32 is not a supported SDK host.
 - `investigate`: complete model/firmware validation first; do not enable fee-linked physical enforcement yet.
