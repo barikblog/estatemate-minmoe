@@ -50,42 +50,11 @@ Official references:
 
 ## Device connections
 
-### Direct Cloudflare HTTP Listening
+There is exactly one automatic transport: the **EstateMate agent** (`isapi-bridge/`) on the device LAN. The agent holds a persistent ISAPI `alertStream` per terminal (real-time events), flushes them to the Worker in batches, polls pending card/visitor operations, and applies them over ISAPI Digest. Devices not linked to an agent fall back to auditable `manual_sync` (operator applies changes from the Hardware actions queue).
 
-Recommended where the actual firmware can upload HTTP/HTTPS events. It is outbound from the device and needs no site PC. It receives events but does not let the Worker initiate ISAPI commands back through the estate router.
+The former transports — direct Cloudflare HTTP Listening, the Render free HTTPS relay (`bridge/`, `render.yaml`), Hikvision cloud/OpenAPI, and the dedicated ISUP/TCP gateway appliance (`isup-gateway/`) — were removed in migration `0013_agent_only_transports.sql`. See [`MINMOE-NO-PC.md`](MINMOE-NO-PC.md) for the decision record and [`../isapi-bridge/README.md`](../isapi-bridge/README.md) for setup.
 
-### Render free HTTPS relay
-
-`render.yaml` deploys the stateless service under `bridge/`. It forwards compatible HTTPS event uploads to the Cloudflare Worker, which writes normalized events to D1. It stores no data and has no Render database.
-
-Render Free constraints are important:
-
-- it spins down after 15 minutes without inbound traffic;
-- waking can take about one minute;
-- filesystem changes are ephemeral;
-- 750 free instance hours are shared by the workspace each month;
-- it exposes HTTP/WebSocket services, not a general-purpose Hikvision ISUP TCP listener.
-
-Therefore the Render relay is optional and is not the sole production path. Keep the direct Worker endpoint recorded as a fallback. It does not make DS-K2802 ISUP remotely manageable.
-
-Deploying the Blueprint:
-
-1. Sign in to Render and create a new Blueprint from the public EstateMate repository.
-2. Confirm `estatemate-access-bridge` uses the **Free** plan.
-3. Deploy without adding a Render database or persistent disk.
-4. Open `/health` on the assigned Render URL.
-5. In EstateMate **Settings → Portal identity, theme and recommended defaults**, enter only the HTTPS origin.
-6. Select **Render free HTTPS relay** on compatible devices and rotate the device endpoint if necessary.
-
-Official Render free-tier documentation: https://render.com/docs/free
-
-### Dedicated ISUP/TCP gateway appliance
-
-`isup-gateway/` is the separate raw-TCP hosting package. The recommended deployment is a small headless x86_64 Ubuntu appliance on the access-device LAN. It restarts automatically, forwards SDK events to the Worker over outbound HTTPS, polls per-device card/visitor operations, and reports confirmed results. No public ISUP port or Render service is needed. A public Ubuntu VM remains an alternative.
-
-Arduino/ESP32 hardware cannot run the official Hikvision Linux SDK. Raspberry Pi is suitable only when Hikvision provides matching ARM64 SDK libraries. The raw ISUP listener must use the licensed official SDK for the exact SDK version, CPU architecture, model and firmware; a generic TCP socket is not a valid ISUP server.
-
-A free VM may still be reclaimed or unavailable under the provider's free-tier policy; free-only hosting cannot provide an uptime guarantee. See [`../isup-gateway/README.md`](../isup-gateway/README.md) and its SDK adapter contract.
+Keep ISAPI private to the estate VLAN: never port-forward a terminal, and run the agent only on the device LAN.
 
 ## Cloudflare D1 free-tier safeguards
 

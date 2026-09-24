@@ -12,7 +12,7 @@ git log --oneline -8
 printf '\n-- latest migrations --\n'
 find migrations -maxdepth 1 -type f -name '*.sql' -printf '%f\n' | sort | tail -8
 printf '\n-- important continuation files --\n'
-printf '%s\n' AGENTS.md docs/AI-HANDOFF.md README.md src/index.ts src/hikvision-profiles.ts apps/web/src/App.tsx render.yaml
+printf '%s\n' AGENTS.md docs/AI-HANDOFF.md README.md src/index.ts src/hikvision-profiles.ts apps/web/src/App.tsx
 printf '\n-- tracked files changed by the current branch versus origin/main --\n'
 git fetch --quiet origin main 2>/dev/null || true
 git diff --stat origin/main...HEAD 2>/dev/null || true

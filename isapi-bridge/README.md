@@ -5,10 +5,7 @@ The ISAPI bridge is a small Node.js agent that runs on the same LAN as Hikvision
 1. **Applies card/visitor operations** — polls the Worker for pending card/visitor operations (created when facility fees expire, cards are issued, etc.) and applies them to the physical device via Hikvision ISAPI (HTTP Digest).
 2. **Streams real-time access events** — holds one persistent `GET /ISAPI/Event/notification/alertStream` connection per device and forwards every swipe/alarm to the Worker in small batches, giving Gate activity latency of a few seconds without relying on the terminal's HTTP Listening push.
 
-It is an alternative to:
-- **Direct HTTP Listening** (event upload only, no command return path)
-- **Dedicated ISUP gateway** (requires official Hikvision SDK, Linux appliance)
-- **Manual sync** (operator applies from hardware-action queue)
+It replaced and removed the former transports — direct HTTP Listening, the Render free relay, Hikvision cloud/OpenAPI and the dedicated ISUP SDK gateway (migration `0013_agent_only_transports.sql`). `manual_sync` remains as the auditable fallback for devices not linked to an agent.
 
 ISAPI bridge uses the device's documented ISAPI endpoints (`/ISAPI/AccessControl/CardInfo/...`, `/ISAPI/Event/notification/alertStream`) which are available on most K1T, K26xx, K27xx/K28xx controllers when accessed from the LAN. It does **not** require the proprietary SDK.
 
@@ -87,7 +84,7 @@ Per-device `"eventStream": false` in `isapi-devices.json` disables streaming for
 - Run the downloaded `.sh` script (creates `/opt/estatemate/isapi-agent/agent-config.json` 0600).
 - Edit `/opt/estatemate/isapi-agent/isapi-devices.json`.
 - `npm install` (Node 22+) and run `node agent.mjs --config /opt/estatemate/isapi-agent/agent-config.json`.
-- For systemd, create a service similar to `isup-gateway/estatemate-isup-adapter.service`.
+- For systemd, create a small unit that runs `node agent.mjs --config /opt/estatemate/isapi-agent/agent-config.json` with `Restart=always`.
 
 ### 3. Link devices to agent
 
@@ -123,7 +120,7 @@ curl -i http://192.168.1.100/ISAPI/System/deviceInfo --digest -u admin:password
 ## Troubleshooting
 
 - **401 Unauthorized**: Check ISAPI username/password, device allows digest auth, IP not blocked.
-- **No operations**: Device not linked to agent, or connection pattern still `manual_sync` / `direct_http_listener`. Change to `isapi_bridge` / `windows_agent`.
+- **No operations**: Device not linked to agent, or connection pattern still `manual_sync`. Set it to `isapi_bridge` / `windows_agent` and link it.
 - **Operation stuck in sent**: Agent not reporting result. Check agent logs, network to Cloudflare, secret.
 - **Card not opening door**: Card added but not assigned to access group / door. Some models require separate Person + Card + Access Group linking. This bridge currently does simple card add; for full person management, extend `applyCardOperation` to create Person first (`/ISAPI/AccessControl/UserInfo/Record`).
 

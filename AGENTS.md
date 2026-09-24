@@ -14,6 +14,8 @@ This file is the starting point for any AI coding agent continuing EstateMate in
 
 Run `./scripts/ai-context.sh` to print a safe repository summary.
 
+Retired transports: direct HTTP Listening, the Render free relay, Hikvision cloud/OpenAPI and the dedicated ISUP gateway were removed (migration `0013_agent_only_transports.sql` deleted `bridge/`, `render.yaml` and `isup-gateway/`). Devices previously on those transports were migrated to `manual_sync`; link them to an agent to make them automatic again. Do not recreate those endpoints or packages.
+
 ## Architecture
 
 - Cloudflare Worker/Hono API: `src/index.ts`
@@ -22,8 +24,7 @@ Run `./scripts/ai-context.sh` to print a safe repository summary.
 - Android/Compose client: `apps/android/`
 - Access-device event normalisation: `src/hikvision.ts` and `src/hikvision-profiles.ts`
 - Private GitHub upload storage: `src/github-storage.ts`
-- Optional stateless Render HTTPS relay: `bridge/` and `render.yaml`
-- Dedicated local-appliance/off-site official-SDK ISUP gateway package: `isup-gateway/`
+- The only access-device transport: `isapi-bridge/` agent (+ `windows-agent/` Windows Service wrapper)
 - CI deployment: `.github/workflows/deploy.yml`
 
 ## Non-negotiable project rules
@@ -35,10 +36,9 @@ Run `./scripts/ai-context.sh` to print a safe repository summary.
 - Each property has one active legal owner. Tenancy never changes ownership.
 - Preserve ownership, tenancy, billing, card, visitor and access-event history.
 - Default visitor gate policy is preview first, then Admin/Security accepts or rejects.
-- Direct HTTP Listening, the Render relay, and the ISAPI bridge agent's alertStream streaming are event-upload paths, not command channels.
-- Render Free cannot be made into public raw ISUP/TCP by a keep-alive script; use `isup-gateway/` on a small LAN appliance or another eligible TCP-capable host.
-- The ISUP host/control package is not a functioning protocol engine until compiled with the licensed official SDK for the exact architecture/model/firmware.
-- Never claim a model supports QR, HTTP Listening, ISUP or remote commands without model/firmware evidence.
+- There is exactly one automatic device transport: the EstateMate agent (`isapi_bridge`/`windows_agent`/`isapi_windows_agent`). Do not reintroduce direct device-to-Cloudflare paths (HTTP Listening, Render relay, cloud/OpenAPI, ISUP gateway were removed in migration 0013).
+- The agent's alertStream streaming is an event-upload path; card/visitor commands always flow agent-side via operation polling and ISAPI Digest.
+- Never claim a model supports QR, alertStream, ISAPI card APIs or remote commands without model/firmware evidence.
 - DS-K1T808MFWX-B is card/fingerprint/PIN oriented; DS-K2802 is a controller and needs a reader.
 - Soft-delete access devices so historical events retain referential integrity.
 

@@ -1,9 +1,0 @@
-{
-  "devices": [
-    {
-      "sdkDeviceId": "device-id-configured-on-the-hikvision-terminal",
-      "localDeviceId": "main-gate-terminal",
-      "isupKey": "replace-with-a-strong-unique-isup-key"
-    }
-  ]
-}

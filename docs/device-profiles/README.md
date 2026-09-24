@@ -1,6 +1,6 @@
 # Device profiles
 
-Add one Markdown file per tested model and firmware build. Include exact UI labels, HTTP Listening authentication, example redacted payloads, access minor-code mappings, offline retry behavior, certificate behavior, time-zone behavior, and whether a verified remote command channel exists.
+Add one Markdown file per tested model and firmware build. Include exact UI labels, ISAPI alertStream availability and payload shape, example redacted payloads, access minor-code mappings, offline retry behavior, certificate behavior, time-zone behavior, and whether the ISAPI card command APIs work on the firmware.
 
 Naming example:
 

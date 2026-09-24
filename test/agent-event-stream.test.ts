@@ -189,40 +189,6 @@ describe('Agent event streaming and queue batching', () => {
     expect(res.status).toBe(409);
   });
 
-  it('sends one batched queue message for a multi-event direct device post', async () => {
-    const deviceRes = await call(env, 'POST', '/api/access/devices', {
-      token: adminToken,
-      body: { name: 'Side Gate', gateName: 'Side Gate', direction: 'both', model: 'DS-K1T808MFWX-B' },
-    });
-    const { id: deviceId, username, secret } = deviceRes.json as { id: string; username: string; secret: string };
-    const body = [
-      `--bnd`,
-      `Content-Type: application/json`,
-      ``,
-      eventDocument('12345678'),
-      `--bnd`,
-      `Content-Type: application/json`,
-      ``,
-      eventDocument('87654321'),
-      `--bnd--`,
-      ``,
-    ].join('\r\n');
-    const request = new Request(`https://estatemate.test/api/hikvision/v1/events/${deviceId}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'multipart/mixed; boundary=bnd',
-        Authorization: `Basic ${btoa(`${username}:${secret}`)}`,
-      },
-      body,
-    });
-    const response = await worker.fetch(request, env, { waitUntil: async () => undefined, passThroughOnException: () => undefined } as unknown as ExecutionContext);
-    expect(response.status).toBe(200);
-    const sends = queueSendsOf(env);
-    expect(sends.length).toBe(1);
-    expect(sends[0]!.kind).toBe('send');
-    expect((sends[0]!.body as { batch: unknown[] }).batch.length).toBe(2);
-  });
-
   it('hourly schedule prunes events older than the retention setting', async () => {
     const deviceRes = await call(env, 'POST', '/api/access/devices', {
       token: adminToken,

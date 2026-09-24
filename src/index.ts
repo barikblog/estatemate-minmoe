@@ -5,7 +5,7 @@ import type { CsvTable } from './csv';
 import { DEFAULT_ESTATE_TIMEZONE, normalizeTimeZone, parseEstateInstantMs } from './datetime';
 import { AccessLiveFeed } from './live-feed';
 import { evaluateVisitorPass } from './visitor-pass';
-import { extractEventDocuments, normalizeHikvisionDocument } from './hikvision';
+import { normalizeHikvisionDocument } from './hikvision';
 import { HIKVISION_PROFILES, getHikvisionProfile, isConnectionSupported, resolveHikvisionProfile } from './hikvision-profiles';
 import {
   MAX_GITHUB_FILE_SIZE,
@@ -252,7 +252,7 @@ const PORTAL_SETTING_KEYS = [
   'portal_name','estate_name','portal_short_name','portal_tagline','portal_welcome_text','theme_mode',
   'theme_primary_color','theme_accent_color','theme_navigation_color','theme_surface_color','theme_corner_style',
   'support_email','support_phone','estate_timezone','currency','visitor_default_duration_hours',
-  'visitor_gate_policy','visitor_credential_format','card_scan_timeout_minutes','render_bridge_url',
+  'visitor_gate_policy','visitor_credential_format','card_scan_timeout_minutes',
 ] as const;
 
 /**
@@ -2269,7 +2269,6 @@ app.get('/api/access/profiles', requireRoles('admin','manager','security'), (c) 
     authenticationMethods: profile.authenticationMethods,
     supportedConnections: profile.supportedConnections,
     defaultConnection: profile.defaultConnection,
-    httpListener: profile.httpListener,
     visitorCredentials: {
       qr: profile.authenticationMethods.includes('QR'),
       pin: profile.authenticationMethods.includes('PIN'),
@@ -2289,9 +2288,7 @@ app.get('/api/access/device-options', async (c) => {
 
 app.get('/api/access/devices', requireRoles('admin','manager','security'), async (c) => {
   const devices = await c.env.DB.prepare(
-    `SELECT d.id,d.name,d.vendor,d.serial_number,d.model,d.firmware,d.mac_address,d.gate_name,d.direction,d.integration_mode,d.status,d.last_seen_at,d.profile_key,d.connection_pattern,d.listener_format,d.profile_config_json,d.capabilities_json,d.hikconnect_server_address,d.hikconnect_device_serial,
-      CASE WHEN d.hikconnect_verification_code_ciphertext IS NULL THEN 0 ELSE 1 END AS hikconnect_verification_code_configured,
-      CASE WHEN d.sync_agent_secret_hash IS NULL THEN 0 ELSE 1 END AS sync_agent_configured,d.sync_agent_generated_at,
+    `SELECT d.id,d.name,d.vendor,d.serial_number,d.model,d.firmware,d.mac_address,d.gate_name,d.direction,d.integration_mode,d.status,d.last_seen_at,d.profile_key,d.connection_pattern,d.profile_config_json,d.capabilities_json,
       d.isapi_agent_id,d.isapi_sync_enabled,d.last_isapi_sync_at,d.last_isapi_sync_status,d.isapi_host,d.isapi_port,d.isapi_username,
       CASE WHEN d.isapi_password_ciphertext IS NULL THEN 0 ELSE 1 END AS isapi_password_configured,d.isapi_protocol,
       d.created_at,d.updated_at,
@@ -2315,10 +2312,6 @@ app.post('/api/access/devices', requireRoles('admin','manager'), async (c) => {
     direction?: 'entry'|'exit'|'both';
     profileKey?: string;
     connectionPattern?: string;
-    listenerFormat?: 'auto'|'json'|'xml'|'multipart';
-    hikconnectServerAddress?:string;
-    hikconnectDeviceSerial?:string;
-    hikconnectVerificationCode?:string;
   }>();
   if (!body.name?.trim() || !body.gateName?.trim() || !body.direction) return jsonError(c, 400, 'name, gateName and direction are required');
   const profile = resolveHikvisionProfile(body.model, body.profileKey ?? 'auto');
@@ -2326,87 +2319,50 @@ app.post('/api/access/devices', requireRoles('admin','manager'), async (c) => {
   if (!isConnectionSupported(profile, connectionPattern)) {
     return jsonError(c, 400, `${profile.label} does not offer ${connectionPattern} as a supported connection option`);
   }
-  const listenerFormat = body.listenerFormat ?? 'auto';
-  if (!['auto','json','xml','multipart'].includes(listenerFormat)) return jsonError(c, 400, 'Invalid listenerFormat');
-  const hikconnectServerAddress=body.hikconnectServerAddress?.trim() || null;
-  const hikconnectDeviceSerial=body.hikconnectDeviceSerial?.trim() || body.serialNumber?.trim() || null;
-  const verificationCode=body.hikconnectVerificationCode?.trim() || null;
-  if (hikconnectServerAddress && (hikconnectServerAddress.length>255 || /\s/.test(hikconnectServerAddress))) return jsonError(c,400,'Hik-Connect access server must be a hostname or IP address without spaces');
-  if (verificationCode && !/^[A-Za-z0-9_-]{6,32}$/.test(verificationCode)) return jsonError(c,400,'Hik-Connect verification code must contain 6–32 letters, numbers, underscores or hyphens');
-  const encryptedVerification=verificationCode?await encryptSecret(encryptionKey(c.env),verificationCode):null;
-  const legacyMode = ['direct_http_listener','render_http_bridge'].includes(connectionPattern) ? 'http_listener' : ['offsite_isup_gateway','isapi_bridge','windows_agent','isapi_windows_agent'].includes(connectionPattern) ? 'isup_bridge' : 'manual';
+  const legacyMode = ['isapi_bridge','windows_agent','isapi_windows_agent'].includes(connectionPattern) ? 'isup_bridge' : 'manual';
   const id = crypto.randomUUID();
   const pointId = crypto.randomUUID();
-  const credentialId = crypto.randomUUID();
-  const username = `device-${id.slice(0,8)}`;
-  const secret = randomToken(32);
-  const keyHash = await sha256(`${secret}:${c.env.DEVICE_INGEST_PEPPER}`);
   await c.env.DB.batch([
     c.env.DB.prepare(
-      `INSERT INTO hikvision_devices(id,name,vendor,serial_number,model,firmware,gate_name,direction,integration_mode,profile_key,connection_pattern,listener_format,capabilities_json,hikconnect_server_address,hikconnect_device_serial,hikconnect_verification_code_ciphertext,hikconnect_verification_code_iv)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO hikvision_devices(id,name,vendor,serial_number,model,firmware,gate_name,direction,integration_mode,profile_key,connection_pattern,listener_format,capabilities_json)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,'auto',?)`,
     ).bind(
       id,body.name.trim(),body.vendor?.trim() || 'Hikvision',body.serialNumber?.trim() || null,body.model?.trim() || null,
-      body.firmware?.trim() || null,body.gateName.trim(),body.direction,legacyMode,profile.key,connectionPattern,listenerFormat,
+      body.firmware?.trim() || null,body.gateName.trim(),body.direction,legacyMode,profile.key,connectionPattern,
       JSON.stringify({ authenticationMethods:profile.authenticationMethods,devicePattern:profile.devicePattern }),
-      hikconnectServerAddress,hikconnectDeviceSerial,encryptedVerification?.ciphertext ?? null,encryptedVerification?.iv ?? null,
     ),
     c.env.DB.prepare(`INSERT INTO access_points(id,name,gate_name,direction,device_id) VALUES (?,?,?,?,?)`).bind(pointId, `${body.gateName.trim()} ${body.direction === 'both' ? 'Entry' : body.direction}`, body.gateName.trim(), body.direction === 'exit' ? 'exit' : 'entry', id),
-    c.env.DB.prepare(`INSERT INTO device_credentials(id,device_id,username,api_key_hash) VALUES (?,?,?,?)`).bind(credentialId, id, username, keyHash),
   ]);
-  const workerEndpoint = `${new URL(c.req.url).origin}/api/hikvision/v1/events/${id}?key=${encodeURIComponent(secret)}`;
-  const bridgeSetting = await c.env.DB.prepare(`SELECT value FROM settings WHERE key='render_bridge_url'`).first<{ value:string }>();
-  const bridgeOrigin=bridgeSetting?.value?.replace(/\/$/,'') ?? '';
-  const endpoint = connectionPattern==='render_http_bridge' && bridgeOrigin ? `${bridgeOrigin}/v1/events/${id}?key=${encodeURIComponent(secret)}` : workerEndpoint;
   await audit(c, 'create', 'hikvision_device', id, { vendor:body.vendor,model: body.model, firmware: body.firmware, profileKey: profile.key, connectionPattern });
-  const warning = connectionPattern === 'render_http_bridge'
-    ? (bridgeOrigin ? 'Render free relay selected. It forwards HTTPS events only, can sleep after 15 idle minutes, and does not provide ISUP/TCP or automatic hardware commands.' : 'Set the Render bridge URL in Portal customisation before configuring this device; use the Worker endpoint until then.')
-    : connectionPattern === 'direct_http_listener'
-    ? 'The secret is shown once. Direct HTTP Listening uploads events only; card commands still need a verified return channel.'
-    : connectionPattern === 'manual_sync'
-      ? 'No automatic device transport is enabled. Use the hardware action queue and acknowledge each applied change.'
-      : ['isapi_bridge','windows_agent','isapi_windows_agent'].includes(connectionPattern)
-        ? 'ISAPI bridge / Windows agent selected. Install the Windows agent on the device LAN, configure ISAPI host/credentials, and link this device to the agent. Card operations will be polled and applied via ISAPI.'
-        : 'Complete the selected gateway/cloud integration before marking hardware operations as applied.';
+  const warning = connectionPattern === 'manual_sync'
+    ? 'No automatic device transport is enabled. Use the hardware action queue and acknowledge each applied change.'
+    : 'Next: register or select an agent in "ISAPI Bridge & Windows Agent", link this device with its LAN ISAPI address and credentials, then run the agent on the device LAN. The agent streams events in real time and applies card operations automatically.';
   return c.json({
     id,
-    username,
-    secret,
-    endpoint,
-    workerEndpoint,
-    profile: { key: profile.key, label: profile.label, httpListener: profile.httpListener },
+    profile: { key: profile.key, label: profile.label },
     connectionPattern,
-    hikconnect:{ serverAddress:hikconnectServerAddress,deviceSerial:hikconnectDeviceSerial,verificationCodeConfigured:Boolean(verificationCode) },
     warning,
   }, 201);
 });
 
 app.patch('/api/access/devices/:id', requireRoles('admin','manager'), async (c) => {
-  const body=await c.req.json<{ name?:string;vendor?:string;serialNumber?:string;model?:string;firmware?:string;gateName?:string;direction?:'entry'|'exit'|'both';profileKey?:string;connectionPattern?:string;listenerFormat?:'auto'|'json'|'xml'|'multipart';status?:'pending'|'online'|'offline'|'disabled';hikconnectServerAddress?:string;hikconnectDeviceSerial?:string;hikconnectVerificationCode?:string }>();
+  const body=await c.req.json<{ name?:string;vendor?:string;serialNumber?:string;model?:string;firmware?:string;gateName?:string;direction?:'entry'|'exit'|'both';profileKey?:string;connectionPattern?:string;status?:'pending'|'online'|'offline'|'disabled' }>();
   if (!body.name?.trim() || !body.gateName?.trim() || !body.direction) return jsonError(c,400,'name, gateName and direction are required');
   const existing=await c.env.DB.prepare(`SELECT id FROM hikvision_devices WHERE id=? AND deleted_at IS NULL`).bind(c.req.param('id')).first();
   if (!existing) return jsonError(c,404,'Access-control device not found');
   const profile=resolveHikvisionProfile(body.model,body.profileKey ?? 'auto');
   const connectionPattern=body.connectionPattern || profile.defaultConnection;
   if (!isConnectionSupported(profile,connectionPattern)) return jsonError(c,400,`${profile.label} does not offer ${connectionPattern} as a supported connection option`);
-  const listenerFormat=body.listenerFormat ?? 'auto';
-  if (!['auto','json','xml','multipart'].includes(listenerFormat)) return jsonError(c,400,'Invalid listenerFormat');
-  const hikconnectServerAddress=body.hikconnectServerAddress?.trim() || null;const hikconnectDeviceSerial=body.hikconnectDeviceSerial?.trim() || body.serialNumber?.trim() || null;
-  const verificationCode=body.hikconnectVerificationCode?.trim() || null;
-  if (hikconnectServerAddress && (hikconnectServerAddress.length>255 || /\s/.test(hikconnectServerAddress))) return jsonError(c,400,'Hik-Connect access server must be a hostname or IP address without spaces');
-  if (verificationCode && !/^[A-Za-z0-9_-]{6,32}$/.test(verificationCode)) return jsonError(c,400,'Hik-Connect verification code must contain 6–32 letters, numbers, underscores or hyphens');
-  const encryptedVerification=verificationCode?await encryptSecret(encryptionKey(c.env),verificationCode):null;
   const status=body.status ?? 'offline';
-  const legacyMode=['direct_http_listener','render_http_bridge'].includes(connectionPattern)?'http_listener':['offsite_isup_gateway','isapi_bridge','windows_agent','isapi_windows_agent'].includes(connectionPattern)?'isup_bridge':'manual';
+  const legacyMode=['isapi_bridge','windows_agent','isapi_windows_agent'].includes(connectionPattern)?'isup_bridge':'manual';
   await c.env.DB.batch([
     c.env.DB.prepare(
-      `UPDATE hikvision_devices SET name=?,vendor=?,serial_number=?,model=?,firmware=?,gate_name=?,direction=?,integration_mode=?,profile_key=?,connection_pattern=?,listener_format=?,status=?,capabilities_json=?,hikconnect_server_address=?,hikconnect_device_serial=?,hikconnect_verification_code_ciphertext=COALESCE(?,hikconnect_verification_code_ciphertext),hikconnect_verification_code_iv=COALESCE(?,hikconnect_verification_code_iv),updated_at=datetime('now') WHERE id=?`,
-    ).bind(body.name.trim(),body.vendor?.trim() || 'Hikvision',body.serialNumber?.trim() || null,body.model?.trim() || null,body.firmware?.trim() || null,body.gateName.trim(),body.direction,legacyMode,profile.key,connectionPattern,listenerFormat,status,JSON.stringify({ authenticationMethods:profile.authenticationMethods,devicePattern:profile.devicePattern }),hikconnectServerAddress,hikconnectDeviceSerial,encryptedVerification?.ciphertext ?? null,encryptedVerification?.iv ?? null,c.req.param('id')),
+      `UPDATE hikvision_devices SET name=?,vendor=?,serial_number=?,model=?,firmware=?,gate_name=?,direction=?,integration_mode=?,profile_key=?,connection_pattern=?,status=?,capabilities_json=?,updated_at=datetime('now') WHERE id=?`,
+    ).bind(body.name.trim(),body.vendor?.trim() || 'Hikvision',body.serialNumber?.trim() || null,body.model?.trim() || null,body.firmware?.trim() || null,body.gateName.trim(),body.direction,legacyMode,profile.key,connectionPattern,status,JSON.stringify({ authenticationMethods:profile.authenticationMethods,devicePattern:profile.devicePattern }),c.req.param('id')),
     c.env.DB.prepare(`UPDATE access_points SET name=?,gate_name=?,direction=?,updated_at=datetime('now') WHERE device_id=?`).bind(`${body.gateName.trim()} ${body.direction==='both'?'Entry':body.direction}`,body.gateName.trim(),body.direction==='exit'?'exit':'entry',c.req.param('id')),
   ]);
-  const { hikconnectVerificationCode:_,...safeBody }=body;
-  await audit(c,'update','access_device',c.req.param('id'),{ ...safeBody,verificationCodeUpdated:Boolean(verificationCode),profileKey:profile.key,connectionPattern });
-  return c.json({ ok:true,profile:{ key:profile.key,label:profile.label },verificationCodeConfigured:Boolean(verificationCode) });
+  await audit(c,'update','access_device',c.req.param('id'),{ ...body,profileKey:profile.key,connectionPattern });
+  return c.json({ ok:true,profile:{ key:profile.key,label:profile.label } });
 });
 
 app.delete('/api/access/devices/:id', requireRoles('admin','manager'), async (c) => {
@@ -2422,60 +2378,6 @@ app.delete('/api/access/devices/:id', requireRoles('admin','manager'), async (c)
   return c.json({ ok:true,historyPreserved:true });
 });
 
-app.post('/api/access/devices/:id/site-sync-installer', requireRoles('admin','manager'), async (c) => {
-  const device=await c.env.DB.prepare(
-    `SELECT id,name,serial_number,connection_pattern,hikconnect_server_address,hikconnect_device_serial,hikconnect_verification_code_ciphertext,hikconnect_verification_code_iv FROM hikvision_devices WHERE id=? AND deleted_at IS NULL`,
-  ).bind(c.req.param('id')).first<{ id:string;name:string;serial_number:string|null;connection_pattern:string;hikconnect_server_address:string|null;hikconnect_device_serial:string|null;hikconnect_verification_code_ciphertext:string|null;hikconnect_verification_code_iv:string|null }>();
-  if(!device)return jsonError(c,404,'Access-control device not found');
-  if(device.connection_pattern!=='offsite_isup_gateway')return jsonError(c,409,'Select Dedicated ISUP gateway for this device before generating the site synchronizer');
-  let verificationCode:string|null=null;
-  if(device.hikconnect_verification_code_ciphertext && device.hikconnect_verification_code_iv) {
-    try { verificationCode=await decryptSecret(encryptionKey(c.env),device.hikconnect_verification_code_ciphertext,device.hikconnect_verification_code_iv); }
-    catch { return jsonError(c,500,'Stored Hik-Connect verification code could not be decrypted'); }
-  }
-  const syncSecret=randomToken(32);const syncHash=await sha256(`${syncSecret}:${c.env.DEVICE_INGEST_PEPPER}`);
-  await c.env.DB.prepare(`UPDATE hikvision_devices SET sync_agent_secret_hash=?,sync_agent_generated_at=datetime('now'),updated_at=datetime('now') WHERE id=?`).bind(syncHash,device.id).run();
-  const origin=new URL(c.req.url).origin;const localDeviceId=(device.hikconnect_device_serial || device.serial_number || `device-${device.id.slice(0,8)}`).replace(/[^A-Za-z0-9._-]/g,'-').slice(0,80);
-  const deviceConfig=JSON.stringify({ devices:[{ localDeviceId,estateMateDeviceId:device.id,deviceKey:syncSecret }] },null,2);
-  const hikconnectProfile=JSON.stringify({ deviceName:device.name,deviceSerial:device.hikconnect_device_serial || device.serial_number || '',accessServer:device.hikconnect_server_address || '',verificationCode:verificationCode || '',note:'Hik-Connect details do not replace licensed ISUP/OpenAPI integration. Keep this root-only file private.' },null,2);
-  const script=`#!/usr/bin/env bash
-set -euo pipefail
-if [[ \${EUID} -ne 0 ]]; then echo "Run with sudo: sudo bash $0" >&2; exit 1; fi
-apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y git ca-certificates
-workdir="$(mktemp -d)"
-trap 'rm -rf "$workdir"' EXIT
-git clone --depth 1 https://github.com/barikblog/estatemate-minmoe.git "$workdir/estatemate"
-bash "$workdir/estatemate/isup-gateway/install-ubuntu.sh" install
-cat > /etc/estatemate/isup-devices.json <<'ESTATEMATE_DEVICE_CONFIG'
-${deviceConfig}
-ESTATEMATE_DEVICE_CONFIG
-cat > /etc/estatemate/hikconnect-device.json <<'ESTATEMATE_HIKCONNECT_CONFIG'
-${hikconnectProfile}
-ESTATEMATE_HIKCONNECT_CONFIG
-sed -i 's#^ESTATEMATE_WORKER_URL=.*#ESTATEMATE_WORKER_URL=${origin}#' /etc/estatemate/isup-gateway.env
-chmod 0600 /etc/estatemate/isup-devices.json /etc/estatemate/hikconnect-device.json /etc/estatemate/isup-gateway.env
-echo
-printf '%s\n' 'EstateMate site synchronization control plane installed.'
-printf '%s\n' 'Next: install the licensed Hikvision SDK adapter, configure /etc/estatemate/isup-adapter.json, then run:'
-printf '%s\n' '  sudo /opt/estatemate-isup-control/install-ubuntu.sh start'
-printf '%s\n' 'Do not expose the loopback control API or the Hik-Connect verification code.'
-`;
-  await audit(c,'generate_site_sync_installer','access_device',device.id,{ localDeviceId,serverAddressConfigured:Boolean(device.hikconnect_server_address),verificationCodeIncluded:Boolean(verificationCode) });
-  return new Response(script,{ status:200,headers:{ 'Content-Type':'text/x-shellscript; charset=utf-8','Content-Disposition':`attachment; filename="estatemate-site-sync-${device.id.slice(0,8)}.sh"`,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff' } });
-});
-
-app.post('/api/access/devices/:id/rotate-secret', requireRoles('admin'), async (c) => {
-  const device=await c.env.DB.prepare(`SELECT id,connection_pattern FROM hikvision_devices WHERE id=? AND deleted_at IS NULL`).bind(c.req.param('id')).first<{ id:string;connection_pattern:string }>();
-  if (!device) return jsonError(c,404,'Access-control device not found');
-  const secret=randomToken(32); const keyHash=await sha256(`${secret}:${c.env.DEVICE_INGEST_PEPPER}`);
-  await c.env.DB.prepare(`UPDATE device_credentials SET api_key_hash=?,revoked_at=NULL WHERE device_id=?`).bind(keyHash,device.id).run();
-  const workerEndpoint=`${new URL(c.req.url).origin}/api/hikvision/v1/events/${device.id}?key=${encodeURIComponent(secret)}`;
-  const bridge=await c.env.DB.prepare(`SELECT value FROM settings WHERE key='render_bridge_url'`).first<{ value:string }>();
-  const endpoint=device.connection_pattern==='render_http_bridge' && bridge?.value ? `${bridge.value.replace(/\/$/,'')}/v1/events/${device.id}?key=${encodeURIComponent(secret)}`:workerEndpoint;
-  await audit(c,'rotate_secret','access_device',device.id);
-  return c.json({ secret,endpoint,workerEndpoint,warning:'Shown once. Update the physical device immediately; the previous secret no longer works.' });
-});
 
 app.get('/api/access/operations', requireRoles('admin','manager'), async (c) => {
   const { limit, offset, page: pageNumber } = page(c);
@@ -2909,7 +2811,6 @@ app.put('/api/portal-config', requireRoles('admin'), async (c) => {
     if (key === 'theme_mode' && !['light','dark','system'].includes(value)) return jsonError(c,400,'theme_mode must be light, dark or system');
     if (key === 'theme_corner_style' && !['compact','comfortable','rounded'].includes(value)) return jsonError(c,400,'Invalid corner style');
     if (key === 'visitor_gate_policy' && value !== 'security_approval') return jsonError(c,400,'Security approval is the configured visitor gate policy');
-    if (key === 'render_bridge_url' && value && !/^https:\/\/[A-Za-z0-9.-]+\/?$/.test(value)) return jsonError(c,400,'Render bridge URL must be an HTTPS origin');
     if (['visitor_default_duration_hours','card_scan_timeout_minutes'].includes(key) && (!/^\d{1,3}$/.test(value) || Number(value)<1)) return jsonError(c,400,`${key} must be a positive number`);
   }
   await c.env.DB.batch(entries.map(([key,value]) => c.env.DB.prepare(
@@ -2979,8 +2880,6 @@ async function reconcileBill(db: D1Database, billId: string): Promise<void> {
 }
 
 const PENDING_OPERATION_PATTERNS = [
-  'hikvision_cloud_openapi',
-  'offsite_isup_gateway',
   'isapi_bridge',
   'windows_agent',
   'isapi_windows_agent',
@@ -3007,39 +2906,6 @@ async function createDeviceOperations(
       `INSERT INTO device_operations(id,device_id,card_id,operation,payload_json,status) VALUES (?,?,?,?,?,?)`,
     ).bind(crypto.randomUUID(), device.id, cardId, operation, JSON.stringify(payload), status);
   }));
-}
-
-async function authenticateDevice(request: Request, env: Env, deviceId: string): Promise<DeviceIdentity | null> {
-  let username: string | null = null;
-  let secret: string | null = request.headers.get('X-EstateMate-Device-Key') ?? new URL(request.url).searchParams.get('key');
-  const authorization = request.headers.get('Authorization');
-  if (authorization?.startsWith('Basic ')) {
-    try {
-      const decoded = atob(authorization.slice(6));
-      const separator = decoded.indexOf(':');
-      username = decoded.slice(0, separator);
-      secret = decoded.slice(separator + 1);
-    } catch { return null; }
-  }
-  if (!secret) return null;
-  const credential = await env.DB.prepare(
-    `SELECT dc.username,dc.api_key_hash,d.sync_agent_secret_hash,d.id,d.name,d.direction,d.profile_key,d.connection_pattern,ap.id AS access_point_id
-     FROM device_credentials dc JOIN hikvision_devices d ON d.id=dc.device_id
-     LEFT JOIN access_points ap ON ap.device_id=d.id AND ap.enabled=1
-     WHERE d.id=? AND d.deleted_at IS NULL AND dc.revoked_at IS NULL AND (? IS NULL OR dc.username=?) LIMIT 1`,
-  ).bind(deviceId, username, username).first<Record<string, string | null>>();
-  if (!credential) return null;
-  const presentedHash=await sha256(`${secret}:${env.DEVICE_INGEST_PEPPER}`);
-  if (presentedHash!==credential.api_key_hash && presentedHash!==credential.sync_agent_secret_hash) return null;
-  return {
-    id: credential.id!,
-    name: credential.name!,
-    username: credential.username!,
-    direction: credential.direction as 'entry'|'exit'|'both',
-    accessPointId: credential.access_point_id ?? null,
-    profileKey: credential.profile_key ?? 'generic_isapi',
-    connectionPattern: credential.connection_pattern ?? 'direct_http_listener',
-  };
 }
 
 interface IsapiAgentIdentity {
@@ -3196,6 +3062,17 @@ async function handleIsapiAgentEvents(request: Request, env: Env, agentId: strin
   }, { headers: { 'Cache-Control': 'no-store' } });
 }
 
+type GatewayOperationKind = 'card'|'visitor';
+type GatewayOperationRow = {
+  id: string;
+  kind: GatewayOperationKind;
+  operation: string;
+  payload_json: string;
+  attempts: number;
+  created_at: string;
+  updated_at: string;
+};
+
 async function handleIsapiAgentOperations(request: Request, env: Env, agentId: string): Promise<Response> {
   if (request.method !== 'GET') return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET' } });
   const agent = await authenticateIsapiAgent(request, env, agentId);
@@ -3308,104 +3185,6 @@ async function handleIsapiAgentSyncLog(request: Request, env: Env, agentId: stri
     `INSERT INTO isapi_sync_logs(id,device_id,agent_id,operation_type,status,message,duration_ms) VALUES (?,?,?,?,?,?,?)`,
   ).bind(crypto.randomUUID(), body.deviceId, agentId, body.operationType, body.status, body.message?.slice(0,1000) || null, body.durationMs ?? null).run();
   return Response.json({ ok: true }, { headers: { 'Cache-Control': 'no-store' } });
-}
-
-async function handleDeviceEvent(request: Request, env: Env, deviceId: string): Promise<Response> {
-  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'POST' } });
-  const length = Number(request.headers.get('Content-Length') ?? 0);
-  if (length > DEVICE_BODY_LIMIT) return new Response('Payload too large', { status: 413 });
-  const device = await authenticateDevice(request, env, deviceId);
-  if (!device) return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Basic realm="EstateMate device ingest"' } });
-  const body = new Uint8Array(await request.arrayBuffer());
-  if (body.byteLength > DEVICE_BODY_LIMIT) return new Response('Payload too large', { status: 413 });
-  const documents = extractEventDocuments(body, request.headers.get('Content-Type') ?? 'application/octet-stream');
-  const events: NormalizedAccessEvent[] = [];
-  for (const document of documents) {
-    const event = await normalizeHikvisionDocument(document, device);
-    if (event) events.push(event);
-  }
-  if (events.length) await env.ACCESS_EVENTS.send(events.length === 1 ? events[0]! : { batch: events });
-  await env.DB.batch([
-    env.DB.prepare(`UPDATE hikvision_devices SET status='online',last_seen_at=datetime('now'),updated_at=datetime('now') WHERE id=?`).bind(device.id),
-    env.DB.prepare(`UPDATE device_credentials SET last_seen_at=datetime('now') WHERE device_id=? AND username=?`).bind(device.id, device.username),
-  ]);
-  // Hikvision retries when it does not receive 200. Keep this response small and immediate.
-  return Response.json({ ok: true, accepted: events.length });
-}
-
-type GatewayOperationKind = 'card'|'visitor';
-type GatewayOperationRow = {
-  id: string;
-  kind: GatewayOperationKind;
-  operation: string;
-  payload_json: string;
-  attempts: number;
-  created_at: string;
-  updated_at: string;
-};
-
-async function handleGatewayOperationList(request: Request, env: Env, deviceId: string): Promise<Response> {
-  if (request.method !== 'GET') return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET' } });
-  const device = await authenticateDevice(request, env, deviceId);
-  if (!device) return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Basic realm="EstateMate ISUP gateway"' } });
-  if (device.connectionPattern !== 'offsite_isup_gateway') {
-    return Response.json({ error: 'This device is not configured for the dedicated ISUP gateway' }, { status: 409 });
-  }
-  const requestedLimit = Number(new URL(request.url).searchParams.get('limit') ?? 20);
-  const limit = Math.min(50, Math.max(1, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : 20));
-  const result = await env.DB.prepare(
-    `SELECT * FROM (
-       SELECT id,'card' AS kind,operation,payload_json,attempts,created_at,updated_at
-       FROM device_operations
-       WHERE device_id=? AND (status='pending' OR (status='sent' AND updated_at<datetime('now','-2 minutes')))
-       UNION ALL
-       SELECT id,'visitor' AS kind,operation,payload_json,attempts,created_at,updated_at
-       FROM visitor_device_operations
-       WHERE device_id=? AND (status='pending' OR (status='sent' AND updated_at<datetime('now','-2 minutes')))
-     ) ORDER BY created_at LIMIT ?`,
-  ).bind(device.id, device.id, limit).all<GatewayOperationRow>();
-  let claimedOperations = result.results;
-  if (result.results.length) {
-    const claims = await env.DB.batch(result.results.map((operation) => env.DB.prepare(
-      operation.kind === 'card'
-        ? `UPDATE device_operations SET status='sent',attempts=attempts+1,updated_at=datetime('now') WHERE id=? AND device_id=? AND (status='pending' OR (status='sent' AND updated_at<datetime('now','-2 minutes')))`
-        : `UPDATE visitor_device_operations SET status='sent',attempts=attempts+1,updated_at=datetime('now') WHERE id=? AND device_id=? AND (status='pending' OR (status='sent' AND updated_at<datetime('now','-2 minutes')))`,
-    ).bind(operation.id, device.id)));
-    claimedOperations = result.results.filter((_, index) => Number(claims[index]?.meta.changes ?? 0) > 0);
-  }
-  return Response.json({
-    deviceId: device.id,
-    serverTime: new Date().toISOString(),
-    retryAfterSeconds: claimedOperations.length ? 1 : 5,
-    items: claimedOperations.map((operation) => {
-      let payload: unknown;
-      try { payload = JSON.parse(operation.payload_json); } catch { payload = {}; }
-      return { id:operation.id,kind:operation.kind,operation:operation.operation,payload,attempt:operation.attempts+1,createdAt:operation.created_at };
-    }),
-  }, { headers: { 'Cache-Control':'no-store' } });
-}
-
-async function handleGatewayOperationResult(request: Request, env: Env, deviceId: string, operationId: string): Promise<Response> {
-  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'POST' } });
-  const device = await authenticateDevice(request, env, deviceId);
-  if (!device) return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Basic realm="EstateMate ISUP gateway"' } });
-  if (device.connectionPattern !== 'offsite_isup_gateway') {
-    return Response.json({ error: 'This device is not configured for the dedicated ISUP gateway' }, { status: 409 });
-  }
-  let body: { kind?:GatewayOperationKind;status?:'applied'|'failed';errorMessage?:string };
-  try { body = await request.json(); }
-  catch { return Response.json({ error:'A JSON result body is required' }, { status:400 }); }
-  if (!body.kind || !['card','visitor'].includes(body.kind) || !body.status || !['applied','failed'].includes(body.status)) {
-    return Response.json({ error:'kind must be card or visitor and status must be applied or failed' }, { status:400 });
-  }
-  const errorMessage = body.status === 'failed' ? (body.errorMessage?.trim().slice(0,700) || 'ISUP adapter reported failure') : null;
-  const result = await env.DB.prepare(
-    body.kind === 'card'
-      ? `UPDATE device_operations SET status=?,error_message=?,updated_at=datetime('now') WHERE id=? AND device_id=? AND status IN ('pending','sent','failed')`
-      : `UPDATE visitor_device_operations SET status=?,error_message=?,updated_at=datetime('now') WHERE id=? AND device_id=? AND status IN ('pending','sent','failed')`,
-  ).bind(body.status,errorMessage,operationId,device.id).run();
-  if (!result.meta.changes) return Response.json({ error:'Gateway operation was not found or is already complete' }, { status:404 });
-  return Response.json({ ok:true,id:operationId,kind:body.kind,status:body.status }, { headers: { 'Cache-Control':'no-store' } });
 }
 
 async function consumeAccessEvents(batch: MessageBatch<AccessEventQueuePayload>, env: Env): Promise<void> {
@@ -3535,16 +3314,8 @@ async function enforceFacilityFees(env: Env): Promise<void> {
 export default {
   async fetch(request: Request, env: Env, executionCtx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    const eventMatch = /^\/api\/hikvision\/v1\/events\/([^/]+)$/.exec(url.pathname);
-    if (eventMatch?.[1]) return handleDeviceEvent(request, env, decodeURIComponent(eventMatch[1]));
-    const operationResultMatch = /^\/api\/hikvision\/v1\/operations\/([^/]+)\/([^/]+)\/result$/.exec(url.pathname);
-    if (operationResultMatch?.[1] && operationResultMatch[2]) {
-      return handleGatewayOperationResult(request, env, decodeURIComponent(operationResultMatch[1]), decodeURIComponent(operationResultMatch[2]));
-    }
-    const operationListMatch = /^\/api\/hikvision\/v1\/operations\/([^/]+)$/.exec(url.pathname);
-    if (operationListMatch?.[1]) return handleGatewayOperationList(request, env, decodeURIComponent(operationListMatch[1]));
 
-    // ISAPI bridge and Windows agent endpoints (machine-authenticated, no user session)
+    // ISAPI bridge and Windows agent endpoints (machine-authenticated, no user session).
     const isapiHeartbeat = /^\/api\/isapi\/v1\/agents\/([^/]+)\/heartbeat$/.exec(url.pathname);
     if (isapiHeartbeat?.[1]) return handleIsapiAgentHeartbeat(request, env, decodeURIComponent(isapiHeartbeat[1]));
     const isapiDevices = /^\/api\/isapi\/v1\/agents\/([^/]+)\/devices$/.exec(url.pathname);

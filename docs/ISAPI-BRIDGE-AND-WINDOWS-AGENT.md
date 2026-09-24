@@ -4,9 +4,8 @@ This document describes the new ISAPI bridge and Windows agent introduced in mig
 
 ## Problem
 
-- **Direct HTTP Listening** is event-upload only on most Hikvision firmware. Card add/disable commands cannot be sent back through the estate router.
-- **ISUP gateway** (`isup-gateway/`) requires official Hikvision SDK compiled for exact architecture/firmware and a Linux appliance.
-- **Manual sync** requires operator to apply each change in iVMS-4200 or device UI, then mark applied in EstateMate.
+- **Direct HTTP Listening, the Render relay, Hikvision cloud/OpenAPI and the dedicated ISUP gateway were removed** (migration `0013_agent_only_transports.sql`); the agent is the only automatic transport.
+- **Manual sync** requires an operator to apply each change in the device UI, then mark it applied in EstateMate.
 
 Many estates already have a Windows PC (CCTV, accounting) on same LAN as devices. They need automatic card provisioning without buying Linux hardware or SDK.
 

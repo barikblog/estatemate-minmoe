@@ -36,9 +36,9 @@ DS-K1T808MFWX-B ── alertStream (persistent ISAPI HTTP) ──▶ ISAPI bridg
   results. Facility-fee expiry auto-disable works automatically.
 - **Fallback event path:** if the agent host is down, configure the terminal's HTTP Listening
   (Network → Advanced → HTTP Listening) to the Worker per-device endpoint — firmware permitting.
-- **Upgrade path:** ISUP 5.0 is datasheet-documented; an off-site `isup-gateway/` host (e.g.,
-  Oracle Cloud Always Free VM) can take over bidirectional duty once the licensed SDK adapter is
-  compiled, removing the on-LAN agent entirely.
+- **Removed alternative:** the dedicated ISUP gateway transport (which could have used the
+  datasheet-documented ISUP 5.0 from an off-site host) was retired with migration
+  `0013_agent_only_transports.sql`; the agent is the supported path.
 
 ## On-site verification checklist (before production)
 
