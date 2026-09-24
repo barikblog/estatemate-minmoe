@@ -17,5 +17,9 @@ local.properties
 *.jks
 *.keystore
 captures/
+isup-gateway/isup-devices.json
+isup-gateway/isup-adapter.json
+isup-gateway/sdk/
+isup-gateway/vendor/
 
 *.tsbuildinfo

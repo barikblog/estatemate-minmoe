@@ -29,6 +29,7 @@ Included:
 - Kotlin/Compose Android foundation with encrypted token storage, Retrofit/Hilt, Room event cache, role dashboard, and gate history.
 - Private GitHub-backed upload/download storage with encrypted-at-rest repository access tokens, supporting proof on ownership/tenancy/household/visitor/maintenance/payment forms, access checks, and a 4 MB per-file limit. Paid R2 storage remains disabled.
 - Administrator-editable portal identity, theme colours, light/dark mode, support details, visitor defaults, scan timeout and optional Render relay URL.
+- An always-on Ubuntu ISUP gateway hosting/control package with authenticated event forwarding and card/visitor operation polling; the licensed official Hikvision SDK adapter must be supplied and compiled separately.
 - PBKDF2-SHA256 passwords and HS256 sessions implemented with Workers Web Crypto.
 - Tests for password/JWT code and Hikvision JSON/XML/multipart parsing.
 
@@ -39,7 +40,7 @@ Still model/account dependent:
 - Gemini enrichment, FCM delivery, large GitHub exports, and full accounting/reconciliation UI.
 - Android production signing, push configuration, and Play distribution.
 
-See [`docs/MINMOE-NO-PC.md`](docs/MINMOE-NO-PC.md) and [`docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md`](docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md) before installing a device. Property workflows are in [`docs/MULTI-PROPERTY-OWNERSHIP.md`](docs/MULTI-PROPERTY-OWNERSHIP.md) and [`docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md`](docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md). Proof uploads and theming are documented in [`docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md`](docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md). Private upload setup is in [`docs/GITHUB-STORAGE.md`](docs/GITHUB-STORAGE.md). AI agents should begin with [`AGENTS.md`](AGENTS.md).
+See [`docs/MINMOE-NO-PC.md`](docs/MINMOE-NO-PC.md), [`docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md`](docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md), and [`isup-gateway/README.md`](isup-gateway/README.md) before installing a device. Property workflows are in [`docs/MULTI-PROPERTY-OWNERSHIP.md`](docs/MULTI-PROPERTY-OWNERSHIP.md) and [`docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md`](docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md). Proof uploads and theming are documented in [`docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md`](docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md). Private upload setup is in [`docs/GITHUB-STORAGE.md`](docs/GITHUB-STORAGE.md). AI agents should begin with [`AGENTS.md`](AGENTS.md).
 
 ## Architecture
 
@@ -53,9 +54,10 @@ React portal / Android ── HTTPS REST ─────────────
                                                    ├── AccessLiveFeed Durable Object
                                                    └── hourly Cron
 
-Cloud-to-terminal card action
-  └── HTTP Listening mode: audit queue → authorized operator applies on device
-      Future verified mode: Hikvision cloud/OpenAPI or off-site ISUP command bridge
+Cloud-to-terminal card/visitor action
+  ├── HTTP Listening mode: audit queue → authorized operator applies on device
+  └── Off-site ISUP mode: Worker operation endpoint → Ubuntu control plane
+      → licensed official Hikvision SDK adapter → supported terminal/controller
 ```
 
 ## Supported Hikvision series profiles
@@ -82,7 +84,7 @@ Each profile carries model patterns, event-field aliases, grant/deny mappings, c
 - **Direct HTTP Listening:** outbound event upload, no assumed return command channel.
 - **Render free HTTPS relay:** optional stateless event forwarding for HTTP-capable devices; subject to free-tier sleep/cold starts and not an ISUP/TCP server.
 - **Hikvision cloud/OpenAPI:** pending adapter; enable only with approved API documentation and credentials.
-- **Off-site ISUP gateway:** bidirectional option hosted away from the estate, not on-site.
+- **Off-site ISUP gateway:** bidirectional option hosted away from the estate using `isup-gateway/`; it becomes operational only after compiling the wrapper against the licensed official SDK for the exact hardware/firmware.
 - **Manual synchronization:** event/audit platform with operator-applied hardware changes.
 
 The generic parser retains unknown values rather than inventing a grant result. Add firmware-specific evidence in `docs/device-profiles/` before marking a combination production-supported.
@@ -93,6 +95,7 @@ The generic parser retains unknown values rather than inventing a grant result. 
 apps/web/                  React + Vite portal
 apps/android/              Android Studio Kotlin/Compose project
 bridge/                    Optional stateless Render Free HTTPS event relay
+isup-gateway/               Always-on Ubuntu/official-SDK gateway host package
 src/                       Worker/API, parser, auth, Queue and Durable Object
 migrations/                Versioned D1 schema
 scripts/                    Setup and AI-continuation helpers

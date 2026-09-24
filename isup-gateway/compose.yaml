@@ -1,0 +1,27 @@
+services:
+  control-plane:
+    build: .
+    container_name: estatemate-isup-control
+    restart: always
+    network_mode: host
+    env_file:
+      - /etc/estatemate/isup-gateway.env
+    environment:
+      HOST: 127.0.0.1
+      PORT: 8788
+      ESTATEMATE_DEVICES_FILE: /run/estatemate/isup-devices.json
+    volumes:
+      - /etc/estatemate/isup-devices.json:/run/estatemate/isup-devices.json:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8788/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

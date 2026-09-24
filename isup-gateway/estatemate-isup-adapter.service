@@ -1,0 +1,26 @@
+[Unit]
+Description=EstateMate Hikvision ISUP SDK adapter
+Documentation=https://github.com/barikblog/estatemate-minmoe/tree/main/isup-gateway
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=estatemate-isup
+Group=estatemate-isup
+EnvironmentFile=/etc/estatemate/isup-gateway.env
+Environment=LD_LIBRARY_PATH=/opt/hikvision-isup/lib
+ExecStart=/opt/hikvision-isup/bin/estatemate-isup-adapter --bind ${ISUP_BIND_ADDRESS} --registration-port ${ISUP_REGISTRATION_PORT} --alarm-port ${ISUP_ALARM_PORT} --control-url ${ISUP_CONTROL_URL} --device-config /etc/estatemate/isup-adapter.json
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/estatemate-isup /var/log/estatemate-isup
+
+[Install]
+WantedBy=multi-user.target

@@ -24,6 +24,7 @@ Run `git log -1 --oneline` and check the latest GitHub Actions run before making
 - Editable, secret-rotatable and soft-deletable access-device inventory.
 - Profiles for MinMoe, QR K1T807/K1T502 variants, DS-K1T808MFWX-B, DS-K2600, DS-K2700/K2800 including DS-K2802, and a conservative vendor-neutral option.
 - Optional stateless Render Free HTTPS relay Blueprint; it is not an ISUP/TCP server.
+- Off-site Ubuntu ISUP host/control package with machine-authenticated event and operation APIs; the licensed official SDK adapter remains an external required build input.
 - Optional proof uploads linked to ownership, transfer, tenancy, household, visitor, maintenance and payment records.
 - Administrator-editable portal identity, theme and operational defaults.
 
@@ -49,13 +50,16 @@ It adds device inventory metadata/soft deletion, visitor credentials, scan sessi
   - visitor/card hardware-action queues;
   - proof metadata linking and reviewer listing.
 - The Render relay health endpoint and event forwarding to the Worker passed locally.
+- ISUP control-plane relay integration test passed for adapter authentication, event forwarding, operation polling and result forwarding.
+- Local Worker machine API E2E passed for wrong-key rejection, header-based device authentication, operation claim/application and event acceptance.
 - GitHub Actions run `35934290140` applied migration `0006` and deployed commit `d28a66b` successfully; production health, portal configuration, visitor, device/profile, operation and storage-settings reads passed afterward.
 - Android source from the previous tenancy phase remains uncompiled in this environment because JDK 17 and Android SDK are unavailable.
 
 ## Important hardware truth
 
 - Direct HTTP Listening is outbound event ingestion only unless the exact firmware documents a command return path.
-- Render Free can relay HTTP events but sleeps after inactivity and cannot accept arbitrary Hikvision ISUP TCP traffic.
+- Render Free can relay HTTP events but sleeps after inactivity and cannot accept arbitrary Hikvision ISUP TCP traffic. Do not add self-pinging to evade this limit.
+- `isup-gateway/` needs a public raw-TCP Ubuntu host and a native adapter compiled from the licensed official Hikvision SDK; the repository cannot honestly replace that SDK with a generic socket listener.
 - DS-K1T808MFWX-B documents card/fingerprint/PIN rather than an integrated QR reader.
 - DS-K2802 is a controller. QR requires a compatible attached reader.
 - QR access at a terminal requires both QR-capable hardware and credential provisioning. The EstateMate phone scanner works independently of terminal QR support.

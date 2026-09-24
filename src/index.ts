@@ -1905,7 +1905,7 @@ async function createDeviceOperations(
 
 async function authenticateDevice(request: Request, env: Env, deviceId: string): Promise<DeviceIdentity | null> {
   let username: string | null = null;
-  let secret: string | null = new URL(request.url).searchParams.get('key');
+  let secret: string | null = request.headers.get('X-EstateMate-Device-Key') ?? new URL(request.url).searchParams.get('key');
   const authorization = request.headers.get('Authorization');
   if (authorization?.startsWith('Basic ')) {
     try {
@@ -1956,6 +1956,81 @@ async function handleDeviceEvent(request: Request, env: Env, deviceId: string): 
   ]);
   // Hikvision retries when it does not receive 200. Keep this response small and immediate.
   return Response.json({ ok: true, accepted: events.length });
+}
+
+type GatewayOperationKind = 'card'|'visitor';
+type GatewayOperationRow = {
+  id: string;
+  kind: GatewayOperationKind;
+  operation: string;
+  payload_json: string;
+  attempts: number;
+  created_at: string;
+  updated_at: string;
+};
+
+async function handleGatewayOperationList(request: Request, env: Env, deviceId: string): Promise<Response> {
+  if (request.method !== 'GET') return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET' } });
+  const device = await authenticateDevice(request, env, deviceId);
+  if (!device) return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Basic realm="EstateMate ISUP gateway"' } });
+  if (device.connectionPattern !== 'offsite_isup_gateway') {
+    return Response.json({ error: 'This device is not configured for the off-site ISUP gateway' }, { status: 409 });
+  }
+  const requestedLimit = Number(new URL(request.url).searchParams.get('limit') ?? 20);
+  const limit = Math.min(50, Math.max(1, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : 20));
+  const result = await env.DB.prepare(
+    `SELECT * FROM (
+       SELECT id,'card' AS kind,operation,payload_json,attempts,created_at,updated_at
+       FROM device_operations
+       WHERE device_id=? AND (status='pending' OR (status='sent' AND updated_at<datetime('now','-2 minutes')))
+       UNION ALL
+       SELECT id,'visitor' AS kind,operation,payload_json,attempts,created_at,updated_at
+       FROM visitor_device_operations
+       WHERE device_id=? AND (status='pending' OR (status='sent' AND updated_at<datetime('now','-2 minutes')))
+     ) ORDER BY created_at LIMIT ?`,
+  ).bind(device.id, device.id, limit).all<GatewayOperationRow>();
+  let claimedOperations = result.results;
+  if (result.results.length) {
+    const claims = await env.DB.batch(result.results.map((operation) => env.DB.prepare(
+      operation.kind === 'card'
+        ? `UPDATE device_operations SET status='sent',attempts=attempts+1,updated_at=datetime('now') WHERE id=? AND device_id=? AND (status='pending' OR (status='sent' AND updated_at<datetime('now','-2 minutes')))`
+        : `UPDATE visitor_device_operations SET status='sent',attempts=attempts+1,updated_at=datetime('now') WHERE id=? AND device_id=? AND (status='pending' OR (status='sent' AND updated_at<datetime('now','-2 minutes')))`,
+    ).bind(operation.id, device.id)));
+    claimedOperations = result.results.filter((_, index) => Number(claims[index]?.meta.changes ?? 0) > 0);
+  }
+  return Response.json({
+    deviceId: device.id,
+    serverTime: new Date().toISOString(),
+    retryAfterSeconds: claimedOperations.length ? 1 : 5,
+    items: claimedOperations.map((operation) => {
+      let payload: unknown;
+      try { payload = JSON.parse(operation.payload_json); } catch { payload = {}; }
+      return { id:operation.id,kind:operation.kind,operation:operation.operation,payload,attempt:operation.attempts+1,createdAt:operation.created_at };
+    }),
+  }, { headers: { 'Cache-Control':'no-store' } });
+}
+
+async function handleGatewayOperationResult(request: Request, env: Env, deviceId: string, operationId: string): Promise<Response> {
+  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'POST' } });
+  const device = await authenticateDevice(request, env, deviceId);
+  if (!device) return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Basic realm="EstateMate ISUP gateway"' } });
+  if (device.connectionPattern !== 'offsite_isup_gateway') {
+    return Response.json({ error: 'This device is not configured for the off-site ISUP gateway' }, { status: 409 });
+  }
+  let body: { kind?:GatewayOperationKind;status?:'applied'|'failed';errorMessage?:string };
+  try { body = await request.json(); }
+  catch { return Response.json({ error:'A JSON result body is required' }, { status:400 }); }
+  if (!body.kind || !['card','visitor'].includes(body.kind) || !body.status || !['applied','failed'].includes(body.status)) {
+    return Response.json({ error:'kind must be card or visitor and status must be applied or failed' }, { status:400 });
+  }
+  const errorMessage = body.status === 'failed' ? (body.errorMessage?.trim().slice(0,700) || 'ISUP adapter reported failure') : null;
+  const result = await env.DB.prepare(
+    body.kind === 'card'
+      ? `UPDATE device_operations SET status=?,error_message=?,updated_at=datetime('now') WHERE id=? AND device_id=? AND status IN ('pending','sent','failed')`
+      : `UPDATE visitor_device_operations SET status=?,error_message=?,updated_at=datetime('now') WHERE id=? AND device_id=? AND status IN ('pending','sent','failed')`,
+  ).bind(body.status,errorMessage,operationId,device.id).run();
+  if (!result.meta.changes) return Response.json({ error:'Gateway operation was not found or is already complete' }, { status:404 });
+  return Response.json({ ok:true,id:operationId,kind:body.kind,status:body.status }, { headers: { 'Cache-Control':'no-store' } });
 }
 
 async function consumeAccessEvents(batch: MessageBatch<NormalizedAccessEvent>, env: Env): Promise<void> {
@@ -2053,8 +2128,14 @@ async function enforceFacilityFees(env: Env): Promise<void> {
 export default {
   async fetch(request: Request, env: Env, executionCtx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    const match = /^\/api\/hikvision\/v1\/events\/([^/]+)$/.exec(url.pathname);
-    if (match?.[1]) return handleDeviceEvent(request, env, decodeURIComponent(match[1]));
+    const eventMatch = /^\/api\/hikvision\/v1\/events\/([^/]+)$/.exec(url.pathname);
+    if (eventMatch?.[1]) return handleDeviceEvent(request, env, decodeURIComponent(eventMatch[1]));
+    const operationResultMatch = /^\/api\/hikvision\/v1\/operations\/([^/]+)\/([^/]+)\/result$/.exec(url.pathname);
+    if (operationResultMatch?.[1] && operationResultMatch[2]) {
+      return handleGatewayOperationResult(request, env, decodeURIComponent(operationResultMatch[1]), decodeURIComponent(operationResultMatch[2]));
+    }
+    const operationListMatch = /^\/api\/hikvision\/v1\/operations\/([^/]+)$/.exec(url.pathname);
+    if (operationListMatch?.[1]) return handleGatewayOperationList(request, env, decodeURIComponent(operationListMatch[1]));
     return app.fetch(request, env, executionCtx);
   },
   async queue(batch: MessageBatch<NormalizedAccessEvent>, env: Env): Promise<void> {

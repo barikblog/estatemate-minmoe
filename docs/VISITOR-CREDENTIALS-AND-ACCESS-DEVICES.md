@@ -69,6 +69,14 @@ Deploying the Blueprint:
 
 Official Render free-tier documentation: https://render.com/docs/free
 
+### Always-on off-site ISUP/TCP gateway
+
+`isup-gateway/` is the separate raw-TCP hosting package. It targets a public Ubuntu VM, restarts the services automatically, forwards SDK events to the Worker, polls per-device card/visitor operations, and reports confirmed results. It does not self-ping Render or attempt to bypass a provider limit.
+
+The raw ISUP listener must be implemented with the licensed official Hikvision Linux SDK for the exact SDK version, CPU architecture, model and firmware. The SDK is not committed to the public repository. A TCP socket that merely accepts bytes is not a valid ISUP server.
+
+A free VM may still be reclaimed or unavailable under the provider's free-tier policy; free-only hosting cannot provide an uptime guarantee. See [`../isup-gateway/README.md`](../isup-gateway/README.md) and its SDK adapter contract.
+
 ## Cloudflare D1 free-tier safeguards
 
 Event records contain metadata only; images and proof documents are stored in the configured private GitHub repository. Queries use indexed device, card, visitor and timestamp fields, portal lists are paginated, and scan sessions expire quickly.
