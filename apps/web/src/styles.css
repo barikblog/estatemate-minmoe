@@ -224,3 +224,18 @@ tbody tr:hover { background: #fafcff; }
 
 .pass-gates { margin: 12px auto 0; padding: 8px 12px; width: fit-content; border-radius: 8px; background: #eef9f2; color: #167343; font-size: 11px; font-weight: 700; letter-spacing: .04em; }
 .share-status { margin: 14px 0 0; text-align: center; color: var(--muted); font-size: 12px; }
+
+.table-toolbar { display: flex; justify-content: space-between; align-items: center; margin: 12px 0 8px; flex-wrap: wrap; gap: 8px; }
+.record-count { font-size: 12px; font-weight: 600; color: var(--muted); }
+.export-actions { display: flex; gap: 6px; }
+.button-sm, button.sm { padding: 5px 10px; font-size: 11px; font-weight: 700; border-radius: 7px; cursor: pointer; }
+.nav-badge { margin-left: auto; background: var(--red); color: white; border-radius: 10px; padding: 1px 7px; font-size: 11px; font-weight: 800; }
+.maintenance-badge { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+.maintenance-badge.needs_verification { background: #fff8e9; color: #85570c; border: 1px solid #f5dfad; }
+.maintenance-badge.in_progress { background: #edf4ff; color: #25548d; border: 1px solid #cfe1fc; }
+.maintenance-badge.completed, .maintenance-badge.resolved { background: #ebfbf2; color: #167343; border: 1px solid #c2efd5; }
+.maintenance-badge.rejected { background: #fff0f1; color: #9f2631; border: 1px solid #facbd0; }
+.notification-banner { display: flex; align-items: center; justify-content: space-between; padding: 12px 18px; margin-bottom: 16px; border-radius: 12px; background: #fff9eb; border: 1px solid #f5dfad; color: #85570c; font-size: 13px; font-weight: 600; }
+.notification-banner button { margin-left: 12px; }
+:root[data-theme="dark"] .notification-banner { background: #262015; border-color: #4a3a1f; color: #f5dfad; }
+

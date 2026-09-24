@@ -32,7 +32,7 @@ const BLUE = '#1769e0';
 const LINE = '#dfe6ef';
 const FONT = 'Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif';
 const POLICY = 'Security must scan and review this pass before accepting entry. Device recognition requires a compatible, configured reader.';
-const FOOTER = 'Powered by sornix.com.ng';
+const FOOTER = 'Powered by sornix.com.ng (WhatsApp: +2348100065868)';
 
 function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
   const lines: string[] = [];
