@@ -153,9 +153,24 @@ function App() {
     api<{ items: Row[] }>('/api/notices/popup').then((result) => setPopupNotices(result.items)).catch(() => setPopupNotices([]));
   }, [user?.id]);
 
+  // NOTE: every hook must run on every render, before any early return below.
+  // Calling hooks after `if (checking) return` / `if (!user) return` changes the hook
+  // count between the login screen and the signed-in view and crashes React
+  // ("Rendered more hooks than during the previous render") -> blank page.
+  const isOperator = user?.role === 'admin' || user?.role === 'manager';
+  const [openMaintCount, setOpenMaintCount] = useState<number>(0);
+  useEffect(() => {
+    if (!user || !isOperator) { setOpenMaintCount(0); return; }
+    api<{ openMaintenance?: { count: number } }>('/api/dashboard')
+      .then((res) => setOpenMaintCount(Number(res.openMaintenance?.count ?? 0)))
+      .catch(() => {});
+  }, [user?.id, isOperator, section]);
+
   async function logout() {
     await api('/api/auth/logout', { method: 'POST' });
     setUser(null);
+    setSection('dashboard');
+    setMenuOpen(false);
   }
 
   async function acknowledgePopup() {
@@ -169,30 +184,20 @@ function App() {
   if (checking) return <div className="splash"><div className="brand-mark">{portalConfig.portal_short_name}</div><span>Loading {portalConfig.portal_name}…</span></div>;
   if (!user) return <Login onLogin={setUser} config={portalConfig} />;
 
-  const isOperator = user?.role === 'admin' || user?.role === 'manager';
-  const [openMaintCount, setOpenMaintCount] = useState<number>(0);
-  useEffect(() => {
-    if (!user || !isOperator) { setOpenMaintCount(0); return; }
-    api<{ openMaintenance?: { count: number } }>('/api/dashboard')
-      .then((res) => setOpenMaintCount(Number(res.openMaintenance?.count ?? 0)))
-      .catch(() => {});
-  }, [user?.id, isOperator, section]);
-
   const availableNav = navItems.filter((item) => !item.roles || item.roles.includes(user.role));
   const current = availableNav.find((item) => item.id === section) ?? availableNav[0]!;
-  if (current.id !== section) setSection(current.id);
 
   return <div className="app-shell">
     <aside className={menuOpen ? 'sidebar open' : 'sidebar'}>
       <header className="side-brand"><span className="mini-logo">{portalConfig.portal_short_name}</span><strong>{portalConfig.portal_name}</strong><button className="icon-button close-menu" onClick={() => setMenuOpen(false)}>×</button></header>
       <p className="nav-caption">WORKSPACE</p>
-      <nav>{availableNav.map((item) => <button key={item.id} className={section === item.id ? 'nav-active' : ''} onClick={() => { setSection(item.id); setMenuOpen(false); }}><span className="nav-icon">{navIcon(item.id)}</span>{item.label}{item.id === 'maintenance' && isOperator && openMaintCount > 0 && <span className="nav-badge">{openMaintCount}</span>}</button>)}</nav>
+      <nav>{availableNav.map((item) => <button key={item.id} className={current.id === item.id ? 'nav-active' : ''} onClick={() => { setSection(item.id); setMenuOpen(false); }}><span className="nav-icon">{navIcon(item.id)}</span>{item.label}{item.id === 'maintenance' && isOperator && openMaintCount > 0 && <span className="nav-badge">{openMaintCount}</span>}</button>)}</nav>
       <footer className="user-card"><span className="avatar">{initials(user.name)}</span><span><strong>{user.name}</strong><small>{user.role}</small></span><button className="icon-button" title="Sign out" onClick={logout}>↗</button></footer>
     </aside>
     {menuOpen && <button className="scrim" aria-label="Close menu" onClick={() => setMenuOpen(false)} />}
     <main className="workspace">
       <header className="topbar"><button className="icon-button mobile-menu" onClick={() => setMenuOpen(true)}>☰</button><div><p className="eyebrow">{user.role} workspace</p><h1>{current.label}</h1></div><div className="top-status"><span className="pulse-dot" /> System online</div></header>
-      <div className="content"><SectionView section={section} user={user} onNavigate={setSection} /><PortalFooter portalName={portalConfig.portal_name} /></div>
+      <div className="content"><SectionView section={current.id} user={user} onNavigate={setSection} /><PortalFooter portalName={portalConfig.portal_name} /></div>
     </main>
     {popupNotices[0] && <EstateNoticePopup notice={popupNotices[0]} remaining={popupNotices.length - 1} onAcknowledge={acknowledgePopup} />}
   </div>;
