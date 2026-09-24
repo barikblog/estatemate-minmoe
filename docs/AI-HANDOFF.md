@@ -59,6 +59,7 @@ The previous migration, `migrations/0008_managers_operations_imports_hikconnect.
 - Local live API E2E against `wrangler dev`: a resident-issued Lagos wall-clock pass stored as `2026-09-24T07:12:23.000Z` scanned as `valid=true`; expired and not-yet-active passes returned specific estate-time reasons; Security accepted the previewed pass; `/api/payment-channels` returned POS/cash/bank transfer with `editable=false` for a Resident, a Security-role bank edit was rejected with 403, and an Administrator edit was then readable by the Resident.
 - Android remains uncompiled in this environment because JDK 17 and the Android SDK are unavailable.
 - Not executed here: the browser canvas path in `apps/web/src/pass-export.ts` (`renderVisitorPassCanvas`, `sharePassFile`). No headless browser could be installed in this sandbox, so the share-as-image/PDF buttons are verified by production build, typecheck and the PDF-writer tests rather than by clicking them in a browser.
+- GitHub Actions run `35973010739` built commit `a19681c`, applied migration `0009_visitor_gate_scope_payment_channels.sql`, deployed the Worker and portal assets successfully to Cloudflare production.
 
 ### Earlier phase
 
