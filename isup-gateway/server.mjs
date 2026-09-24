@@ -4,7 +4,7 @@ import { timingSafeEqual } from 'node:crypto';
 
 const host = process.env.HOST || '127.0.0.1';
 const port = Number(process.env.PORT || 8788);
-const workerOrigin = String(process.env.ESTATEMATE_WORKER_URL || 'https://estatemate.barikblog.workers.dev').replace(/\/$/, '');
+const workerOrigin = String(process.env.ESTATEMATE_WORKER_URL || 'https://estatemate.estatemate.workers.dev').replace(/\/$/, '');
 const configPath = process.env.ESTATEMATE_DEVICES_FILE || '/etc/estatemate/isup-devices.json';
 const adapterSecret = String(process.env.ADAPTER_SHARED_SECRET || '');
 const maxBody = 2 * 1024 * 1024;

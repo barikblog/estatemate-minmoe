@@ -64,7 +64,7 @@ Many estates already have a Windows PC for CCTV (iVMS-4200) or accounting. This 
   {
     "agentId": "uuid-from-portal",
     "agentSecret": "one-time-secret",
-    "workerUrl": "https://estatemate.barikblog.workers.dev",
+    "workerUrl": "https://estatemate.estatemate.workers.dev",
     "syncIntervalSeconds": 30,
     "heartbeatIntervalSeconds": 60
   }

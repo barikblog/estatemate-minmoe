@@ -1,12 +1,12 @@
 # AI handoff — EstateMate
 
-Updated: 2026-09-24 (Africa/Lagos) — ISAPI Bridge & Windows Agent deployed
+Updated: 2026-09-24 (Africa/Lagos) — ISAPI Bridge & Windows Agent deployed; production domain corrected to `https://estatemate.estatemate.workers.dev`
 
 
 
 Repository: https://github.com/barikblog/estatemate-minmoe
 
-Production: https://estatemate.barikblog.workers.dev
+Production: https://estatemate.estatemate.workers.dev
 
 Run `git log -1 --oneline` and check the latest GitHub Actions run before making changes. This file is intended to remain useful without embedding credentials or assuming that a deployment is still in progress.
 
@@ -70,8 +70,9 @@ The previous migration, `migrations/0010_maintenance_billing_and_verification.sq
   - Device creation with isapi_bridge sets visitor operation status to pending (not manual)
 - `npm run build:web` passed cleanly (416 modules, 358kB + 412kB chunks).
 - Migration chain validated via Python sqlite3 through 0011.
-- Cloudflare deployment run `35991657930` succeeded on `main`, successfully applying migration `0011_hikvision_isapi_sync.sql` to Cloudflare D1 `estatemate-db` and deploying Worker + web assets to production `https://estatemate.barikblog.workers.dev`.
+- Cloudflare deployment run `35991657930` succeeded on `main`, successfully applying migration `0011_hikvision_isapi_sync.sql` to Cloudflare D1 `estatemate-db` and deploying Worker + web assets to production `https://estatemate.estatemate.workers.dev`.
 - Production health check attempted (DNS not resolvable from sandbox, but GitHub Actions deploy succeeded with 42s build).
+- **Production domain corrected.** The live Worker is `https://estatemate.estatemate.workers.dev` (account `workers.dev` subdomain `estatemate`, Worker name `estatemate`). Verified externally: `GET /api/health` returns `{"ok":true,...}`, the SPA sign-in page renders, and served asset hashes (`index-CNQVCKox.js`, `pass-export-GRQJmxO5.js`) match the local `main` build. The previously documented `estatemate.barikblog.workers.dev` hostname never resolved and has been replaced in `docs/`, `scripts/ai-context.sh`, `render.yaml`, `bridge/server.mjs`, `isup-gateway/`, `isapi-bridge/` and `windows-agent/` defaults.
 - Frontend UI: new section **ISAPI Bridge & Windows Agent** with agent registration, device linking, installer download (PowerShell .ps1 for Windows, shell .sh for Linux), sync logs, and quick reference; updated **Access-control devices** form to include isapi_bridge/windows_agent/isapi_windows_agent and shows isapi_agent_name, isapi_host, last_isapi_sync_status, queued ops.
 - Backend: new endpoints `/api/isapi/agents`, `/api/isapi/device-configs`, `/api/isapi/sync-logs`, `/api/isapi/agents/:id/installer`, `/api/isapi/agents/:id/rotate-secret` plus machine endpoints `/api/isapi/v1/agents/:id/heartbeat`, `/devices`, `/operations`, `/operations/:id/result`, `/sync-logs` with X-EstateMate-Agent-Key / Bearer auth.
 - Windows agent: `windows-agent/` with service wrapper, Node installer, README; `isapi-bridge/` with cross-platform Node agent implementing ISAPI Digest, operation polling, result reporting, and example configs.
@@ -104,7 +105,7 @@ The previous migration, `migrations/0010_maintenance_billing_and_verification.sq
 - ISUP control-plane relay integration test passed for adapter authentication, event forwarding, operation polling and result forwarding.
 - Local Worker machine API E2E passed for wrong-key rejection, header-based device authentication, operation claim/application and event acceptance.
 - GitHub Actions run `35963135145` built commit `35c5d35`, applied migration `0008`, deployed successfully, and passed production health plus Manager/Import Centre/Hik-Connect/site-sync bundle smoke checks.
-- GitHub Actions run `35973010739` built commit `a19681c` (PR #1), applied migration `0009`, and deployed successfully to Cloudflare production at `https://estatemate.barikblog.workers.dev`.
+- GitHub Actions run `35973010739` built commit `a19681c` (PR #1), applied migration `0009`, and deployed successfully to Cloudflare production at `https://estatemate.estatemate.workers.dev`.
 - Android Manager visibility logic was updated, but Android remains uncompiled in this environment because JDK 17 and Android SDK are unavailable.
 
 ## Important hardware truth

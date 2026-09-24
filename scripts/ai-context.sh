@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 printf '\n== EstateMate AI continuation context ==\n'
 printf 'Repository: https://github.com/barikblog/estatemate-minmoe\n'
-printf 'Live portal: https://estatemate.barikblog.workers.dev\n'
+printf 'Live portal: https://estatemate.estatemate.workers.dev\n'
 printf '\n-- branch and working tree --\n'
 git branch --show-current
 git status --short

@@ -53,7 +53,7 @@ const devicesConfig = loadJson(devicesPath);
 
 const agentId = String(config.agentId || '').trim();
 const agentSecret = String(config.agentSecret || '').trim();
-const workerUrl = String(config.workerUrl || 'https://estatemate.barikblog.workers.dev').replace(/\/$/, '');
+const workerUrl = String(config.workerUrl || 'https://estatemate.estatemate.workers.dev').replace(/\/$/, '');
 const syncInterval = Math.max(5, Number(config.syncIntervalSeconds || 30));
 const heartbeatInterval = Math.max(15, Number(config.heartbeatIntervalSeconds || 60));
 const isapiTimeout = Math.max(2000, Number(config.isapiTimeoutMs || 15000));
