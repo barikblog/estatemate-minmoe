@@ -8,12 +8,11 @@ Please reply with this template. Do **not** put device admin passwords, permanen
 - Quantity of each model:
 - Full firmware version/build for each:
 - Gate and direction for each terminal:
-- HTTP Listening screen supports HTTPS: yes / no
 - It accepts a DNS hostname: yes / no / unknown
 - Listener authentication options: none / Basic / Digest / username+password / unknown
 - Payload option shown: JSON / XML / both / unknown
-- Platform Access also offers ISUP 5.0: yes / no / unknown
-- Upload screenshots of Device Information, HTTP Listening, and Platform Access (redact serial/public IP/secrets if preferred):
+- ISAPI alertStream availability (test with `curl --digest` against `/ISAPI/Event/notification/alertStream?format=json`): yes / no / unknown
+- Upload screenshots of Device Information and Platform Access (redact serial/public IP/secrets if preferred):
 
 ## 2. GitHub
 
@@ -65,5 +64,5 @@ Choose one:
 
 - `events-only`: deploy now with audited manual terminal changes.
 - `Hikvision cloud/OpenAPI`: provide the product name, region, approved API documentation, AppKey/AppSecret via a secret channel, and test tenant.
-- `dedicated ISUP gateway`: approve a small headless x86_64 Ubuntu appliance on the estate LAN (recommended) or an Internet VM, and provide licensing/SDK details. Raspberry Pi requires vendor ARM64 libraries; Arduino/ESP32 is not a supported SDK host.
+- `ISAPI bridge agent`: approve an always-on computer on the estate LAN (office Windows PC, Termux on a spare Android phone, or a small board) and hold its ISAPI administrator credentials.
 - `investigate`: complete model/firmware validation first; do not enable fee-linked physical enforcement yet.

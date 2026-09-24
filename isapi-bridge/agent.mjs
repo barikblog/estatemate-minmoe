@@ -16,7 +16,7 @@
 
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -59,6 +59,14 @@ const heartbeatInterval = Math.max(15, Number(config.heartbeatIntervalSeconds ||
 const isapiTimeout = Math.max(2000, Number(config.isapiTimeoutMs || 15000));
 const logLevel = String(config.logLevel || 'info');
 
+// Real-time event streaming (ISAPI alertStream). Enabled by default; set
+// "eventStream": false in agent-config.json (global) or per device to disable.
+const eventStreamEnabled = config.eventStream !== false;
+const eventFlushCount = Math.max(1, Math.min(50, Number(config.eventFlushCount || 25)));
+const eventFlushSeconds = Math.max(1, Number(config.eventFlushSeconds || 5));
+const eventBufferLimit = Math.max(eventFlushCount * 4, Number(config.eventBufferLimit || 500));
+const alertStreamPath = String(config.alertStreamPath || '/ISAPI/Event/notification/alertStream?format=json');
+
 if (!/^[0-9a-f-]{36}$/i.test(agentId)) {
   console.error('Invalid agentId, must be UUID');
   process.exit(1);
@@ -80,6 +88,7 @@ for (const d of devicesConfig.devices || []) {
     isapiUsername: String(d.isapiUsername || 'admin'),
     isapiPassword: String(d.isapiPassword || ''),
     protocol: d.protocol === 'https' ? 'https' : 'http',
+    eventStream: d.eventStream !== false,
   });
 }
 
@@ -100,7 +109,7 @@ async function apiFetch(path, init = {}) {
   const headers = {
     'Content-Type': 'application/json',
     'X-EstateMate-Agent-Key': agentSecret,
-    'User-Agent': 'EstateMate-ISAPI-Bridge/1.0',
+    'User-Agent': 'EstateMate-ISAPI-Bridge/1.1',
     ...(init.headers || {}),
   };
   const controller = new AbortController();
@@ -119,9 +128,15 @@ async function heartbeat() {
     const { res, json } = await apiFetch(`/api/isapi/v1/agents/${agentId}/heartbeat`, {
       method: 'POST',
       body: JSON.stringify({
-        version: '1.0.0',
+        version: '1.1.0',
         hostname: process.env.COMPUTERNAME || process.env.HOSTNAME || 'isapi-bridge',
         platform: process.platform,
+        stats: {
+          eventsForwarded: eventStats.forwarded,
+          eventsDropped: eventStats.dropped,
+          eventsPending: pendingEvents.length,
+          eventStream: eventStreamEnabled,
+        },
       }),
     });
     if (!res.ok) log('warn', 'Heartbeat failed', res.status, json);
@@ -148,6 +163,30 @@ function parseDigest(header) {
   return params;
 }
 
+/** Builds an ISAPI HTTP Digest authorization header from a WWW-Authenticate challenge. */
+function buildDigestAuthHeader(device, method, path, wwwAuth) {
+  const digest = parseDigest(wwwAuth);
+  const realm = digest.realm || '';
+  const nonce = digest.nonce || '';
+  const qop = digest.qop || 'auth';
+  const opaque = digest.opaque || '';
+  const algorithm = digest.algorithm || 'MD5';
+  const nc = '00000001';
+  const cnonce = Math.random().toString(36).slice(2, 10);
+
+  const ha1 = md5(`${device.isapiUsername}:${realm}:${device.isapiPassword}`);
+  const ha2 = md5(`${method}:${path}`);
+  const response = md5(`${ha1}:${nonce}:${nc}:${cnonce}:${qop}:${ha2}`);
+
+  let authHeader = `Digest username="${device.isapiUsername}", realm="${realm}", nonce="${nonce}", uri="${path}", algorithm=${algorithm}, response="${response}", qop=${qop}, nc=${nc}, cnonce="${cnonce}"`;
+  if (opaque) authHeader += `, opaque="${opaque}"`;
+  return authHeader;
+}
+
+function basicAuthHeader(device) {
+  return `Basic ${Buffer.from(`${device.isapiUsername}:${device.isapiPassword}`).toString('base64')}`;
+}
+
 async function isapiRequest(device, method, path, body = null, isXml = true) {
   const base = `${device.protocol}://${device.isapiHost}:${device.isapiPort}`;
   const url = `${base}${path}`;
@@ -170,11 +209,10 @@ async function isapiRequest(device, method, path, body = null, isXml = true) {
     const wwwAuth = res.headers.get('www-authenticate') || '';
     if (!wwwAuth.toLowerCase().includes('digest')) {
       // Fallback to basic
-      const basic = Buffer.from(`${device.isapiUsername}:${device.isapiPassword}`).toString('base64');
       res = await fetch(url, {
         method,
         headers: {
-          Authorization: `Basic ${basic}`,
+          Authorization: basicAuthHeader(device),
           'Content-Type': isXml ? 'application/xml; charset=utf-8' : 'application/json',
         },
         body: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : undefined,
@@ -184,22 +222,7 @@ async function isapiRequest(device, method, path, body = null, isXml = true) {
       clearTimeout(timeout);
       return { status: res.status, body: text, headers: res.headers };
     }
-    const digest = parseDigest(wwwAuth);
-    const realm = digest.realm || '';
-    const nonce = digest.nonce || '';
-    const qop = digest.qop || 'auth';
-    const opaque = digest.opaque || '';
-    const algorithm = digest.algorithm || 'MD5';
-    const nc = '00000001';
-    const cnonce = Math.random().toString(36).slice(2, 10);
-
-    const ha1 = md5(`${device.isapiUsername}:${realm}:${device.isapiPassword}`);
-    const ha2 = md5(`${method}:${path}`);
-    const response = md5(`${ha1}:${nonce}:${nc}:${cnonce}:${qop}:${ha2}`);
-
-    let authHeader = `Digest username="${device.isapiUsername}", realm="${realm}", nonce="${nonce}", uri="${path}", algorithm=${algorithm}, response="${response}", qop=${qop}, nc=${nc}, cnonce="${cnonce}"`;
-    if (opaque) authHeader += `, opaque="${opaque}"`;
-
+    const authHeader = buildDigestAuthHeader(device, method, path, wwwAuth);
     res = await fetch(url, {
       method,
       headers: {
@@ -216,6 +239,232 @@ async function isapiRequest(device, method, path, body = null, isXml = true) {
     clearTimeout(timeout);
     throw err;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Real-time event streaming (ISAPI alertStream)
+//
+// The agent keeps one persistent GET /ISAPI/Event/notification/alertStream
+// connection per device and forwards every event document to the Worker in
+// small batches. This gives real-time Gate activity even for terminals whose
+// firmware has no HTTP Listening push: the device streams events over its
+// documented ISAPI interface on the LAN, and the agent relays them outbound.
+// ---------------------------------------------------------------------------
+
+let shutdownRequested = false;
+const eventStats = { forwarded: 0, dropped: 0 };
+const pendingEvents = [];
+let flushTimer = null;
+let flushing = false;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Opens the alertStream request, answering one Digest/Basic challenge. Returns the raw Response. */
+async function openAlertStream(device) {
+  const url = `${device.protocol}://${device.isapiHost}:${device.isapiPort}${alertStreamPath}`;
+  let res = await fetch(url, { headers: { Accept: 'multipart/mixed, application/json' } });
+  if (res.status === 401) {
+    const wwwAuth = res.headers.get('www-authenticate') || '';
+    const authHeader = wwwAuth.toLowerCase().includes('digest')
+      ? buildDigestAuthHeader(device, 'GET', alertStreamPath, wwwAuth)
+      : basicAuthHeader(device);
+    try { await res.arrayBuffer(); } catch { /* drain best effort */ }
+    res = await fetch(url, { headers: { Accept: 'multipart/mixed, application/json', Authorization: authHeader } });
+  }
+  return res;
+}
+
+/**
+ * Incremental multipart/mixed parser. Each complete part between boundary
+ * markers becomes one event document string (JSON text or XML) exactly the
+ * shape the EstateMate normalizer accepts.
+ */
+function createMultipartEventParser(boundary, onEvent) {
+  const delimiter = `--${boundary}`;
+  let buffer = '';
+  const extractPart = (raw) => {
+    const trimmed = raw.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
+    const separator = trimmed.search(/\r?\n\r?\n/);
+    if (separator < 0) return;
+    const body = trimmed.slice(separator + (trimmed.includes('\r\n\r\n') ? 4 : 2)).trim();
+    if (!body.startsWith('{') && !body.startsWith('<')) return;
+    onEvent(body);
+  };
+  return function feed(chunk) {
+    buffer += chunk;
+    for (;;) {
+      const start = buffer.indexOf(delimiter);
+      if (start < 0) {
+        if (buffer.length > 1024 * 1024) buffer = buffer.slice(-1024);
+        return;
+      }
+      const next = buffer.indexOf(delimiter, start + delimiter.length);
+      if (next < 0) return; // wait for the next boundary marker
+      extractPart(buffer.slice(start + delimiter.length, next));
+      buffer = buffer.slice(next);
+    }
+  };
+}
+
+/**
+ * Fallback parser for firmwares that stream bare JSON objects without a
+ * multipart envelope. Walks brace depth while respecting JSON strings.
+ * A scan cursor plus buffer trimming guarantee chunks are never re-scanned.
+ */
+function createJsonEventScanner(onEvent) {
+  let buffer = '';
+  let scanned = 0; // index into buffer of the first unscanned char
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  return function feed(chunk) {
+    buffer += chunk;
+    let i = scanned;
+    while (i < buffer.length) {
+      const ch = buffer[i];
+      let restart = false;
+      if (depth > 0) {
+        if (inString) {
+          if (escaped) escaped = false;
+          else if (ch === '\\') escaped = true;
+          else if (ch === '"') inString = false;
+        } else if (ch === '"') inString = true;
+        else if (ch === '{') depth++;
+        else if (ch === '}') {
+          depth--;
+          if (depth === 0) {
+            onEvent(buffer.slice(start, i + 1));
+            buffer = buffer.slice(i + 1);
+            scanned = 0;
+            start = -1;
+            i = 0;
+            restart = true;
+          }
+        }
+      } else if (ch === '{') {
+        depth = 1;
+        start = i;
+      }
+      if (!restart) i++;
+    }
+    scanned = i; // === buffer.length
+    if (depth === 0) {
+      // Fully scanned and not inside a document: drop everything scanned.
+      buffer = '';
+      scanned = 0;
+      start = -1;
+    } else if (start > 0) {
+      // Mid-document: keep only the in-progress document bytes.
+      buffer = buffer.slice(start);
+      scanned -= start;
+      start = 0;
+    }
+    if (buffer.length > 1024 * 1024) {
+      buffer = '';
+      scanned = 0;
+      depth = 0;
+      start = -1;
+      inString = false;
+      escaped = false;
+    }
+  };
+}
+
+function queueEvent(deviceId, document) {
+  if (!document || document.length > 512 * 1024) {
+    log('warn', 'Skipping missing or oversized event document for device', deviceId);
+    return;
+  }
+  pendingEvents.push({ deviceId, document });
+  if (pendingEvents.length > eventBufferLimit) {
+    const drop = pendingEvents.length - eventBufferLimit;
+    pendingEvents.splice(0, drop);
+    eventStats.dropped += drop;
+    log('warn', `Event buffer overflow; dropped ${drop} oldest document(s)`);
+  }
+  if (pendingEvents.length >= eventFlushCount) {
+    flushEvents();
+    return;
+  }
+  if (!flushTimer) {
+    flushTimer = setTimeout(() => { flushTimer = null; flushEvents(); }, eventFlushSeconds * 1000);
+  }
+}
+
+async function flushEvents() {
+  if (flushing || !pendingEvents.length) return;
+  flushing = true;
+  try {
+    while (pendingEvents.length) {
+      const items = pendingEvents.splice(0, 50);
+      try {
+        const { res, json } = await apiFetch(`/api/isapi/v1/agents/${agentId}/events`, {
+          method: 'POST',
+          body: JSON.stringify({ items }),
+        });
+        if (!res.ok) {
+          log('warn', 'Event flush failed', res.status, json);
+          pendingEvents.unshift(...items);
+          break;
+        }
+        eventStats.forwarded += Number(json.accepted || 0);
+        log('debug', `Forwarded ${json.accepted} event(s), ${json.rejected} rejected, pending ${pendingEvents.length}`);
+      } catch (err) {
+        log('warn', 'Event flush error', err.message);
+        pendingEvents.unshift(...items);
+        break;
+      }
+    }
+  } finally {
+    flushing = false;
+  }
+  if (pendingEvents.length > eventBufferLimit) {
+    const drop = pendingEvents.length - eventBufferLimit;
+    pendingEvents.splice(0, drop);
+    eventStats.dropped += drop;
+    log('warn', `Event buffer overflow after failed flush; dropped ${drop} oldest document(s)`);
+  }
+}
+
+async function deviceEventLoop(device) {
+  let backoffMs = 5000;
+  for (;;) {
+    if (shutdownRequested) break;
+    try {
+      const res = await openAlertStream(device);
+      if (res.status !== 200) {
+        const snippet = await res.text().catch(() => '');
+        log('warn', `Alert stream unavailable for ${device.name}: HTTP ${res.status} ${snippet.slice(0, 200)}`);
+      } else {
+        const contentType = res.headers.get('content-type') || '';
+        const boundary = /boundary\s*=\s*"?([^";]+)"?/i.exec(contentType)?.[1] || null;
+        backoffMs = 5000;
+        if (!res.body) {
+          log('warn', `Alert stream for ${device.name} returned no body`);
+        } else {
+          log('info', `Event stream connected for ${device.name}${boundary ? ' (multipart)' : ' (bare JSON)'}`);
+          const decoder = new TextDecoder();
+          const feed = boundary
+            ? createMultipartEventParser(boundary, (document) => queueEvent(device.estateMateDeviceId, document))
+            : createJsonEventScanner((document) => queueEvent(device.estateMateDeviceId, document));
+          for await (const chunk of res.body) {
+            if (shutdownRequested) break;
+            feed(decoder.decode(chunk, { stream: true }));
+          }
+          log('warn', `Event stream closed for ${device.name}`);
+        }
+      }
+    } catch (err) {
+      log('warn', `Event stream error for ${device.name}`, err.message);
+    }
+    if (shutdownRequested) break;
+    await sleep(backoffMs);
+    backoffMs = Math.min(backoffMs * 2, 60000);
+  }
+  log('info', `Event stream stopped for ${device.name}`);
 }
 
 async function applyCardOperation(device, operation) {
@@ -369,26 +618,57 @@ async function pollAndApply() {
 
 async function main() {
   log('info', `EstateMate ISAPI Bridge starting...`);
-  log('info', `Agent: ${agentId}, Worker: ${workerUrl}, Devices: ${devices.size}, Interval: ${syncInterval}s`);
+  const streamDevices = [...devices.values()].filter((device) => device.eventStream !== false);
+  log('info', `Agent: ${agentId}, Worker: ${workerUrl}, Devices: ${devices.size}, Interval: ${syncInterval}s, EventStream: ${eventStreamEnabled ? `on (${streamDevices.length} device(s))` : 'off'}`);
 
   await heartbeat();
   await pollAndApply();
 
+  if (eventStreamEnabled) {
+    for (const device of streamDevices) {
+      deviceEventLoop(device).catch((err) => log('error', `Event stream crashed for ${device.name}`, err.message));
+    }
+  }
+
   setInterval(heartbeat, heartbeatInterval * 1000);
   setInterval(pollAndApply, syncInterval * 1000);
 
-  // Graceful shutdown
-  process.on('SIGINT', () => {
+  // Graceful shutdown: stop stream loops first, then flush buffered events.
+  const shutdown = () => {
+    if (shutdownRequested) return;
+    shutdownRequested = true;
     log('info', 'Shutting down...');
-    process.exit(0);
-  });
-  process.on('SIGTERM', () => {
-    log('info', 'Shutting down...');
-    process.exit(0);
-  });
+    flushEvents().finally(() => process.exit(0));
+    setTimeout(() => process.exit(0), 8000).unref();
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
-main().catch((err) => {
-  console.error('Fatal:', err);
-  process.exit(1);
-});
+// Runnable as CLI (`node agent.mjs`), auto-starting when imported by the
+// Windows service wrapper. Set ESTATEMATE_AGENT_STANDBY=1 to import the
+// exported functions for testing without starting the main loops.
+export {
+  createMultipartEventParser,
+  createJsonEventScanner,
+  queueEvent,
+  flushEvents,
+  deviceEventLoop,
+  openAlertStream,
+  main,
+  pendingEvents,
+  eventStats,
+};
+const isEntrypoint = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+if (!isEntrypoint && !process.env.ESTATEMATE_AGENT_STANDBY) {
+  // Imported by windows-agent/agent.mjs — keep the historical auto-start behavior.
+  main().catch((err) => {
+    console.error('Fatal:', err);
+    process.exit(1);
+  });
+} else if (isEntrypoint) {
+  main().catch((err) => {
+    console.error('Fatal:', err);
+    process.exit(1);
+  });
+}

@@ -1,9 +1,0 @@
-{
-  "devices": [
-    {
-      "localDeviceId": "main-gate-terminal",
-      "estateMateDeviceId": "00000000-0000-0000-0000-000000000000",
-      "deviceKey": "paste-the-one-time-estatemate-device-secret-here"
-    }
-  ]
-}

@@ -1,6 +1,6 @@
 # AI handoff — EstateMate
 
-Updated: 2026-09-24 (Africa/Lagos) — ISAPI Bridge & Windows Agent deployed; production domain corrected to `https://estatemate.estatemate.workers.dev`
+Updated: 2026-09-24 (Africa/Lagos) — Retired every access-device transport except the EstateMate agent (ISAPI bridge/Windows agent with real-time alertStream streaming); production domain is `https://estatemate.estatemate.workers.dev`
 
 
 
@@ -25,15 +25,12 @@ Run `git log -1 --oneline` and check the latest GitHub Actions run before making
 - Physical card enrollment by tapping/scanning at a selected saved device.
 - Editable, secret-rotatable and soft-deletable access-device inventory.
 - Profiles for MinMoe, QR K1T807/K1T502 variants, DS-K1T808MFWX-B, DS-K2600, DS-K2700/K2800 including DS-K2802, and a conservative vendor-neutral option.
-- Optional stateless Render Free HTTPS relay Blueprint; it is not an ISUP/TCP server.
-- Dedicated Ubuntu ISUP gateway package for a small LAN appliance or off-site host, with machine-authenticated event and operation APIs; the licensed official SDK adapter remains an external required build input.
-- **Hikvision ISAPI bridge and Windows agent**: `isapi-bridge/` cross-platform Node agent (ISAPI Digest, no SDK) + `windows-agent/` Windows Service wrapper, with portal UI for agent registry, device ISAPI configs, PowerShell/shell installer generation (one-time secret, 24h expiry), heartbeat, operation polling (`isapi_bridge`, `windows_agent`, `isapi_windows_agent` connection patterns), result reporting and sync logs.
+- **Hikvision ISAPI bridge and Windows agent**: `isapi-bridge/` cross-platform Node agent (ISAPI Digest, no SDK) + `windows-agent/` Windows Service wrapper, with portal UI for agent registry, device ISAPI configs, PowerShell/shell installer generation (one-time secret, 24h expiry), heartbeat, operation polling (`isapi_bridge`, `windows_agent`, `isapi_windows_agent` connection patterns), result reporting and sync logs. Agent v1.1.0 also streams real-time device events to the Worker in batches via a persistent ISAPI alertStream connection (see the streaming phase section below).
 - Optional proof uploads linked to ownership, transfer, tenancy, household, visitor, maintenance and payment records.
 - Administrator-editable portal identity, theme and operational defaults.
 - People administration with available-property selection, bulk CSV registration, generated one-time passwords, editing, reset, lifecycle guards and history-preserving deletion.
 - Operational Manager category with explicit separation from finance, private storage, global settings and elevated account management.
 - Private-storage-backed operational imports for properties, ownerships, tenancies and cards.
-- Encrypted Hik-Connect configuration and one-time generated on-site synchronization installer for the official-SDK gateway package.
 - Encrypted ISAPI device credentials and agent secrets (STORAGE_ENCRYPTION_KEY + DEVICE_INGEST_PEPPER).
 - Administrator-generated, one-time-download sample logins for every role with automatic 24-hour expiry.
 - Initiate-payment flow with POS at office, cash at office and bank transfer; the estate bank account is Administrator-editable and read-only for Residents/Cashiers. Online collection is removed from the portal and rejected by `POST /api/payments`.
@@ -43,9 +40,51 @@ Run `git log -1 --oneline` and check the latest GitHub Actions run before making
 
 ## Most recent migration
 
-`migrations/0011_hikvision_isapi_sync.sql`
+`migrations/0013_agent_only_transports.sql`
 
-It adds Hikvision ISAPI bridge and Windows agent support:
+It removes every access-device transport except the EstateMate agent:
+
+- Repoints devices still on `direct_http_listener`, `render_http_bridge`, `hikvision_cloud_openapi` or `offsite_isup_gateway` to `manual_sync` + `integration_mode='manual'` (history preserved; they become automatic again once linked to an agent).
+- Deletes the `render_bridge_url` setting row.
+- Code/package removals in the same phase: `bridge/`, `render.yaml`, `isup-gateway/` deleted; Worker endpoints `/api/hikvision/v1/events/:id`, `/api/hikvision/v1/operations/*`, `/api/access/devices/:id/site-sync-installer` and `/api/access/devices/:id/rotate-secret` removed; connection-pattern registry reduced to `isapi_bridge`/`windows_agent`/`isapi_windows_agent`/`manual_sync` (`generic_network_access` is manual-only); Hik-Connect device fields removed from the device create/patch APIs and portal UI; profiles no longer expose `httpListener`; device registration no longer creates `device_credentials` rows (per-device ingest secrets are gone — agents authenticate with their own secret).
+
+The previous migration, `migrations/0012_agent_event_stream_retention.sql`
+
+It enables real-time agent event streaming and free-tier retention:
+
+- Seeds `agent_event_stream_enabled` (default `true`) — the master kill switch for agent event ingestion; when `false`, `POST /api/isapi/v1/agents/:id/events` answers `409`.
+- Seeds `access_event_retention_days` (default `365`) — the hourly cron (`pruneAccessEvents` in `src/index.ts`) deletes `access_events` (by ISO `device_timestamp`) and `isapi_sync_logs` older than this in indexed 500-row batches, keeping a busy estate inside the 500 MB D1 free-tier database limit. Values below 30 are refused.
+
+The previous migration, `migrations/0011_hikvision_isapi_sync.sql`, added the ISAPI bridge and Windows agent registry/configs/logs/installers (detailed below).
+
+## Agent event streaming phase (2026-09-24)
+
+Extends `isapi-bridge/agent.mjs` to v1.1.0 and the Worker so a Hikvision terminal with documented ISAPI (e.g. **DS-K1T808MFWX-B**, whose datasheet states "Supports ISAPI and ISUP 5.0") runs fully real-time and automatic on the Cloudflare Workers Free plan:
+
+- **Agent:** one persistent `GET /ISAPI/Event/notification/alertStream?format=json` connection per device (Digest/Basic challenge supported, 5 s → 60 s reconnect backoff). Incremental `multipart/mixed` parser plus a brace-depth bare-JSON fallback feed a bounded buffer (default 500) flushed to the Worker in batches (≤ 50 items or every 5 s; `eventFlush*`/`eventBufferLimit`/`alertStreamPath`/`eventStream` config knobs). Graceful shutdown flushes the buffer. Module exports parsers/main with an `ESTATEMATE_AGENT_STANDBY=1` guard so the Windows service wrapper keeps auto-starting.
+- **Worker:** new machine endpoint `POST /api/isapi/v1/agents/:id/events` (`handleIsapiAgentEvents`) authenticates the agent, enforces the kill switch, verifies each device links to the calling agent (`hikvision_devices.isapi_agent_id` or `isapi_device_configs`), normalizes documents via the standard pipeline, touches device last-seen, and queues the batch as ONE message.
+- **Queue batching:** `AccessEventQueuePayload` (in `src/types.ts`) is `NormalizedAccessEvent | { batch: NormalizedAccessEvent[] }`; `flattenQueuePayload` lets the consumer accept both single-event and batched messages. Direct device posts with multiple multipart documents also batch into one message. One batch ≈ one Queue message ≈ 3 Queue operations (free tier: 10,000/day), so ~3,000 events/day costs ~200–600 operations instead of ~9,000.
+- **Consumer resilience:** a live-feed Durable Object failure no longer requeues already-persisted events (broadcast is best-effort with error logging).
+- **Free tier retention:** `pruneAccessEvents` runs in the hourly `scheduled` handler alongside property lifecycle and facility-fee jobs.
+- **Tests:** `test/agent-event-stream.test.ts` (9 tests) covers auth, agent-scoped device checks, batch normalization, one-message batching, legacy single-event consumer shape, multipart direct-post batching, kill switch, 413 batch cap and retention pruning; `test/harness.ts` now records queue sends and live-feed broadcasts. `isapi-bridge/agent.integration.mjs` (wired into `npm run test:isapi-bridge` inside `npm test`) unit-checks both stream parsers and streams a fake terminal end-to-end into a fake Worker.
+- **Docs:** `docs/device-profiles/DS-K1T808MFWX-B.md` records the datasheet evidence and the on-site verification checklist; `docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md`, `isapi-bridge/README.md` and both example configs document streaming; `AGENTS.md` names alertStream an event-upload path.
+
+### Agent-only transport phase (2026-09-24, after streaming)
+
+- Removed all non-agent transports per `migrations/0013_agent_only_transports.sql`: deleted `bridge/`, `render.yaml`, `isup-gateway/`; removed device ingest + ISUP gateway operation endpoints, site-sync installer, device secret rotation and per-device credential creation; reduced connection patterns to agent patterns + `manual_sync`; dropped Hik-Connect fields and Render relay URL from APIs and portal UI; updated README/AGENTS/MINMOE-NO-PC/VISITOR-CREDENTIALS/MANAGERS/QUESTIONNAIRE/device-profile docs.
+- Validation: `npm run typecheck`, 81 vitest tests (11 files), `npm run test:isapi-bridge`, `npm run build:web`, migration chain through 0013, `git diff --check` all passed. Removed the retired-transport vitest case with the endpoint; web app device panel rewritten for agent-only registration.
+
+### Streaming-phase validation record (2026-09-24)
+
+- Root and web TypeScript passed (`npm run typecheck`).
+- 82 Vitest tests passed across 11 files, including new suite `test/agent-event-stream.test.ts` (9 tests).
+- `npm run test:isup-gateway` passed; new `npm run test:isapi-bridge` passed (agent syntax, both stream parsers, fake-terminal end-to-end streaming with one batched flush).
+- `npm run build:web` passed cleanly.
+- Migration chain validated via Python sqlite3 through 0012.
+- `git diff --check` clean.
+- Not executed here: no real DS-K1T808MFWX-B hardware in the sandbox — the on-site verification checklist in `docs/device-profiles/DS-K1T808MFWX-B.md` must be completed before production cutover, and deployment happens on the next push to `main`.
+
+## Migration 0011 — ISAPI bridge and Windows agent (previous phase)
 
 - `isapi_agents` — registry of Windows/Linux bridge agents: id, name, hostname, platform (windows/linux/darwin/other), version, status (pending/online/offline/disabled), secret_hash, last_seen_at, last_ip, created_by.
 - `isapi_device_configs` — per-device ISAPI mapping: device_id (FK hikvision_devices), agent_id (FK isapi_agents), isapi_host (LAN IP), isapi_port, isapi_username, isapi_password_ciphertext/iv (encrypted with STORAGE_ENCRYPTION_KEY), protocol http/https, sync_enabled, last_sync_at/status/error.
@@ -58,7 +97,7 @@ It adds Hikvision ISAPI bridge and Windows agent support:
 
 The previous migration, `migrations/0010_maintenance_billing_and_verification.sql`, adds maintenance scope (personal/street/block/zone/estate), status workflow (in_progress, needs_verification), charging fields, gate ID verification for visitors, and bill_batches audience targeting.
 
-## Validation recorded for this phase
+### 0011 validation record
 
 - Root and web TypeScript passed (`tsc --noEmit` plus `tsc -b` in `apps/web`).
 - 73 Vitest tests passed across 10 files, including new suite `test/isapi-bridge.test.ts` (6 tests):

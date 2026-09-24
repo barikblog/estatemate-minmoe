@@ -11,7 +11,7 @@ Managers can:
 - assign and end tenancies, manage household profiles and create dependant logins;
 - manage maintenance, visitors and general estate notices;
 - issue/suspend access cards and operate card-enrolment sessions;
-- register/edit access-control devices, download a site-sync installer and work the hardware-action queue;
+- register/edit access-control devices and work the hardware-action queue;
 - import users, properties, ownerships, tenancies and access cards.
 
 Managers cannot:
@@ -61,30 +61,9 @@ Optional: `card_label,status,expires_at`
 
 Active imported cards are placed into the existing device-operation synchronization queue.
 
-## Hik-Connect details
+## Retired integration
 
-An access-control device may store:
-
-- access-server hostname or IP;
-- Hik-Connect/device serial;
-- verification code.
-
-The verification code is AES-GCM encrypted with the configured storage encryption key (falling back to the Worker JWT key for existing installations), is never returned in device-list APIs, and is excluded from audit details. Entering a blank code during edit preserves the existing value.
-
-These settings are configuration material, not proof of an available command API. Hik-Connect consumer registration details do not replace licensed Hikvision ISUP SDK integration or approved Hikvision OpenAPI credentials.
-
-## Generated on-site synchronizer
-
-For a device configured as **Dedicated ISUP gateway**, Administrator or Manager can choose **Download site sync**. EstateMate:
-
-1. generates a separate one-time synchronization key;
-2. stores only its peppered hash;
-3. invalidates the prior generated site-sync key;
-4. returns a no-cache Ubuntu shell installer once.
-
-The installer clones the public EstateMate repository, installs the loopback-only gateway control plane, writes the device mapping and root-only Hik-Connect profile, and points it at the current EstateMate Worker. It deliberately does not pretend to supply Hikvision’s licensed SDK.
-
-The estate must still install the official SDK adapter for the exact device/firmware and CPU architecture, configure `/etc/estatemate/isup-adapter.json`, and then start the gateway. Do not publish the generated script, verification code, ISUP key or device mapping.
+The Hik-Connect detail storage and the one-time ISUP site-sync installer were removed with the dedicated ISUP gateway transport (migration `0013_agent_only_transports.sql`). Managers now register devices and work the hardware-action queue; card provisioning runs through the ISAPI bridge agent. See [`ISAPI-BRIDGE-AND-WINDOWS-AGENT.md`](ISAPI-BRIDGE-AND-WINDOWS-AGENT.md).
 
 ## Sample logins
 

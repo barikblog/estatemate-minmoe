@@ -2,7 +2,7 @@ export type Role = 'admin' | 'manager' | 'resident' | 'security' | 'cashier';
 
 export interface Env {
   DB: D1Database;
-  ACCESS_EVENTS: Queue<NormalizedAccessEvent>;
+  ACCESS_EVENTS: Queue<AccessEventQueuePayload>;
   LIVE_FEED: DurableObjectNamespace;
   ASSETS: Fetcher;
   APP_NAME: string;
@@ -58,6 +58,21 @@ export interface NormalizedAccessEvent {
   deviceTimestamp: string;
   profileKey: string;
   rawSummary: string;
+}
+
+/**
+ * Queue message payload. A message normally carries a single event, but batch
+ * ingestion (ISAPI bridge agent event streaming, multipart device posts) sends
+ * one message containing the whole request batch so a burst of events costs a
+ * single Queue operation set instead of one set per event.
+ */
+export type AccessEventQueuePayload = NormalizedAccessEvent | { batch: NormalizedAccessEvent[] };
+
+export function flattenQueuePayload(body: AccessEventQueuePayload): NormalizedAccessEvent[] {
+  if (body && typeof body === 'object' && 'batch' in body && Array.isArray((body as { batch?: unknown }).batch)) {
+    return (body as { batch: NormalizedAccessEvent[] }).batch;
+  }
+  return [body as NormalizedAccessEvent];
 }
 
 export interface AppVariables {

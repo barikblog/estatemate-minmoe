@@ -13,7 +13,7 @@ It reuses the core logic from `../isapi-bridge/agent.mjs` but adds Windows-speci
 
 Many estates already have a Windows PC for CCTV (iVMS-4200) or accounting. This agent allows them to:
 
-- Avoid buying a Linux appliance for ISUP SDK.
+- No separate Linux appliance is needed; the office PC already on the CCTV/accounting LAN does the job.
 - Use existing Windows machine as ISAPI bridge.
 - Keep ISAPI traffic on LAN (no port forwarding).
 - Get automatic card disable/enable when facility fees expire.

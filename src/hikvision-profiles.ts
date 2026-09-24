@@ -14,14 +14,13 @@ export type HikvisionProfileKey =
   | 'generic_isapi';
 
 export type ConnectionPattern =
-  | 'direct_http_listener'
-  | 'render_http_bridge'
-  | 'hikvision_cloud_openapi'
-  | 'offsite_isup_gateway'
   | 'isapi_bridge'
   | 'windows_agent'
   | 'isapi_windows_agent'
   | 'manual_sync';
+
+/** Every device reaches EstateMate through the EstateMate agent method. */
+const AGENT_CONNECTIONS: ConnectionPattern[] = ['isapi_bridge', 'windows_agent', 'isapi_windows_agent', 'manual_sync'];
 
 export interface HikvisionProfile {
   key: Exclude<HikvisionProfileKey, 'auto'>;
@@ -33,11 +32,6 @@ export interface HikvisionProfile {
   authenticationMethods: string[];
   supportedConnections: ConnectionPattern[];
   defaultConnection: ConnectionPattern;
-  httpListener: {
-    expected: boolean;
-    formats: Array<'json' | 'xml' | 'multipart'>;
-    note: string;
-  };
   aliases: {
     eventType: string[];
     eventId: string[];
@@ -87,9 +81,8 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['^DS-K1T3', '^K1T3'],
     devicePattern: 'standalone_terminal',
     authenticationMethods: ['face', 'card', 'fingerprint', 'PIN', 'QR where fitted'],
-    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'hikvision_cloud_openapi', 'offsite_isup_gateway', 'isapi_bridge', 'windows_agent', 'isapi_windows_agent', 'manual_sync'],
-    defaultConnection: 'direct_http_listener',
-    httpListener: { expected: true, formats: ['json', 'xml', 'multipart'], note: 'Availability and HTTPS/auth options vary by firmware build.' },
+    supportedConnections: AGENT_CONNECTIONS,
+    defaultConnection: 'isapi_bridge',
     aliases: aliases({ cardUid: ['cardNoString'], employeeNo: ['employeeNo'] }),
     grantedPatterns: [...commonGranted, 'legalCardPass', 'faceMatch'],
     deniedPatterns: [...commonDenied, 'invalidCard', 'faceMismatch'],
@@ -102,9 +95,8 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['^DS-K1T67', '^K1T67'],
     devicePattern: 'standalone_terminal',
     authenticationMethods: ['face', 'card', 'fingerprint', 'PIN', 'QR', 'mobile credential where fitted'],
-    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'hikvision_cloud_openapi', 'offsite_isup_gateway', 'isapi_bridge', 'windows_agent', 'isapi_windows_agent', 'manual_sync'],
-    defaultConnection: 'direct_http_listener',
-    httpListener: { expected: true, formats: ['json', 'xml', 'multipart'], note: 'Confirm firmware upload format and certificate validation.' },
+    supportedConnections: AGENT_CONNECTIONS,
+    defaultConnection: 'isapi_bridge',
     aliases: aliases({ credentialType: ['mask', 'helmet', 'recognitionMode'] }),
     grantedPatterns: [...commonGranted, 'legalCardPass', 'faceMatch', 'multiVerifyPass'],
     deniedPatterns: [...commonDenied, 'invalidCard', 'faceMismatch', 'multiVerifyFailed'],
@@ -117,9 +109,8 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['^DS-K1T68', '^K1T68'],
     devicePattern: 'standalone_terminal',
     authenticationMethods: ['face', 'card', 'fingerprint', 'PIN', 'QR', 'palm/iris where fitted'],
-    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'hikvision_cloud_openapi', 'offsite_isup_gateway', 'isapi_bridge', 'windows_agent', 'isapi_windows_agent', 'manual_sync'],
-    defaultConnection: 'direct_http_listener',
-    httpListener: { expected: true, formats: ['json', 'xml', 'multipart'], note: 'Large image events are accepted only up to the configured request limit.' },
+    supportedConnections: AGENT_CONNECTIONS,
+    defaultConnection: 'isapi_bridge',
     aliases: aliases({ credentialType: ['irisMode', 'palmMode', 'recognitionMode'] }),
     grantedPatterns: [...commonGranted, 'legalCardPass', 'faceMatch', 'palmMatch', 'irisMatch'],
     deniedPatterns: [...commonDenied, 'invalidCard', 'faceMismatch', 'palmMismatch', 'irisMismatch'],
@@ -132,9 +123,8 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['^DS-K560', '^DS-K567', '^DS-K3.*FACE'],
     devicePattern: 'turnstile_module',
     authenticationMethods: ['face', 'card', 'QR where fitted'],
-    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'offsite_isup_gateway', 'isapi_bridge', 'windows_agent', 'isapi_windows_agent', 'manual_sync'],
-    defaultConnection: 'direct_http_listener',
-    httpListener: { expected: true, formats: ['json', 'xml', 'multipart'], note: 'Verify whether the turnstile controller or face module owns the event upload.' },
+    supportedConnections: AGENT_CONNECTIONS,
+    defaultConnection: 'isapi_bridge',
     aliases: aliases({ direction: ['laneDirection'], doorNo: ['laneNo', 'barrierNo'] }),
     grantedPatterns: [...commonGranted, 'faceMatch', 'barrierOpen'],
     deniedPatterns: [...commonDenied, 'faceMismatch', 'barrierDenied'],
@@ -147,9 +137,8 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['^DS-K1T807.*QR', '^K1T807.*QR', '^DS-K1T502.*(QR|CQR)', '^K1T502.*(QR|CQR)'],
     devicePattern: 'standalone_terminal',
     authenticationMethods: ['card', 'PIN', 'QR', 'fingerprint/Bluetooth where fitted'],
-    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'offsite_isup_gateway', 'isapi_bridge', 'windows_agent', 'isapi_windows_agent', 'manual_sync'],
-    defaultConnection: 'direct_http_listener',
-    httpListener: { expected: true, formats: ['json', 'xml', 'multipart'], note: 'Provision the numeric visitor credential to the terminal before relying on its QR reader.' },
+    supportedConnections: AGENT_CONNECTIONS,
+    defaultConnection: 'isapi_bridge',
     aliases: aliases({ cardUid: ['cardNoString', 'qrCode'], credentialType: ['qrCodeMode'] }),
     grantedPatterns: [...commonGranted, 'legalCardPass', 'qrCodePass'],
     deniedPatterns: [...commonDenied, 'invalidCard', 'invalidQRCode'],
@@ -162,9 +151,8 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['^DS-K1T8', '^K1T8'],
     devicePattern: 'standalone_terminal',
     authenticationMethods: ['card', 'fingerprint where fitted', 'PIN'],
-    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'offsite_isup_gateway', 'isapi_bridge', 'windows_agent', 'isapi_windows_agent', 'manual_sync'],
-    defaultConnection: 'direct_http_listener',
-    httpListener: { expected: true, formats: ['json', 'xml', 'multipart'], note: 'ISAPI/ISUP support depends on model and firmware; use PIN or card because most K1T8xx models have no QR scanner.' },
+    supportedConnections: AGENT_CONNECTIONS,
+    defaultConnection: 'isapi_bridge',
     aliases: aliases({ cardUid: ['cardNoString'] }),
     grantedPatterns: [...commonGranted, 'legalCardPass', 'fingerprintPass'],
     deniedPatterns: [...commonDenied, 'invalidCard', 'fingerprintMismatch'],
@@ -177,9 +165,8 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['^DS-K1T5', '^K1T5'],
     devicePattern: 'standalone_terminal',
     authenticationMethods: ['card', 'face where fitted', 'fingerprint where fitted', 'PIN'],
-    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'offsite_isup_gateway', 'isapi_bridge', 'windows_agent', 'isapi_windows_agent', 'manual_sync'],
-    defaultConnection: 'direct_http_listener',
-    httpListener: { expected: true, formats: ['json', 'xml', 'multipart'], note: 'The K1T502 family documents HTTP/HTTPS event alarm upload; verify each regional firmware.' },
+    supportedConnections: AGENT_CONNECTIONS,
+    defaultConnection: 'isapi_bridge',
     aliases: aliases({ cardUid: ['cardNoString'] }),
     grantedPatterns: [...commonGranted, 'legalCardPass'],
     deniedPatterns: [...commonDenied, 'invalidCard'],
@@ -192,9 +179,8 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['^DS-K1A', '^K1A'],
     devicePattern: 'attendance_terminal',
     authenticationMethods: ['face', 'card', 'fingerprint', 'PIN'],
-    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'offsite_isup_gateway', 'isapi_bridge', 'windows_agent', 'isapi_windows_agent', 'manual_sync'],
-    defaultConnection: 'direct_http_listener',
-    httpListener: { expected: true, formats: ['json', 'xml', 'multipart'], note: 'Attendance check-in/out labels are normalized to entry/exit when present.' },
+    supportedConnections: AGENT_CONNECTIONS,
+    defaultConnection: 'isapi_bridge',
     aliases: aliases({ direction: ['attendanceStatus', 'label'], timestamp: ['attendanceTime'] }),
     grantedPatterns: [...commonGranted, 'checkIn', 'checkOut'],
     deniedPatterns: [...commonDenied],
@@ -207,9 +193,8 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['^DS-K260', '^K260'],
     devicePattern: 'multi_door_controller',
     authenticationMethods: ['card', 'PIN', 'reader-dependent biometrics'],
-    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'offsite_isup_gateway', 'isapi_bridge', 'windows_agent', 'isapi_windows_agent', 'manual_sync'],
-    defaultConnection: 'offsite_isup_gateway',
-    httpListener: { expected: false, formats: ['json', 'xml'], note: 'EHome/ISUP or a management platform is common; confirm direct HTTP host notification on the actual firmware.' },
+    supportedConnections: AGENT_CONNECTIONS,
+    defaultConnection: 'isapi_bridge',
     aliases: aliases({ doorNo: ['doorNo', 'cardReaderNo'], direction: ['cardReaderKind'] }),
     grantedPatterns: [...commonGranted, 'legalCardPass', 'normalCard'],
     deniedPatterns: [...commonDenied, 'invalidCard', 'interlock', 'antiPassback'],
@@ -222,9 +207,8 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['^DS-K27', '^DS-K28', '^K27', '^K28'],
     devicePattern: 'multi_door_controller',
     authenticationMethods: ['card', 'PIN', 'reader-dependent biometrics'],
-    supportedConnections: ['offsite_isup_gateway', 'isapi_bridge', 'windows_agent', 'isapi_windows_agent', 'manual_sync'],
-    defaultConnection: 'offsite_isup_gateway',
-    httpListener: { expected: false, formats: ['json', 'xml'], note: 'Do not select direct mode until HTTP Host/Listening is confirmed in the controller firmware.' },
+    supportedConnections: AGENT_CONNECTIONS,
+    defaultConnection: 'isapi_bridge',
     aliases: aliases({ doorNo: ['doorNo', 'readerNo'], direction: ['readerDirection'] }),
     grantedPatterns: [...commonGranted, 'legalCardPass', 'normalCard'],
     deniedPatterns: [...commonDenied, 'invalidCard', 'interlock', 'antiPassback'],
@@ -237,9 +221,8 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: [],
     devicePattern: 'standalone_terminal',
     authenticationMethods: ['card', 'PIN', 'QR or biometrics when provided by the device'],
-    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'isapi_bridge', 'windows_agent', 'isapi_windows_agent', 'manual_sync'],
+    supportedConnections: ['manual_sync'],
     defaultConnection: 'manual_sync',
-    httpListener: { expected: false, formats: ['json', 'xml', 'multipart'], note: 'Validate a real event sample before enabling production decisions or automatic commands.' },
     aliases: aliases(),
     grantedPatterns: commonGranted,
     deniedPatterns: commonDenied,
@@ -252,9 +235,8 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     modelPatterns: ['.*'],
     devicePattern: 'standalone_terminal',
     authenticationMethods: ['unknown'],
-    supportedConnections: ['direct_http_listener', 'render_http_bridge', 'offsite_isup_gateway', 'isapi_bridge', 'windows_agent', 'isapi_windows_agent', 'manual_sync'],
-    defaultConnection: 'manual_sync',
-    httpListener: { expected: false, formats: ['json', 'xml', 'multipart'], note: 'Run the device-profile validation procedure before production.' },
+    supportedConnections: AGENT_CONNECTIONS,
+    defaultConnection: 'isapi_bridge',
     aliases: aliases(),
     grantedPatterns: commonGranted,
     deniedPatterns: commonDenied,

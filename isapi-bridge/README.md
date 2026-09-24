@@ -1,13 +1,13 @@
 # EstateMate Hikvision ISAPI Bridge
 
-The ISAPI bridge is a small Node.js agent that runs on the same LAN as Hikvision access devices. It polls the Cloudflare Worker for pending card/visitor operations (created when facility fees expire, cards are issued, etc.) and applies them to the physical device via Hikvision ISAPI (HTTP Digest).
+The ISAPI bridge is a small Node.js agent that runs on the same LAN as Hikvision access devices. It does two things, both over ordinary outbound HTTPS to the Cloudflare Worker:
 
-It is an alternative to:
-- **Direct HTTP Listening** (event upload only, no command return path)
-- **Dedicated ISUP gateway** (requires official Hikvision SDK, Linux appliance)
-- **Manual sync** (operator applies from hardware-action queue)
+1. **Applies card/visitor operations** — polls the Worker for pending card/visitor operations (created when facility fees expire, cards are issued, etc.) and applies them to the physical device via Hikvision ISAPI (HTTP Digest).
+2. **Streams real-time access events** — holds one persistent `GET /ISAPI/Event/notification/alertStream` connection per device and forwards every swipe/alarm to the Worker in small batches, giving Gate activity latency of a few seconds without relying on the terminal's HTTP Listening push.
 
-ISAPI bridge uses the device's documented ISAPI endpoints (`/ISAPI/AccessControl/CardInfo/...`) which are available on most K1T, K26xx, K27xx/K28xx controllers when accessed from the LAN. It does **not** require the proprietary SDK.
+It replaced and removed the former transports — direct HTTP Listening, the Render free relay, Hikvision cloud/OpenAPI and the dedicated ISUP SDK gateway (migration `0013_agent_only_transports.sql`). `manual_sync` remains as the auditable fallback for devices not linked to an agent.
+
+ISAPI bridge uses the device's documented ISAPI endpoints (`/ISAPI/AccessControl/CardInfo/...`, `/ISAPI/Event/notification/alertStream`) which are available on most K1T, K26xx, K27xx/K28xx controllers when accessed from the LAN. It does **not** require the proprietary SDK.
 
 > **Security:** Keep ISAPI devices and this bridge on the same VLAN. Never expose ISAPI (port 80/443) to the Internet. The bridge config contains secrets — restrict file permissions to Administrators / 0600.
 
@@ -17,16 +17,44 @@ ISAPI bridge uses the device's documented ISAPI endpoints (`/ISAPI/AccessControl
 Cloudflare Worker (D1, Queue)
   ├── POST /api/isapi/v1/agents/:id/heartbeat
   ├── GET  /api/isapi/v1/agents/:id/operations  (pending card/visitor ops)
-  └── POST /api/isapi/v1/agents/:id/operations/:opId/result
+  ├── POST /api/isapi/v1/agents/:id/operations/:opId/result
+  └── POST /api/isapi/v1/agents/:id/events      (batched alertStream events)
 
 ISAPI Bridge Agent (Node.js, LAN)
   ├── polls operations every 30s
   ├── applies via ISAPI Digest to device (http://device-ip/ISAPI/...)
+  ├── holds GET /ISAPI/Event/notification/alertStream per device (real-time)
+  ├── buffers events; flushes up to 50 per request or every 5s
   └── reports applied/failed + sync logs
 
 Hikvision Device (LAN)
-  └── ISAPI: /ISAPI/AccessControl/CardInfo/Record, Delete, etc.
+  ├── ISAPI: /ISAPI/AccessControl/CardInfo/Record, Delete, etc.
+  └── ISAPI: /ISAPI/Event/notification/alertStream (persistent event stream)
 ```
+
+## Real-time event streaming
+
+Event streaming is **enabled by default** for every enabled device in `isapi-devices.json`. Disable globally with `"eventStream": false` in `agent-config.json`, or per device in the devices file. The portal can also kill it server-side: **Settings → `agent_event_stream_enabled` = `false`** (the Worker then answers `409` and the agent keeps buffering with backoff).
+
+How it works:
+
+- The agent answers the device's Digest (or Basic) challenge once, then keeps the alertStream connection open.
+- Events arrive as `multipart/mixed` parts (JSON or XML documents). Firmware that streams bare JSON objects is handled by a brace-depth scanner fallback.
+- Documents are buffered and flushed to `POST /api/isapi/v1/agents/:id/events` — up to 50 items per request, or every `eventFlushSeconds` (default 5 s), whichever comes first. The Worker normalizes each document with the same pipeline as direct device posts (profile aliases, granted/denied inference, idempotency on `(device_id, vendor_event_id)`), updates device last-seen, and queues the batch as **one** Queue message so the Cloudflare Workers Free plan Queues allowance (10,000 operations/day ≈ one message ≈ 3 operations) is preserved even on busy estates.
+- On connection loss the agent reconnects with 5 s → 60 s exponential backoff. A local buffer (default 500 events) rides out Worker outages; on overflow the oldest documents are dropped with a warning.
+
+Config knobs (`agent-config.json`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `eventStream` | `true` | Master switch for event streaming |
+| `eventFlushCount` | `25` | Buffer size that triggers an immediate flush (max 50) |
+| `eventFlushSeconds` | `5` | Maximum seconds an event waits in the buffer |
+| `eventBufferLimit` | `500` | Local buffer cap before oldest events are dropped |
+| `alertStreamPath` | `/ISAPI/Event/notification/alertStream?format=json` | Override for unusual firmware |
+
+Per-device `"eventStream": false` in `isapi-devices.json` disables streaming for that terminal only.
+
 
 ## Setup
 
@@ -56,7 +84,7 @@ Hikvision Device (LAN)
 - Run the downloaded `.sh` script (creates `/opt/estatemate/isapi-agent/agent-config.json` 0600).
 - Edit `/opt/estatemate/isapi-agent/isapi-devices.json`.
 - `npm install` (Node 22+) and run `node agent.mjs --config /opt/estatemate/isapi-agent/agent-config.json`.
-- For systemd, create a service similar to `isup-gateway/estatemate-isup-adapter.service`.
+- For systemd, create a small unit that runs `node agent.mjs --config /opt/estatemate/isapi-agent/agent-config.json` with `Restart=always`.
 
 ### 3. Link devices to agent
 
@@ -92,7 +120,7 @@ curl -i http://192.168.1.100/ISAPI/System/deviceInfo --digest -u admin:password
 ## Troubleshooting
 
 - **401 Unauthorized**: Check ISAPI username/password, device allows digest auth, IP not blocked.
-- **No operations**: Device not linked to agent, or connection pattern still `manual_sync` / `direct_http_listener`. Change to `isapi_bridge` / `windows_agent`.
+- **No operations**: Device not linked to agent, or connection pattern still `manual_sync`. Set it to `isapi_bridge` / `windows_agent` and link it.
 - **Operation stuck in sent**: Agent not reporting result. Check agent logs, network to Cloudflare, secret.
 - **Card not opening door**: Card added but not assigned to access group / door. Some models require separate Person + Card + Access Group linking. This bridge currently does simple card add; for full person management, extend `applyCardOperation` to create Person first (`/ISAPI/AccessControl/UserInfo/Record`).
 

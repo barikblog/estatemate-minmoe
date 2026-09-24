@@ -1,5 +1,10 @@
 # EstateMate Build Prompt v3 — Direct MinMoe Internet Mode
 
+> **Historical document (v3 build prompt).** The transports described below were consolidated on
+> 2026-09-24: direct HTTP Listening, the Render relay, Hikvision cloud/OpenAPI and the ISUP gateway
+> were removed in migration `0013_agent_only_transports.sql`. The agent (`isapi-bridge/`) is now the
+> only automatic transport. Read [`MINMOE-NO-PC.md`](MINMOE-NO-PC.md) for the current decision.
+
 This document amends `EstateMate_Build_Prompt_v2` for estates where supported Hikvision MinMoe terminals have Internet access but no PC/server is installed on site.
 
 ## Superseding architecture decision

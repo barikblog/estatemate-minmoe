@@ -2,10 +2,10 @@
 
 EstateMate is a residential-estate operations platform with a responsive React portal, Kotlin/Compose Android client, and Cloudflare Worker API backed by D1, Queues, Durable Objects, and an administrator-configurable private GitHub upload repository.
 
-This repository replaces the original on-site Edge Sync Agent with direct **Hikvision HTTP Listening** event upload. A supported MinMoe terminal sends access events over outbound HTTPS to the Worker, so no PC is required at the estate for event collection.
+All access devices connect to EstateMate through one channel: the **EstateMate agent** (`isapi-bridge/`, wrapped for Windows in `windows-agent/`) running on the estate LAN. The agent holds a persistent Hikvision ISAPI `alertStream` connection per terminal and streams swipe events to the Worker in real time, and it polls the Worker for pending card/visitor operations and applies them over ISAPI (HTTP Digest) — so events are live and fee-linked card enable/disable is automatic. Any always-on small computer on the device LAN works: the existing estate office Windows PC, a spare Android phone on estate Wi-Fi (Termux + Node), or a single-board computer.
 
 > [!IMPORTANT]
-> **HTTP Listening is an event-upload channel, not a bidirectional device-management channel.** It can deliver card/face/access events to EstateMate, but it normally cannot receive add/enable/disable-card commands from Cloudflare. The platform therefore records required card changes in a visible, auditable **Hardware actions** queue. Fully automatic fee-linked card disable/enable requires one model-specific command path: an approved Hikvision cloud/OpenAPI proxy, a small headless Linux appliance (or off-site VM) running the licensed ISUP 5.0 SDK, or a verified firmware capability that polls a command endpoint. Do not expose ISAPI or the terminal admin interface directly to the public Internet.
+> **The agent keeps ISAPI private to the estate VLAN.** Only the agent talks to the terminals, and only the agent's outbound HTTPS reaches Cloudflare. Never port-forward a terminal's ISAPI/admin interface to the public Internet, and never run the agent anywhere except the device LAN. Devices not yet linked to an agent fall back to auditable **manual synchronization**: the Hardware actions queue lists each change for an operator to apply.
 
 ## Repository status
 
@@ -15,7 +15,7 @@ Included:
 
 - One Cloudflare Worker serving the SPA and `/api/*`.
 - D1 schema for users, multi-property ownership and approval requests, streets/properties, billing, historical bill/payment imports, visitors, maintenance, general estate notices, access cards, access events, devices, operations, settings, and audit records.
-- Direct or optional Render-relayed JSON/XML/multipart HTTP Listening ingestion for compatible Internet-connected access devices.
+- LAN-agent event ingestion: the agent streams JSON/XML device events (ISAPI alertStream) to the Worker in batches; retired transports (direct HTTP Listening, Render relay, Hikvision cloud, ISUP gateway) were removed in migration 0013.
 - Per-device one-time credentials; editable/soft-deletable device inventory; Queue buffering; D1 event persistence; Durable Object live WebSocket feed.
 - Device-tap card enrollment, phone/device visitor-code scanning, QR + Code 128 visitor passes, and preview-before-entry Security decisions.
 - Hourly facility-fee expiry/reactivation job and hardware-action audit queue.
@@ -33,8 +33,7 @@ Included:
 - Audited immediate or scheduled ownership transfers, downloadable property statements, and grouped street/block/zone billing.
 - Kotlin/Compose Android foundation with encrypted token storage, Retrofit/Hilt, Room event cache, role dashboard, and gate history.
 - Private GitHub-backed upload/download storage with encrypted-at-rest repository access tokens, supporting proof on ownership/tenancy/household/visitor/maintenance/payment forms, access checks, and a 4 MB per-file limit. Paid R2 storage remains disabled.
-- Administrator-editable portal identity, theme colours, light/dark mode, support details, visitor defaults, scan timeout and optional Render relay URL.
-- Encrypted Hik-Connect access-server/device details plus a one-time generated Ubuntu site-sync installer for the ISUP gateway control plane; the licensed official Hikvision SDK adapter must still be supplied and compiled separately.
+- Administrator-editable portal identity, theme colours, light/dark mode, support details, visitor defaults and scan timeout.
 - PBKDF2-SHA256 passwords and HS256 sessions implemented with Workers Web Crypto.
 - Tests for password/JWT code and Hikvision JSON/XML/multipart parsing.
 
@@ -45,14 +44,13 @@ Still model/account dependent:
 - Gemini enrichment, FCM delivery, large GitHub exports, and full accounting/reconciliation UI.
 - Android production signing, push configuration, and Play distribution.
 
-See [`docs/MINMOE-NO-PC.md`](docs/MINMOE-NO-PC.md), [`docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md`](docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md), and [`isup-gateway/README.md`](isup-gateway/README.md) before installing a device. Property workflows are in [`docs/MULTI-PROPERTY-OWNERSHIP.md`](docs/MULTI-PROPERTY-OWNERSHIP.md) and [`docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md`](docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md). Proof uploads and theming are documented in [`docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md`](docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md). Private upload setup is in [`docs/GITHUB-STORAGE.md`](docs/GITHUB-STORAGE.md), people administration is in [`docs/PEOPLE-REGISTRATION-AND-IMPORTS.md`](docs/PEOPLE-REGISTRATION-AND-IMPORTS.md), and Manager/import/Hik-Connect/site-sync behavior is in [`docs/MANAGERS-IMPORTS-HIKCONNECT-SITE-SYNC.md`](docs/MANAGERS-IMPORTS-HIKCONNECT-SITE-SYNC.md). AI agents should begin with [`AGENTS.md`](AGENTS.md).
+See [`docs/MINMOE-NO-PC.md`](docs/MINMOE-NO-PC.md), [`docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md`](docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md), and [`isapi-bridge/README.md`](isapi-bridge/README.md) before installing a device. Property workflows are in [`docs/MULTI-PROPERTY-OWNERSHIP.md`](docs/MULTI-PROPERTY-OWNERSHIP.md) and [`docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md`](docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md). Proof uploads and theming are documented in [`docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md`](docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md). Private upload setup is in [`docs/GITHUB-STORAGE.md`](docs/GITHUB-STORAGE.md), people administration is in [`docs/PEOPLE-REGISTRATION-AND-IMPORTS.md`](docs/PEOPLE-REGISTRATION-AND-IMPORTS.md), and Manager and import behavior is in [`docs/MANAGERS-IMPORTS-HIKCONNECT-SITE-SYNC.md`](docs/MANAGERS-IMPORTS-HIKCONNECT-SITE-SYNC.md). AI agents should begin with [`AGENTS.md`](AGENTS.md).
 
 ## Architecture
 
 ```text
-Access device ── outbound HTTPS event POST ──────────────┐
-              └── optional Render Free HTTPS relay ──────┤
-React portal / Android ── HTTPS REST ────────────────────▶ Cloudflare Worker
+Access device ── ISAPI alertStream (LAN) ──▶ EstateMate agent ── outbound HTTPS batches ──┐
+React portal / Android ── HTTPS REST ────────────────────────────────────────────────────▶ Cloudflare Worker
                                                    ├── D1
                                                    ├── private GitHub repository API
                                                    ├── access-events Queue
@@ -60,9 +58,8 @@ React portal / Android ── HTTPS REST ─────────────
                                                    └── hourly Cron
 
 Cloud-to-terminal card/visitor action
-  ├── HTTP Listening mode: audit queue → authorized operator applies on device
-  └── Dedicated ISUP mode: Worker operation endpoint → small Ubuntu gateway
-      → licensed official Hikvision SDK adapter → supported terminal/controller
+  ├── Agent mode: Worker operation queue → LAN agent polls → ISAPI Digest (automatic)
+  └── Manual mode: audit queue → authorized operator applies on the device
 ```
 
 ## Supported Hikvision series profiles
@@ -84,13 +81,13 @@ Device registration now offers profile auto-detection plus an explicit override 
 | Other network access | Explicitly validated non-Hikvision device | Vendor-neutral conservative parser |
 | Generic ISAPI | Unknown/unlisted Hikvision models | Conservative fallback |
 
-Each profile carries model patterns, event-field aliases, grant/deny mappings, credential types, expected event formats, and permitted connection patterns. The selectable connection patterns are:
+Each profile carries model patterns, event-field aliases, grant/deny mappings, credential types, expected event formats, and permitted connection patterns. There is exactly one automatic transport — the agent — plus an auditable manual fallback:
 
-- **Direct HTTP Listening:** outbound event upload, no assumed return command channel.
-- **Render free HTTPS relay:** optional stateless event forwarding for HTTP-capable devices; subject to free-tier sleep/cold starts and not an ISUP/TCP server.
-- **Hikvision cloud/OpenAPI:** pending adapter; enable only with approved API documentation and credentials.
-- **Dedicated ISUP gateway:** bidirectional option using `isup-gateway/` on a small local x86_64 Ubuntu appliance (recommended) or off-site VM; it becomes operational only after compiling the wrapper against the licensed official SDK for the exact hardware/firmware.
-- **Manual synchronization:** event/audit platform with operator-applied hardware changes.
+- **ISAPI bridge agent (`isapi_bridge`):** cross-platform Node agent on the device LAN; real-time alertStream event streaming plus ISAPI card operations. Recommended default.
+- **Windows agent (`windows_agent`) / combined (`isapi_windows_agent`):** the same agent on the estate office Windows PC as a service.
+- **Manual synchronization (`manual_sync`):** event/audit platform with operator-applied hardware changes; also the migration target for devices previously on retired transports.
+
+The former direct HTTP Listening, Render free relay, Hikvision cloud/OpenAPI, and dedicated ISUP gateway transports were removed (migration `0013_agent_only_transports.sql`); their history-preserving replacements are documented in `docs/MINMOE-NO-PC.md`.
 
 The generic parser retains unknown values rather than inventing a grant result. Add firmware-specific evidence in `docs/device-profiles/` before marking a combination production-supported.
 
@@ -99,14 +96,14 @@ The generic parser retains unknown values rather than inventing a grant result. 
 ```text
 apps/web/                  React + Vite portal
 apps/android/              Android Studio Kotlin/Compose project
-bridge/                    Optional stateless Render Free HTTPS event relay
-isup-gateway/               Always-on Ubuntu/official-SDK gateway host package
+isapi-bridge/              The only device transport: cross-platform LAN agent
+                           (real-time alertStream events + ISAPI card operations)
+windows-agent/             Windows Service wrapper for the ISAPI bridge agent
 src/                       Worker/API, parser, auth, Queue and Durable Object
 migrations/                Versioned D1 schema
 scripts/                    Setup and AI-continuation helpers
 docs/                       Device, architecture and deployment guides
 AGENTS.md                   Starting instructions for another AI coding agent
-render.yaml                 Render Blueprint (free web service only)
 wrangler.jsonc              Local/current deployment config
 wrangler.template.jsonc     Clean template for another Cloudflare account
 ```
@@ -170,17 +167,16 @@ npm run deploy
 
 A scoped Cloudflare token needs permissions for Workers Scripts, D1, Queues, account metadata, and Workers routes only if a custom route is used. Never commit Cloudflare, GitHub, or device credentials.
 
-## MinMoe setup
+## Access-device setup (agent method)
 
 1. Sign in as an EstateMate administrator.
-2. Go to **Access-control devices → Register device** and enter the exact model, firmware, serial, gate, and direction.
-3. Copy the endpoint and one-time secret.
-4. In the terminal web interface, find **Network → Network Service/Advanced → HTTP Listening** (wording varies).
-5. Choose **HTTPS**, enter the Worker hostname, port `443`, and URL/path shown by EstateMate.
-6. If the firmware supports listener authentication, use the displayed username and secret. If it cannot send Basic auth, the generated endpoint includes a per-device key as a compatibility fallback.
-7. Run the terminal’s listener test. Present a test card and confirm **last seen** and **Gate activity** update.
+2. Go to **Access-control devices → Register device** and enter the exact model, firmware, serial, gate, and direction. Keep the default **ISAPI bridge** connection pattern.
+3. Under **ISAPI Bridge & Windows Agent**, register the agent that runs on the estate LAN and download its installer (PowerShell for Windows, shell for Linux). The one-time secret is shown once.
+4. Install the agent on an always-on computer on the device LAN (office PC, Termux on a spare Android phone, or a small board), and edit `isapi-devices.json` with each terminal's LAN IP, ISAPI port, and administrator credentials.
+5. Link each device to the agent in the portal (**Device ISAPI configs**) with its ISAPI host/port/credentials.
+6. Present a test card and confirm **last seen** and **Gate activity** update within seconds; issue a test card and confirm it appears on the terminal within the polling interval.
 
-Do not use HTTP over the public Internet. Do not configure router port-forwarding to the MinMoe terminal.
+Do not expose ISAPI to the public Internet. Do not configure router port-forwarding to any terminal. Full details: [`isapi-bridge/README.md`](isapi-bridge/README.md).
 
 ## Android
 
@@ -202,7 +198,6 @@ Production builds require your own signing key. Do not commit a keystore or its 
 ## Security notes
 
 - Device secrets are SHA-256 hashed with a server-side pepper. The plaintext secret is shown once.
-- Query-string device keys are provided only because some terminal firmware lacks listener authentication. They are protected in transit by HTTPS but can appear in logs; Basic authentication is preferred where tested.
 - Device request bodies are capped at 2 MB. User files are capped at 4 MB and stored through the GitHub Contents API in a dedicated private repository.
 - The GitHub storage token is encrypted with `STORAGE_ENCRYPTION_KEY`, never returned by the API, and should be a fine-grained token limited to the storage repository.
 - A resident’s properties, ownership requests, bills, cards, visitors, maintenance requests, files, and access events are scoped server-side.

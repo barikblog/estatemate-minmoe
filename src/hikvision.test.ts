@@ -9,7 +9,7 @@ const device: DeviceIdentity = {
   direction: 'entry',
   accessPointId: 'point-1',
   profileKey: 'minmoe_value_3xx',
-  connectionPattern: 'direct_http_listener',
+  connectionPattern: 'isapi_bridge',
 };
 
 describe('Hikvision event parser', () => {

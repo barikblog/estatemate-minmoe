@@ -1,91 +1,51 @@
-# Hikvision MinMoe no-PC integration decision
+# Access-device transport decision — agent-only
 
-## What direct HTTP Listening solves
+## The one transport: the EstateMate agent
 
-On supported MinMoe firmware, **HTTP Listening** (also called HTTP Host, Alarm Server, or event alarm upload) lets the terminal initiate an outbound HTTP/HTTPS request whenever an event occurs. This works through ordinary estate NAT and does not require inbound router ports or a computer on the terminal LAN.
+Every access device reaches EstateMate through the **EstateMate agent** (`isapi-bridge/agent.mjs`, wrapped as a Windows Service by `windows-agent/`) running on an always-on computer on the device LAN — the estate office Windows PC, a spare Android phone on estate Wi-Fi (Termux + Node 22), or a small single-board computer. The agent provides both directions over ordinary outbound HTTPS to the Cloudflare Worker:
 
-EstateMate accepts:
+- **Events (real-time):** one persistent `GET /ISAPI/Event/notification/alertStream?format=json` connection per terminal. Events arrive as `multipart/mixed` JSON/XML documents (bare-JSON fallback parser included), are buffered locally, and are flushed in batches (≤50 items or every 5 s) to `POST /api/isapi/v1/agents/:id/events`. Gate activity latency is seconds.
+- **Commands (automatic):** the agent polls `GET /api/isapi/v1/agents/:id/operations`, applies card upsert/enable/disable and visitor credentials over ISAPI (HTTP Digest) on the LAN, and reports applied/failed per operation. Facility-fee expiry auto-disable and visitor credential push work with no operator.
 
-- direct JSON event bodies;
-- direct XML `EventNotificationAlert` bodies;
-- `multipart/mixed` events containing JSON/XML metadata plus an image part;
-- access card number, person name, device time, event type, direction, and granted/denied inference where those values exist.
+Why one transport:
 
-The Worker acknowledges accepted messages and puts normalized events on a Queue. The consumer stores them in D1 and publishes them to live Admin/Security WebSockets.
+- **One security boundary.** Only the agent touches a terminal's ISAPI interface, and only on the VLAN. Nothing about a terminal is exposed to the Internet, and the agent needs no inbound firewall rule.
+- **One thing to monitor.** The agent heartbeats (`isapi_agents.status`, `last_seen_at`); if the LAN host dies, the portal shows the agent offline and devices stop updating — visible within minutes via the heartbeat.
+- **Free-tier headroom.** Agent batches collapse into one Queue message (~3 Queue operations) per flush, and the hourly cron prunes old events, so a busy estate stays far inside the Workers Free plan.
 
-## What it does not solve
+Connection patterns in the registry:
 
-HTTP Listening is normally one-way. Cloudflare receives event uploads, but cannot call a MinMoe terminal behind NAT. A terminal connected to the Internet does not automatically become remotely addressable.
+| Pattern | Meaning |
+|---|---|
+| `isapi_bridge` | Cross-platform agent (Linux/Windows/macOS) — recommended default |
+| `windows_agent` / `isapi_windows_agent` | The same agent on the estate office Windows PC |
+| `manual_sync` | Auditable fallback: events flow only through a linked agent; hardware changes are operator-applied from the Hardware actions queue |
 
-Consequences in `http-listener-events-only` mode:
+`generic_network_access` (validated non-Hikvision devices) supports `manual_sync` only because its ISAPI dialect is unverified.
 
-- Facility-fee rules change the authoritative cloud card status.
-- EstateMate creates one hardware operation per terminal.
-- The portal clearly labels the operation `manual_action_required`.
-- An authorized operator applies the card enable/disable in the terminal UI, iVMS-4200 during a maintenance visit, or another approved management channel and marks the operation applied.
-- Until that action reaches the terminal, its local authorization list can still grant access. Do not represent cloud status as physical enforcement until sync is confirmed.
+## Retired transports (migration `0013_agent_only_transports.sql`)
 
-## Ways to obtain automatic bidirectional control without an on-site PC
+The following were removed from the product — endpoints, packages, portal options and settings no longer exist. Historical access events and audit rows are preserved; devices that were configured on a retired transport were migrated to `manual_sync` and become automatic again once linked to an agent.
 
-Choose only after the exact model and firmware are known.
+- **Direct HTTP Listening (device → Worker push):** removed. It was event-upload only — no command return channel — and required each terminal to hold outbound HTTPS plus DNS/HTTPS support that varied by firmware. The agent's alertStream streaming replaces it with equal real-time behavior plus commands.
+- **Render free HTTPS relay (`bridge/`, `render.yaml`):** removed. It was a stateless forwarding shim for HTTP Listening devices, subject to free-tier sleep/cold starts; with HTTP Listening gone it had no purpose.
+- **Hikvision cloud/OpenAPI:** removed. It was never implemented (pending approved API documentation/licensing) and was a second cloud dependency.
+- **Dedicated ISUP gateway (`isup-gateway/`, SDK adapter):** removed. It required compiling Hikvision's licensed proprietary SDK for the exact architecture/firmware on a dedicated Ubuntu host — a second, fragile control plane. The agent covers the same bidirectional need over documented ISAPI for terminals that expose it (e.g. DS-K1T808MFWX-B datasheet: "Supports ISAPI and ISUP 5.0"). Record any future cloud/ISUP evidence in `docs/device-profiles/` before proposing a new transport.
 
-### 1. Approved Hikvision cloud/OpenAPI proxy
-
-Some commercial Hikvision platforms can proxy device management through an outbound device connection. This is the preferred no-site-PC option when the account/product exposes documented person/card APIs. It requires platform credentials, product licensing/region availability, and model verification.
-
-### 2. Off-site ISUP 5.0 gateway
-
-Many MinMoe models can register outward to an ISUP server. The gateway runs on an Internet VM/container, not at the estate. It can provide a return command channel, but ISUP uses proprietary TCP/UDP services and often Hikvision SDK/licensing. The EstateMate app can remain on Cloudflare while the gateway exposes a narrow mutually-authenticated HTTPS API to it.
-
-This is not the same as deploying everything to standard Cloudflare Workers. Do not claim support until an end-to-end card add/disable test passes on the actual firmware.
-
-### 3. Public ISAPI/port forwarding — rejected
-
-Do not expose the terminal’s web/ISAPI/server ports to the Internet. Risks include credential attacks, outdated terminal firmware, biometric/person database exposure, and a direct path to door controls.
-
-### 4. Manual audited actions
-
-This repository’s safe default. It has no extra infrastructure and keeps events live, but physical card changes are not immediate.
-
-## Multiple series and installation patterns
-
-EstateMate does not treat every Hikvision access product as one MinMoe model. The device registry supports separate profiles for Value K1T3xx, Pro K1T67x, Ultra K1T68x/selected K1T67x, turnstile modules, K1T5xx access terminals, K1A attendance terminals, K2600 controllers, K2700/K2800 controllers, and a generic ISAPI fallback.
-
-Profiles affect field aliases, event result mapping, credential-type inference, door/channel handling, and allowed transport choices. They do not override the need to test the exact suffix, region, hardware revision, and firmware. A model prefix is a starting point—not proof that HTTPS listening or remote commands are supported.
-
-Supported deployment patterns:
-
-1. Standalone terminal with direct HTTP Listening.
-2. Entry and exit terminals as separate devices/access points.
-3. One terminal configured for both directions when its event contains reliable direction data.
-4. Face module attached to a turnstile, with explicit lane/channel mapping.
-5. Multi-door K2600/K2700/K2800 controller, with one access-point row per door/reader direction.
-6. Multiple mixed series in one estate; every device keeps its own profile and transport.
-
-## Optional Render free HTTPS relay
-
-For a compatible terminal that can send HTTP/HTTPS event notifications, EstateMate includes a stateless Render Blueprint (`render.yaml`, service code in `bridge/`). It forwards event payloads to the Cloudflare Worker and does not store data.
-
-This is an optional compatibility route, not an ISUP server. Render Free spins down after 15 minutes without inbound traffic, can take about one minute to wake, and exposes web traffic rather than arbitrary Hikvision ISUP TCP services. Keep the direct Worker endpoint as the recommended path and fallback. See [`VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md`](VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md).
-
-DS-K1T808MFWX-B can use card/fingerprint/PIN and documents ISAPI/ISUP support, but does not document an integrated QR camera. DS-K2802 is a two-door controller requiring attached Wiegand readers and should not be treated as a MinMoe optical terminal.
+Do not recreate these endpoints or packages. If a future requirement genuinely cannot be met by the agent, document the evidence first and add a new migration-backed pattern — do not silently widen the attack surface.
 
 ## Required model-validation test
 
 For each terminal model/firmware:
 
 1. Record model, full firmware/build, hardware version, serial (redacted in shared tickets), and region.
-2. Screenshot **Network → Platform Access** and **HTTP Listening** settings.
-3. Confirm HTTPS listener support, DNS hostname support, URL length, authentication options, payload format, and certificate validation.
-4. Create a dedicated test device record in EstateMate.
-5. Use the terminal’s Test function and capture the Worker log.
-6. Present a valid card, invalid card, face, PIN, and denied/expired credential.
-7. Compare event minor/sub-event codes with the terminal UI event log.
-8. Verify time zone and NTP.
-9. Disconnect Internet, trigger events, reconnect, and determine whether firmware retries buffered events.
-10. Test duplicate delivery and verify D1 idempotency.
-11. Confirm whether ISUP or a Hikvision cloud platform can perform person/card operations remotely.
-12. Document results under `docs/device-profiles/MODEL-FIRMWARE.md` before production.
+2. Confirm ISAPI reachability: `curl --digest -u admin:password http://<device-ip>/ISAPI/System/deviceInfo`.
+3. Confirm the alert stream: `curl --digest -u admin:password -H "Accept: multipart/mixed" "http://<device-ip>/ISAPI/Event/notification/alertStream?format=json"` and note the payload shape (multipart vs bare JSON).
+4. Create the device record in EstateMate (`isapi_bridge`), link it to the agent, and confirm the stream connects in the agent log.
+5. Present a valid card, invalid card, PIN, and a disabled/expired credential; compare Gate activity grant/deny results with the terminal's local event log.
+6. Issue a card from the portal; confirm it reaches the terminal within the polling interval. Expire a facility fee and confirm automatic `disable_card`.
+7. Verify time zone/NTP so event timestamps match estate time.
+8. Document results under `docs/device-profiles/` before production.
 
 ## Information still needed
 
