@@ -85,15 +85,34 @@ async function hmac(secret: string, input: string): Promise<Uint8Array> {
   return new Uint8Array(await crypto.subtle.sign('HMAC', key, encoder.encode(input)));
 }
 
+/**
+ * Extra claims that may be attached to a session token. `gate` scopes a
+ * Security officer to the access-control device they selected at login;
+ * `pendingGate` marks the short-lived token used only to make that selection.
+ */
+export interface ExtraJwtClaims {
+  gate?: string | null;
+  pendingGate?: boolean;
+}
+
 export async function signJwt(
   env: Pick<Env, 'JWT_SECRET'>,
   user: { id: string; role: Role; name: string },
   ttlSeconds = 60 * 60 * 12,
+  extra: ExtraJwtClaims = {},
 ): Promise<string> {
   if (!env.JWT_SECRET || env.JWT_SECRET.length < 32) throw new Error('JWT_SECRET must be at least 32 characters');
   const now = Math.floor(Date.now() / 1000);
   const header = base64Url(encoder.encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })));
-  const payload: JwtClaims = { sub: user.id, role: user.role, name: user.name, iat: now, exp: now + ttlSeconds };
+  const payload: JwtClaims = {
+    sub: user.id,
+    role: user.role,
+    name: user.name,
+    ...(extra.gate ? { gate: extra.gate } : {}),
+    ...(extra.pendingGate ? { pendingGate: true } : {}),
+    iat: now,
+    exp: now + ttlSeconds,
+  };
   const encodedPayload = base64Url(encoder.encode(JSON.stringify(payload)));
   const input = `${header}.${encodedPayload}`;
   return `${input}.${base64Url(await hmac(env.JWT_SECRET, input))}`;

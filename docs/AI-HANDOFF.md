@@ -1,6 +1,6 @@
 # AI handoff — EstateMate
 
-Updated: 2026-09-24 (Africa/Lagos) — Retired every access-device transport except the EstateMate agent (ISAPI bridge/Windows agent with real-time alertStream streaming); production domain is `https://estatemate.estatemate.workers.dev`
+Updated: 2026-09-24 (Africa/Lagos) — Portal UX phase (migration `0014`): administrator-published estate gate welcome image on the login screen and dashboard, searchable card-holder picker, and gate-scoped Security login sessions. Previous phase retired every access-device transport except the EstateMate agent; production domain is `https://estatemate.estatemate.workers.dev`
 
 
 
@@ -28,6 +28,10 @@ Run `git log -1 --oneline` and check the latest GitHub Actions run before making
 - **Hikvision ISAPI bridge and Windows agent**: `isapi-bridge/` cross-platform Node agent (ISAPI Digest, no SDK) + `windows-agent/` Windows Service wrapper, with portal UI for agent registry, device ISAPI configs, PowerShell/shell installer generation (one-time secret, 24h expiry), heartbeat, operation polling (`isapi_bridge`, `windows_agent`, `isapi_windows_agent` connection patterns), result reporting and sync logs. Agent v1.1.0 also streams real-time device events to the Worker in batches via a persistent ISAPI alertStream connection (see the streaming phase section below).
 - Optional proof uploads linked to ownership, transfer, tenancy, household, visitor, maintenance and payment records.
 - Administrator-editable portal identity, theme and operational defaults.
+- **Estate gate welcome image**: an Administrator uploads a photograph of the estate gate to the private GitHub repository; it is shown behind the welcome text on the login screen (and as a compact banner on phones, where the brand panel is hidden) and on every dashboard hero. Served by the unauthenticated `GET /api/portal-gate-image` because the login screen renders before a session exists; only a file explicitly published under the `portal-branding` category with an image content type can ever be returned.
+- **Searchable card-holder picker**: `GET /api/access/card-recipients` returns active main residents and active household members in one list, searchable by name, unit, email or phone, so issuing a card no longer means pasting a raw `residentId`/`householdMemberId`.
+- **Gate-scoped Security sessions**: Administrators and Managers post officers at gates (`security_gate_assignments`); an officer with at least one assignment must choose their gate at login, and that choice scopes their visitor queue, gate activity, device list and device options for the whole session. Shift history is recorded in `security_gate_sessions`.
+- **Access-termination guide** on the operator dashboard: the ordered chain for ending access (card, dependant, tenancy/account, visitor passes, terminal, hardware-action confirmation) with deep links to each section.
 - People administration with available-property selection, bulk CSV registration, generated one-time passwords, editing, reset, lifecycle guards and history-preserving deletion.
 - Operational Manager category with explicit separation from finance, private storage, global settings and elevated account management.
 - Private-storage-backed operational imports for properties, ownerships, tenancies and cards.
@@ -40,7 +44,16 @@ Run `git log -1 --oneline` and check the latest GitHub Actions run before making
 
 ## Most recent migration
 
-`migrations/0013_agent_only_transports.sql`
+`migrations/0014_gate_image_and_security_gate_sessions.sql`
+
+It adds the portal UX phase:
+
+- Seeds `portal_gate_image_key`, `portal_gate_image_caption` and `portal_gate_image_enabled` (default `false`). All three are in `PORTAL_SETTING_KEYS`, so they are Administrator-only through `PUT /api/portal-config`; `portal_gate_image_enabled` is validated as a literal `true`/`false` via `BOOLEAN_SETTING_KEYS`. The image bytes stay in the private GitHub repository — D1 keeps only the storage key.
+- Creates `security_gate_assignments` (`UNIQUE(security_user_id,device_id)`): which gates an officer may be posted at. Removing an assignment sets `active=0` rather than deleting, and re-assigning reactivates the surviving row.
+- Creates `security_gate_sessions`: which gate each officer selected and when the post ended (`replaced`, `assignment_removed`, `device_retired`).
+- No existing table was altered, so previously issued sessions and all historical gate data are untouched.
+
+The previous migration, `migrations/0013_agent_only_transports.sql`
 
 It removes every access-device transport except the EstateMate agent:
 
@@ -56,6 +69,54 @@ It enables real-time agent event streaming and free-tier retention:
 - Seeds `access_event_retention_days` (default `365`) — the hourly cron (`pruneAccessEvents` in `src/index.ts`) deletes `access_events` (by ISO `device_timestamp`) and `isapi_sync_logs` older than this in indexed 500-row batches, keeping a busy estate inside the 500 MB D1 free-tier database limit. Values below 30 are refused.
 
 The previous migration, `migrations/0011_hikvision_isapi_sync.sql`, added the ISAPI bridge and Windows agent registry/configs/logs/installers (detailed below).
+
+## Portal UX phase (2026-09-24)
+
+Four operator-facing changes, all behind migration `0014`. No existing table was altered.
+
+### 1. Estate gate welcome image (login page and dashboard)
+
+- Administrator uploads a JPEG/PNG/WebP through **Settings → Estate gate welcome image**. The portal posts it to `POST /api/files` with `X-File-Category: portal-branding`, then saves the returned storage key plus caption and visibility flag through `PUT /api/portal-config`.
+- `GET /api/portal-gate-image` streams the configured image **without authentication**. This is deliberate and unavoidable: the login screen renders before any session exists, so a gate photograph behind the welcome text cannot sit behind `requireAuth`. The exposure is bounded by *what can be published*, not by who asks — `downloadPortalBrandingImage` in `src/github-storage.ts` returns `null` unless the row is `status='active'`, `category='portal-branding'` **and** has an image content type. Visitor proofs, imports and every other category remain behind the authenticated `/api/files/*` route and are never reachable this way.
+- Rendered with an inline dark scrim (`gateImageStyle` in `App.tsx`) so welcome text stays legible over any photograph. On screens ≤850px the brand panel is hidden by existing layout, so the image moves to `.mobile-gate-banner` at the top of the sign-in card.
+- When no image is enabled the route answers `404` and the portal falls back to the original gradient — nothing renders broken.
+
+### 2. Searchable card-holder picker
+
+`GET /api/access/card-recipients?search=` (Administrator/Manager only) returns one merged, name-sorted list of active main residents and active household members. Residents match on name, email, phone and the unit numbers they own or rent; dependants match on their own name and phone, their primary resident's name, and the unit. Each item carries `kind: 'resident' | 'household_member'` so `PersonPicker` submits `residentId` or `householdMemberId` to the existing `POST /api/access/cards` and `POST /api/access/card-scan-sessions` contracts, which were already correct — only the UI was raw-id entry.
+
+### 3. Gate-scoped Security sessions
+
+Two-step handshake, because a session cookie must not exist before the officer states their post:
+
+1. `POST /api/auth/login` verifies the password. For `role='security'` with at least one active assignment it returns `requiresGateSelection: true`, the `gates` list and a **5-minute `selectionToken`** (`signJwt` with `pendingGate: true`), and sets **no** cookie.
+2. `POST /api/auth/select-gate` verifies the officer really is assigned to that device, then issues the real 12-hour session with a `gate` claim and opens a `security_gate_sessions` row.
+
+`requireAuth` rejects any `pendingGate` token outright, so a selection token can never be used as a session. It also re-checks the assignment on every request: if an administrator removes the post or retires the device mid-shift, the officer gets `401` and must select again rather than continuing to act at a gate they no longer cover.
+
+`gateScope(c)` returns the claim for Security and `null` for everyone else, and is applied to `/api/access/events` (the claim *overrides* any client `deviceId` filter, so it can narrow but never widen), `/api/visitors` (passes with `gate_scope='both'` plus passes attached to their own device), `/api/access/devices`, `/api/access/device-options`, and `/api/visitors/scan` (a pass issued for another gate is refused `403` and recorded as an `invalid` scan).
+
+**Deliberate fallback:** a Security account with *no* assignments still signs in unscoped and sees every gate, with a dashboard notice asking for an assignment. Forcing selection with nothing to select would have locked every existing officer out at deployment. Administrators and Managers are unaffected — `is_manager=1` accounts map to `manager`, never to the security gate check.
+
+Officers switch posts mid-shift from the gate chip in the topbar (`SwitchGateDialog`), which reuses `select-gate` with their existing session instead of a password.
+
+### 4. Access-termination guide
+
+`TERMINATION_STEPS` in `App.tsx` renders a collapsible six-step chain on the operator dashboard: card → dependant → tenancy/account → visitor passes → terminal → hardware-action confirmation. Each step deep-links to the section that performs it. It is guidance only, no new API. The final step exists because terminating in EstateMate does not by itself stop a physical card — the queued `disable_card`/`revoke_card` device operation must actually be applied.
+
+### Portal UX validation record (2026-09-24)
+
+- `npm run typecheck`, `npm test` (105 tests: 81 existing + 24 new in `test/portal-ux.test.ts`) and `npm run build:web` all pass; `git diff --check` clean; the 0001→0014 migration chain replays against in-memory SQLite.
+- Verified locally against `wrangler dev --local` with all 14 migrations applied: security login returns `requiresGateSelection` with no cookie and no token; the selection token is rejected as a session (`401`); selecting a gate issues a scoped session echoed by `/api/auth/me`; the scoped device list, device options and event list contain only that gate; a client `deviceId` filter cannot widen it; an unassigned device is refused `403`; and an Administrator login stays unscoped across both gates.
+- `card-recipients` returned both a resident (`Owns A-01`) and a dependant (`Dependant (child) of Rita Resident`) from one query.
+- **Not verified end-to-end:** the gate image bytes themselves. `downloadPortalBrandingImage` fetches from GitHub, which needs configured private storage plus a token; this environment has neither, so only the negative paths were exercised (non-branding category, non-image content type, unset/disabled key → all `404` before any network call). Upload and display against a real private repository should be smoke-tested after deployment.
+- Android/Kotlin **was** touched and **was not compiled**: this environment has no JDK, Gradle or Android SDK (`java` is absent), so the Kotlin edits are reviewed by inspection only and must be compiled before any Android release.
+
+### Unfinished work
+
+- **Android has no gate-picker UI.** The data layer now handles the new login contract: `LoginResponse.token` is nullable, `POST /api/auth/select-gate` is wired up, an officer posted at exactly one gate is scoped automatically, and an officer with several posts gets a `GateSelectionRequired` error naming their gates and pointing them at the web portal. Still missing: a Compose screen to choose between multiple posts, so a multi-gate officer cannot sign in on Android yet. **None of this Kotlin was compiled.**
+- The gate image has no automatic pruning: replacing it leaves the previous file in the private repository (only the D1 pointer moves).
+- `GET /api/security/gate-sessions` (shift history) has an endpoint and test coverage but no portal screen yet.
 
 ## Agent event streaming phase (2026-09-24)
 

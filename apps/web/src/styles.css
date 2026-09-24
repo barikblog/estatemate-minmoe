@@ -239,3 +239,75 @@ tbody tr:hover { background: #fafcff; }
 .notification-banner button { margin-left: 12px; }
 :root[data-theme="dark"] .notification-banner { background: #262015; border-color: #4a3a1f; color: #f5dfad; }
 
+
+/* ---------------------------------------------------------------------------
+   Estate gate welcome image, Security gate selection, the card-holder people
+   picker and the access-termination guide.
+   The gate photograph is layered with a dark scrim inline (gateImageStyle in
+   App.tsx); these rules only handle layout and legibility of the copy above it.
+   --------------------------------------------------------------------------- */
+.brand-copy { position: relative; z-index: 1; display: flex; flex-direction: column; }
+.brand-panel.has-gate-image::before, .brand-panel.has-gate-image::after { border-color: rgba(255,255,255,.09); }
+.gate-image-caption { margin: 0 0 20px; padding: 7px 12px; width: fit-content; max-width: 100%; border-radius: 9px; background: rgba(6,20,44,.42); border: 1px solid rgba(255,255,255,.18); color: rgba(255,255,255,.92); font-size: 12px; font-weight: 650; letter-spacing: .02em; }
+.hero-card.has-gate-image { box-shadow: var(--shadow), inset 0 0 0 1px rgba(255,255,255,.12); }
+.hero-card > div { position: relative; z-index: 1; }
+.hero-card .gate-image-caption { background: rgba(6,20,44,.4); }
+
+/* Security gate selection (login step two and the mid-shift switch dialog) */
+.gate-choice-list { display: grid; gap: 10px; margin: 6px 0 18px; }
+.gate-choice { display: grid; gap: 3px; text-align: left; padding: 14px 16px; border-radius: 12px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); transition: border-color .15s ease, transform .15s ease, box-shadow .15s ease; }
+.gate-choice:hover:not(:disabled) { border-color: var(--blue); transform: translateY(-1px); box-shadow: 0 8px 22px rgba(25,55,105,.12); }
+.gate-choice strong { font-size: 15px; letter-spacing: -.01em; }
+.gate-choice small { color: var(--muted); font-size: 12px; }
+.gate-choice.current { border-color: var(--green); background: #f2fcf6; }
+.gate-choice-busy, .gate-choice-current { justify-self: start; margin-top: 4px; padding: 2px 8px; border-radius: 6px; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; }
+.gate-choice-busy { background: #edf4ff; color: #25548d; }
+.gate-choice-current { background: #ebfbf2; color: #167343; }
+:root[data-theme="dark"] .gate-choice { background: #17253a; border-color: #30415c; }
+:root[data-theme="dark"] .gate-choice.current { background: #14301f; border-color: #2c6b45; }
+
+.gate-chip { display: inline-flex; align-items: center; gap: 8px; padding: 7px 13px; border-radius: 999px; border: 1px solid #c2efd5; background: #ebfbf2; color: #167343; font-size: 12px; font-weight: 750; white-space: nowrap; }
+.gate-chip span { padding: 1px 7px; border-radius: 6px; background: #167343; color: white; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; }
+:root[data-theme="dark"] .gate-chip { background: #14301f; border-color: #2c6b45; color: #9fe6bd; }
+:root[data-theme="dark"] .gate-chip span { background: #2c6b45; }
+
+/* Card-holder people picker */
+.person-picker { grid-column: 1 / -1; position: relative; }
+.person-results { position: absolute; z-index: 30; top: 100%; left: 0; right: 0; max-height: 288px; overflow-y: auto; margin-top: 6px; padding: 6px; border-radius: 12px; border: 1px solid var(--line); background: var(--surface); box-shadow: 0 20px 48px rgba(25,55,105,.2); }
+.person-result { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 11px; width: 100%; padding: 9px 10px; border: 0; border-radius: 9px; background: transparent; color: var(--ink); text-align: left; }
+.person-result:hover { background: #edf4ff; }
+.person-result + .person-result { margin-top: 2px; }
+.person-identity { display: grid; gap: 2px; min-width: 0; }
+.person-identity strong { font-size: 13.5px; }
+.person-identity small { color: var(--muted); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.person-result em { padding: 2px 8px; border-radius: 6px; background: #eef9f2; color: #167343; font-size: 9.5px; font-weight: 800; font-style: normal; text-transform: uppercase; letter-spacing: .07em; }
+.person-empty { margin: 6px 4px; color: var(--muted); font-size: 12.5px; line-height: 1.55; }
+.person-picked { grid-column: 1 / -1; display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 12px; padding: 11px 13px; border-radius: 12px; border: 1px solid #c2efd5; background: #f2fcf6; }
+.person-picked > div { display: grid; gap: 2px; min-width: 0; }
+.person-picked strong { font-size: 14px; }
+.person-picked small { color: var(--muted); font-size: 11.5px; }
+:root[data-theme="dark"] .person-results { background: #17253a; border-color: #30415c; }
+:root[data-theme="dark"] .person-result:hover { background: #22344e; }
+:root[data-theme="dark"] .person-picked { background: #14301f; border-color: #2c6b45; }
+
+/* Gate image administration */
+.gate-image-preview { display: grid; gap: 8px; }
+.gate-image-preview img { width: 100%; max-height: 220px; object-fit: cover; border-radius: 12px; border: 1px solid var(--line); }
+
+/* Access termination guide */
+.termination-guide > p { color: var(--muted); line-height: 1.65; font-size: 13.5px; }
+.termination-steps { display: grid; gap: 12px; margin: 18px 0 0; padding: 0; list-style: none; counter-reset: none; }
+.termination-steps li { display: grid; grid-template-columns: auto 1fr; gap: 13px; padding: 14px 16px; border-radius: 12px; border: 1px solid var(--line); border-left: 3px solid var(--blue); background: var(--surface); }
+.termination-steps strong { display: block; font-size: 14px; letter-spacing: -.01em; margin-bottom: 4px; }
+.termination-steps p { margin: 0 0 6px; color: var(--muted); font-size: 12.8px; line-height: 1.6; }
+.step-number { width: 27px; height: 27px; display: grid; place-items: center; border-radius: 9px; background: var(--blue); color: white; font-size: 12px; font-weight: 850; }
+:root[data-theme="dark"] .termination-steps li { background: #17253a; border-color: #30415c; border-left-color: var(--blue); }
+
+/* The login brand panel is hidden below 850px, so the gate photograph moves to a
+   compact banner at the top of the sign-in card on phones and small tablets. */
+.mobile-gate-banner { display: none; }
+@media (max-width: 850px) {
+  .mobile-gate-banner { display: flex; align-items: flex-end; min-height: 118px; margin-bottom: 20px; padding: 12px 16px; border-radius: 16px; color: rgba(255,255,255,.95); font-size: 12px; font-weight: 700; letter-spacing: .02em; }
+  .gate-chip { font-size: 11px; padding: 6px 10px; }
+  .gate-chip span { display: none; }
+}
