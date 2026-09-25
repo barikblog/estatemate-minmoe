@@ -255,33 +255,44 @@ jobs:
           if (-not $proc.WaitForExit(60000)) { $proc.Kill($true); $proc.WaitForExit() }
           $stdout = $stdoutTask.Result
           $stderr = $stderrTask.Result
-          Write-Host "--- launcher stdout ---"
+          # Assert against both streams together. The wrapper logs with
+          # console.log (stdout) while the core agent writes through its own
+          # logger, and which stream a given line lands on is not worth betting a
+          # release gate on.
+          $combined = ($stdout + "`n" + $stderr)
+          Write-Host "--- launcher stdout ($($stdout.Length) chars) ---"
           Write-Host $stdout
-          if ($stderr) { Write-Host "--- launcher stderr ---"; Write-Host $stderr }
+          Write-Host "--- launcher stderr ($($stderr.Length) chars) ---"
+          Write-Host $stderr
 
-          try {
-            if ($stdout -notmatch 'EstateMate Windows ISAPI Agent starting') {
-              throw 'wrapper banner not emitted'
+          $problems = @()
+          if ($combined -notmatch 'EstateMate Windows ISAPI Agent starting') {
+            $problems += 'wrapper banner not emitted'
+          }
+          # Either core location is correct: the wrapper prefers
+          # ../isapi-bridge/agent.mjs and falls back to ./agent-core.mjs. Inside a
+          # CI checkout the monorepo path exists, so the fallback is not used.
+          if ($combined -match 'Core agent:') {
+            Write-Host "wrapper reported a core agent path"
+          } else {
+            $problems += 'wrapper did not report a core agent path'
+          }
+          if ($combined -notmatch 'EstateMate ISAPI Bridge starting') {
+            $problems += 'core agent never logged its startup banner'
+          }
+
+          Remove-Item (Join-Path $bundle 'agent-config.json') -Force -ErrorAction SilentlyContinue
+          Remove-Item (Join-Path $bundle 'isapi-devices.json') -Force -ErrorAction SilentlyContinue
+
+          if ($problems.Count -gt 0) {
+            # Surface the raw streams as annotations: the job log archive is not
+            # always retrievable, and guessing at the cause wastes a whole run.
+            foreach ($p in $problems) { Write-Host "::error::startup smoke test: $p" }
+            $n = 0
+            foreach ($line in ($combined -split "`r?`n")) {
+              if ($line.Trim() -and $n -lt 50) { Write-Host "::error title=launcher-output::$line"; $n++ }
             }
-            # Either core location is correct. The wrapper prefers
-            # ../isapi-bridge/agent.mjs and only falls back to ./agent-core.mjs;
-            # inside a CI checkout the monorepo path exists, so asserting the
-            # fallback specifically would be wrong. What matters is that a core
-            # was resolved and that it started.
-            if ($stdout -match 'Core agent: (.+)$') {
-              Write-Host "wrapper resolved core: $($Matches[1].Trim())"
-            } else {
-              throw 'wrapper did not report which core agent it resolved'
-            }
-            if ($stdout -notmatch 'EstateMate ISAPI Bridge starting') {
-              throw 'core agent never started'
-            }
-          } catch {
-            Write-Host "::error::startup smoke test failed: $($_.Exception.Message)"
-            throw
-          } finally {
-            Remove-Item (Join-Path $bundle 'agent-config.json') -Force -ErrorAction SilentlyContinue
-            Remove-Item (Join-Path $bundle 'isapi-devices.json') -Force -ErrorAction SilentlyContinue
+            throw "startup smoke test failed: $($problems -join '; ')"
           }
 
           Write-Host "::notice::Windows bundle smoke tests passed (runtime $nodeVer; refuses to start unconfigured; starts and loads its core agent when configured)."
@@ -482,15 +493,16 @@ jobs:
             echo "::error::assembleDebug failed. Compiler errors follow as annotations, and the full log is uploaded as the android-build-logs artifact."
             # Kotlin/AGP errors are the actionable lines; without this the only
             # signal is a bare "exit code 1".
-            {
-              grep -E "^e: |error:|FAILURE:|Caused by:|Unresolved reference|not enough information|Compilation error|Execution failed for task" "$log_dir/assembleDebug.log" || true
-              # The "* What went wrong:" section names the failing task on the
-              # lines after it, which the pattern above would otherwise skip.
-              grep -A 6 '^\* What went wrong:' "$log_dir/assembleDebug.log" || true
-            } | grep -vE '^\s*$|^--$' | sort -u | head -60 \
-              | while IFS= read -r line; do
-                  printf '%s\n' "::error title=Gradle::${line}"
-                done
+            # The Kotlin compiler's `e:` lines are the actionable output, but the
+            # exact format varies with --console and the Kotlin daemon, and the
+            # log archive is not always retrievable. So dump counts for each
+            # candidate pattern plus the raw tail, verbatim, as annotations.
+            log="$log_dir/assembleDebug.log"
+            echo "::notice::gradle log has $(wc -l < "$log") lines; e:=$(grep -c '^e: ' "$log" || true) error:=$(grep -c 'error:' "$log" || true) w:=$(grep -c '^w: ' "$log" || true)"
+            grep -nE "^e: |^w: |error:|FAILURE:|Caused by:|What went wrong|Execution failed|Unresolved|Compilation|cannot find symbol|No such|not found" "$log" | head -40 \
+              | while IFS= read -r line; do printf '%s\n' "::error title=Gradle-match::${line}"; done
+            tail -n 70 "$log" \
+              | while IFS= read -r line; do printf '%s\n' "::error title=Gradle-tail::${line}"; done
             exit 1
           fi
 
