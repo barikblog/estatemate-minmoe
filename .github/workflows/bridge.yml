@@ -263,8 +263,15 @@ jobs:
             if ($stdout -notmatch 'EstateMate Windows ISAPI Agent starting') {
               throw 'wrapper banner not emitted'
             }
-            if ($stdout -notmatch 'Core agent: .*agent-core\.mjs') {
-              throw 'wrapper did not resolve the flat agent-core.mjs core'
+            # Either core location is correct. The wrapper prefers
+            # ../isapi-bridge/agent.mjs and only falls back to ./agent-core.mjs;
+            # inside a CI checkout the monorepo path exists, so asserting the
+            # fallback specifically would be wrong. What matters is that a core
+            # was resolved and that it started.
+            if ($stdout -match 'Core agent: (.+)$') {
+              Write-Host "wrapper resolved core: $($Matches[1].Trim())"
+            } else {
+              throw 'wrapper did not report which core agent it resolved'
             }
             if ($stdout -notmatch 'EstateMate ISAPI Bridge starting') {
               throw 'core agent never started'
@@ -277,7 +284,7 @@ jobs:
             Remove-Item (Join-Path $bundle 'isapi-devices.json') -Force -ErrorAction SilentlyContinue
           }
 
-          Write-Host "::notice::Windows bundle smoke tests passed (runtime $nodeVer; refuses unconfigured; starts and loads agent-core.mjs when configured)."
+          Write-Host "::notice::Windows bundle smoke tests passed (runtime $nodeVer; refuses to start unconfigured; starts and loads its core agent when configured)."
 
       - name: Sign the bundle runtime (optional)
         shell: pwsh
@@ -460,21 +467,49 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x gradlew
-          common=(--no-daemon --stacktrace
+          # Inside the workspace: upload-artifact cannot collect from RUNNER_TEMP.
+          log_dir="$GITHUB_WORKSPACE/build-logs"
+          mkdir -p "$log_dir"
+          echo "GRADLE_LOG_DIR=$log_dir" >> "$GITHUB_ENV"
+          common=(--no-daemon --stacktrace --console=plain
                   -PapiBaseUrl="${{ steps.api.outputs.url }}"
                   -PappVersionName="${{ steps.version.outputs.version_name }}"
                   -PappVersionCode="${{ steps.version.outputs.version_code }}")
 
-          ./gradlew "${common[@]}" assembleDebug
+          # Tee rather than redirect: the live log stays in the job output, while
+          # the copy is what gets surfaced as annotations and uploaded below.
+          if ! ./gradlew "${common[@]}" assembleDebug 2>&1 | tee "$log_dir/assembleDebug.log"; then
+            echo "::error::assembleDebug failed. Compiler errors follow as annotations, and the full log is uploaded as the android-build-logs artifact."
+            # Kotlin/AGP errors are the actionable lines; without this the only
+            # signal is a bare "exit code 1".
+            {
+              grep -E "^e: |error:|FAILURE:|Caused by:|Unresolved reference|not enough information|Compilation error|Execution failed for task" "$log_dir/assembleDebug.log" || true
+              # The "* What went wrong:" section names the failing task on the
+              # lines after it, which the pattern above would otherwise skip.
+              grep -A 6 '^\* What went wrong:' "$log_dir/assembleDebug.log" || true
+            } | grep -vE '^\s*$|^--$' | sort -u | head -60 \
+              | while IFS= read -r line; do
+                  printf '%s\n' "::error title=Gradle::${line}"
+                done
+            exit 1
+          fi
 
           if [ -n "${ANDROID_KEYSTORE_PATH:-}" ]; then
-            ./gradlew "${common[@]}" assembleRelease
+            if ! ./gradlew "${common[@]}" assembleRelease 2>&1 | tee "$log_dir/assembleRelease.log"; then
+              echo "::error::assembleRelease failed with signing configured."
+              {
+                grep -E "^e: |error:|FAILURE:|Caused by:|Unresolved reference|Compilation error|Execution failed for task" "$log_dir/assembleRelease.log" || true
+                grep -A 6 '^\* What went wrong:' "$log_dir/assembleRelease.log" || true
+              } | grep -vE '^\s*$|^--$' | sort -u | head -40 \
+                | while IFS= read -r line; do printf '%s\n' "::error title=Gradle::${line}"; done
+              exit 1
+            fi
           else
             # No signing config means AGP emits app-release-unsigned.apk, which
             # cannot be installed. That is expected on a PR, not an error - but it
             # must never be mistaken for a shippable artifact, so it is not
             # collected below.
-            ./gradlew "${common[@]}" assembleRelease > release.log 2>&1 || true
+            ./gradlew "${common[@]}" assembleRelease > "$log_dir/assembleRelease-unsigned.log" 2>&1 || true
             echo "::warning::ANDROID_KEYSTORE_* secrets are not set, so no installable release APK was produced. Set ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS and ANDROID_KEY_PASSWORD to enable release signing."
           fi
 
@@ -527,6 +562,17 @@ jobs:
           fi
           ( cd dist && sha256sum *.apk ) | tee dist/SHA256SUMS.txt
           ls -la dist
+
+      - name: Upload Gradle logs (on failure)
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-logs
+          path: |
+            build-logs/*.log
+            apps/android/app/build/reports/**
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload Android artifacts
         uses: actions/upload-artifact@v4
