@@ -76,12 +76,21 @@ if (agentSecret.length < 16) {
   process.exit(1);
 }
 
+// The EstateMate device id is the Worker's primary key for a terminal: queued
+// operations are addressed with it and events are uploaded against it. Asking
+// an installer to copy a UUID per gate out of the portal is where setups go
+// wrong, so a terminal that only has its LAN address is allowed here and the id
+// is looked up from the agent's own linked devices (see resolveDeviceIds).
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isUuid = (value) => UUID_PATTERN.test(String(value || '').trim());
+
 const devices = new Map();
+const unresolvedDevices = [];
 for (const d of devicesConfig.devices || []) {
-  if (!d.estateMateDeviceId || !d.isapiHost) continue;
+  if (!d.isapiHost) continue;
   if (d.enabled === false) continue;
-  devices.set(d.estateMateDeviceId, {
-    estateMateDeviceId: String(d.estateMateDeviceId),
+  const device = {
+    estateMateDeviceId: String(d.estateMateDeviceId || '').trim(),
     name: String(d.name || d.isapiHost),
     isapiHost: String(d.isapiHost).trim(),
     isapiPort: Number(d.isapiPort || 80),
@@ -89,12 +98,73 @@ for (const d of devicesConfig.devices || []) {
     isapiPassword: String(d.isapiPassword || ''),
     protocol: d.protocol === 'https' ? 'https' : 'http',
     eventStream: d.eventStream !== false,
-  });
+  };
+  if (isUuid(device.estateMateDeviceId)) devices.set(device.estateMateDeviceId, device);
+  else unresolvedDevices.push(device);
 }
 
-if (!devices.size) {
+if (!devices.size && !unresolvedDevices.length) {
   console.error('No enabled devices in devices file');
   process.exit(1);
+}
+
+/**
+ * Fills in the EstateMate device id for terminals configured by LAN address
+ * alone, by matching them against the devices the portal has linked to this
+ * agent (same host, and the same port when both sides state one). Exits with an
+ * explanation when a terminal cannot be matched, because a device without an id
+ * would silently drop the events it reads.
+ */
+async function resolveDeviceIds() {
+  if (!unresolvedDevices.length) return;
+  let linked = [];
+  try {
+    const { res, json } = await apiFetch(`/api/isapi/v1/agents/${agentId}/devices`, { method: 'GET' });
+    if (!res.ok) {
+      console.error(`Cannot resolve EstateMate device ids: the Worker answered HTTP ${res.status} for the linked-device list.`);
+      process.exit(1);
+    }
+    linked = Array.isArray(json.items) ? json.items : [];
+  } catch (err) {
+    console.error(`Cannot resolve EstateMate device ids: ${err.message}`);
+    process.exit(1);
+  }
+
+  const matched = new Set();
+  for (const device of unresolvedDevices) {
+    const host = device.isapiHost.toLowerCase();
+    const candidates = linked.filter((item) => String(item.isapi_host || '').trim().toLowerCase() === host);
+    const exact = candidates.filter((item) => !item.isapi_port || Number(item.isapi_port) === device.isapiPort);
+    const chosen = (exact.length ? exact : candidates)[0];
+    const chosenId = chosen && String(chosen.device_id || '').trim();
+    if (chosenId && isUuid(chosenId)) {
+      device.estateMateDeviceId = chosenId;
+      devices.set(chosenId, device);
+      matched.add(chosenId);
+      log('info', `Resolved EstateMate device id for "${device.name}" from the portal: ${chosenId}${chosen.isapi_port && Number(chosen.isapi_port) !== device.isapiPort ? ' (portal port differs)' : ''}`);
+    }
+  }
+
+  const unresolved = unresolvedDevices.filter((device) => !devices.has(device.estateMateDeviceId));
+  if (unresolved.length) {
+    const known = linked.length
+      ? linked.map((item) => `${item.device_name || item.device_id} (${item.isapi_host}${item.isapi_port ? `:${item.isapi_port}` : ''})`).join(', ')
+      : 'none';
+    for (const device of unresolved) {
+      console.error(
+        `Terminal "${device.name}" (${device.protocol}://${device.isapiHost}:${device.isapiPort}) has no EstateMate device id and the portal does not list it` +
+          ` — link it to this agent (Device agent → Connect terminal), or paste the terminal's EstateMate device ID from Connected terminals.`,
+      );
+    }
+    console.error(`Devices linked to this agent in the portal: ${known}`);
+    process.exit(1);
+  }
+
+  const linkedIds = linked.map((item) => String(item.device_id || '').trim()).filter(Boolean);
+  const orphans = linkedIds.filter((id) => !devices.has(id));
+  if (orphans.length) {
+    log('warn', `${orphans.length} device(s) linked to this agent in the portal are not in the devices file — operations for them stay queued until a terminal is configured for them.`);
+  }
 }
 
 function log(level, ...args) {
@@ -618,6 +688,7 @@ async function pollAndApply() {
 
 async function main() {
   log('info', `EstateMate ISAPI Bridge starting...`);
+  await resolveDeviceIds();
   const streamDevices = [...devices.values()].filter((device) => device.eventStream !== false);
   log('info', `Agent: ${agentId}, Worker: ${workerUrl}, Devices: ${devices.size}, Interval: ${syncInterval}s, EventStream: ${eventStreamEnabled ? `on (${streamDevices.length} device(s))` : 'off'}`);
 
@@ -658,6 +729,16 @@ export {
   main,
   pendingEvents,
   eventStats,
+  // Exported for sibling hosts that need to talk to a device without starting
+  // the main loops: bridge-apps/windows runs `bridge check` in standby mode and
+  // reuses the digest/basic ISAPI client instead of reimplementing it, so there
+  // is exactly one place where Hikvision authentication is spelled out.
+  isapiRequest,
+  resolveDeviceIds,
+  isUuid,
+  buildDigestAuthHeader,
+  basicAuthHeader,
+  alertStreamPath,
 };
 const isEntrypoint = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
 if (!isEntrypoint && !process.env.ESTATEMATE_AGENT_STANDBY) {

@@ -1449,7 +1449,7 @@ function Devices({ user }: { user: User }) {
       <label>Connection pattern<select name="connectionPattern"><option value="">Use profile recommendation (recommended)</option><option value="isapi_bridge">ISAPI bridge agent (cross-platform)</option><option value="windows_agent">Windows agent (ISAPI)</option><option value="isapi_windows_agent">ISAPI Windows agent (combined)</option><option value="manual_sync">Manual synchronization (no agent)</option></select></label>
       <button className="primary">Register</button>
     </FormCard>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Device'],['vendor','Vendor'],['model','Model'],['profile_key','Series profile'],['connection_pattern','Connection'],['isapi_agent_name','ISAPI agent'],['isapi_host','ISAPI host'],['last_isapi_sync_status','ISAPI sync'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['last_seen_at','Last event','date'],['pending_operations','Manual pending'],['queued_operations','Queued ops']]} action={operator?(row)=><div className="row-actions"><button className="text" onClick={()=>edit(row)}>Edit</button><button className="text danger" onClick={()=>remove(row)}>Delete</button></div>:undefined} /></ListState>
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Device'],['id','EstateMate device ID','id'],['vendor','Vendor'],['model','Model'],['profile_key','Series profile'],['connection_pattern','Connection'],['isapi_agent_name','ISAPI agent'],['isapi_host','ISAPI host'],['last_isapi_sync_status','ISAPI sync'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['last_seen_at','Last event','date'],['pending_operations','Manual pending'],['queued_operations','Queued ops']]} action={operator?(row)=><div className="row-actions"><button className="text" onClick={()=>edit(row)}>Edit</button><button className="text danger" onClick={()=>remove(row)}>Delete</button></div>:undefined} /></ListState>
   </PagePanel>;
 }
 
@@ -1464,6 +1464,7 @@ function IsapiBridge({ user }: { user: User }) {
   const [showLink, setShowLink] = useState(false);
   const [credentials, setCredentials] = useState<Row | null>(null);
   const [error, setError] = useState('');
+  const [copyNotice, copy] = useCopy();
 
   async function submitAgent(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setError('');
@@ -1476,6 +1477,8 @@ function IsapiBridge({ user }: { user: User }) {
 
   async function rotateAgent(row: Row) {
     if (!confirm(`Rotate the secret for ${String(row.name)}? Its current bridge will disconnect until it is set up again.`)) return;
+    // The rotate response carries only the new secret; keep the row's name and
+    // ID so the panel that follows can still show which agent was rotated.
     try { setCredentials({ ...row, ...(await api<Row>(`/api/isapi/agents/${row.id}/rotate-secret`, { method: 'POST' })) }); }
     catch (reason) { setError(reason instanceof Error ? reason.message : 'Rotate failed'); }
   }
@@ -1543,21 +1546,24 @@ function IsapiBridge({ user }: { user: User }) {
         <ol>
           <li>Add an agent and connect each terminal to it here using the terminal's LAN address and login.</li>
           <li><a href="https://github.com/barikblog/estatemate-minmoe/releases/latest" target="_blank" rel="noreferrer">Get the latest bridge</a>: use the single-file Windows app, or the Android bridge APK for a dedicated phone or tablet.</li>
-          <li>Choose <strong>Download setup</strong> on the agent row. Import that file during Windows setup, or paste it into the Android bridge. Add each terminal's LAN login when prompted; its EstateMate ID is resolved automatically.</li>
+          <li>Choose <strong>Download setup</strong> on the agent row. Import that file during Windows setup (<code>setup --from-installer</code>), or paste it into the Android bridge. Add each terminal's LAN login when prompted; its EstateMate ID is resolved automatically.</li>
           <li>Run <strong>Check</strong> or <strong>Test connection</strong>, start the bridge and confirm the agent status below changes to <strong>online</strong>.</li>
+          <li>Configuring a bridge by hand instead? <em>Copy ID</em> on the agent and terminal rows supplies the two IDs a bridge config needs — the agent ID and each terminal's EstateMate device ID.</li>
         </ol>
       </details>
     </div>
 
     {error && <Notice tone="error">{error}</Notice>}
+    {copyNotice && <Notice tone="success">{copyNotice}</Notice>}
     {credentials && <section className="credential-box">
-      <p className="eyebrow">SHOWN ONCE</p>
+      <p className="eyebrow">COPY NOW — SHOWN ONCE</p>
       <h3>Agent credentials</h3>
       <p>Agent: <code>{String(credentials.name ?? '—')}</code></p>
-      {Boolean(credentials.id) && <p>ID: <code>{String(credentials.id)}</code></p>}
-      {Boolean(credentials.secret) && <p>Secret: <code>{String(credentials.secret)}</code></p>}
-      <p>Use these only for manual configuration. For Windows or Android, <strong>Download setup</strong> from the agent row instead.</p>
-      {Boolean(credentials.secret) && <button className="secondary" onClick={() => navigator.clipboard.writeText(String(credentials.secret))}>Copy secret</button>}
+      {Boolean(credentials.id) && <p>Agent ID: <code>{String(credentials.id)}</code> <button className="secondary sm" onClick={() => copy(credentials.id, 'Agent ID')}>Copy ID</button></p>}
+      {Boolean(credentials.secret) && <p>Secret: <code>{String(credentials.secret)}</code> <button className="secondary sm" onClick={() => copy(credentials.secret, 'Agent secret')}>Copy secret</button></p>}
+      {Boolean(credentials.id) && Boolean(credentials.secret) && <p><button className="secondary sm" onClick={() => copy(`agentId=${String(credentials.id)}\nagentSecret=${String(credentials.secret)}`, 'Agent ID and secret')}>Copy both</button></p>}
+      <p>{String(credentials.warning ?? '')}</p>
+      <p>Use these only for manual configuration. For Windows or Android, <strong>Download setup</strong> from the agent row instead — that file already carries the agent ID, the secret and the Worker URL.</p>
     </section>}
 
     {showAgent && administrator && <FormCard title="Add device agent" onSubmit={submitAgent}>
@@ -1581,12 +1587,12 @@ function IsapiBridge({ user }: { user: User }) {
 
     <section className="panel agent-section">
       <div className="panel-title"><div><p className="eyebrow">Bridge hosts</p><h3>Agents</h3></div><button className="secondary sm" onClick={() => agents.reload()}>Refresh</button></div>
-      <ListState list={agents}><DataTable rows={agents.data?.items ?? []} columns={[['name','Agent'],['hostname','Computer'],['platform','Runs on'],['status','Status'],['last_seen_at','Last heartbeat','date'],['linked_devices','Terminals'],['pending_operations','Pending actions']]} action={administrator ? (row) => <div className="row-actions"><button className="text" onClick={() => downloadInstaller(row)}>Download setup</button><button className="text" onClick={() => rotateAgent(row)}>Rotate secret</button><button className="text danger" onClick={() => removeAgent(row)}>Delete</button></div> : undefined} /></ListState>
+      <ListState list={agents}><DataTable rows={agents.data?.items ?? []} columns={[['name','Agent'],['id','Agent ID','id'],['hostname','Computer'],['platform','Runs on'],['status','Status'],['last_seen_at','Last heartbeat','date'],['linked_devices','Terminals'],['pending_operations','Pending actions']]} action={administrator ? (row) => <div className="row-actions"><button className="text" onClick={() => copy(row.id, 'Agent ID')}>Copy ID</button><button className="text" onClick={() => downloadInstaller(row)}>Download setup</button><button className="text" onClick={() => rotateAgent(row)}>Rotate secret</button><button className="text danger" onClick={() => removeAgent(row)}>Delete</button></div> : undefined} /></ListState>
     </section>
 
     <section className="panel agent-section">
       <div className="panel-title"><div><p className="eyebrow">Gate network</p><h3>Connected terminals</h3></div><button className="secondary sm" onClick={() => deviceConfigs.reload()}>Refresh</button></div>
-      <ListState list={deviceConfigs}><DataTable rows={deviceConfigs.data?.items ?? []} columns={[['device_name','Terminal'],['gate_name','Gate'],['device_status','Terminal status'],['isapi_host','LAN address'],['isapi_port','Port'],['agent_name','Agent'],['agent_status','Agent status'],['last_sync_at','Last update','date'],['last_sync_status','Update status'],['last_error','Last error']]} action={operator ? (row) => <div className="row-actions"><button className="text danger" onClick={() => removeLink(row)}>Disconnect</button></div> : undefined} /></ListState>
+      <ListState list={deviceConfigs}><DataTable rows={deviceConfigs.data?.items ?? []} columns={[['device_name','Terminal'],['device_id','EstateMate device ID','id'],['gate_name','Gate'],['device_status','Terminal status'],['isapi_host','LAN address'],['isapi_port','Port'],['agent_name','Agent'],['agent_status','Agent status'],['last_sync_at','Last update','date'],['last_sync_status','Update status'],['last_error','Last error']]} action={operator ? (row) => <div className="row-actions"><button className="text" onClick={() => copy(row.device_id, 'EstateMate device ID')}>Copy ID</button><button className="text danger" onClick={() => removeLink(row)}>Disconnect</button></div> : undefined} /></ListState>
     </section>
 
     <section className="panel agent-section">
@@ -1838,6 +1844,32 @@ function useList(url: string) {
   return useAsync<ListResponse<Row>>(() => api(url), [url]);
 }
 
+/**
+ * Clipboard writes that say what they did. Several pages here hand out
+ * identifiers someone has to type into another program - the bridge's
+ * agent-config.json takes the agent ID and isapi-devices.json takes one
+ * EstateMate device ID per terminal - and a 36-character UUID is not something
+ * to transcribe from a screenshot.
+ */
+function useCopy() {
+  const [notice, setNotice] = useState('');
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(''), 4000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+  const copy = useCallback((value: unknown, label = 'Value') => {
+    const text = String(value ?? '').trim();
+    if (!text) { setNotice(`Nothing to copy — ${label.toLowerCase()} is empty.`); return; }
+    if (!navigator.clipboard?.writeText) { setNotice(`Clipboard unavailable here — select the ${label.toLowerCase()} and copy it manually.`); return; }
+    navigator.clipboard.writeText(text).then(
+      () => setNotice(`${label} copied to the clipboard.`),
+      () => setNotice(`Could not copy automatically — select the ${label.toLowerCase()} and copy it manually.`),
+    );
+  }, []);
+  return [notice, copy] as const;
+}
+
 function ListState({ list, children }: { list: ReturnType<typeof useList>; children: ReactNode }) {
   if (list.loading) return <Loading />;
   if (list.error) return <Notice tone="error">{list.error} <button className="text" onClick={list.reload}>Retry</button></Notice>;
@@ -1854,7 +1886,7 @@ function FormCard({ title, onSubmit, message, children }: { title: string; onSub
   return <form className="form-card" onSubmit={onSubmit}><h3>{title}</h3>{message && <Notice tone="error">{message}</Notice>}<div className="form-grid">{children}</div></form>;
 }
 
-type Column = [string, string, ('date'|'money')?];
+type Column = [string, string, ('date'|'money'|'id')?];
 function DataTable({ rows, columns, action, exportTitle }: { rows: Row[]; columns: Column[]; action?: (row: Row) => ReactNode; exportTitle?: string }) {
   if (!rows.length) return <div className="empty"><div>◇</div><h3>Nothing here yet</h3><p>New records will appear in this view.</p></div>;
   return (
@@ -1873,9 +1905,10 @@ function DataTable({ rows, columns, action, exportTitle }: { rows: Row[]; column
   );
 }
 
-function cell(value: unknown, key: string, format?: 'date'|'money'): ReactNode {
+function cell(value: unknown, key: string, format?: 'date'|'money'|'id'): ReactNode {
   if (format === 'date') return readableDate(value);
   if (format === 'money') return money(value);
+  if (format === 'id') return <code className="id-value" title={String(value ?? '')}>{String(value ?? '—')}</code>;
   if (key === 'status' || key === 'result' || key === 'role' || key === 'direction') return <span className={`pill ${String(value ?? '').toLowerCase()}`}>{String(value ?? '—').replaceAll('_',' ')}</span>;
   if (typeof value === 'boolean') return value ? 'Yes' : 'No';
   return String(value ?? '—');

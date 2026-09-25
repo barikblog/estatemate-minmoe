@@ -2566,7 +2566,7 @@ app.post('/api/access/devices', requireRoles('admin','manager'), async (c) => {
   await audit(c, 'create', 'hikvision_device', id, { vendor:body.vendor,model: body.model, firmware: body.firmware, profileKey: profile.key, connectionPattern });
   const warning = connectionPattern === 'manual_sync'
     ? 'No automatic device transport is enabled. Use the hardware action queue and acknowledge each applied change.'
-    : 'Next: register or select an agent in "ISAPI Bridge & Windows Agent", link this device with its LAN ISAPI address and credentials, then run the agent on the device LAN. The agent streams events in real time and applies card operations automatically.';
+    : 'Next: add or select an agent in "Device agent", connect this device with its LAN ISAPI address and credentials, then run the agent on the device LAN. The agent streams events in real time and applies card operations automatically.';
   return c.json({
     id,
     profile: { key: profile.key, label: profile.label },

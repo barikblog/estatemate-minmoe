@@ -1,6 +1,6 @@
 # AI handoff — EstateMate
 
-Updated: 2026-09-25 (Africa/Lagos) — **Device-agent portal cleanup deployed:** PR #17 merged as `6795c0e`; Deploy EstateMate run `36161420893` succeeded and the cache-busted production health check returned `ok: true`. The page is now named **Device agent**, replaces implementation-level connection-pattern and queue copy with a compact on-demand setup guide, points operators to the current single-file Windows bridge and Android bridge release, removes obsolete Node.js/`sc.exe` instructions, trims status tables, and fixes the phone layout so the heading and actions stack instead of forcing horizontal overflow. Setup downloads now match explicit secret rotation and are Administrator-only in both the UI and API; Managers can still connect, disconnect, and monitor terminals. Previous: **Bridge release CI phase** added `.github/workflows/bridge.yml` (Windows agent portable bundle + the project's first real Android compile), fixed the `API_BASE_URL` placeholder and the wrong `sc.exe`/`pkg` install advice. Previous: 2026-09-24 — Portal UX phase (migration `0014`) **deployed to production** via PR #11 (`f4e543d`), Deploy EstateMate run `36074600948`: administrator-published estate gate welcome image on the login screen and dashboard, searchable card-holder picker, and gate-scoped Security login sessions. Previous phase retired every access-device transport except the EstateMate agent; production domain is `https://estatemate.estatemate.workers.dev`
+Updated: 2026-09-25 (Africa/Lagos) — **Bridge apps merged onto the Device-agent portal (not yet deployed):** `bridge-apps/` (single-file Windows bridge executable + Android bridge APK) and the agent's EstateMate-device-id resolution are merged on top of main, with the one `apps/web/src/App.tsx` conflict resolved and the operator-facing portal labels brought in line with the renamed **Device agent** page — see "Bridge apps phase, merged onto the Device-agent portal". Previous: **Device-agent portal cleanup deployed:** PR #17 merged as `6795c0e`; Deploy EstateMate run `36161420893` succeeded and the cache-busted production health check returned `ok: true`. The page is now named **Device agent**, replaces implementation-level connection-pattern and queue copy with a compact on-demand setup guide, points operators to the current single-file Windows bridge and Android bridge release, removes obsolete Node.js/`sc.exe` instructions, trims status tables, and fixes the phone layout so the heading and actions stack instead of forcing horizontal overflow. Setup downloads now match explicit secret rotation and are Administrator-only in both the UI and API; Managers can still connect, disconnect, and monitor terminals. Previous: **Bridge release CI phase** added `.github/workflows/bridge.yml` (Windows agent portable bundle + the project's first real Android compile), fixed the `API_BASE_URL` placeholder and the wrong `sc.exe`/`pkg` install advice. Previous: 2026-09-24 — Portal UX phase (migration `0014`) **deployed to production** via PR #11 (`f4e543d`), Deploy EstateMate run `36074600948`: administrator-published estate gate welcome image on the login screen and dashboard, searchable card-holder picker, and gate-scoped Security login sessions. Previous phase retired every access-device transport except the EstateMate agent; production domain is `https://estatemate.estatemate.workers.dev`
 
 
 
@@ -177,6 +177,67 @@ exposes no step summary), the Android job re-emits Kotlin `e:`/`w:` lines, the f
 task and the raw log tail as `::error` annotations, and the Windows smoke test dumps both
 launcher streams the same way. Annotations *are* readable through the check-runs API, so
 that is the channel a future agent will have.
+
+## Bridge apps phase, merged onto the Device-agent portal (2026-09-25)
+
+`bridge-apps/` is now part of the repository: the two hosts that put the
+access-device transport on the estate LAN, so a terminal never has to be
+reachable from the Internet. `bridge-apps/windows/` + `scripts/package-bridge-exe.mjs`
+build `estatemate-bridge-win-x64.exe` (a Node SEA single file that embeds
+`isapi-bridge/agent.mjs` as a SHA-256-verified asset; `setup`, `check --json`,
+`run`, `install-service`, and cross-builds for `linux-*`/`darwin-*`).
+`bridge-apps/android/` + `scripts/build-bridge-apk.py` build the same bridge as a
+~41 KB APK with no Gradle, Kotlin or AndroidX — aapt2 + ecj/javac + d8 +
+apksigner — as a foreground service. Both speak the same three Worker endpoints
+with the same agent key, so the portal cannot tell them apart. Read
+`bridge-apps/README.md` before installing either one.
+
+The agent also learned to resolve each terminal's EstateMate device id itself: a
+device entry may carry only its LAN address, and `isapi-bridge/agent.mjs` looks
+the id up among the devices the portal has linked to that agent. A terminal the
+portal has not linked exits 1 with a message naming the terminal, its address and
+the devices that are linked. `isapi-bridge/agent.resolution.integration.mjs`
+proves both halves and runs as part of `npm test` (`npm run test:isapi-bridge`).
+
+### The merge conflict this required, and how it was resolved
+
+This work was cut from `8a4b85e`, before PR #17 renamed and simplified the same
+portal page, so `apps/web/src/App.tsx` conflicted in the `IsapiBridge` component
+— the only conflicting file. The resolution keeps **both** intents:
+
+* main's page wins on structure and copy: the title **Device agent**, the
+  collapsible setup guide, the trimmed tables, and Administrator-only
+  **Download setup** / **Rotate secret** / **Delete** (matching
+  `POST /api/isapi/agents/:id/installer` being `requireRoles('admin')`).
+* this branch's contribution is folded in: an `Agent ID` and an
+  `EstateMate device ID` column rendered as monospace identifiers, a **Copy ID**
+  row action on both tables, and **Copy ID** / **Copy secret** / **Copy both**
+  with a notice in the credentials panel. `rotateAgent` keeps
+  `{ ...row, ...(await api(...)) }` so rotating a secret no longer blanks the
+  agent's name and ID.
+
+Both sides had also rewritten the operator-facing strings that say where to
+click, and this branch's version named a page that no longer exists. They now
+say **Device agent → Add agent**, **Connect terminal**, **Download setup**,
+**Agents** and **Connected terminals** — in the two apps' runtime messages, their
+READMEs, `isapi-bridge/README.md`, the root `README.md` and the `manual_sync`
+warning the Worker returns when a device is registered. Two tests assert that
+message text, so they were renamed in lockstep.
+
+### Validation record (2026-09-25)
+
+`npm ci`, `npm run typecheck`, `npm test` (108 vitest tests + the ISAPI bridge
+integration and device-id-resolution scripts, which run the real
+`isapi-bridge/agent.mjs` in a child process), `npm run build:web`,
+`git diff --check` and the migration-chain check (14 migrations) all pass.
+`node --check` passes on every `.mjs`/`.cjs` file the merge touches.
+
+**Not compiled locally: the Java.** This sandbox has no JDK
+(`command -v javac java ecj` finds nothing), so `bridge-apps/android/**` and the
+`ProtocolTest.java` assertion rename are unverified here. `.github/workflows/bridge.yml`
+is the path that compiles them: `bridge-apk` runs `scripts/build-bridge-apk.py --test`
+(the 66-check protocol gate) before every APK build, and `bridge-exe` smoke-tests
+the built executable against a fake Worker and a fake Digest terminal.
 
 ## Most recent migration
 

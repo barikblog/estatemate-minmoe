@@ -60,10 +60,10 @@ Per-device `"eventStream": false` in `isapi-devices.json` disables streaming for
 
 ### 1. Register agent in EstateMate portal
 
-1. Sign in as Administrator → **ISAPI Bridge & Windows Agent** (new section) → **Register agent**.
+1. Sign in as Administrator → **Device agent** → **Add agent**.
 2. Enter name (e.g., "Estate Office Windows PC"), platform (windows/linux), hostname.
 3. Copy the one-time secret and agent ID.
-4. Click **Download installer** to get a PowerShell (Windows) or shell (Linux) script that contains the secret and writes the config.
+4. Click **Download setup** to get a PowerShell (Windows) or shell (Linux) script that contains the secret and writes the config.
 
 ### 2. Install on Windows (recommended) or Linux
 
@@ -88,7 +88,7 @@ Per-device `"eventStream": false` in `isapi-devices.json` disables streaming for
 
 ### 3. Link devices to agent
 
-In portal → **ISAPI Bridge & Windows Agent** → **Device ISAPI Configs** → **Link device**:
+In portal → **Device agent** → **Connected terminals** (use **Connect terminal** to add one):
 
 - Select Hikvision device (must have connection pattern `isapi_bridge`, `windows_agent`, or `isapi_windows_agent`).
 - Select agent.

@@ -1,0 +1,176 @@
+/*
+ * Shared state between the background service and the activity: counters, the
+ * last error, and the bounded queue of event documents waiting to be forwarded.
+ *
+ * On a phone the activity can be killed at any moment without touching the
+ * service, so nothing here may hold a reference to a Context or a View.
+ */
+package com.estatemate.bridge;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+public final class BridgeRuntime {
+    private static final Object QUEUE_LOCK = new Object();
+    private static final ArrayList<Map<String, Object>> PENDING = new ArrayList<Map<String, Object>>();
+    private static int bufferLimit = 500;
+
+    private static volatile boolean running;
+    private static volatile boolean workerOnline;
+    private static volatile long eventsForwarded;
+    private static volatile long eventsDropped;
+    private static volatile String lastEventAt = "—";
+    private static volatile String lastError = "";
+    private static volatile String workerStatus = "not started";
+    private static volatile int configuredDevices;
+
+    private BridgeRuntime() {}
+
+    public static boolean isRunning() {
+        return running;
+    }
+
+    public static void setRunning(boolean value) {
+        running = value;
+        if (!value) workerStatus = "stopped";
+    }
+
+    public static boolean isWorkerOnline() {
+        return workerOnline;
+    }
+
+    public static void setWorkerOnline(boolean value) {
+        workerOnline = value;
+    }
+
+    public static void setWorkerStatus(String value) {
+        workerStatus = value;
+    }
+
+    public static String workerStatus() {
+        return workerStatus;
+    }
+
+    public static void setConfiguredDevices(int count) {
+        configuredDevices = count;
+    }
+
+    public static int configuredDevices() {
+        return configuredDevices;
+    }
+
+    /** The operator-configurable cap on buffered event documents. */
+    public static void setBufferLimit(int limit) {
+        bufferLimit = Math.max(1, limit);
+    }
+
+    public static long eventsForwarded() {
+        return eventsForwarded;
+    }
+
+    public static void addForwarded(int count) {
+        eventsForwarded += count;
+    }
+
+    public static long eventsDropped() {
+        return eventsDropped;
+    }
+
+    public static String lastEventAt() {
+        return lastEventAt;
+    }
+
+    public static String lastError() {
+        return lastError;
+    }
+
+    public static void setLastError(String message) {
+        lastError = message == null ? "" : message;
+    }
+
+    public static int pendingCount() {
+        synchronized (QUEUE_LOCK) {
+            return PENDING.size();
+        }
+    }
+
+    /** Queues one event document, dropping the oldest when the buffer overflows. */
+    public static void queue(String deviceId, String document) {
+        if (document == null || document.isEmpty() || document.length() > 512 * 1024) {
+            BridgeLog.append("warn", "skipping missing or oversized event document for " + deviceId);
+            return;
+        }
+        Map<String, Object> item = new LinkedHashMap<String, Object>();
+        item.put("deviceId", deviceId);
+        item.put("document", document);
+        synchronized (QUEUE_LOCK) {
+            PENDING.add(item);
+            while (PENDING.size() > bufferLimit) {
+                PENDING.remove(0);
+                eventsDropped++;
+            }
+            lastEventAt = nowLabel();
+            QUEUE_LOCK.notifyAll();
+        }
+    }
+
+    /** Removes up to `max` items for the next flush; never blocks. */
+    public static List<Object> drain(int max) {
+        ArrayList<Object> items = new ArrayList<Object>();
+        synchronized (QUEUE_LOCK) {
+            int count = Math.min(max, PENDING.size());
+            for (int index = 0; index < count; index++) items.add(PENDING.remove(0));
+        }
+        return items;
+    }
+
+    /** Puts a failed batch back at the head so ordering is preserved. */
+    public static void requeue(List<Object> items) {
+        if (items == null || items.isEmpty()) return;
+        synchronized (QUEUE_LOCK) {
+            for (int index = items.size() - 1; index >= 0; index--) {
+                Object item = items.get(index);
+                if (item instanceof Map) PENDING.add(0, Json.asObject(item));
+            }
+            while (PENDING.size() > bufferLimit) {
+                PENDING.remove(0);
+                eventsDropped++;
+            }
+        }
+    }
+
+    /** Waits for the queue to become non-empty, or for the flush interval to pass. */
+    public static boolean awaitWork(long timeoutMs) {
+        synchronized (QUEUE_LOCK) {
+            if (!PENDING.isEmpty()) return true;
+            try {
+                QUEUE_LOCK.wait(timeoutMs);
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+            }
+            return !PENDING.isEmpty();
+        }
+    }
+
+    public static Map<String, Object> stats() {
+        Map<String, Object> stats = new LinkedHashMap<String, Object>();
+        stats.put("eventsForwarded", Long.valueOf(eventsForwarded));
+        stats.put("eventsDropped", Long.valueOf(eventsDropped));
+        stats.put("eventsPending", Integer.valueOf(pendingCount()));
+        stats.put("eventStream", Boolean.TRUE);
+        return stats;
+    }
+
+    public static String summary() {
+        return eventsForwarded + " events forwarded · " + pendingCount() + " pending · "
+                + "last event " + lastEventAt + (eventsDropped > 0 ? " · " + eventsDropped + " dropped" : "");
+    }
+
+    private static String nowLabel() {
+        java.text.SimpleDateFormat format = new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US);
+        format.setTimeZone(java.util.TimeZone.getDefault());
+        return format.format(new java.util.Date());
+    }
+}

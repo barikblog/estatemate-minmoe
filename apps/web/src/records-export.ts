@@ -1,7 +1,9 @@
 import { money, readableDate } from './api';
 import { imageToPdfBlob } from './pdf';
 
-export type Column = [string, string, ('date' | 'money')?];
+// 'id' marks a cell that the portal renders as a monospace identifier. Exports
+// write it as plain text, so it stays a valid format here.
+export type Column = [string, string, ('date' | 'money' | 'id')?];
 export type Row = Record<string, unknown>;
 
 function escapeXml(value: unknown): string {

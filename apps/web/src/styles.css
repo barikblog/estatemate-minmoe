@@ -129,6 +129,9 @@ tbody tr:hover { background: #fafcff; }
 .pill.pending, .pill.manual_action_required, .pill.partial, .pill.connecting { color: #94600c; background: #fff3d9; }
 .pill.admin, .pill.security, .pill.blue { color: #165db9; background: #e7f1ff; }
 .row-actions { display: flex; gap: 8px; white-space: nowrap; }
+/* Identifiers that get typed into another program: monospace, selectable, and
+   allowed to wrap so a 36-character UUID never widens the whole table. */
+.id-value { display: inline-block; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10px; letter-spacing: -.01em; color: #2c3e57; background: #eef3fa; border-radius: 5px; padding: 3px 6px; word-break: break-all; }
 .text { border: 0; color: var(--blue); background: transparent; padding: 2px; font-weight: 750; font-size: 11px; }
 .text.danger { color: var(--red); }
 .empty { min-height: 310px; display: grid; place-content: center; justify-items: center; text-align: center; color: #9aa5b5; }
