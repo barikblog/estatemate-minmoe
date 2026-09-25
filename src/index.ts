@@ -2827,11 +2827,13 @@ $agentSecret = "${secret}"
 $installerKey = "${installerKey}"
 $workerUrl = "${origin}"
 
-# Create directories
-$installDir = "C:\\EstateMate\\ISAPI-Agent"
+# Install alongside the unzipped bundle so the bundled Node.js runtime stays next
+# to agent.mjs. Edit $installDir below to install somewhere else.
 $serviceName = "EstateMateISAPIAgent"
+$installDir = if ($PSScriptRoot) { $PSScriptRoot } else { "C:\\EstateMate\\ISAPI-Agent" }
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-Write-Host "Created $installDir" -ForegroundColor Green
+New-Item -ItemType Directory -Force -Path (Join-Path $installDir "logs") | Out-Null
+Write-Host "Install directory: $installDir" -ForegroundColor Green
 
 # Save configuration (restricted ACL)
 $configPath = Join-Path $installDir "agent-config.json"
@@ -2854,10 +2856,18 @@ $acl.SetAccessRule($systemRule)
 Set-Acl $configPath $acl
 Write-Host "Configuration saved to $configPath (restricted)" -ForegroundColor Green
 
-# Download agent binary (placeholder - replace with real release URL)
-Write-Host "Downloading agent binary..." -ForegroundColor Cyan
-Write-Host "NOTE: Replace this URL with your published Windows agent release." -ForegroundColor Yellow
-# Invoke-WebRequest -Uri "$workerUrl/api/isapi/agent-binary" -OutFile "$installDir\\estatemate-isapi-agent.exe"
+# The agent itself ships in the portable bundle, not over the Worker API.
+# The "Build EstateMate Bridge" workflow publishes it as a GitHub Release asset:
+#   estatemate-isapi-agent-win-x64-<version>.zip
+# Unzip that bundle into $installDir so these files are present:
+#   runtime\\node.exe, agent.mjs, agent-core.mjs, estatemate-isapi-agent.cmd,
+#   install-service.ps1
+$bundleRuntime = Join-Path $installDir "runtime\\node.exe"
+$bundleLauncher = Join-Path $installDir "estatemate-isapi-agent.cmd"
+if (-not (Test-Path $bundleLauncher)) {
+  Write-Warning "estatemate-isapi-agent.cmd not found in $installDir."
+  Write-Warning "Download estatemate-isapi-agent-win-x64-*.zip from the repository releases and unzip it here, then re-run this installer."
+}
 
 # Create example device mapping file
 $devicesPath = Join-Path $installDir "isapi-devices.json"
@@ -2877,15 +2887,18 @@ $devicesPath = Join-Path $installDir "isapi-devices.json"
 "@ | Set-Content -Path $devicesPath -Encoding UTF8
 Write-Host "Example device mapping created at $devicesPath - EDIT IT!" -ForegroundColor Yellow
 
-# NSSM or native service installation placeholder
+# Start-at-boot registration.
 Write-Host @"
 Next steps:
-1. Edit $devicesPath with your Hikvision device ISAPI details (host, port, credentials).
-2. Download the Windows agent binary from your release artifacts to $installDir\\estatemate-isapi-agent.exe
-3. Install as Windows Service:
-   sc.exe create $serviceName binPath= \\"$installDir\\estatemate-isapi-agent.exe --config $configPath\\" start= auto
-   sc.exe description $serviceName "EstateMate ISAPI Bridge - Syncs access cards via ISAPI"
-   sc.exe start $serviceName
+1. Unzip estatemate-isapi-agent-win-x64-*.zip (from the repository releases) into:
+   $installDir
+2. Edit $devicesPath with your Hikvision device ISAPI details (host, port, credentials).
+3. Register the agent to start automatically:
+   powershell -ExecutionPolicy Bypass -File "$installDir\\install-service.ps1" -InstallDir "$installDir"
+   That registers a SYSTEM Scheduled Task at startup. Add -Nssm to register a real
+   Windows Service named $serviceName instead (requires NSSM).
+   NOTE: do not use "sc.exe create" against the agent directly - it is a console
+   process, not an SCM binary, so the service would fail to start with error 1053.
 4. Check logs in $installDir\\logs\\
 
 Security:

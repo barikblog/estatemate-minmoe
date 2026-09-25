@@ -6,6 +6,50 @@ plugins {
     id("com.google.devtools.ksp")
 }
 
+// Worker base URL baked into BuildConfig. Override with -PapiBaseUrl=https://.../
+// The default is production so a plain `./gradlew assembleDebug` yields a working
+// APK instead of one pointing at a placeholder host.
+val apiBaseUrl: String = (project.findProperty("apiBaseUrl") as String?)
+    ?.trim()
+    ?.takeIf { it.isNotEmpty() }
+    ?: "https://estatemate.estatemate.workers.dev/"
+
+// Version identity. CI derives these from the `bridge-*` tag using
+// major*10000 + minor*100 + patch; locally they fall back to the committed
+// defaults. The fallback uses the same formula (0.1.0 -> 10) so a dev build can
+// never collide with a real bridge-0.0.1 release.
+val appVersionName: String = (project.findProperty("appVersionName") as String?)
+    ?.trim()
+    ?.takeIf { it.isNotEmpty() }
+    ?: "0.1.0"
+val appVersionCode: Int = (project.findProperty("appVersionCode") as String?)
+    ?.trim()
+    ?.toIntOrNull()
+    ?.takeIf { it > 0 }
+    ?: 10
+
+// Optional release signing, activated only when every ANDROID_KEYSTORE_* variable
+// is present. Without them `assembleRelease` still builds, but stays unsigned, so
+// a missing secret can never silently produce a mis-signed artifact.
+val keystorePath: String? = System.getenv("ANDROID_KEYSTORE_PATH")?.takeIf { it.isNotBlank() }
+val keystorePassword: String? = System.getenv("ANDROID_KEYSTORE_PASSWORD")?.takeIf { it.isNotBlank() }
+val keystoreAlias: String? = System.getenv("ANDROID_KEY_ALIAS")?.takeIf { it.isNotBlank() }
+val keystoreKeyPassword: String? = System.getenv("ANDROID_KEY_PASSWORD")?.takeIf { it.isNotBlank() }
+val hasReleaseSigning = listOf(
+    keystorePath,
+    keystorePassword,
+    keystoreAlias,
+    keystoreKeyPassword,
+).all { it != null } && keystorePath?.let { file(it).exists() } == true
+
+if (listOf(keystorePath, keystorePassword, keystoreAlias, keystoreKeyPassword).any { it != null } && !hasReleaseSigning) {
+    logger.warn(
+        "ANDROID_KEYSTORE_* partially set (keystore file present: ${keystorePath?.let { file(it).exists() }}). " +
+            "Release build will be UNSIGNED. Set ANDROID_KEYSTORE_PATH, ANDROID_KEYSTORE_PASSWORD, " +
+            "ANDROID_KEY_ALIAS and ANDROID_KEY_PASSWORD together.",
+    )
+}
+
 android {
     namespace = "com.estatemate.app"
     compileSdk = 35
@@ -14,9 +58,30 @@ android {
         applicationId = "com.estatemate.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
-        buildConfigField("String", "API_BASE_URL", "\"https://REPLACE_WITH_WORKER_DOMAIN/\"")
+        versionCode = appVersionCode
+        versionName = appVersionName
+        buildConfigField("String", "API_BASE_URL", "\"$apiBaseUrl\"")
+    }
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(keystorePath!!)
+                storePassword = keystorePassword
+                keyAlias = keystoreAlias
+                keyPassword = keystoreKeyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
+        }
     }
 
     buildFeatures {

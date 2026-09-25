@@ -1,0 +1,478 @@
+name: Build EstateMate Bridge
+
+# Builds and validates the two client artifacts that ship outside the Worker:
+#   * the Windows ISAPI bridge agent (self-contained portable bundle)
+#   * the Android client APK
+#
+# This workflow needs no Cloudflare credentials and cannot deploy anything.
+# Release signing secrets are optional; when absent, artifacts are unsigned and
+# each job says so loudly rather than failing or silently mis-signing.
+
+on:
+  push:
+    tags: ['bridge-*']
+  workflow_dispatch:
+    inputs:
+      api_base_url:
+        description: 'Worker base URL baked into the Android APK'
+        required: false
+        default: 'https://estatemate.estatemate.workers.dev/'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'isapi-bridge/**'
+      - 'windows-agent/**'
+      - 'apps/android/**'
+      - 'scripts/package-windows-bundle.mjs'
+      - 'scripts/verify-android-apk.py'
+      - '.github/workflows/bridge.yml'
+
+permissions:
+  contents: read
+
+# Tag builds must not be cancelled mid-release; PR builds supersede each other.
+concurrency:
+  group: bridge-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_RUNTIME_VERSION: '22.22.2'
+  DEFAULT_API_BASE_URL: 'https://estatemate.estatemate.workers.dev/'
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Gate: the agent must pass its own checks before anything is packaged.
+  # Credentials-free — the integration test spins up a local stub Worker.
+  # --------------------------------------------------------------------------
+  validate:
+    name: Validate ISAPI bridge agent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert every migration number is unique
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Append-only migrations are a project rule; a duplicate prefix would
+          # make `wrangler d1 migrations apply` order ambiguous.
+          dupes=$(ls migrations | grep -oE '^[0-9]{4}' | sort | uniq -d || true)
+          if [ -n "$dupes" ]; then
+            echo "::error::Duplicate migration prefixes: $dupes"
+            exit 1
+          fi
+          echo "migration numbering OK ($(ls migrations/*.sql | wc -l) files)"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Syntax-check the agent and packaging script
+        run: |
+          node --check isapi-bridge/agent.mjs
+          node --check isapi-bridge/agent.integration.mjs
+          node --check windows-agent/agent.mjs
+          node --check windows-agent/install-windows.mjs
+          node --check scripts/package-windows-bundle.mjs
+
+      - name: Run ISAPI bridge integration checks
+        run: node isapi-bridge/agent.integration.mjs
+
+      - name: Dry-run the Windows bundle packer
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/package-windows-bundle.mjs \
+            --out "$RUNNER_TEMP/bundle-dryrun" \
+            --node-version "$NODE_RUNTIME_VERSION" \
+            --version "${GITHUB_REF_NAME}-dryrun" \
+            --commit "$GITHUB_SHA"
+          test -f "$RUNNER_TEMP/bundle-dryrun/agent-core.mjs"
+          test -f "$RUNNER_TEMP/bundle-dryrun/estatemate-isapi-agent.cmd"
+          echo "::notice::Packer dry-run staged the bundle successfully on ubuntu-latest."
+
+  # --------------------------------------------------------------------------
+  # Windows agent bundle. Runs on windows-latest so node.exe integrity can be
+  # checked against its Authenticode signature as well as its published sha256.
+  # --------------------------------------------------------------------------
+  windows-agent-bundle:
+    name: Package Windows agent bundle
+    runs-on: windows-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Stage bundle contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          case "$VERSION" in bridge-*) VERSION="${VERSION#bridge-}" ;; esac
+          node scripts/package-windows-bundle.mjs \
+            --out bundle \
+            --node-version "$NODE_RUNTIME_VERSION" \
+            --version "$VERSION" \
+            --commit "$GITHUB_SHA"
+
+      - name: Fetch, verify and stage the Node.js Windows runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver  = $env:NODE_RUNTIME_VERSION
+          $zip  = "node-v$ver-win-x64.zip"
+          $base = "https://nodejs.org/dist/v$ver"
+          $tmp  = Join-Path $env:RUNNER_TEMP $zip
+
+          Write-Host "Downloading $base/$zip"
+          Invoke-WebRequest -Uri "$base/$zip" -OutFile $tmp -UseBasicParsing
+
+          # Verify against the published checksum file before extracting anything.
+          $sums     = (Invoke-WebRequest -Uri "$base/SHASUMS256.txt" -UseBasicParsing).Content
+          $expected = ($sums -split "`n" | Where-Object { $_ -match "\s$zip$" } | Select-Object -First 1) -split '\s+' | Select-Object -First 1
+          if (-not $expected) { throw "$zip not listed in SHASUMS256.txt - refusing an unverified download." }
+
+          $actual = (Get-FileHash -Path $tmp -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected.ToLower()) {
+            throw "sha256 mismatch for ${zip}: expected $expected, got $actual"
+          }
+          Write-Host "Verified $zip sha256 $actual"
+
+          New-Item -ItemType Directory -Force -Path (Join-Path bundle 'runtime') | Out-Null
+          tar -xf $tmp -C bundle/runtime --strip-components=1 "node-v$ver-win-x64/node.exe"
+          if (-not (Test-Path bundle/runtime/node.exe)) { throw 'node.exe was not extracted' }
+
+          # Belt and braces: the official runtime is Authenticode-signed by the
+          # OpenJS Foundation. A tampered mirror would fail one check or the other.
+          $sig = Get-AuthenticodeSignature bundle/runtime/node.exe
+          Write-Host "node.exe signature: $($sig.Status) - $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "node.exe Authenticode signature is not Valid: $($sig.Status)" }
+
+          $exeSha = (Get-FileHash bundle/runtime/node.exe -Algorithm SHA256).Hash.ToLower()
+          Write-Host "node.exe sha256 $exeSha"
+          "NODE_EXE_SHA256=$exeSha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Record the verified runtime in VERSION
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/package-windows-bundle.mjs --out bundle --finalize-runtime
+          cat bundle/VERSION
+
+      - name: Smoke-test the bundled runtime and launcher
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $node = Join-Path bundle 'runtime\node.exe'
+          $nodeVer = (& $node --version)
+          if ($LASTEXITCODE -ne 0 -or -not $nodeVer) { throw "bundled runtime\node.exe did not run (exit $LASTEXITCODE)" }
+          Write-Host "bundled runtime reports $nodeVer"
+
+          # The launcher must refuse to run without a config rather than start an
+          # agent that silently cannot authenticate.
+          $out = & cmd /c "bundle\estatemate-isapi-agent.cmd" 2>&1
+          Write-Host ($out -join "`n")
+          if ($LASTEXITCODE -eq 0) { throw 'launcher exited 0 with no agent-config.json - expected it to refuse to start' }
+          Write-Host "Launcher correctly refused to start without config (exit $LASTEXITCODE)."
+
+      - name: Sign the bundle runtime (optional)
+        shell: pwsh
+        run: |
+          if (-not $env:WIN_CRT_PFX_BASE64) {
+            Write-Host '::warning::WIN_CRT_PFX_BASE64 is not set - the Windows bundle is UNSIGNED. SmartScreen will warn estates on first run.'
+            'UNSIGNED' | Out-File -FilePath bundle/SIGNING.txt -Encoding ascii -NoNewline
+            exit 0
+          }
+          $ErrorActionPreference = 'Stop'
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WIN_CRT_PFX_BASE64))
+          try {
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+              Sort-Object FullName -Descending | Select-Object -First 1
+            if (-not $signtool) { throw 'signtool.exe (x64) not found under the Windows SDK bin directory.' }
+            Write-Host "Using $($signtool.FullName)"
+            $tsUrl = if ($env:WIN_CRT_TIMESTAMP_URL) { $env:WIN_CRT_TIMESTAMP_URL } else { 'http://timestamp.digicert.com' }
+            & $signtool.FullName sign /f $pfxPath /p $env:WIN_CRT_PFX_PASSWORD /fd SHA256 /tr $tsUrl /td SHA256 bundle/runtime/node.exe
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed with exit code $LASTEXITCODE" }
+            & $signtool.FullName verify /pa /v bundle/runtime/node.exe
+            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed with exit code $LASTEXITCODE" }
+            Write-Host '::notice::node.exe was Authenticode-signed with the supplied certificate.'
+            'SIGNED' | Out-File -FilePath bundle/SIGNING.txt -Encoding ascii -NoNewline
+          } finally {
+            Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
+          }
+        env:
+          WIN_CRT_PFX_BASE64: ${{ secrets.WIN_CRT_PFX_BASE64 }}
+          WIN_CRT_PFX_PASSWORD: ${{ secrets.WIN_CRT_PFX_PASSWORD }}
+          # Optional override; defaults to http://timestamp.digicert.com.
+          WIN_CRT_TIMESTAMP_URL: ${{ vars.WIN_CRT_TIMESTAMP_URL }}
+
+      - name: Zip the bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "estatemate-isapi-agent-win-x64-$($env:GITHUB_REF_NAME -replace '[^A-Za-z0-9._-]','-')"
+          Compress-Archive -Path bundle/* -DestinationPath "$name.zip" -Force
+          $sha = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          # LF-only and two-space separated, so `sha256sum -c` works on Linux too.
+          $lines = @("$sha  $name.zip")
+          $lines += "$($env:NODE_EXE_SHA256)  runtime/node.exe"
+          [IO.File]::WriteAllText("$PWD\SHA256SUMS.txt", (($lines -join "`n") + "`n"))
+          Write-Host "Built $name.zip sha256 $sha"
+          Get-Content SHA256SUMS.txt
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-agent-bundle
+          path: |
+            *.zip
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  # --------------------------------------------------------------------------
+  # Android APK. This is the only place in the project that compiles Kotlin:
+  # docs/AI-HANDOFF.md records that previous changes were never built because
+  # the working environment had no JDK or Android SDK.
+  # --------------------------------------------------------------------------
+  android-apk:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive release version from the tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF_NAME}"
+          case "$ref" in
+            bridge-*) v="${ref#bridge-}" ;;
+            *)        v="" ;;
+          esac
+          # Only accept a plain numeric release; anything else (branch name, PR
+          # merge ref, pre-release suffix) falls back to the committed default so
+          # versionCode can never silently become 0 or collide.
+          if printf '%s' "$v" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            code=$(printf '%s' "$v" | awk -F. '{ printf "%d", ($1*10000)+($2*100)+$3 }')
+          else
+            # Match the committed fallback in app/build.gradle.kts (0.1.0 -> 10)
+            # so a non-tag build can never collide with a real bridge-0.0.1.
+            v="0.1.0"
+            code=10
+          fi
+          {
+            echo "version_name=$v"
+            echo "version_code=$code"
+          } >> "$GITHUB_OUTPUT"
+          echo "Android versionName=$v versionCode=$code"
+
+      - name: Resolve the Worker base URL
+        id: api
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="${{ github.event.inputs.api_base_url }}"
+          if [ -z "$url" ]; then url="$DEFAULT_API_BASE_URL"; fi
+          # Retrofit resolves relative paths against this, so the trailing slash
+          # is load-bearing.
+          case "$url" in */) ;; *) url="$url/" ;; esac
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "API_BASE_URL=$url"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install the SDK packages this project targets
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
+
+      - name: Decode the release keystore (optional)
+        run: |
+          if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            echo "::warning::ANDROID_KEYSTORE_* secrets are not set - the release APK will be UNSIGNED."
+            exit 0
+          fi
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/keystore"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/keystore/release.jks"
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/keystore/release.jks" >> "$GITHUB_ENV"
+          test -s "$RUNNER_TEMP/keystore/release.jks"
+          echo "Keystore decoded ($(stat -c%s "$RUNNER_TEMP/keystore/release.jks") bytes)."
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+
+      - name: Build the APKs
+        working-directory: apps/android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          common=(--no-daemon --stacktrace
+                  -PapiBaseUrl="${{ steps.api.outputs.url }}"
+                  -PappVersionName="${{ steps.version.outputs.version_name }}"
+                  -PappVersionCode="${{ steps.version.outputs.version_code }}")
+
+          ./gradlew "${common[@]}" assembleDebug
+
+          if [ -n "${ANDROID_KEYSTORE_PATH:-}" ]; then
+            ./gradlew "${common[@]}" assembleRelease
+          else
+            # No signing config means AGP emits app-release-unsigned.apk, which
+            # cannot be installed. That is expected on a PR, not an error - but it
+            # must never be mistaken for a shippable artifact, so it is not
+            # collected below.
+            ./gradlew "${common[@]}" assembleRelease > release.log 2>&1 || true
+            echo "::warning::ANDROID_KEYSTORE_* secrets are not set, so no installable release APK was produced. Set ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS and ANDROID_KEY_PASSWORD to enable release signing."
+          fi
+
+      - name: Verify the built artifacts
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ env.ANDROID_KEYSTORE_PATH }}
+        run: |
+          set -euo pipefail
+          debug=$(ls apps/android/app/build/outputs/apk/debug/*.apk | head -1)
+
+          python3 scripts/verify-android-apk.py "$debug" \
+            --api-base-url "${{ steps.api.outputs.url }}" \
+            --version-name "${{ steps.version.outputs.version_name }}" \
+            --build-tools "$ANDROID_HOME/build-tools/35.0.0"
+
+          echo "::notice::Debug APK verified against ${{ steps.api.outputs.url }}."
+
+          if [ -n "${ANDROID_KEYSTORE_PATH:-}" ]; then
+            rel="apps/android/app/build/outputs/apk/release/app-release.apk"
+            if [ ! -f "$rel" ]; then
+              echo "::error::Keystore was configured but no signed app-release.apk was produced."
+              ls -la apps/android/app/build/outputs/apk/release/ || true
+              exit 1
+            fi
+            "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$rel"
+            python3 scripts/verify-android-apk.py "$rel" \
+              --api-base-url "${{ steps.api.outputs.url }}" \
+              --version-name "${{ steps.version.outputs.version_name }}" \
+              --build-tools "$ANDROID_HOME/build-tools/35.0.0"
+            echo "::notice::Signed release APK verified."
+          fi
+
+      - name: Collect artifacts
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ env.ANDROID_KEYSTORE_PATH }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          name="${GITHUB_REF_NAME//[^A-Za-z0-9._-]/-}"
+          cp apps/android/app/build/outputs/apk/debug/*.apk \
+             "dist/estatemate-android-$name-debug.apk"
+          # Deliberately app-release.apk only: app-release-unsigned.apk cannot be
+          # installed and must never be published as if it were a release.
+          if [ -n "${ANDROID_KEYSTORE_PATH:-}" ] && \
+             [ -f apps/android/app/build/outputs/apk/release/app-release.apk ]; then
+            cp apps/android/app/build/outputs/apk/release/app-release.apk \
+               "dist/estatemate-android-$name-release.apk"
+          fi
+          ( cd dist && sha256sum *.apk ) | tee dist/SHA256SUMS.txt
+          ls -la dist
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  # --------------------------------------------------------------------------
+  # Publish a GitHub Release. Only on a bridge-* tag, and only when every
+  # artifact job succeeded - a partial release is worse than none.
+  # --------------------------------------------------------------------------
+  publish-release:
+    name: Publish bridge release
+    runs-on: ubuntu-latest
+    needs: [validate, windows-agent-bundle, android-apk]
+    if: ${{ startsWith(github.ref, 'refs/tags/bridge-') }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Show what will be published
+        run: |
+          set -euo pipefail
+          find artifacts -type f -exec ls -la {} \;
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#bridge-}"
+          notes_file="$(mktemp)"
+          {
+            echo "EstateMate Bridge $version"
+            echo
+            echo "Built from commit \`${GITHUB_SHA}\`."
+            echo
+            echo "### Artifacts"
+            echo "- **Windows agent bundle** (\`estatemate-isapi-agent-win-x64-*.zip\`) - self-contained; ships its own Node.js runtime, so the estate PC needs no Node.js install."
+            echo "- **Android APK** (\`estatemate-android-*-debug.apk\`, plus \`-release.apk\` when signing secrets are configured)."
+            echo "- \`SHA256SUMS.txt\` for each artifact family."
+            echo
+            echo "### Windows install"
+            echo "Unzip to \`C:\\EstateMate\\ISAPI-Agent\`, then in an Administrator PowerShell:"
+            echo
+            echo '```powershell'
+            echo 'powershell -ExecutionPolicy Bypass -File .\install-service.ps1 -AgentId <uuid> -AgentSecret <secret>'
+            echo '```'
+            echo
+            echo "Then edit \`isapi-devices.json\` with each Hikvision device's ISAPI host and credentials."
+            echo
+            echo "### Signing status"
+            if [ -f artifacts/windows-agent-bundle/SIGNING.txt ] && \
+               grep -q SIGNED artifacts/windows-agent-bundle/SIGNING.txt && \
+               ! grep -q UNSIGNED artifacts/windows-agent-bundle/SIGNING.txt; then
+              echo "- Windows bundle: Authenticode-signed."
+            else
+              echo "- Windows bundle: **unsigned** (set \`WIN_CRT_PFX_BASE64\`/\`WIN_CRT_PFX_PASSWORD\` to sign)."
+            fi
+            if ls artifacts/android-apk/*-release.apk >/dev/null 2>&1; then
+              echo "- Android release APK: built and signed."
+            else
+              echo "- Android release APK: **not built** (set the \`ANDROID_KEYSTORE_*\` secrets). The debug APK is for testing only."
+            fi
+          } > "$notes_file"
+
+          # find, not a glob: Actions bash has globstar off, so artifacts/**/*
+          # would silently match only one directory level.
+          mapfile -t files < <(find artifacts -type f | sort)
+          echo "Publishing ${#files[@]} file(s):"
+          printf '  %s\n' "${files[@]}"
+
+          gh release create "$tag" \
+            --title "EstateMate Bridge $version" \
+            --notes-file "$notes_file" \
+            --verify-tag \
+            "${files[@]}"
+          rm -f "$notes_file"

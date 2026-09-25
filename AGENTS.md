@@ -26,6 +26,7 @@ Retired transports: direct HTTP Listening, the Render free relay, Hikvision clou
 - Private GitHub upload storage: `src/github-storage.ts`
 - The only access-device transport: `isapi-bridge/` agent (+ `windows-agent/` Windows Service wrapper)
 - CI deployment: `.github/workflows/deploy.yml`
+- Client artifact builds (Windows agent bundle + Android APK): `.github/workflows/bridge.yml`, on `bridge-*` tags
 
 ## Non-negotiable project rules
 
@@ -59,7 +60,7 @@ print('migration chain OK')
 PY
 ```
 
-Android requires JDK 17 and an Android SDK. If unavailable, state clearly that Kotlin changes were not compiled.
+Android requires JDK 17 and an Android SDK. If unavailable, state clearly that Kotlin changes were not compiled locally — `.github/workflows/bridge.yml` (`Build EstateMate Bridge`) is the path that does compile them: it runs on a pull request touching `apps/android/**` and on every `bridge-*` tag.
 
 ## Deployment workflow
 
