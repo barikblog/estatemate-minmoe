@@ -658,6 +658,14 @@ export {
   main,
   pendingEvents,
   eventStats,
+  // Exported for sibling hosts that need to talk to a device without starting
+  // the main loops: bridge-apps/windows runs `bridge check` in standby mode and
+  // reuses the digest/basic ISAPI client instead of reimplementing it, so there
+  // is exactly one place where Hikvision authentication is spelled out.
+  isapiRequest,
+  buildDigestAuthHeader,
+  basicAuthHeader,
+  alertStreamPath,
 };
 const isEntrypoint = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
 if (!isEntrypoint && !process.env.ESTATEMATE_AGENT_STANDBY) {
