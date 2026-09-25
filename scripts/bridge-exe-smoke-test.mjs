@@ -27,6 +27,19 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
+/**
+ * GitHub renders workflow failure messages only in the job log, which the
+ * sandboxed reviewers of this repository cannot always fetch. Surface the
+ * message as a check annotation too, so a red run explains itself.
+ */
+function annotateError(error) {
+  if (!process.env.GITHUB_ACTIONS) return;
+  const message = String((error && error.message) || error).replace(/[\r\n]+/g, ' | ').slice(0, 3000);
+  const escaped = message.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+  console.log(`::error::${escaped}`);
+}
+
+
 function parseArgs(argv) {
   const flags = {};
   for (let index = 0; index < argv.length; index += 1) {
@@ -490,5 +503,6 @@ async function main() {
 
 main().catch((error) => {
   process.stderr.write(`smoke test crashed: ${error && error.stack ? error.stack : error}\n`);
+  annotateError(error);
   process.exit(2);
 });

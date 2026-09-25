@@ -30,6 +30,19 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 
 const SEA_FUSE = 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2';
+
+/**
+ * GitHub renders workflow failure messages only in the job log, which the
+ * sandboxed reviewers of this repository cannot always fetch. Surface the
+ * message as a check annotation too, so a red run explains itself.
+ */
+function annotateError(error) {
+  if (!process.env.GITHUB_ACTIONS) return;
+  const message = String((error && error.message) || error).replace(/[\r\n]+/g, ' | ').slice(0, 3000);
+  const escaped = message.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+  console.log(`::error::${escaped}`);
+}
+
 const SEA_RESOURCE = 'NODE_SEA_BLOB';
 const DEFAULT_NODE_VERSION = '22.22.2';
 
@@ -468,5 +481,6 @@ main()
   .then(() => process.exit(0))
   .catch((error) => {
     console.error(`package-bridge-exe: ${error.message}`);
+    annotateError(error);
     process.exit(1);
   });
