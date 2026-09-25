@@ -5,12 +5,14 @@ describe('Hikvision ISAPI bridge and Windows agent', () => {
   let db: Awaited<ReturnType<typeof createTestDatabase>>;
   let env: ReturnType<typeof createTestEnv>;
   let adminToken: string;
+  let managerToken: string;
 
   beforeEach(async () => {
     db = await createTestDatabase();
     env = createTestEnv(db.d1);
     const estate = seedEstate(db);
     adminToken = await tokenFor(env, estate.adminId, 'admin', 'Ada Admin');
+    managerToken = await tokenFor(env, estate.managerId, 'manager', 'Musa Manager');
   });
 
   it('creates ISAPI agent and returns one-time secret', async () => {
@@ -36,6 +38,22 @@ describe('Hikvision ISAPI bridge and Windows agent', () => {
       body: { platform: 'windows' },
     });
     expect(res.status).toBe(400);
+  });
+
+  it('keeps secret-bearing setup downloads administrator-only', async () => {
+    const agent = await call(env, 'POST', '/api/isapi/agents', {
+      token: adminToken,
+      body: { name: 'Estate Office PC', platform: 'windows' },
+    });
+    const agentId = String(agent.json.id);
+
+    const managerDownload = await call(env, 'POST', `/api/isapi/agents/${agentId}/installer`, { token: managerToken });
+    expect(managerDownload.status).toBe(403);
+
+    const adminDownload = await call(env, 'POST', `/api/isapi/agents/${agentId}/installer`, { token: adminToken });
+    expect(adminDownload.status).toBe(200);
+    expect(adminDownload.text).toContain('$agentId');
+    expect(adminDownload.text).toContain('$agentSecret');
   });
 
   it('creates device ISAPI config linked to agent', async () => {
