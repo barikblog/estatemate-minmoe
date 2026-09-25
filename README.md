@@ -171,7 +171,7 @@ A scoped Cloudflare token needs permissions for Workers Scripts, D1, Queues, acc
 
 1. Sign in as an EstateMate administrator.
 2. Go to **Access-control devices → Register device** and enter the exact model, firmware, serial, gate, and direction. Keep the default **ISAPI bridge** connection pattern.
-3. Under **ISAPI Bridge & Windows Agent**, register the agent that runs on the estate LAN and download its installer (PowerShell for Windows, shell for Linux). The one-time secret is shown once.
+3. Under **Device agent**, add the agent that runs on the estate LAN and download its installer (PowerShell for Windows, shell for Linux). The one-time secret is shown once.
 4. Install the agent on an always-on computer on the device LAN (office PC, Termux on a spare Android phone, or a small board), and edit `isapi-devices.json` with each terminal's LAN IP, ISAPI port, and administrator credentials.
 5. Link each device to the agent in the portal (**Device ISAPI configs**) with its ISAPI host/port/credentials.
 6. Present a test card and confirm **last seen** and **Gate activity** update within seconds; issue a test card and confirm it appears on the terminal within the polling interval.

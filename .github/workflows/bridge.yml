@@ -22,8 +22,13 @@ on:
     paths:
       - 'isapi-bridge/**'
       - 'windows-agent/**'
+      - 'bridge-apps/**'
       - 'apps/android/**'
       - 'scripts/package-windows-bundle.mjs'
+      - 'scripts/lib/**'
+      - 'scripts/package-bridge-exe.mjs'
+      - 'scripts/bridge-exe-smoke-test.mjs'
+      - 'scripts/build-bridge-apk.py'
       - 'scripts/verify-android-apk.py'
       - 'scripts/lint-powershell.py'
       - '.github/workflows/bridge.yml'
@@ -614,10 +619,174 @@ jobs:
   # Publish a GitHub Release. Only on a bridge-* tag, and only when every
   # artifact job succeeded - a partial release is worse than none.
   # --------------------------------------------------------------------------
+  # --------------------------------------------------------------------------
+  # The single-file Windows executable: what an estate actually double-clicks.
+  # Built and smoke-tested on Windows, because a cross-compiled artifact can
+  # only be believed once it has been run.
+  # --------------------------------------------------------------------------
+  bridge-exe:
+    name: Build the bridge executable
+    runs-on: windows-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build the Windows single-file executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          case "$VERSION" in bridge-*) VERSION="${VERSION#bridge-}" ;; *) VERSION="0.2.0" ;; esac
+          node scripts/package-bridge-exe.mjs \
+            --out exe \
+            --target win-x64 \
+            --version "$VERSION" \
+            --commit "$GITHUB_SHA" \
+            --node-version "$NODE_RUNTIME_VERSION" \
+            --download
+
+      - name: Smoke-test the executable
+        shell: bash
+        run: node scripts/bridge-exe-smoke-test.mjs --exe exe/estatemate-bridge-win-x64.exe
+
+      - name: Upload the executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-exe
+          if-no-files-found: error
+          path: |
+            exe/estatemate-bridge-win-x64.exe
+            exe/SHA256SUMS.txt
+            exe/BUILD-INFO.json
+            exe/README.txt
+
+  # --------------------------------------------------------------------------
+  # The Android bridge APK: no Gradle, no AndroidX, no Kotlin. aapt2 + javac +
+  # d8 + apksigner, the same pipeline scripts/build-bridge-apk.py runs locally,
+  # with the protocol test suite as the gate.
+  # --------------------------------------------------------------------------
+  bridge-apk:
+    name: Build the bridge APK
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive the release version from the tag
+        id: version
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          case "$version" in bridge-*) version="${version#bridge-}" ;; *) version="0.2.0" ;; esac
+          code=200
+          if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            code=$(( 10#${BASH_REMATCH[1]} * 10000 + 10#${BASH_REMATCH[2]} * 100 + 10#${BASH_REMATCH[3]} ))
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Deliberately no android-actions/setup-android: v3 unconditionally runs
+      # `sdkmanager tools`, a legacy package Google removed from the SDK
+      # repository, so it exits 1 before the build ever starts.
+      - name: Locate the preinstalled Android SDK
+        id: sdk
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$sdk" ]; then
+            echo "::error::No preinstalled Android SDK found (ANDROID_HOME/ANDROID_SDK_ROOT unset)."
+            exit 1
+          fi
+          echo "root=$sdk" >> "$GITHUB_OUTPUT"
+          sm=""
+          for candidate in "$sdk/cmdline-tools/latest/bin/sdkmanager" "$sdk/tools/bin/sdkmanager"; do
+            if [ -x "$candidate" ]; then sm="$candidate"; break; fi
+          done
+          if [ -z "$sm" ]; then
+            sm=$(find "$sdk/cmdline-tools" -maxdepth 3 -name sdkmanager -type f 2>/dev/null | sort | head -1 || true)
+          fi
+          if [ -z "$sm" ]; then
+            echo "::error::sdkmanager not found under $sdk."
+            exit 1
+          fi
+          echo "sdkmanager=$sm" >> "$GITHUB_OUTPUT"
+
+      - name: Install the SDK packages this project targets
+        run: |
+          set -euo pipefail
+          sm="${{ steps.sdk.outputs.sdkmanager }}"
+          yes | "$sm" --sdk_root="${{ steps.sdk.outputs.root }}" --licenses > /dev/null 2>&1 || true
+          "$sm" --sdk_root="${{ steps.sdk.outputs.root }}" \
+            'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
+
+      - name: Prepare the signing keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/bridge.jks"
+            echo "BRIDGE_KEYSTORE=$RUNNER_TEMP/bridge.jks" >> "$GITHUB_ENV"
+            echo "BRIDGE_KEYSTORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "BRIDGE_KEY_ALIAS=$ANDROID_KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "BRIDGE_KEY_PASSWORD=$ANDROID_KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "Signing the bridge APK with the release keystore."
+          else
+            # An unsigned APK cannot be installed at all; a debug-signed one is
+            # what side-loading an internal app expects.
+            keytool -genkeypair -keystore "$RUNNER_TEMP/bridge-debug.keystore" \
+              -alias androiddebugkey -storepass android -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=EstateMate Bridge Debug, O=EstateMate, C=US"
+            echo "BRIDGE_KEYSTORE=$RUNNER_TEMP/bridge-debug.keystore" >> "$GITHUB_ENV"
+            echo "BRIDGE_KEYSTORE_PASSWORD=android" >> "$GITHUB_ENV"
+            echo "BRIDGE_KEY_ALIAS=androiddebugkey" >> "$GITHUB_ENV"
+            echo "BRIDGE_KEY_PASSWORD=android" >> "$GITHUB_ENV"
+            echo "::warning::ANDROID_KEYSTORE_* secrets are not set - the bridge APK is signed with a throwaway debug key."
+          fi
+
+      - name: Run the protocol tests and build the APK
+        run: |
+          set -euo pipefail
+          sdk="${{ steps.sdk.outputs.root }}"
+          python3 scripts/build-bridge-apk.py --test \
+            --out apk \
+            --version-name "${{ steps.version.outputs.version }}" \
+            --version-code "${{ steps.version.outputs.code }}" \
+            --android-jar "$sdk/platforms/android-35/android.jar" \
+            --aapt2 "$sdk/build-tools/35.0.0/aapt2" \
+            --d8 "$sdk/build-tools/35.0.0/d8" \
+            --apksigner "$sdk/build-tools/35.0.0/apksigner" \
+            --keystore "$BRIDGE_KEYSTORE" \
+            --keystore-password "$BRIDGE_KEYSTORE_PASSWORD" \
+            --key-alias "$BRIDGE_KEY_ALIAS" \
+            --key-password "$BRIDGE_KEY_PASSWORD"
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-apk
+          if-no-files-found: error
+          path: |
+            apk/estatemate-bridge-*.apk
+            apk/SHA256SUMS.txt
+
   publish-release:
     name: Publish bridge release
     runs-on: ubuntu-latest
-    needs: [validate, windows-agent-bundle, android-apk]
+    needs: [validate, windows-agent-bundle, android-apk, bridge-exe, bridge-apk]
     if: ${{ startsWith(github.ref, 'refs/tags/bridge-') }}
     permissions:
       contents: write
@@ -654,6 +823,8 @@ jobs:
             echo "Built from commit \`${GITHUB_SHA}\`."
             echo
             echo "### Artifacts"
+            echo "- **Windows bridge exe** (\`estatemate-bridge-win-x64.exe\`) - one file: no Node.js install and nothing to unzip. Run \`estatemate-bridge-win-x64.exe setup\`, then \`check\`, then \`install-service\`."
+            echo "- **Android bridge APK** (\`estatemate-bridge-*.apk\`) - install on a phone or tablet on the same LAN as the terminals; the bridge runs in a foreground service and restarts after a reboot."
             echo "- **Windows agent bundle** (\`estatemate-isapi-agent-win-x64-*.zip\`) - self-contained; ships its own Node.js runtime, so the estate PC needs no Node.js install."
             echo "- **Android APK** (\`estatemate-android-*-debug.apk\`, plus \`-release.apk\` when signing secrets are configured)."
             echo "- Checksums for each artifact family, as \`SHA256SUMS.txt\` - qualified with the family name where two would otherwise collide, since release asset names are flat."
