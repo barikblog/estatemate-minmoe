@@ -93,6 +93,8 @@ async function hmac(secret: string, input: string): Promise<Uint8Array> {
 export interface ExtraJwtClaims {
   gate?: string | null;
   pendingGate?: boolean;
+  /** The gate was picked freely because the officer had no assigned posts. */
+  openGate?: boolean;
 }
 
 export async function signJwt(
@@ -110,6 +112,7 @@ export async function signJwt(
     name: user.name,
     ...(extra.gate ? { gate: extra.gate } : {}),
     ...(extra.pendingGate ? { pendingGate: true } : {}),
+    ...(extra.openGate ? { openGate: true } : {}),
     iat: now,
     exp: now + ttlSeconds,
   };

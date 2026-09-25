@@ -101,11 +101,15 @@ const requireAuth: MiddlewareHandler<{ Bindings: Env; Variables: AppVariables }>
     // Re-check the assignment on every request: if an administrator unassigns the
     // gate mid-shift the officer must select a new one rather than keep acting at
     // a post they no longer cover.
-    const stillAssigned = await c.env.DB.prepare(
-      `SELECT 1 AS ok FROM security_gate_assignments a JOIN hikvision_devices d ON d.id=a.device_id
-       WHERE a.security_user_id=? AND a.device_id=? AND a.active=1 AND d.deleted_at IS NULL AND d.status!='disabled'`,
-    ).bind(user.id, claims.gate).first<{ ok: number }>();
-    if (!stillAssigned) return jsonError(c, 401, 'Your gate assignment changed. Sign in again and select your gate.');
+    // Re-check on every request. A gate taken from an assignment must still be
+    // assigned (an administrator unassigning it mid-shift forces a new choice).
+    // A freely picked gate stays valid only while the officer has no posts at all
+    // and the device is still active, so assigning the officer anywhere moves him.
+    const assigned = await assignedGates(c.env.DB, user.id);
+    const stillAllowed = claims.openGate
+      ? !assigned.length && (await selectableGates(c.env.DB, user.id)).some((device) => device.id === claims.gate)
+      : assigned.some((device) => device.id === claims.gate);
+    if (!stillAllowed) return jsonError(c, 401, 'Your gate assignment changed. Sign in again and select your gate.');
     sessionGate = claims.gate;
   }
   c.set('sessionGate', sessionGate);
@@ -136,6 +140,21 @@ async function assignedGates(db: D1Database, securityUserId: string): Promise<Ar
      WHERE a.security_user_id=? AND a.active=1 AND d.deleted_at IS NULL AND d.status!='disabled'
      ORDER BY d.gate_name,d.name`,
   ).bind(securityUserId).all<Record<string, string | null>>();
+  return result.results;
+}
+
+/**
+ * Gates a Security officer may pick for a session. An administrator or manager
+ * who has posted the officer at specific gates restricts the choice to those
+ * posts; an officer with no posts chooses from every active gate device.
+ */
+async function selectableGates(db: D1Database, securityUserId: string): Promise<Array<Record<string, string | null>>> {
+  const assigned = await assignedGates(db, securityUserId);
+  if (assigned.length) return assigned;
+  const result = await db.prepare(
+    `SELECT id,name,gate_name,direction,model,status FROM hikvision_devices
+     WHERE deleted_at IS NULL AND status!='disabled' ORDER BY gate_name,name`,
+  ).all<Record<string, string | null>>();
   return result.results;
 }
 
@@ -408,7 +427,7 @@ app.post('/api/auth/login', async (c) => {
   // working for this session. No session cookie is set yet: the short-lived
   // selection token below can only be exchanged through /api/auth/select-gate.
   if (user.role === 'security') {
-    const gates = await assignedGates(c.env.DB, user.id);
+    const gates = await selectableGates(c.env.DB, user.id);
     if (gates.length) {
       const selectionToken = await signJwt(c.env, user, GATE_SELECTION_TTL_SECONDS, { pendingGate: true });
       return c.json({ requiresGateSelection: true, gates, selectionToken, user: safeUser });
@@ -417,8 +436,8 @@ app.post('/api/auth/login', async (c) => {
 
   const token = await signJwt(c.env, user);
   c.header('Set-Cookie', `estatemate_session=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=43200`);
-  // An officer with no gate assignments keeps estate-wide visibility so nobody is
-  // locked out before an administrator configures their posts.
+  // Only reached by a Security officer when the estate has no active gate device
+  // at all, so there is nothing to choose; they keep estate-wide visibility.
   return c.json({ token, user: safeUser, ...(user.role === 'security' ? { gateSelectionUnavailable: true } : {}) });
 });
 
@@ -449,10 +468,11 @@ app.post('/api/auth/select-gate', async (c) => {
   if (!user) return jsonError(c, 401, 'User is inactive or no longer exists');
   if (user.role !== 'security') return jsonError(c, 403, 'Only a Security officer selects a gate for a session');
 
-  const gate = (await assignedGates(c.env.DB, user.id)).find((device) => device.id === deviceId);
-  if (!gate) return jsonError(c, 403, 'You are not assigned to that gate');
+  const openGate = (await assignedGates(c.env.DB, user.id)).length === 0;
+  const gate = (await selectableGates(c.env.DB, user.id)).find((device) => device.id === deviceId);
+  if (!gate) return jsonError(c, 403, 'You are not allowed to work at that gate');
 
-  const token = await signJwt(c.env, user, 60 * 60 * 12, { gate: deviceId });
+  const token = await signJwt(c.env, user, 60 * 60 * 12, { gate: deviceId, openGate });
   c.header('Set-Cookie', `estatemate_session=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=43200`);
   await c.env.DB.batch([
     c.env.DB.prepare(`UPDATE security_gate_sessions SET ended_at=datetime('now'),end_reason='replaced' WHERE security_user_id=? AND ended_at IS NULL`).bind(user.id),
@@ -479,7 +499,7 @@ app.get('/api/auth/me', async (c) => {
 
 /** Gates the signed-in Security officer may work, for the "switch gate" control. */
 app.get('/api/auth/gates', requireRoles('security'), async (c) => {
-  return c.json({ items: await assignedGates(c.env.DB, c.get('user').id), selected: gateScope(c) });
+  return c.json({ items: await selectableGates(c.env.DB, c.get('user').id), selected: gateScope(c) });
 });
 
 app.post('/api/auth/change-password', async (c) => {
