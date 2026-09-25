@@ -19,6 +19,7 @@
  * downloads a build-host runtime of the same version alongside the target one.
  */
 import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -186,6 +187,41 @@ async function fetchNodeFromNpm({ version, nodePlatform, nodeArch, cacheDir }) {
   const binary = path.join(extractDir, 'package', 'bin', binaryName);
   if (!fs.existsSync(binary)) throw new Error(`${packageName}@${version} did not contain bin/${binaryName}`);
   return { binary, archivePath, sha256: fileSha256(archivePath), fileName: path.basename(archivePath), integrity };
+}
+
+const POSTJECT_VERSION = '1.0.0-alpha.6';
+
+/**
+ * postject is the tool Node's own documentation uses to inject the SEA blob.
+ * Its `dist/api.js` needs no dependencies (only the CLI pulls in commander), so
+ * the tarball is fetched once, integrity-checked against the registry's sha512
+ * and imported directly. That avoids `npx` entirely: on Windows a .cmd shim
+ * cannot be spawned without a shell since Node's 2024 EINVAL hardening, and a
+ * build step that only works on two of three platforms is a trap.
+ */
+async function ensurePostject(cacheDir) {
+  const extractDir = path.join(cacheDir, `postject-${POSTJECT_VERSION}.extracted`);
+  const apiPath = path.join(extractDir, 'package', 'dist', 'api.js');
+  if (fs.existsSync(apiPath)) return apiPath;
+
+  const metaResponse = await fetch(`https://registry.npmjs.org/postject/${POSTJECT_VERSION}`);
+  if (!metaResponse.ok) throw new Error(`cannot fetch postject ${POSTJECT_VERSION} from the npm registry (HTTP ${metaResponse.status})`);
+  const meta = await metaResponse.json();
+  const tarballUrl = meta?.dist?.tarball;
+  const integrity = meta?.dist?.integrity;
+  if (!tarballUrl) throw new Error(`the npm registry published no tarball for postject ${POSTJECT_VERSION}`);
+
+  const archivePath = path.join(cacheDir, `postject-${POSTJECT_VERSION}.tgz`);
+  if (!fs.existsSync(archivePath)) await download(tarballUrl, archivePath);
+  if (integrity) {
+    const actual = `sha512-${createHash('sha512').update(fs.readFileSync(archivePath)).digest('base64')}`;
+    if (actual !== integrity) throw new Error(`integrity mismatch for postject ${POSTJECT_VERSION}: registry ${integrity}, downloaded ${actual}`);
+  }
+  fs.rmSync(extractDir, { recursive: true, force: true });
+  fs.mkdirSync(extractDir, { recursive: true });
+  run('tar', ['-xzf', archivePath, '-C', extractDir]);
+  if (!fs.existsSync(apiPath)) throw new Error(`postject ${POSTJECT_VERSION} did not contain dist/api.js`);
+  return apiPath;
 }
 
 async function shaSumsFor(version, cacheDir) {
@@ -378,16 +414,15 @@ async function main() {
   const exePath = path.join(outDir, exeName);
   fs.copyFileSync(targetBinary, exePath);
 
-  // postject flips the sentinel fuse and appends the resource; the CLI is used
-  // rather than the API so the injection strategy matches Node's own
-  // documentation (`--sentinel-fuse` / Mach-O segment name).
-  const postjectArgs = [exePath, SEA_RESOURCE, blobPath, '--sentinel-fuse', SEA_FUSE];
-  if (target.platform === 'darwin') postjectArgs.push('--macho-segment-name', 'NODE_SEA');
+  // postject flips the sentinel fuse and appends the resource, exactly as Node's
+  // own documentation instructs. Run in-process: the same code the CLI wraps,
+  // with no shell and no package-manager shim in the way.
   log('Injecting the blob …');
-  const postject = run('npx', ['--yes', 'postject@1.0.0-alpha.6', ...postjectArgs], { allowFailure: true });
-  if (postject.status !== 0) {
-    throw new Error(`postject failed:\n${postject.stdout || ''}${postject.stderr || ''}`);
-  }
+  const postjectApi = await ensurePostject(cacheDir);
+  const { inject } = createRequire(import.meta.url)(postjectApi);
+  const injectOptions = { sentinelFuse: SEA_FUSE };
+  if (target.platform === 'darwin') injectOptions.machoSegmentName = 'NODE_SEA';
+  await inject(exePath, SEA_RESOURCE, fs.readFileSync(blobPath), injectOptions);
   const injected = fs.readFileSync(exePath);
   if (!injected.includes(Buffer.from(SEA_RESOURCE))) throw new Error('the injected executable does not contain the SEA blob resource name');
 
