@@ -138,6 +138,46 @@ itself needed two fixes after a positive control exposed false positives, so it 
 validated against both negative and positive controls. It is wired into the `validate`
 job so future edits are caught on ubuntu in seconds.
 
+### Two real product bugs the first Windows/Android runs found (run 36128679749)
+
+These are defects in shipped code, not CI problems. Neither could have been found
+without a real `windows-latest` runner and a real Kotlin compile.
+
+**1. `windows-agent/agent.mjs` could never start on Windows.** It resolved an absolute
+core-agent path and passed it straight to `import(coreAgentPath)`. On Windows, Node's
+ESM loader parses `D:\a\...\agent.mjs` as a URL with protocol `d:` and throws
+`ERR_UNSUPPORTED_ESM_URL_SCHEME`. The wrapper caught it, logged
+`[ERROR] Failed to load core agent` and called `process.exit(1)` — so the Windows
+Service wrapper, the entire reason `windows-agent/` exists, exited immediately on the
+only platform it targets. Fixed with `import(pathToFileURL(coreAgentPath).href)`, which
+is a no-op on POSIX where the bare path already worked. The error branch now also
+prints the path and its file URL, since a silent exit-1 there cost a full release cycle
+to diagnose.
+
+Note this was masked in review because the failure only occurs on Windows: every
+previous agent environment was Linux, where the same line works fine.
+
+**2. `apps/android` `MainActivity.kt` did not compile.** Line 17 imported
+`androidx.compose.foundation.layout.weight`, which is not a public top-level symbol —
+the only thing by that name is `val RowColumnParentData?.weight`, which is `internal`.
+Kotlin rejects it: *"Cannot access 'val RowColumnParentData?.weight: Float': it is
+internal in file."* The import was also shadowing the `RowScope`/`ColumnScope` member
+extension that all four `Modifier.weight(1f)` call sites actually need. Removed the
+import; the call sites were already correct inside their `Row`/`Column` scopes. This is
+the concrete cost of the handoff's repeated "None of this Kotlin was compiled".
+
+Also silenced a Room warning: `AppDatabase` had `exportSchema = true` with no
+`room.schemaLocation`, which warns on every build. It is a single-entity offline cache
+with no migration history to preserve, so `exportSchema` is now `false`.
+
+The diagnostics added for this are worth keeping: because the Actions log archive is not
+retrievable from a sandbox (results-receiver, `*.blob.core.windows.net` and
+`pipelines.actions.githubusercontent.com` all refuse connections, and the jobs API
+exposes no step summary), the Android job re-emits Kotlin `e:`/`w:` lines, the failing
+task and the raw log tail as `::error` annotations, and the Windows smoke test dumps both
+launcher streams the same way. Annotations *are* readable through the check-runs API, so
+that is the channel a future agent will have.
+
 ## Most recent migration
 
 `migrations/0014_gate_image_and_security_gate_sessions.sql`

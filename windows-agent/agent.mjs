@@ -10,7 +10,7 @@
  * For core logic, see ../isapi-bridge/agent.mjs
  */
 
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { readFileSync, existsSync } from 'node:fs';
 
@@ -63,8 +63,15 @@ console.log(`[INFO] Config: ${configPath}`);
 console.log(`[INFO] Core agent: ${coreAgentPath}`);
 console.log(`[INFO] To install as Windows Service, run install-windows.mjs or use sc.exe / NSSM as described in README.md`);
 
-// Dynamically import core agent (it has its own main loop)
-import(coreAgentPath).catch((err) => {
+// Dynamically import core agent (it has its own main loop).
+// The specifier MUST be a file:// URL. On Windows a bare absolute path such as
+// D:\...\agent.mjs is parsed as a URL whose protocol is "d:", which the ESM
+// loader rejects with ERR_UNSUPPORTED_ESM_URL_SCHEME - so the agent died at
+// startup on the only platform this wrapper exists for. pathToFileURL is a no-op
+// on POSIX, where the absolute path already worked.
+import(pathToFileURL(coreAgentPath).href).catch((err) => {
   console.error('[ERROR] Failed to load core agent:', err);
+  console.error(`[ERROR] Core agent path was: ${coreAgentPath}`);
+  console.error(`[ERROR] As file URL: ${pathToFileURL(coreAgentPath).href}`);
   process.exit(1);
 });

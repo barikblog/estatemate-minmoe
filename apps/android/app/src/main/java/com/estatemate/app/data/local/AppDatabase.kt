@@ -32,7 +32,10 @@ interface AccessEventDao {
     suspend fun clear()
 }
 
-@Database(entities = [CachedAccessEvent::class], version = 1, exportSchema = true)
+// exportSchema is off because this is a local offline cache with one entity and
+// no migration history to preserve; leaving it on without a room.schemaLocation
+// makes every build warn about a missing schema export directory.
+@Database(entities = [CachedAccessEvent::class], version = 1, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun accessEventDao(): AccessEventDao
 }
