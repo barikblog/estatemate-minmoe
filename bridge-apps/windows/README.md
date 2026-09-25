@@ -45,7 +45,9 @@ protocol documentation.
    port, ISAPI username and password.
 2. **Portal** — in the agent row, click **Download installer** and save the
    `.ps1`. It already contains the agent id, secret and Worker URL, so the file is
-   the one thing worth carrying to the PC: nothing above has to be retyped.
+   the one thing worth carrying to the PC: nothing above has to be retyped, and
+   neither does the EstateMate device id — the bridge resolves each terminal from
+   the portal by its LAN address.
 3. **Estate PC** — copy `estatemate-bridge.exe` and the `.ps1` to the PC, then in
    PowerShell:
 
@@ -110,7 +112,6 @@ wherever `--config`/`--data-dir` says).
 {
   "devices": [
     {
-      "estateMateDeviceId": "11111111-1111-4111-8111-111111111111",
       "name": "Main Gate MinMoe",
       "isapiHost": "192.168.1.100",
       "isapiPort": 80,
@@ -124,10 +125,14 @@ wherever `--config`/`--data-dir` says).
 }
 ```
 
-`estateMateDeviceId` is the id shown on the portal's *Access-control devices*
-page — operations queued for that device are matched by it, so a mismatch shows
-up as operations that stay queued. `check` reports both directions of that
-mismatch.
+`estateMateDeviceId` is optional, and usually best left out: it is the
+**EstateMate device ID** on the portal's *ISAPI Bridge & Windows Agent → ISAPI
+device configs* page, and the bridge looks it up by matching `isapiHost` (and
+port) against the devices the portal has linked to this agent — `check` prints
+`· Main Gate MinMoe → <id>` for every terminal it resolves that way. Set it
+explicitly when one address has several terminals behind it. A terminal the
+portal has not linked, or a mistyped id, is reported by `check` and refused at
+startup rather than silently dropping the events it reads.
 
 ## Troubleshooting
 

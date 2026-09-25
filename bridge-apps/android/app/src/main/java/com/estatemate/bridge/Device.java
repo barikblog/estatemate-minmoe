@@ -40,6 +40,11 @@ public final class Device {
         this.eventStream = eventStream;
     }
 
+    /** The same terminal with its EstateMate device id filled in. */
+    public Device withEstateMateDeviceId(String id) {
+        return new Device(id, name, isapiHost, isapiPort, isapiUsername, isapiPassword, protocol, enabled, eventStream);
+    }
+
     public static Device fromJson(Map<String, Object> json) {
         String host = Json.string(json, "isapiHost", "");
         return new Device(

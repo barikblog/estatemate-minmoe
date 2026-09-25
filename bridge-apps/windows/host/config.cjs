@@ -284,8 +284,13 @@ function validateDevicesConfig(devicesFile) {
     }
     const id = String(entry.estateMateDeviceId || '').trim();
     const host = String(entry.isapiHost || '').trim();
-    if (!id) errors.push(`${label} (${entry.name || host || 'unnamed'}) has no estateMateDeviceId — copy it from Access-control devices in the portal`);
-    else if (!isUuid(id)) warnings.push(`${label} estateMateDeviceId "${id}" is not a UUID`);
+    // The EstateMate device id is optional: it is a UUID that lives in the
+    // portal, so a terminal may be configured by LAN address alone and the
+    // agent looks the id up from its own linked devices at startup. A malformed
+    // one is dropped rather than fatal for the same reason — the portal match
+    // is authoritative, and it is reported by `check`.
+    if (id && !isUuid(id)) warnings.push(`${label} estateMateDeviceId "${id}" is not a UUID and will be replaced by the portal match at startup`);
+    if (!id) warnings.push(`${label} (${entry.name || host || 'unnamed'}) has no estateMateDeviceId; it is resolved from the portal by LAN address at startup`);
     if (!host) errors.push(`${label} (${id || 'unnamed'}) has no isapiHost`);
     if (id && seen.has(id)) warnings.push(`${label} repeats estateMateDeviceId ${id}; the later entry wins`);
     if (id) seen.add(id);

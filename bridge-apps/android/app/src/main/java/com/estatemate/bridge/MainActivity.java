@@ -33,6 +33,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.util.List;
+import java.util.Map;
 
 public final class MainActivity extends Activity {
     private static final int LOG_POLL_MS = 800;
@@ -262,16 +263,36 @@ public final class MainActivity extends Activity {
                         WorkerClient client = new WorkerClient(config.workerUrl, config.agentId, config.agentSecret,
                                 "EstateMate-Bridge-Android/" + BridgeService.VERSION, 20000);
                         WorkerClient.Reply reply = client.listDevices();
+                        java.util.List<String> portalIds = null;
                         if (!reply.ok()) {
                             BridgeLog.append("error", "Worker: " + reply.message());
                         } else {
+                            // The Worker keys the id as `device_id`; reading `id`
+                            // here made every terminal look unlinked.
+                            portalIds = BridgeConfig.portalDeviceIds(reply.json());
                             List<Object> items = Json.asArray(reply.json().get("items"));
                             BridgeLog.append("info", "Worker: OK · " + items.size() + " device(s) linked to this agent");
-                            java.util.ArrayList<String> linked = new java.util.ArrayList<String>();
-                            for (Object item : items) linked.add(Json.string(Json.asObject(item), "id", "").toLowerCase());
+                            for (Object item : items) {
+                                Map<String, Object> entry = Json.asObject(item);
+                                BridgeLog.append("info", "  linked: " + Json.string(entry, "device_name", "(unnamed)")
+                                        + " · " + Json.string(entry, "isapi_host", "?")
+                                        + " · " + Json.string(entry, "device_id", "?"));
+                            }
+                            BridgeConfig resolved = config.withPortalDevices(reply.json());
+                            for (int index = 0; index < config.devices().size(); index += 1) {
+                                Device before = config.devices().get(index);
+                                Device after = resolved.devices().get(index);
+                                if (!after.estateMateDeviceId.equalsIgnoreCase(before.estateMateDeviceId)) {
+                                    BridgeLog.append("info", "  " + after.name + ": EstateMate device id resolved from the portal → " + after.estateMateDeviceId);
+                                } else if (!BridgeConfig.isUuid(after.estateMateDeviceId)) {
+                                    BridgeLog.append("warn", "  " + after.name + " (" + after.baseUrl() + ") is not linked to this agent in the portal — link it under Link device to agent");
+                                }
+                            }
+                        }
+                        if (portalIds == null) {
                             for (Device device : config.devices()) {
-                                if (!device.estateMateDeviceId.isEmpty() && !linked.contains(device.estateMateDeviceId.toLowerCase())) {
-                                    BridgeLog.append("warn", "  " + device.name + " is not linked to this agent in the portal yet");
+                                if (!BridgeConfig.isUuid(device.estateMateDeviceId)) {
+                                    BridgeLog.append("warn", "  " + device.name + " has no EstateMate device id, and the portal could not be reached to look it up");
                                 }
                             }
                         }
@@ -303,11 +324,17 @@ public final class MainActivity extends Activity {
             public void onClick(View view) {
                 BridgeConfig config = persist();
                 if (config == null) return;
+                // Only syntax is checked here; the service resolves terminals that
+                // were configured by LAN address against the portal, and reports
+                // anything it cannot resolve there.
                 List<String> problems = config.problems();
                 if (!problems.isEmpty()) {
                     BridgeLog.append("error", "cannot start: " + BridgeConfig.describe(problems));
                     refresh();
                     return;
+                }
+                if (!config.unresolvedDevices().isEmpty()) {
+                    BridgeLog.append("info", config.unresolvedDevices().size() + " terminal(s) have no EstateMate device id; looking them up in the portal…");
                 }
                 Intent intent = new Intent(MainActivity.this, BridgeService.class).setAction(BridgeService.ACTION_START);
                 try {

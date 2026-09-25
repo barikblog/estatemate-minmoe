@@ -29,7 +29,6 @@ foreground service, restarts it after a reboot, and shows the live log on screen
    {
      "devices": [
        {
-         "estateMateDeviceId": "11111111-1111-4111-8111-111111111111",
          "name": "Main Gate MinMoe",
          "isapiHost": "192.168.1.100",
          "isapiPort": 80,
@@ -43,11 +42,14 @@ foreground service, restarts it after a reboot, and shows the live log on screen
    }
    ```
 
-   `estateMateDeviceId` is the **EstateMate device ID** in the portal — it is the
-   `device_id` column of *ISAPI Bridge & Windows Agent → ISAPI device configs*, and
-   the same value appears on the *Access-control devices* page; **Copy ID** is in
-   the row actions. If it does not match what the Worker has linked to this agent,
-   queued operations stay queued and the app says so.
+   There is nothing else to copy: the app asks the portal which EstateMate device
+   is behind that LAN address and fills in the id itself (the log says
+   `resolved EstateMate device id for "Main Gate MinMoe" from the portal: …`).
+   `estateMateDeviceId` may still be set explicitly — it is the **EstateMate
+   device ID** in the portal, the `device_id` column of *ISAPI Bridge & Windows
+   Agent → ISAPI device configs*, with **Copy ID** in the row actions — and a
+   device the portal has not linked to this agent is reported by name instead of
+   failing later with queued operations.
 4. **Phone** — **Save**, then **Test connection** (it reports the Worker, every
    terminal's model and firmware, and any terminal the portal has not linked to
    this agent yet), then **Start bridge**.

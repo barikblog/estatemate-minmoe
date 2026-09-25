@@ -1579,6 +1579,7 @@ function IsapiBridge({ user }: { user: User }) {
 
     <section className="panel callout"><p className="eyebrow">Agent quick reference</p><h3>Install the bridge on the device LAN</h3>
       <p className="eyebrow">Windows — one file, no Node.js install</p>
+      <p>Neither the agent ID nor any device ID has to be copied by hand: the installer script and <code>setup</code> carry the agent credentials, and the bridge matches each terminal to the portal by its LAN address. <strong>Download installer</strong> is the one thing to carry to the device.</p>
       <ol>
         <li>Register the agent above, then <strong>Download installer</strong>. The script already carries the agent ID, the secret and the Worker URL, so none of them has to be retyped.</li>
         <li><code>estatemate-bridge-win-x64.exe setup --from-installer .\estatemate-isapi-agent-xxxx.ps1</code> — or run <code>setup</code> and paste the script (blank installs start the prompts).</li>
@@ -1588,7 +1589,7 @@ function IsapiBridge({ user }: { user: User }) {
       <p className="eyebrow">Android — a phone or tablet on the terminals' LAN</p>
       <ol>
         <li>Install <code>estatemate-bridge-&lt;version&gt;.apk</code>, press <em>Paste installer</em> and paste the same script.</li>
-        <li>Add each terminal to the devices block — <code>estateMateDeviceId</code> from the device mappings table above, plus its LAN IP, ISAPI username and password — then <em>Save</em>.</li>
+        <li>Add each terminal to the devices block with its LAN IP, ISAPI username and password — that is all it needs. The EstateMate device ID is resolved from the portal by matching that address against the device mappings above; add <code>estateMateDeviceId</code> explicitly only when one address has several terminals behind it.</li>
         <li><em>Test connection</em>, then <em>Start bridge</em>, then allow the app to run without battery optimisation so gate events arrive while the screen is off.</li>
       </ol>
       <p className="eyebrow">Windows PowerShell bundle (older path)</p>

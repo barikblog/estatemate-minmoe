@@ -102,21 +102,110 @@ public final class BridgeConfig {
                 devices);
     }
 
-    /** Human-readable blocking problems; an empty list means the bridge can start. */
+    /**
+     * Human-readable blocking problems; an empty list means the bridge can start.
+     *
+     * `portalDeviceIds` is the set of EstateMate device ids the Worker reports as
+     * linked to this agent, or null when the portal has not been consulted yet.
+     * Without it, a terminal that has no usable id is not a problem: the id is a
+     * UUID that lives in the portal, so the bridge looks it up by LAN address at
+     * startup (see withPortalDevices) instead of asking anyone to copy it.
+     */
     public List<String> problems() {
+        return problems(null);
+    }
+
+    public List<String> problems(List<String> portalDeviceIds) {
         ArrayList<String> problems = new ArrayList<String>();
-        if (!isUuid(agentId)) problems.add("agent id must be the UUID shown in the portal");
+        if (!isUuid(agentId)) {
+            problems.add("agent id \"" + abbreviate(agentId) + "\" is not a UUID — the portal shows it as Agent ID (ISAPI Bridge & Windows Agent → Copy ID);"
+                    + " or paste the installer script, which already contains it");
+        }
         if (agentSecret.length() < 16) problems.add("agent secret is missing or too short");
         if (!workerUrl.startsWith("http://") && !workerUrl.startsWith("https://")) problems.add("worker URL must start with http:// or https://");
         if (devices.isEmpty()) problems.add("no terminals configured");
         for (Device device : devices) {
             if (device.isapiHost.isEmpty()) problems.add("a terminal has no ISAPI host");
-            if (!device.estateMateDeviceId.isEmpty() && !isUuid(device.estateMateDeviceId)) {
-                problems.add("terminal \"" + device.name + "\" has a malformed EstateMate device id");
-            }
             if (device.isapiPassword.isEmpty()) problems.add("terminal \"" + device.name + "\" has no ISAPI password");
+            if (!isUuid(device.estateMateDeviceId)) {
+                if (portalDeviceIds != null) {
+                    problems.add("terminal \"" + device.name + "\" (" + device.baseUrl() + ") is not linked to this agent in the portal"
+                            + (device.estateMateDeviceId.isEmpty()
+                                ? ""
+                                : " (the configured " + abbreviate(device.estateMateDeviceId) + " is not a device id)")
+                            + " — link it under ISAPI Bridge & Windows Agent → Link device to agent");
+                }
+            } else if (portalDeviceIds != null && !containsIgnoreCase(portalDeviceIds, device.estateMateDeviceId)) {
+                problems.add("terminal \"" + device.name + "\" uses " + device.estateMateDeviceId
+                        + ", which the portal does not list for this agent — check the devices file, or re-link the device");
+            }
         }
         return problems;
+    }
+
+    private static boolean containsIgnoreCase(List<String> values, String wanted) {
+        for (String value : values) {
+            if (value != null && value.equalsIgnoreCase(wanted)) return true;
+        }
+        return false;
+    }
+
+    private static String abbreviate(String value) {
+        if (value == null || value.isEmpty()) return "(empty)";
+        return value.length() <= 48 ? value : value.substring(0, 45) + "…";
+    }
+
+    /**
+     * The EstateMate device ids in a Worker linked-device reply
+     * (`GET /api/isapi/v1/agents/:id/devices`). The Worker keys the id as
+     * `device_id`; reading `id` here silently produced an empty set, which made
+     * every terminal look unlinked.
+     */
+    public static ArrayList<String> portalDeviceIds(Map<String, Object> reply) {
+        ArrayList<String> ids = new ArrayList<String>();
+        for (Object item : Json.asArray(reply.get("items"))) {
+            String id = Json.string(Json.asObject(item), "device_id", "");
+            if (!id.isEmpty()) ids.add(id);
+        }
+        return ids;
+    }
+
+    /**
+     * Fills in a terminal's EstateMate device id from the portal's linked
+     * devices, matching on LAN address (and on port when both sides state one).
+     * Terminals that already carry a valid id are left exactly as they are.
+     */
+    public BridgeConfig withPortalDevices(Map<String, Object> reply) {
+        List<Object> items = Json.asArray(reply.get("items"));
+        ArrayList<Device> resolved = new ArrayList<Device>();
+        for (Device device : devices) {
+            if (isUuid(device.estateMateDeviceId)) {
+                resolved.add(device);
+                continue;
+            }
+            Map<String, Object> match = null;
+            for (Object item : items) {
+                Map<String, Object> entry = Json.asObject(item);
+                if (!Json.string(entry, "isapi_host", "").trim().equalsIgnoreCase(device.isapiHost.trim())) continue;
+                int entryPort = Json.integer(entry, "isapi_port", device.isapiPort);
+                if (match != null && entryPort != device.isapiPort) continue;
+                match = entry;
+                if (entryPort == device.isapiPort) break;
+            }
+            String id = match == null ? "" : Json.string(match, "device_id", "");
+            resolved.add(isUuid(id) ? device.withEstateMateDeviceId(id) : device);
+        }
+        return new BridgeConfig(agentId, agentSecret, workerUrl, syncIntervalSeconds, heartbeatIntervalSeconds,
+                isapiTimeoutMs, eventStreamEnabled, eventFlushCount, eventFlushSeconds, eventBufferLimit, resolved);
+    }
+
+    /** Terminals still without a usable id after the portal was consulted. */
+    public List<Device> unresolvedDevices() {
+        ArrayList<Device> unresolved = new ArrayList<Device>();
+        for (Device device : devices) {
+            if (!isUuid(device.estateMateDeviceId)) unresolved.add(device);
+        }
+        return unresolved;
     }
 
     public static boolean isUuid(String value) {

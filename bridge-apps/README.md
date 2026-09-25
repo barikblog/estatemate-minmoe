@@ -47,9 +47,17 @@ Both hosts use the same two documents, so a device list exported from one can be
 pasted into the other:
 
 * `agent-config.json` — `agentId`, `agentSecret`, `workerUrl` and the intervals;
-* `isapi-devices.json` — one entry per terminal: `estateMateDeviceId`, `name`,
-  `isapiHost`, `isapiPort`, `isapiUsername`, `isapiPassword`, `protocol`,
-  `enabled`, `eventStream`.
+* `isapi-devices.json` — one entry per terminal: `name`, `isapiHost`,
+  `isapiPort`, `isapiUsername`, `isapiPassword`, `protocol`, `enabled`,
+  `eventStream`, and optionally `estateMateDeviceId`.
+
+`estateMateDeviceId` is the portal's key for a terminal and both hosts resolve it
+automatically: leave it out and the bridge matches the terminal by its LAN
+address against the devices linked to this agent, logging
+`resolved EstateMate device id for "<name>" from the portal: <uuid>`. That is the
+whole reason the installer script is the recommended way to configure a host —
+an agent id is a UUID nobody should be copying by hand, and with this the only
+per-terminal facts anyone needs are ones printed on the terminal itself.
 
 The portal's **Download installer** script contains the first three values; both
 hosts can read it (`estatemate-bridge.exe setup --from-installer …` on Windows,

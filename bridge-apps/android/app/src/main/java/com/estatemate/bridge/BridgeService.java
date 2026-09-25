@@ -39,7 +39,7 @@ public final class BridgeService extends Service {
     public static final String ACTION_START = "com.estatemate.bridge.action.START";
     public static final String ACTION_STOP = "com.estatemate.bridge.action.STOP";
     public static final String CHANNEL_ID = "estatemate-bridge";
-    public static final String VERSION = "0.2.0";
+    public static final String VERSION = "0.2.1";
 
     private static final String TAG = "EstateMateBridge";
     private static final int NOTIFICATION_ID = 41;
@@ -86,12 +86,60 @@ public final class BridgeService extends Service {
         super.onDestroy();
     }
 
+    // ------------------------------------------------------------ resolution --
+
+    /**
+     * Reads the portal's linked devices and, where a terminal was configured by
+     * LAN address alone, adopts the EstateMate device id the portal knows for it.
+     * Returns the ids the portal listed, or null when it could not be read - in
+     * which case a missing id is reported, but a wrong one is not.
+     */
+    private List<String> resolveFromPortal() {
+        WorkerClient client = new WorkerClient(config.workerUrl, config.agentId, config.agentSecret,
+                "EstateMate-Bridge-Android/" + VERSION, 25000);
+        WorkerClient.Reply linked = client.listDevices();
+        if (!linked.ok()) {
+            BridgeLog.append("warn", "could not read the portal's linked devices: " + linked.message());
+            return null;
+        }
+        worker = client;
+        List<String> portalIds = BridgeConfig.portalDeviceIds(linked.json());
+        BridgeLog.append("info", "portal: " + portalIds.size() + " device(s) linked to this agent");
+        if (config.unresolvedDevices().isEmpty()) return portalIds;
+
+        BridgeConfig resolved = config.withPortalDevices(linked.json());
+        List<Device> before = config.devices();
+        List<Device> after = resolved.devices();
+        for (int index = 0; index < after.size(); index += 1) {
+            String previous = before.get(index).estateMateDeviceId;
+            String current = after.get(index).estateMateDeviceId;
+            if (!current.equalsIgnoreCase(previous)) {
+                BridgeLog.append("info", "resolved EstateMate device id for \"" + after.get(index).name + "\" from the portal: " + current);
+            }
+        }
+        config = resolved;
+        return portalIds;
+    }
+
     // ------------------------------------------------------------- lifecycle --
 
     private void startBridge() {
         if (running) return;
         config = readConfig();
+
+        // Devices configured by LAN address alone get their EstateMate device id
+        // from the portal: it is the Worker's key for a terminal, and asking an
+        // installer to copy a UUID per gate is where setups go wrong. The check
+        // is deliberately two-pass so the only configuration that fails is the
+        // one that cannot work.
         List<String> problems = config.problems();
+        if (problems.isEmpty()) {
+            List<String> portalIds = resolveFromPortal();
+            problems = config.problems(portalIds);
+            if (!problems.isEmpty() && portalIds == null) {
+                problems.add("and the portal could not be reached to look the id up — check the Worker URL and this device's network, then start the bridge again");
+            }
+        }
         if (!problems.isEmpty()) {
             String message = BridgeConfig.describe(problems);
             BridgeLog.append("error", "cannot start: " + message);
@@ -109,7 +157,6 @@ public final class BridgeService extends Service {
         BridgeRuntime.setWorkerOnline(false);
         BridgeRuntime.setWorkerStatus("connecting…");
         BridgeRuntime.setLastError("");
-        worker = new WorkerClient(config.workerUrl, config.agentId, config.agentSecret, "EstateMate-Bridge-Android/" + VERSION, 25000);
         isapi = new IsapiClient(config.isapiTimeoutMs);
 
         startForeground(NOTIFICATION_ID, notification("Starting…", config.deviceCount() + " terminal(s) configured"));

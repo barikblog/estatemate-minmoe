@@ -246,19 +246,40 @@ function printReport(report, logger) {
     line(`  Worker          HTTP ${worker.status} — ${worker.error || 'unexpected response'}`);
   }
 
-  const linkedIds = new Set((worker.linkedDevices || []).map((d) => String(d.id || d.deviceId || '')).filter(Boolean));
+  // The Worker's linked-device payload keys the id as `device_id` — reading
+  // `id` here made this whole comparison silently do nothing.
+  const linkedIds = new Set((worker.linkedDevices || []).map((d) => String(d.device_id || d.deviceId || d.id || '')).filter(Boolean));
   if (linkedIds.size) {
     const localIds = new Set(report.devices.map((d) => d.id).filter(Boolean));
-    const notLocal = [...linkedIds].filter((id) => !localIds.has(id));
+    // An entry without an id is matched to the portal by LAN address, which is
+    // exactly what the agent does at startup.
+    const matchedIds = new Set();
+    for (const device of report.devices) {
+      if (device.id) matchedIds.add(device.id);
+      else if (device.resolvedPortalId) matchedIds.add(device.resolvedPortalId);
+    }
+    const notLocal = [...linkedIds].filter((id) => !matchedIds.has(id));
     const notLinked = [...localIds].filter((id) => !linkedIds.has(id));
     if (notLocal.length) line(`                  ${notLocal.length} device(s) linked in the portal are not in isapi-devices.json — operations for them will stay queued`);
     if (notLinked.length) line(`                  ${notLinked.length} entry(ies) in isapi-devices.json are not linked to this agent in the portal`);
+  }
+
+  // An entry may leave the EstateMate device id out and be matched to the
+  // portal by LAN address; say what the agent will do with each one, so a
+  // typo in an address does not turn into silent event loss at run time.
+  const withoutId = (report.devices || []).filter((device) => !String(device.id || '').trim());
+  if (withoutId.length) {
+    line(`  Device ids      ${withoutId.length} entry(ies) have no EstateMate device id; the agent resolves them from the portal by LAN address`);
+    for (const device of withoutId) {
+      if (device.resolvedPortalId) line(`                    · ${device.name} → ${device.resolvedPortalId} (${device.resolvedPortalName || 'unnamed'})`);
+      else line(`                    ! ${device.name} (${device.host}:${device.port}) is not linked to this agent in the portal — the bridge will refuse to start until it is`);
+    }
   }
   line('');
 
   for (const device of report.devices) {
     const status = device.ok ? 'OK  ' : 'FAIL';
-    line(`  [${status}] ${device.name} — ${device.protocol}://${device.host}:${device.port} (${device.id || 'no device id'})`);
+    line(`  [${status}] ${device.name} — ${device.protocol}://${device.host}:${device.port} (${device.id || (device.resolvedPortalId ? `portal id ${device.resolvedPortalId}` : 'no device id')})`);
     if (device.deviceInfo) {
       const bits = [device.deviceInfo.model, device.deviceInfo.deviceName, device.deviceInfo.firmwareVersion, device.deviceInfo.serialNumber].filter(Boolean);
       if (bits.length) line(`         device: ${bits.join(' | ')}`);
@@ -343,16 +364,40 @@ async function runCheck({ ctx, logger, json = false }) {
 
   const alertStreamPath = String(config.alertStreamPath || '/ISAPI/Event/notification/alertStream?format=json');
   const timeoutMs = Math.max(3000, Math.min(60000, Number(config.isapiTimeoutMs || 15000)));
-  const entries = (devicesFile.devices || []).filter((d) => d && d.estateMateDeviceId && d.isapiHost);
+  // A terminal needs a LAN address to be checkable. Its EstateMate device id is
+  // optional: the agent resolves that from the portal at startup, so `check`
+  // reports what it will resolve to rather than refusing to look.
+  const entries = (devicesFile.devices || []).filter((d) => d && d.isapiHost && d.enabled !== false);
+  const portalMatchFor = (host, port) => (report.worker.linkedDevices || []).find(
+    (item) => String(item.isapi_host || '').trim().toLowerCase() === String(host || '').trim().toLowerCase()
+      && (!item.isapi_port || port === undefined || Number(item.isapi_port) === Number(port)),
+  );
   for (const entry of entries) {
     // eslint-disable-next-line no-await-in-loop -- devices are checked one at a
     // time on purpose: a hung terminal must not starve the others.
-    report.devices.push(await checkDevice(entry, { agent, alertStreamPath, timeoutMs, logger }));
+    const result = await checkDevice(entry, { agent, alertStreamPath, timeoutMs, logger });
+    if (!String(result.id || '').trim()) {
+      const match = portalMatchFor(result.host, result.port);
+      if (match && match.device_id) {
+        result.resolvedPortalId = String(match.device_id);
+        result.resolvedPortalName = match.device_name ? String(match.device_name) : null;
+      }
+    }
+    report.devices.push(result);
   }
 
   const workerOk = report.worker.status === 200;
   const devicesOk = report.devices.every((d) => d.ok);
   report.exitCode = workerOk && devicesOk && entries.length > 0 ? 0 : 1;
+  const unresolved = report.devices.filter((device) => !String(device.id || '').trim() && !device.resolvedPortalId);
+  if (unresolved.length) {
+    report.errors.push(
+      `${unresolved.length} terminal(s) have no EstateMate device id and are not linked to this agent in the portal (${unresolved
+        .map((device) => `${device.name} at ${device.host}:${device.port}`)
+        .join(', ')}) — link them under ISAPI Bridge & Windows Agent → Link device to agent`,
+    );
+    report.exitCode = 1;
+  }
   if (!entries.length) report.errors.push('no usable device entries in isapi-devices.json');
 
   if (json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);

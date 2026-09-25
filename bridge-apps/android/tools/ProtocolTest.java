@@ -117,6 +117,40 @@ public final class ProtocolTest {
 
         BridgeConfig missingSecret = BridgeConfig.fromText("{\"agentId\":\"" + AGENT_ID + "\"}", devicesJson);
         check("a missing secret is reported", !missingSecret.problems().isEmpty());
+        check("a non-UUID device id is not a problem before the portal is consulted", configWithNameAsId().problems().isEmpty(),
+                BridgeConfig.describe(configWithNameAsId().problems()));
+
+        // The portal's linked-device payload keys the id as device_id; reading
+        // `id` yields an empty set and makes every terminal look unlinked.
+        java.util.ArrayList<String> portalIds = BridgeConfig.portalDeviceIds(Json.parseObject(
+                "{\"items\":[{\"device_id\":\"" + DEVICE_ID + "\",\"isapi_host\":\"10.0.0.5\",\"isapi_port\":80}]}"));
+        check("portal device ids are read from device_id", portalIds.size() == 1 && portalIds.get(0).equals(DEVICE_ID), portalIds.toString());
+        check("portal ids from an id-keyed payload are ignored", BridgeConfig.portalDeviceIds(
+                Json.parseObject("{\"items\":[{\"id\":\"" + DEVICE_ID + "\"}]}")).isEmpty());
+
+        BridgeConfig withLanOnly = BridgeConfig.fromText(
+                "{\"agentId\":\"" + AGENT_ID + "\",\"agentSecret\":\"" + AGENT_SECRET + "\",\"workerUrl\":\"http://worker.test\"}",
+                "{\"devices\":[{\"name\":\"Main Gate MinMoe\",\"isapiHost\":\"10.0.0.5\",\"isapiPort\":80,\"isapiPassword\":\"pw\"}]}");
+        check("a terminal configured by LAN address alone is unresolved", withLanOnly.unresolvedDevices().size() == 1);
+        BridgeConfig resolved = withLanOnly.withPortalDevices(Json.parseObject(
+                "{\"items\":[{\"device_id\":\"" + DEVICE_ID + "\",\"device_name\":\"Main Gate MinMoe\",\"isapi_host\":\"10.0.0.5\",\"isapi_port\":80}]}"));
+        check("the portal resolves a terminal by LAN address", resolved.devices().get(0).estateMateDeviceId.equals(DEVICE_ID),
+                resolved.devices().get(0).estateMateDeviceId);
+        java.util.ArrayList<String> justThis = new java.util.ArrayList<String>();
+        justThis.add(DEVICE_ID);
+        check("a resolved terminal passes validation", resolved.problems(justThis).isEmpty(), BridgeConfig.describe(resolved.problems(justThis)));
+        check("a terminal the portal does not link is reported with how to fix it",
+                BridgeConfig.describe(withLanOnly.problems(new java.util.ArrayList<String>())).contains("Link device to agent"),
+                BridgeConfig.describe(withLanOnly.problems(new java.util.ArrayList<String>())));
+        check("a name pasted where the id belongs is replaced by the portal match",
+                withLanOnlyByIdName().withPortalDevices(Json.parseObject(
+                        "{\"items\":[{\"device_id\":\"" + DEVICE_ID + "\",\"isapi_host\":\"10.0.0.5\",\"isapi_port\":80}]}"))
+                        .devices().get(0).estateMateDeviceId.equals(DEVICE_ID));
+        check("a mistyped but well-formed id is reported against the portal",
+                BridgeConfig.describe(configWithRealId().problems(java.util.Collections.singletonList("99999999-9999-4999-8999-999999999999")))
+                        .contains("which the portal does not list"));
+        check("the agent id message names the value and where to copy it",
+                BridgeConfig.describe(defaults.problems()).contains("Copy ID"));
     }
 
     // --------------------------------------------------------------- installer --
@@ -485,5 +519,21 @@ public final class ProtocolTest {
         checks++;
         if (!condition) FAILURES.add(name + (detail.isEmpty() ? "" : " (" + detail + ")"));
         System.out.println("  [" + (condition ? "ok  " : "FAIL") + "] " + name + (!condition && !detail.isEmpty() ? " — " + detail : ""));
+    }
+
+    private static BridgeConfig configWithNameAsId() {
+        return BridgeConfig.fromText(
+                "{\"agentId\":\"" + AGENT_ID + "\",\"agentSecret\":\"" + AGENT_SECRET + "\",\"workerUrl\":\"http://worker.test\"}",
+                "{\"devices\":[{\"estateMateDeviceId\":\"Main Gate MinMoe\",\"name\":\"Main Gate MinMoe\",\"isapiHost\":\"10.0.0.5\",\"isapiPassword\":\"pw\"}]}");
+    }
+
+    private static BridgeConfig withLanOnlyByIdName() {
+        return configWithNameAsId();
+    }
+
+    private static BridgeConfig configWithRealId() {
+        return BridgeConfig.fromText(
+                "{\"agentId\":\"" + AGENT_ID + "\",\"agentSecret\":\"" + AGENT_SECRET + "\",\"workerUrl\":\"http://worker.test\"}",
+                "{\"devices\":[{\"estateMateDeviceId\":\"" + DEVICE_ID + "\",\"name\":\"Main Gate MinMoe\",\"isapiHost\":\"10.0.0.5\",\"isapiPassword\":\"pw\"}]}");
     }
 }
