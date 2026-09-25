@@ -647,7 +647,7 @@ jobs:
             echo "### Artifacts"
             echo "- **Windows agent bundle** (\`estatemate-isapi-agent-win-x64-*.zip\`) - self-contained; ships its own Node.js runtime, so the estate PC needs no Node.js install."
             echo "- **Android APK** (\`estatemate-android-*-debug.apk\`, plus \`-release.apk\` when signing secrets are configured)."
-            echo "- \`SHA256SUMS.txt\` for each artifact family."
+            echo "- Checksums for each artifact family, as \`SHA256SUMS.txt\` - qualified with the family name where two would otherwise collide, since release asset names are flat."
             echo
             echo "### Windows install"
             echo "Unzip to \`C:\\EstateMate\\ISAPI-Agent\`, then in an Administrator PowerShell:"
@@ -681,13 +681,52 @@ jobs:
 
           # find, not a glob: Actions bash has globstar off, so artifacts/**/*
           # would silently match only one directory level.
-          mapfile -t files < <(find artifacts -type f | sort)
+          #
+          # Release asset names are FLAT: GitHub stores only the basename, and it
+          # must be unique within a release. Both artifact families ship a
+          # SHA256SUMS.txt, so handing both paths to `gh release create` publishes
+          # one asset that claims to be two. Stage everything under unique names
+          # first, qualifying only the basenames that actually collide so the zip
+          # and APK keep exactly the names the notes above document.
+          stage="$(mktemp -d)"
+          while IFS= read -r f; do
+            base="$(basename "$f")"
+            if [ "$(find artifacts -type f -name "$base" | wc -l)" -gt 1 ]; then
+              family="${f#artifacts/}"; family="${family%%/*}"
+              base="${family}-${base}"
+            fi
+            cp "$f" "$stage/$base"
+          done < <(find artifacts -type f | sort)
+
+          mapfile -t files < <(find "$stage" -type f | sort)
           echo "Publishing ${#files[@]} file(s):"
           printf '  %s\n' "${files[@]}"
+          gh --version | head -1
 
-          gh release create "$tag" \
+          # The job log archive is not retrievable from here, so a bare "Process
+          # completed with exit code 1." costs a whole release cycle to diagnose.
+          # Capture gh's own output and re-emit it as annotations instead.
+          set +e
+          gh_out="$(gh release create "$tag" \
             --title "EstateMate Bridge $version" \
             --notes-file "$notes_file" \
             --verify-tag \
-            "${files[@]}"
+            "${files[@]}" 2>&1)"
+          gh_status=$?
+          set -e
+
+          if [ "$gh_status" -ne 0 ]; then
+            echo "::error::gh release create exited $gh_status for tag $tag with ${#files[@]} asset(s)"
+            n=0
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              echo "::error title=gh-release-create::$line"
+              n=$((n + 1))
+              [ "$n" -ge 40 ] && break
+            done <<< "$gh_out"
+            rm -f "$notes_file"
+            exit "$gh_status"
+          fi
+
+          printf '%s\n' "$gh_out"
           rm -f "$notes_file"
