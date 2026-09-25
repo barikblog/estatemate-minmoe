@@ -1874,14 +1874,29 @@ app.post('/api/visitors', requireRoles('resident','admin','manager'), async (c) 
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'active',?,?)`,
   ).bind(id,residentId,propertyId,body.visitorName.trim(),body.visitorPhone?.trim() ?? null,pin,qrToken,credentialNumber,credentialNumber,credentialMode,device?.id ?? null,gateScope,1,requireGateIdVerification,validFrom,validUntil).run();
   await linkProofFiles(c.env.DB,proofKeys(body.proofKeys),'visitor_request',id,requester.id);
-  if (device) {
-    const status=isPendingPattern(device.connection_pattern)?'pending':'manual_action_required';
-    await c.env.DB.prepare(
-      `INSERT INTO visitor_device_operations(id,visitor_request_id,device_id,operation,payload_json,status) VALUES (?,?,?,'upsert_visitor',?,?)`,
-    ).bind(crypto.randomUUID(),id,device.id,JSON.stringify({ credentialNumber,visitorName:body.visitorName.trim(),validFrom,validUntil,enabled:false,requiresSecurityApproval:true }),status).run();
-  }
-  await audit(c,'create','visitor_request',id,{ propertyId,deviceId:device?.id ?? null,gateScope,credentialMode,requireGateIdVerification });
-  return c.json({ id, propertyId, pin, qrToken, credentialNumber, barcodePayload:credentialNumber, credentialMode, gateScope, validFrom, validUntil, requiresSecurityApproval:true, requireGateIdVerification }, 201);
+  const hardwareOperationsQueued = await queueVisitorDeviceOperations(c.env.DB, id, device?.id ?? null, {
+    credentialNumber,
+    visitorName: body.visitorName.trim(),
+    validFrom,
+    validUntil,
+    enabled: false,
+    requiresSecurityApproval: true,
+  });
+  await audit(c,'create','visitor_request',id,{ propertyId,deviceId:device?.id ?? null,gateScope,credentialMode,requireGateIdVerification,hardwareOperationsQueued });
+  return c.json({ id, propertyId, pin, qrToken, credentialNumber, barcodePayload:credentialNumber, credentialMode, gateScope, validFrom, validUntil, requiresSecurityApproval:true, requireGateIdVerification, hardwareOperationsQueued }, 201);
+});
+
+/**
+ * Re-queue every currently usable visitor pass against its intended hardware.
+ * Every-gate passes are sent to every enabled access-control device; a pass
+ * scoped to one gate is sent only to that device. This is also useful after an
+ * operator links a new device, because older passes were created before that
+ * device existed.
+ */
+app.post('/api/visitors/sync-active', requireRoles('admin','manager'), async (c) => {
+  const result = await syncActiveVisitorPasses(c.env.DB);
+  await audit(c,'sync_active_visitor_passes','visitor_requests',null,result);
+  return c.json({ ok: true, ...result });
 });
 
 app.post('/api/visitors/scan', requireRoles('security','admin','manager'), async (c) => {
@@ -3238,6 +3253,103 @@ async function createDeviceOperations(
   }));
 }
 
+interface VisitorOperationDevice {
+  id: string;
+  connection_pattern: string;
+}
+
+interface VisitorOperationRow {
+  id: string;
+  device_id: string;
+  status: string;
+}
+
+/**
+ * Queue a visitor credential for one device, or for every enabled access-control
+ * device when targetDeviceId is null. Existing operations are reused so the
+ * scheduled reconciliation and the manual sync endpoint are idempotent.
+ */
+async function queueVisitorDeviceOperations(
+  db: D1Database,
+  visitorRequestId: string,
+  targetDeviceId: string | null,
+  payload: unknown,
+): Promise<number> {
+  const devices = targetDeviceId
+    ? await db.prepare(`SELECT id,connection_pattern FROM hikvision_devices WHERE id=? AND status!='disabled' AND deleted_at IS NULL`).bind(targetDeviceId).all<VisitorOperationDevice>()
+    : await db.prepare(`SELECT id,connection_pattern FROM hikvision_devices WHERE status!='disabled' AND deleted_at IS NULL`).all<VisitorOperationDevice>();
+  if (!devices.results.length) return 0;
+
+  const existing = await db.prepare(
+    `SELECT id,device_id,status FROM visitor_device_operations WHERE visitor_request_id=? AND operation='upsert_visitor'`,
+  ).bind(visitorRequestId).all<VisitorOperationRow>();
+  const byDevice = new Map(existing.results.map((row) => [row.device_id, row]));
+  const payloadJson = JSON.stringify(payload);
+  const statements = [];
+  let queued = 0;
+
+  for (const device of devices.results) {
+    const status = isPendingPattern(device.connection_pattern) ? 'pending' : 'manual_action_required';
+    const current = byDevice.get(device.id);
+    if (!current) {
+      statements.push(db.prepare(
+        `INSERT INTO visitor_device_operations(id,visitor_request_id,device_id,operation,payload_json,status) VALUES (?,?,?,'upsert_visitor',?,?)`,
+      ).bind(crypto.randomUUID(), visitorRequestId, device.id, payloadJson, status));
+      queued += 1;
+    } else if (current.status === 'failed') {
+      // A reconciliation is allowed to retry a failed hardware delivery, but
+      // never creates a second operation for the same visitor/device pair.
+      statements.push(db.prepare(
+        `UPDATE visitor_device_operations SET payload_json=?,status=?,error_message=NULL,updated_at=datetime('now') WHERE id=?`,
+      ).bind(payloadJson, status, current.id));
+      queued += 1;
+    }
+  }
+
+  if (statements.length) await db.batch(statements);
+  return queued;
+}
+
+/**
+ * Keep active and checked-in passes present on the access-control estate. The
+ * hourly reconciliation covers passes issued before a device was linked and
+ * passes that were created while an agent was offline; the API route exposes
+ * the same operation for an administrator who needs it immediately.
+ */
+async function syncActiveVisitorPasses(db: D1Database): Promise<{ passes: number; devices: number; queued: number }> {
+  const passes = await db.prepare(
+    `SELECT id,credential_number,visitor_name,valid_from,valid_until,requires_security_approval,gate_scope,device_id
+     FROM visitor_requests
+     WHERE status IN ('active','checked_in') AND datetime(valid_until)>datetime('now')
+     ORDER BY created_at LIMIT 500`,
+  ).all<{
+    id: string;
+    credential_number: string | null;
+    visitor_name: string;
+    valid_from: string;
+    valid_until: string;
+    requires_security_approval: number;
+    gate_scope: string;
+    device_id: string | null;
+  }>();
+  if (!passes.results.length) return { passes: 0, devices: 0, queued: 0 };
+
+  const devices = await db.prepare(`SELECT COUNT(*) AS count FROM hikvision_devices WHERE status!='disabled' AND deleted_at IS NULL`).first<{ count: number }>();
+  let queued = 0;
+  for (const pass of passes.results) {
+    if (!pass.credential_number) continue;
+    queued += await queueVisitorDeviceOperations(db, pass.id, pass.gate_scope === 'gate' ? pass.device_id : null, {
+      credentialNumber: pass.credential_number,
+      visitorName: pass.visitor_name,
+      validFrom: pass.valid_from,
+      validUntil: pass.valid_until,
+      enabled: false,
+      requiresSecurityApproval: Boolean(pass.requires_security_approval),
+    });
+  }
+  return { passes: passes.results.length, devices: Number(devices?.count ?? 0), queued };
+}
+
 interface IsapiAgentIdentity {
   id: string;
   name: string;
@@ -3670,6 +3782,6 @@ export default {
     await consumeAccessEvents(batch, env);
   },
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(Promise.all([processPropertyLifecycle(env),enforceFacilityFees(env),pruneAccessEvents(env)]).then(() => undefined));
+    ctx.waitUntil(Promise.all([processPropertyLifecycle(env),enforceFacilityFees(env),pruneAccessEvents(env),syncActiveVisitorPasses(env.DB)]).then(() => undefined));
   },
 };
