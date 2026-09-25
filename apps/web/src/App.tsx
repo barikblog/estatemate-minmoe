@@ -63,7 +63,7 @@ const navItems: NavItem[] = [
   { id: 'cards', label: 'Access cards', roles: ['admin','manager','cashier','resident'] },
   { id: 'events', label: 'Gate activity', roles: ['admin','manager','security','resident'] },
   { id: 'devices', label: 'Access-control devices', roles: ['admin','manager','security'] },
-  { id: 'isapi', label: 'ISAPI Bridge & Windows Agent', roles: ['admin','manager'] },
+  { id: 'isapi', label: 'Device agent', roles: ['admin','manager'] },
   { id: 'operations', label: 'Hardware actions', roles: ['admin','manager'] },
   { id: 'settings', label: 'Settings', roles: ['admin'] },
 ];
@@ -1436,10 +1436,10 @@ function Devices({ user }: { user: User }) {
   }
   async function remove(row:Row) { if(!confirm(`Delete ${String(row.name)}? Credentials will be revoked while historical gate events remain.`))return;try{await api(`/api/access/devices/${row.id}`,{ method:'DELETE' });list.reload();setError('');}catch(reason){setError(reason instanceof Error?reason.message:'Delete failed');} }
   return <PagePanel title="Access-control devices" subtitle="Hikvision MinMoe, card/fingerprint terminals, DS-K2800 controllers and validated third-party devices" action={operator?<button className="primary" onClick={() => setShow(!show)}>Register device</button>:null}>
-    <Notice tone="info"><strong>How devices connect:</strong> every access device reaches EstateMate through the <strong>ISAPI bridge / Windows agent</strong> running on the device LAN. The agent streams swipe events in real time (ISAPI alertStream) and applies card enable/disable commands automatically. Register the device here, then link it to an agent under “ISAPI Bridge &amp; Windows Agent”. Keep ISAPI private to the estate VLAN — never expose it to the Internet.</Notice>
+    <Notice tone="info"><strong>How devices connect:</strong> the EstateMate device agent runs on the gate network, sends live events to the portal and applies access updates. Register the terminal here, then connect it under <strong>Device agent</strong>. Keep terminal ports private to the estate network.</Notice>
     {error && <Notice tone="error">{error}</Notice>}
     {credentials && <section className="credential-box"><h3>Device registered</h3><p>Profile: <code>{String((credentials.profile as Row | undefined)?.label ?? '')}</code></p><p>Connection: <code>{String(credentials.connectionPattern??'')}</code></p><p>{String(credentials.warning??'')}</p></section>}
-    {show && <FormCard title="Register an Internet-connected access device" onSubmit={submit}>
+    {show && <FormCard title="Register an access-control terminal" onSubmit={submit}>
       <label>Display name<input name="name" placeholder="Gate 1 terminal" required /></label><label>Vendor<input name="vendor" defaultValue="Hikvision" /></label>
       <label>Gate name<input name="gateName" placeholder="Main gate" required /></label>
       <label>Direction<select name="direction"><option value="entry">Entry</option><option value="exit">Exit</option><option value="both">Both</option></select></label>
@@ -1455,6 +1455,7 @@ function Devices({ user }: { user: User }) {
 
 function IsapiBridge({ user }: { user: User }) {
   const operator = user.role === 'admin' || user.role === 'manager';
+  const administrator = user.role === 'admin';
   const agents = useList('/api/isapi/agents');
   const deviceConfigs = useList('/api/isapi/device-configs');
   const devices = useAsync<{ items: Row[] }>(() => api('/api/access/device-options'), []);
@@ -1474,13 +1475,13 @@ function IsapiBridge({ user }: { user: User }) {
   }
 
   async function rotateAgent(row: Row) {
-    if (!confirm(`Rotate secret for agent ${String(row.name)}? Old secret stops working immediately.`)) return;
-    try { setCredentials(await api<Row>(`/api/isapi/agents/${row.id}/rotate-secret`, { method: 'POST' })); }
+    if (!confirm(`Rotate the secret for ${String(row.name)}? Its current bridge will disconnect until it is set up again.`)) return;
+    try { setCredentials({ ...row, ...(await api<Row>(`/api/isapi/agents/${row.id}/rotate-secret`, { method: 'POST' })) }); }
     catch (reason) { setError(reason instanceof Error ? reason.message : 'Rotate failed'); }
   }
 
   async function downloadInstaller(row: Row) {
-    if (!confirm(`Generate new installer for ${String(row.name)}? Previous installer keys will be invalidated and secret rotated.`)) return;
+    if (!confirm(`Create a new setup file for ${String(row.name)}? Its current secret will stop working, so use the new file on the bridge.`)) return;
     setError('');
     try {
       const response = await fetch(`/api/isapi/agents/${row.id}/installer`, { method: 'POST', credentials: 'include' });
@@ -1527,53 +1528,70 @@ function IsapiBridge({ user }: { user: User }) {
     catch (reason) { setError(reason instanceof Error ? reason.message : 'Delete failed'); }
   }
 
-  return <PagePanel title="ISAPI Bridge & Windows Agent" subtitle="Windows service and cross-platform ISAPI bridge for automatic card provisioning" action={operator ? <div className="row-actions"><button className="primary" onClick={() => setShowAgent(!showAgent)}>Register agent</button><button className="secondary" onClick={() => setShowLink(!showLink)}>Link device to agent</button></div> : null}>
-    <Notice tone="info"><strong>What this does:</strong> Install a small agent on a Windows PC (or Linux) on the same LAN as Hikvision devices. The agent polls Cloudflare for pending card operations (facility-fee expiry, new cards) and applies them via ISAPI (HTTP Digest) directly to the device. No SDK required. Keep ISAPI devices and agent on same VLAN; never expose ISAPI to the Internet.</Notice>
-    <Notice tone="warning"><strong>Connection patterns:</strong> For devices managed by this bridge, set connection pattern to <code>isapi_bridge</code>, <code>windows_agent</code>, or <code>isapi_windows_agent</code>. Operations will then be queued as <code>pending</code> instead of <code>manual_action_required</code> and picked up by the linked agent.</Notice>
+  return <PagePanel
+    title="Device agent"
+    subtitle="Connect local gate terminals for live events and automatic access updates"
+    action={operator ? <div className="row-actions page-actions">
+      {administrator && <button className="primary" onClick={() => setShowAgent(!showAgent)} aria-expanded={showAgent}>{showAgent ? 'Close form' : 'Add agent'}</button>}
+      <button className="secondary" onClick={() => setShowLink(!showLink)} aria-expanded={showLink}>{showLink ? 'Close form' : 'Connect terminal'}</button>
+    </div> : null}
+  >
+    <div className="agent-summary">
+      <p><strong>Local connection only.</strong> Run one bridge on a Windows or Linux computer, or an Android device, that stays on the same network as the gate terminals. No inbound Internet access or port forwarding is required.</p>
+      <details className="agent-setup">
+        <summary>Setup instructions</summary>
+        <ol>
+          <li>Add an agent and connect each terminal to it here using the terminal's LAN address and login.</li>
+          <li><a href="https://github.com/barikblog/estatemate-minmoe/releases/latest" target="_blank" rel="noreferrer">Get the latest bridge</a>: use the single-file Windows app, or the Android bridge APK for a dedicated phone or tablet.</li>
+          <li>Choose <strong>Download setup</strong> on the agent row. Import that file during Windows setup, or paste it into the Android bridge. Add each terminal's LAN login when prompted; its EstateMate ID is resolved automatically.</li>
+          <li>Run <strong>Check</strong> or <strong>Test connection</strong>, start the bridge and confirm the agent status below changes to <strong>online</strong>.</li>
+        </ol>
+      </details>
+    </div>
+
     {error && <Notice tone="error">{error}</Notice>}
-    {credentials && <section className="credential-box"><p className="eyebrow">COPY NOW — SHOWN ONCE</p><h3>ISAPI Agent Secret</h3><p>Name: <code>{String(credentials.name)}</code></p><p>Platform: <code>{String(credentials.platform)}</code></p>{Boolean(credentials.secret) && <p>Secret: <code>{String(credentials.secret)}</code></p>}<p>{String(credentials.warning ?? '')}</p><button className="secondary" onClick={() => navigator.clipboard.writeText(String(credentials.secret))}>Copy secret</button></section>}
-    {showAgent && <FormCard title="Register ISAPI bridge / Windows agent" onSubmit={submitAgent}>
-      <label>Agent name<input name="name" placeholder="Estate Office Windows PC" required /></label>
-      <label>Hostname<input name="hostname" placeholder="WIN-OFFICE-01 or 192.168.1.10" /></label>
-      <label>Platform<select name="platform"><option value="windows">Windows (recommended)</option><option value="linux">Linux</option><option value="darwin">macOS</option><option value="other">Other</option></select></label>
-      <label>Version<input name="version" placeholder="1.0.0" /></label>
-      <button className="primary">Register agent</button>
-    </FormCard>}
-    {showLink && <FormCard title="Link device to ISAPI agent" onSubmit={submitLink}>
-      <label>Device<select name="deviceId" required><option value="">Select device</option>{devices.data?.items.map((d) => <option key={String(d.id)} value={String(d.id)}>{String(d.gate_name)} — {String(d.name)} ({String(d.model)}) [{String(d.connection_pattern)}]</option>)}</select></label>
-      <label>Agent<select name="agentId"><option value="">Select agent (optional - can set later)</option>{agents.data?.items.map((a) => <option key={String(a.id)} value={String(a.id)}>{String(a.name)} — {String(a.platform)} ({String(a.status)})</option>)}</select></label>
-      <label>ISAPI host (LAN IP)<input name="isapiHost" placeholder="192.168.1.100" required /></label>
-      <label>ISAPI port<input name="isapiPort" type="number" min={1} max={65535} defaultValue={80} /></label>
-      <label>ISAPI username<input name="isapiUsername" defaultValue="admin" /></label>
-      <label>ISAPI password<input name="isapiPassword" type="password" placeholder="Device admin password" /><small>Encrypted at rest, never returned.</small></label>
-      <label>Protocol<select name="protocol"><option value="http">HTTP (port 80)</option><option value="https">HTTPS (port 443)</option></select></label>
-      <label>Sync enabled<input name="syncEnabled" type="checkbox" defaultChecked /></label>
-      <button className="primary">Link device</button>
+    {credentials && <section className="credential-box">
+      <p className="eyebrow">SHOWN ONCE</p>
+      <h3>Agent credentials</h3>
+      <p>Agent: <code>{String(credentials.name ?? '—')}</code></p>
+      {Boolean(credentials.id) && <p>ID: <code>{String(credentials.id)}</code></p>}
+      {Boolean(credentials.secret) && <p>Secret: <code>{String(credentials.secret)}</code></p>}
+      <p>Use these only for manual configuration. For Windows or Android, <strong>Download setup</strong> from the agent row instead.</p>
+      {Boolean(credentials.secret) && <button className="secondary" onClick={() => navigator.clipboard.writeText(String(credentials.secret))}>Copy secret</button>}
+    </section>}
+
+    {showAgent && administrator && <FormCard title="Add device agent" onSubmit={submitAgent}>
+      <label>Agent name<input name="name" placeholder="Estate office PC" required /></label>
+      <label>Computer name (optional)<input name="hostname" placeholder="OFFICE-PC" /></label>
+      <label>Runs on<select name="platform"><option value="windows">Windows</option><option value="linux">Linux</option><option value="darwin">macOS</option><option value="other">Android or other</option></select></label>
+      <button className="primary">Add agent</button>
     </FormCard>}
 
-    <section className="panel"><div className="panel-title"><div><p className="eyebrow">Registered agents</p><h3>ISAPI bridge agents</h3></div><button className="secondary sm" onClick={() => agents.reload()}>Refresh</button></div>
-      <ListState list={agents}><DataTable rows={agents.data?.items ?? []} columns={[['name','Agent'],['hostname','Hostname'],['platform','Platform'],['status','Status'],['last_seen_at','Last heartbeat','date'],['last_ip','Last IP'],['linked_devices','Linked devices'],['pending_operations','Pending ops']]} action={operator ? (row) => <div className="row-actions"><button className="text" onClick={() => downloadInstaller(row)}>Download installer</button>{user.role==='admin' && <button className="text" onClick={() => rotateAgent(row)}>Rotate secret</button>}<button className="text danger" onClick={() => removeAgent(row)}>Delete</button></div> : undefined} /></ListState>
+    {showLink && <FormCard title="Connect a gate terminal" onSubmit={submitLink}>
+      <label>Terminal<select name="deviceId" required><option value="">Select terminal</option>{devices.data?.items.map((device) => <option key={String(device.id)} value={String(device.id)}>{String(device.gate_name)} — {String(device.name)} ({String(device.model)})</option>)}</select></label>
+      <label>Agent<select name="agentId" required><option value="">Select agent</option>{agents.data?.items.map((agent) => <option key={String(agent.id)} value={String(agent.id)}>{String(agent.name)} — {String(agent.platform)} ({String(agent.status)})</option>)}</select></label>
+      <label>Terminal LAN address<input name="isapiHost" placeholder="192.168.1.100" required /></label>
+      <label>Port<input name="isapiPort" type="number" min={1} max={65535} defaultValue={80} /></label>
+      <label>Terminal username<input name="isapiUsername" defaultValue="admin" /></label>
+      <label>Terminal password<input name="isapiPassword" type="password" placeholder="Device administrator password" required /><small>Encrypted at rest and never displayed again.</small></label>
+      <label>Connection<select name="protocol"><option value="http">HTTP on the private LAN</option><option value="https">HTTPS</option></select></label>
+      <label className="check"><input name="syncEnabled" type="checkbox" defaultChecked /> Enable automatic updates</label>
+      <button className="primary">Connect terminal</button>
+    </FormCard>}
+
+    <section className="panel agent-section">
+      <div className="panel-title"><div><p className="eyebrow">Bridge hosts</p><h3>Agents</h3></div><button className="secondary sm" onClick={() => agents.reload()}>Refresh</button></div>
+      <ListState list={agents}><DataTable rows={agents.data?.items ?? []} columns={[['name','Agent'],['hostname','Computer'],['platform','Runs on'],['status','Status'],['last_seen_at','Last heartbeat','date'],['linked_devices','Terminals'],['pending_operations','Pending actions']]} action={administrator ? (row) => <div className="row-actions"><button className="text" onClick={() => downloadInstaller(row)}>Download setup</button><button className="text" onClick={() => rotateAgent(row)}>Rotate secret</button><button className="text danger" onClick={() => removeAgent(row)}>Delete</button></div> : undefined} /></ListState>
     </section>
 
-    <section className="panel"><div className="panel-title"><div><p className="eyebrow">Device mappings</p><h3>ISAPI device configs</h3></div><button className="secondary sm" onClick={() => deviceConfigs.reload()}>Refresh</button></div>
-      <ListState list={deviceConfigs}><DataTable rows={deviceConfigs.data?.items ?? []} columns={[['device_name','Device'],['gate_name','Gate'],['connection_pattern','Connection'],['device_status','Device status'],['isapi_host','ISAPI host'],['isapi_port','Port'],['isapi_username','ISAPI user'],['protocol','Protocol'],['sync_enabled','Sync enabled'],['agent_name','Agent'],['agent_status','Agent status'],['last_sync_at','Last sync','date'],['last_sync_status','Sync status'],['last_error','Last error']]} action={operator ? (row) => <div className="row-actions"><button className="text danger" onClick={() => removeLink(row)}>Remove</button></div> : undefined} /></ListState>
+    <section className="panel agent-section">
+      <div className="panel-title"><div><p className="eyebrow">Gate network</p><h3>Connected terminals</h3></div><button className="secondary sm" onClick={() => deviceConfigs.reload()}>Refresh</button></div>
+      <ListState list={deviceConfigs}><DataTable rows={deviceConfigs.data?.items ?? []} columns={[['device_name','Terminal'],['gate_name','Gate'],['device_status','Terminal status'],['isapi_host','LAN address'],['isapi_port','Port'],['agent_name','Agent'],['agent_status','Agent status'],['last_sync_at','Last update','date'],['last_sync_status','Update status'],['last_error','Last error']]} action={operator ? (row) => <div className="row-actions"><button className="text danger" onClick={() => removeLink(row)}>Disconnect</button></div> : undefined} /></ListState>
     </section>
 
-    <section className="panel"><div className="panel-title"><div><p className="eyebrow">Audit trail</p><h3>ISAPI sync logs (recent 50)</h3></div><button className="secondary sm" onClick={() => logs.reload()}>Refresh</button></div>
-      <ListState list={logs}><DataTable rows={logs.data?.items ?? []} columns={[['created_at','Time','date'],['device_name','Device'],['agent_name','Agent'],['operation_type','Operation'],['status','Status'],['message','Message'],['duration_ms','Duration ms']]} /></ListState>
-    </section>
-
-    <section className="panel callout"><p className="eyebrow">Windows agent quick reference</p><h3>Install on Windows (Administrator PowerShell)</h3>
-      <ol>
-        <li>Register agent above and <strong>Download installer</strong> (PowerShell <code>.ps1</code>).</li>
-        <li>Run installer as Administrator: <code>powershell -ExecutionPolicy Bypass -File .\estatemate-isapi-agent-xxxx.ps1</code></li>
-        <li>Edit <code>C:\EstateMate\ISAPI-Agent\isapi-devices.json</code> with LAN IPs and ISAPI passwords.</li>
-        <li>Install Node.js 22+ and copy <code>isapi-bridge/agent.mjs</code> to agent folder, or use compiled exe.</li>
-        <li>Create service: <code>sc.exe create EstateMateISAPIAgent binPath= &quot;C:\Program Files\nodejs\node.exe C:\EstateMate\ISAPI-Agent\agent.mjs --config C:\EstateMate\ISAPI-Agent\agent-config.json&quot; start= auto</code></li>
-        <li><code>sc.exe start EstateMateISAPIAgent</code> and verify in portal that agent shows <code>online</code>.</li>
-      </ol>
-      <p><strong>Test ISAPI manually:</strong> <code>curl --digest -u admin:password http://192.168.1.100/ISAPI/System/deviceInfo</code></p>
-      <p><strong>Security:</strong> Keep agent and devices on same VLAN, no port forwarding. Config ACL restricted to Administrators.</p>
+    <section className="panel agent-section">
+      <div className="panel-title"><div><p className="eyebrow">Recent activity</p><h3>Agent updates</h3></div><button className="secondary sm" onClick={() => logs.reload()}>Refresh</button></div>
+      <ListState list={logs}><DataTable rows={logs.data?.items ?? []} columns={[['created_at','Time','date'],['device_name','Terminal'],['agent_name','Agent'],['operation_type','Action'],['status','Status'],['message','Message']]} /></ListState>
     </section>
   </PagePanel>;
 }

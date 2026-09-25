@@ -2799,7 +2799,10 @@ app.post('/api/isapi/agents/:id/rotate-secret', requireRoles('admin'), async (c)
   return c.json({ secret, warning: 'Shown once. Update the Windows agent configuration immediately.' });
 });
 
-app.post('/api/isapi/agents/:id/installer', requireRoles('admin','manager'), async (c) => {
+// Generating a setup file rotates the agent's ingest secret. Keep it
+// Administrator-only just like explicit secret rotation; Managers may link and
+// monitor devices but must not gain credential-control permissions.
+app.post('/api/isapi/agents/:id/installer', requireRoles('admin'), async (c) => {
   const agent = await c.env.DB.prepare(`SELECT id,name,platform FROM isapi_agents WHERE id=? AND deleted_at IS NULL`).bind(c.req.param('id')).first<{ id:string;name:string;platform:string }>();
   if (!agent) return jsonError(c, 404, 'ISAPI agent not found');
   const secret = randomToken(32);

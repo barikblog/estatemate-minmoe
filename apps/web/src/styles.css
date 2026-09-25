@@ -311,3 +311,36 @@ tbody tr:hover { background: #fafcff; }
   .gate-chip { font-size: 11px; padding: 6px 10px; }
   .gate-chip span { display: none; }
 }
+
+/* Device-agent administration stays operational rather than exposing transport
+   names and queue internals. Setup help is available on demand, while the live
+   agent and terminal status remain the focus of the page. */
+.agent-summary { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px 20px; margin: 0 0 18px; padding: 14px 16px; border: 1px solid #cfe1fc; border-radius: 12px; background: #f4f8ff; }
+.agent-summary > p { margin: 0; color: #385675; font-size: 13px; line-height: 1.6; }
+.agent-setup summary { list-style: none; cursor: pointer; border-radius: 9px; padding: 9px 13px; background: #e3edfc; color: var(--blue); font-size: 12px; font-weight: 800; white-space: nowrap; }
+.agent-setup summary::-webkit-details-marker { display: none; }
+.agent-setup summary::after { content: ' +'; }
+.agent-setup[open] { grid-column: 1 / -1; }
+.agent-setup[open] summary { width: fit-content; }
+.agent-setup[open] summary::after { content: ' −'; }
+.agent-setup ol { margin: 14px 0 2px; padding: 14px 14px 2px 34px; border-top: 1px solid #d8e5f6; color: #465b73; font-size: 12.5px; line-height: 1.65; }
+.agent-setup li + li { margin-top: 8px; }
+.agent-setup a { color: var(--blue); font-weight: 800; }
+.agent-section { margin-top: 16px; box-shadow: none; }
+.page-actions { flex-wrap: wrap; white-space: normal; }
+:root[data-theme="dark"] .agent-summary { background: #17253a; border-color: #30415c; }
+:root[data-theme="dark"] .agent-summary > p, :root[data-theme="dark"] .agent-setup ol { color: #b7c4d6; }
+:root[data-theme="dark"] .agent-setup summary { background: #243854; color: #9cc4ff; }
+:root[data-theme="dark"] .agent-setup ol { border-color: #30415c; }
+
+@media (max-width: 560px) {
+  .page-panel > .panel-title { flex-direction: column; align-items: stretch; gap: 14px; }
+  .page-panel > .panel-title > div:first-child { min-width: 0; }
+  .page-panel > .panel-title > .page-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); width: 100%; }
+  .page-panel > .panel-title > .page-actions button { width: 100%; padding: 11px 12px; font-size: 12px; }
+  .agent-summary { grid-template-columns: 1fr; padding: 13px; }
+  .agent-setup, .agent-setup[open] { grid-column: 1; }
+  .agent-setup summary, .agent-setup[open] summary { width: 100%; text-align: center; white-space: normal; }
+  .agent-setup ol { padding-left: 28px; }
+  .agent-section { padding: 16px; }
+}
