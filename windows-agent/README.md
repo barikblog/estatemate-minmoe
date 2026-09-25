@@ -20,42 +20,53 @@ Many estates already have a Windows PC for CCTV (iVMS-4200) or accounting. This 
 
 ## Quick start (Administrator)
 
-1. **Portal:** Register agent in EstateMate → **ISAPI Bridge & Windows Agent** → **Register agent** → platform `windows` → copy secret → **Download installer** (`.ps1`).
+1. **Portal:** Register agent in EstateMate → **ISAPI Bridge & Windows Agent** → **Register agent** → platform `windows` → copy the one-time secret → **Download installer** (`.ps1`).
 
-2. **Windows host (as Administrator):**
+2. **Windows host:** download `estatemate-isapi-agent-win-x64-<version>.zip` from the
+   [repository releases](https://github.com/barikblog/estatemate-minmoe/releases) and unzip it to
+   `C:\EstateMate\ISAPI-Agent`. The bundle includes its own Node.js runtime, so the host
+   needs no Node.js install.
+
+3. **Run the portal installer** (Administrator PowerShell, from the unzipped directory):
    ```powershell
-   # Run downloaded installer, e.g.:
    powershell -ExecutionPolicy Bypass -File .\estatemate-isapi-agent-xxxx.ps1
-   # It creates C:\EstateMate\ISAPI-Agent\agent-config.json (restricted) and example isapi-devices.json
    ```
+   It writes `agent-config.json` with the agent id/secret (ACL restricted to
+   Administrators + SYSTEM) and creates `isapi-devices.json` from the example.
 
-3. **Edit device mapping:**
+4. **Edit device mapping:**
    ```powershell
    notepad C:\EstateMate\ISAPI-Agent\isapi-devices.json
    # Fill estateMateDeviceId (from portal device list), isapiHost (192.168.1.x), isapiUsername, isapiPassword
    ```
 
-4. **Install service:**
+5. **Register to start automatically:**
    ```powershell
    cd C:\EstateMate\ISAPI-Agent
-   # Option A: using sc.exe (built-in)
-   sc.exe create EstateMateISAPIAgent binPath= "C:\Program Files\nodejs\node.exe C:\EstateMate\ISAPI-Agent\agent.mjs --config C:\EstateMate\ISAPI-Agent\agent-config.json" start= auto
-   sc.exe description EstateMateISAPIAgent "EstateMate ISAPI Bridge - Syncs access cards via ISAPI"
-   sc.exe start EstateMateISAPIAgent
-
-   # Option B: using NSSM (if installed)
-   nssm install EstateMateISAPIAgent "C:\Program Files\nodejs\node.exe" "C:\EstateMate\ISAPI-Agent\agent.mjs --config C:\EstateMate\ISAPI-Agent\agent-config.json"
-   nssm set EstateMateISAPIAgent AppDirectory C:\EstateMate\ISAPI-Agent
-   nssm set EstateMateISAPIAgent Start SERVICE_AUTO_START
-   nssm start EstateMateISAPIAgent
+   powershell -ExecutionPolicy Bypass -File .\install-service.ps1 -InstallDir "C:\EstateMate\ISAPI-Agent"
+   ```
+   That registers a SYSTEM Scheduled Task which starts at boot and restarts on failure.
+   Prefer a real Windows Service? Add `-Nssm` (requires [NSSM](https://nssm.cc/)):
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\install-service.ps1 -InstallDir "C:\EstateMate\ISAPI-Agent" -Nssm
    ```
 
-5. **Verify:**
+   > **Do not** `sc.exe create` the agent directly. It is a console process, not an SCM
+   > binary, so the service would fail to start with **error 1053**. Use
+   > `install-service.ps1`, which handles both options.
+
+6. **Verify:**
    ```powershell
-   Get-Service EstateMateISAPIAgent
+   Get-ScheduledTask EstateMateISAPIAgent | Format-List TaskName,State   # or: Get-Service EstateMateISAPIAgent (NSSM)
    Get-Content C:\EstateMate\ISAPI-Agent\logs\agent.log -Tail 50
    # Or check portal: ISAPI Bridge → agent should show online, last_seen recent
    ```
+
+7. **Remove:**
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\uninstall-service.ps1 -RemoveFiles
+   ```
+
 
 ## Configuration files
 
@@ -112,16 +123,65 @@ The Windows agent shares core with `isapi-bridge/agent.mjs`. To run in foregroun
 node agent.mjs --config C:\EstateMate\ISAPI-Agent\agent-config.json --devices C:\EstateMate\ISAPI-Agent\isapi-devices.json
 ```
 
-## Packaging as executable
+## Packaging for estates without Node.js
 
-For estates without Node.js, compile with `pkg` or `nexe`:
+Use the portable bundle produced by the `Build EstateMate Bridge` workflow
+(`.github/workflows/bridge.yml`), published on every `bridge-*` tag as
+`estatemate-isapi-agent-win-x64-<version>.zip`.
 
-```bash
-npm install -g pkg
-pkg agent.mjs --targets node22-win-x64 --output estatemate-isapi-agent.exe
+The bundle ships the **official Node.js Windows x64 runtime** alongside the agent,
+so the target PC needs no Node.js install and no Internet access beyond the
+EstateMate Worker and the devices on its LAN:
+
+```
+runtime\node.exe                  Node.js 22 (sha256 + Authenticode verified in CI)
+agent.mjs                         Windows wrapper / entrypoint
+agent-core.mjs                    ISAPI bridge core agent
+estatemate-isapi-agent.cmd        launcher (uses runtime\node.exe)
+install-service.ps1               register startup task, or -Nssm for a Service
+uninstall-service.ps1
+agent-config.example.json
+isapi-devices.example.json
+VERSION                           build metadata incl. node.exe sha256
 ```
 
-Then distribute `estatemate-isapi-agent.exe` with installer.
+Build it locally with:
+
+```bash
+node scripts/package-windows-bundle.mjs --out bundle --version 1.0.0
+# then place a verified runtime/node.exe in bundle/runtime/ and run:
+node scripts/package-windows-bundle.mjs --out bundle --finalize-runtime
+```
+
+Install on the estate PC (Administrator PowerShell, from the unzipped bundle):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-service.ps1 `
+  -AgentId <uuid-from-portal> -AgentSecret <secret-from-portal>
+```
+
+### Why not `sc.exe create` / a compiled `.exe`?
+
+The agent is a **console process**; it does not implement the Service Control
+Manager handshake, so `sc.exe create ... start= auto` reports error 1053
+("service did not respond"). `install-service.ps1` therefore registers a SYSTEM
+**Scheduled Task** that starts at boot and restarts on failure — no extra tools
+required. Pass `-Nssm` to register a real Windows Service named
+`EstateMateISAPIAgent` if you have [NSSM](https://nssm.cc/) installed.
+
+Compiling to a single `.exe` with `pkg` or `nexe` is **not** the supported path:
+the original `pkg` package is archived and does not support Node 22, and a
+compiled binary would still not speak SCM, so it would not solve the service
+problem either.
+
+### Code signing
+
+Set `WIN_CRT_PFX_BASE64` (base64 of the `.pfx`) and `WIN_CRT_PFX_PASSWORD` as
+repository secrets and the workflow Authenticode-signs `runtime\node.exe` with
+`signtool`, timestamping against `WIN_CRT_TIMESTAMP_URL` (defaults to
+`http://timestamp.digicert.com`). Without them the bundle is **unsigned** and
+SmartScreen will warn estates on first run; the job emits a warning rather than
+failing, and records the status in `SIGNING.txt` inside the bundle.
 
 ## License
 

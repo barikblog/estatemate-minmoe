@@ -1,6 +1,6 @@
 # AI handoff — EstateMate
 
-Updated: 2026-09-24 (Africa/Lagos) — Portal UX phase (migration `0014`) **deployed to production** via PR #11 (`f4e543d`), Deploy EstateMate run `36074600948`: administrator-published estate gate welcome image on the login screen and dashboard, searchable card-holder picker, and gate-scoped Security login sessions. Post-deploy HTTP smoke test still owed (see below). Previous phase retired every access-device transport except the EstateMate agent; production domain is `https://estatemate.estatemate.workers.dev`
+Updated: 2026-09-25 (Africa/Lagos) — **Bridge release CI phase** adds `.github/workflows/bridge.yml` (Windows agent portable bundle + the project's first real Android compile), fixes the `API_BASE_URL` placeholder and the wrong `sc.exe`/`pkg` install advice. Not deployed and no `bridge-*` tag pushed yet — see below. Previous: 2026-09-24 — Portal UX phase (migration `0014`) **deployed to production** via PR #11 (`f4e543d`), Deploy EstateMate run `36074600948`: administrator-published estate gate welcome image on the login screen and dashboard, searchable card-holder picker, and gate-scoped Security login sessions. Post-deploy HTTP smoke test still owed (see below). Previous phase retired every access-device transport except the EstateMate agent; production domain is `https://estatemate.estatemate.workers.dev`
 
 
 
@@ -41,6 +41,142 @@ Run `git log -1 --oneline` and check the latest GitHub Actions run before making
 - Visitor passes shareable as a locally rendered PNG image or one-page A4 PDF, with a native share sheet where the device supports files.
 - Estate-timezone-aware visitor validity windows (`src/datetime.ts`); resident passes default to `gate_scope='both'` and the gate picker is hidden from Residents.
 - Show/hide password on sign-in and a `Powered by sornix.com.ng` portal footer.
+
+## Bridge release CI phase (2026-09-25)
+
+`.github/workflows/bridge.yml` (**Build EstateMate Bridge**) builds the two client
+artifacts that ship outside the Worker. It needs no Cloudflare credentials and
+cannot deploy; `deploy.yml` remains the only production path. Triggers: `bridge-*`
+tags, `workflow_dispatch`, and pull requests touching `isapi-bridge/**`,
+`windows-agent/**`, `apps/android/**`, the two new `scripts/`, or the workflow itself.
+
+Jobs: `validate` (agent `node --check`, the ISAPI integration test, migration-prefix
+uniqueness, and an ubuntu dry-run of the packer) → then in parallel
+`windows-agent-bundle` (`windows-latest`) and `android-apk` (`ubuntu-latest`) →
+`publish-release` (tag builds only, needs all three).
+
+**Windows: a portable bundle, not a compiled `.exe`.** `scripts/package-windows-bundle.mjs`
+stages `agent.mjs` (the `windows-agent/` wrapper) beside `agent-core.mjs` (the
+`isapi-bridge/` core) in one flat directory, which is the wrapper's own documented
+fallback, so it runs unmodified. The CI job then downloads Node.js `22.22.2` win-x64,
+verifies it against the published `SHASUMS256.txt` **and** its Authenticode signature
+before extracting only `node.exe` into `runtime/`, and re-runs the packer with
+`--finalize-runtime` to record the hash in `VERSION`. Verified locally: the staged flat
+bundle starts, resolves `agent-core.mjs`, parses config, and shuts down cleanly on
+SIGTERM (what a service stop relies on); the launcher refuses to start with no
+`agent-config.json`.
+
+**`sc.exe create` was wrong and is no longer advised.** The agent is a console process
+with no SCM handshake, so `sc.exe create ... start= auto` fails with error 1053. The
+bundle's `install-service.ps1` registers a SYSTEM **Scheduled Task** at startup instead,
+or a real service via `-Nssm`. `windows-agent/README.md` and the portal's generated
+`.ps1` in `src/index.ts` were both corrected — the latter also pointed at a
+`/api/isapi/agent-binary` endpoint that does not exist and installed to a fixed path
+away from the bundle; it now installs to `$PSScriptRoot`. The `pkg`/`nexe` advice was
+removed (the original `pkg` is archived and predates Node 22).
+
+**Android is compiled here for the first time.** Previous phases record that Kotlin
+changes were never built because no working environment had a JDK or Android SDK; this
+sandbox had none either (no root, and `services.gradle.org`/`dl.google.com` are
+unreachable), so the Gradle changes are still **uncompiled locally** — the workflow is
+the first real build. `apps/android/app/build.gradle.kts` now takes `-PapiBaseUrl`,
+`-PappVersionName` and `-PappVersionCode`, because `API_BASE_URL` was hardcoded to
+`https://REPLACE_WITH_WORKER_DOMAIN/` and every APK built before now pointed at a host
+that does not exist. It defaults to production, so a plain `assembleDebug` works.
+`versionCode` is `major*10000 + minor*100 + patch`, and the non-tag fallback is 10 (not
+1) so a dev build cannot collide with a real `bridge-0.0.1`.
+
+`scripts/verify-android-apk.py` gates the result: it reads the generated `BuildConfig`
+back out of the APK (falling back to a `.dex`/`.arsc` scan) and fails if the intended
+base URL is absent or the placeholder survives. Tested against eight fabricated APKs —
+good, placeholder, wrong URL, binary-only variants, empty and truncated — and each
+failure mode returns non-zero. Note it deliberately requires the trailing slash.
+
+**Signing is optional and never silently wrong.** `ANDROID_KEYSTORE_BASE64` /
+`ANDROID_KEYSTORE_PASSWORD` / `ANDROID_KEY_ALIAS` / `ANDROID_KEY_PASSWORD` enable a
+signed release; absent them the build warns and **no** release APK is published, since
+AGP would emit an uninstallable `app-release-unsigned.apk`. Likewise `WIN_CRT_PFX_BASE64`
+/ `WIN_CRT_PFX_PASSWORD` (+ optional `WIN_CRT_TIMESTAMP_URL` var, defaulting to
+`http://timestamp.digicert.com`) drive `signtool`, and the outcome is recorded in the
+bundle's `SIGNING.txt` so the release notes report signing truthfully. **None of these
+secrets are set yet**, so the first release will be unsigned.
+
+Not yet done: no `bridge-*` tag has been pushed, so `windows-latest` and the Android
+SDK path have not executed on a real runner. The four `pwsh` steps could not be
+syntax-checked locally (no PowerShell in the sandbox) — only the 15 bash steps were
+verified with `bash -n`, plus a here-string/brace/`param()` checker run over both
+generated PowerShell scripts with negative controls.
+
+### First runner feedback (run 36126444022, PR #14)
+
+The first PR run gave two real failures, both now fixed:
+
+- **`android-actions/setup-android@v3` is broken upstream** and was removed. It
+  unconditionally runs `sdkmanager tools`, a legacy package Google removed from the SDK
+  repository, so it exits 1 in ~13s before the build starts. This is not specific to
+  this repo — the same failure is being fixed across many projects right now. The job
+  now locates the runner's preinstalled SDK (`$ANDROID_HOME`, probing
+  `cmdline-tools/latest/bin/sdkmanager`, then `tools/bin`, then a `find` fallback) and
+  installs `platform-tools`, `platforms;android-35` and `build-tools;35.0.0` itself.
+  `actions/setup-java` was bumped v4 → v5 for the same class of reason (v4 is
+  announced deprecated).
+- **The Windows smoke test was wrong, not the bundle.** Steps 4–6 passed, meaning the
+  Node runtime download, `SHASUMS256.txt` verification, Authenticode check, extraction,
+  packer and `--finalize-runtime` all work on a real runner. The smoke test asserted the
+  core agent logged its startup banner, but it was seeded with `{ "devices": [] }` and
+  `isapi-bridge/agent.mjs` exits 1 with "No enabled devices in devices file" *before*
+  that banner. Reproduced locally, and the fixture now carries one enabled device
+  pointing at an unroutable host. The step was also rewritten to test the positive path
+  (agent genuinely starts and resolves `agent-core.mjs`) rather than only refusal, to
+  use absolute paths, and to stop merging a native command's stderr into the success
+  stream, which pwsh can turn into a terminating error.
+
+Two PowerShell bugs were caught locally by the new linter before they reached a runner:
+an indented here-string closer (YAML block indentation makes column-0 `"@`/`'@`
+impossible, so the devices fixture now uses `ConvertTo-Json` instead) — and the linter
+itself needed two fixes after a positive control exposed false positives, so it is
+validated against both negative and positive controls. It is wired into the `validate`
+job so future edits are caught on ubuntu in seconds.
+
+### Two real product bugs the first Windows/Android runs found (run 36128679749)
+
+These are defects in shipped code, not CI problems. Neither could have been found
+without a real `windows-latest` runner and a real Kotlin compile.
+
+**1. `windows-agent/agent.mjs` could never start on Windows.** It resolved an absolute
+core-agent path and passed it straight to `import(coreAgentPath)`. On Windows, Node's
+ESM loader parses `D:\a\...\agent.mjs` as a URL with protocol `d:` and throws
+`ERR_UNSUPPORTED_ESM_URL_SCHEME`. The wrapper caught it, logged
+`[ERROR] Failed to load core agent` and called `process.exit(1)` — so the Windows
+Service wrapper, the entire reason `windows-agent/` exists, exited immediately on the
+only platform it targets. Fixed with `import(pathToFileURL(coreAgentPath).href)`, which
+is a no-op on POSIX where the bare path already worked. The error branch now also
+prints the path and its file URL, since a silent exit-1 there cost a full release cycle
+to diagnose.
+
+Note this was masked in review because the failure only occurs on Windows: every
+previous agent environment was Linux, where the same line works fine.
+
+**2. `apps/android` `MainActivity.kt` did not compile.** Line 17 imported
+`androidx.compose.foundation.layout.weight`, which is not a public top-level symbol —
+the only thing by that name is `val RowColumnParentData?.weight`, which is `internal`.
+Kotlin rejects it: *"Cannot access 'val RowColumnParentData?.weight: Float': it is
+internal in file."* The import was also shadowing the `RowScope`/`ColumnScope` member
+extension that all four `Modifier.weight(1f)` call sites actually need. Removed the
+import; the call sites were already correct inside their `Row`/`Column` scopes. This is
+the concrete cost of the handoff's repeated "None of this Kotlin was compiled".
+
+Also silenced a Room warning: `AppDatabase` had `exportSchema = true` with no
+`room.schemaLocation`, which warns on every build. It is a single-entity offline cache
+with no migration history to preserve, so `exportSchema` is now `false`.
+
+The diagnostics added for this are worth keeping: because the Actions log archive is not
+retrievable from a sandbox (results-receiver, `*.blob.core.windows.net` and
+`pipelines.actions.githubusercontent.com` all refuse connections, and the jobs API
+exposes no step summary), the Android job re-emits Kotlin `e:`/`w:` lines, the failing
+task and the raw log tail as `::error` annotations, and the Windows smoke test dumps both
+launcher streams the same way. Annotations *are* readable through the check-runs API, so
+that is the channel a future agent will have.
 
 ## Most recent migration
 
