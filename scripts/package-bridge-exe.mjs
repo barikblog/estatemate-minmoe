@@ -26,6 +26,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { extractFromTarGz, extractFromZip } from './lib/archive.mjs';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 
@@ -154,19 +156,21 @@ async function fetchNodeRuntime({ version, nodePlatform, nodeArch, archive, cach
   const actual = fileSha256(archivePath);
   if (actual !== expected) throw new Error(`sha256 mismatch for ${fileName}: expected ${expected}, got ${actual}`);
 
+  const binaryName = nodePlatform === 'win' ? 'node.exe' : 'node';
   const extractDir = path.join(cacheDir, `${base}.extracted`);
   fs.rmSync(extractDir, { recursive: true, force: true });
-  fs.mkdirSync(extractDir, { recursive: true });
-  if (archive === 'zip') {
-    if (process.platform === 'win32') run('tar', ['-xf', archivePath, '-C', extractDir]);
-    else run('unzip', ['-q', '-o', archivePath, '-d', extractDir]);
-  } else if (archive === 'tar.xz') {
-    run('tar', ['-xJf', archivePath, '-C', extractDir]);
-  } else {
-    run('tar', ['-xzf', archivePath, '-C', extractDir]);
-  }
-  const binaryName = nodePlatform === 'win' ? 'node.exe' : 'node';
   const binary = path.join(extractDir, base, binaryName);
+  if (archive === 'zip') {
+    // Windows only, and therefore never handed to `tar`: Git Bash's GNU tar reads
+    // the drive letter of C:\...\node.zip as a remote host and refuses.
+    extractFromZip(archivePath, `${base}/${binaryName}`, binary);
+  } else if (archive === 'tar.gz') {
+    extractFromTarGz(archivePath, `${base}/${binaryName}`, binary);
+  } else {
+    // tar.xz has no in-process reader in Node; every target that uses it is a
+    // Unix host, where `tar -xJf` is a local path with no colon in it.
+    run('tar', ['-xJf', archivePath, '-C', extractDir]);
+  }
   if (!fs.existsSync(binary)) throw new Error(`archive ${fileName} did not contain ${binaryName}`);
   return { binary, archivePath, sha256: actual, fileName };
 }
@@ -194,11 +198,9 @@ async function fetchNodeFromNpm({ version, nodePlatform, nodeArch, cacheDir }) {
 
   const extractDir = path.join(cacheDir, `${packageName}-${version}.extracted`);
   fs.rmSync(extractDir, { recursive: true, force: true });
-  fs.mkdirSync(extractDir, { recursive: true });
-  run('tar', ['-xzf', archivePath, '-C', extractDir]);
   const binaryName = nodePlatform === 'win' ? 'node.exe' : 'node';
   const binary = path.join(extractDir, 'package', 'bin', binaryName);
-  if (!fs.existsSync(binary)) throw new Error(`${packageName}@${version} did not contain bin/${binaryName}`);
+  extractFromTarGz(archivePath, `package/bin/${binaryName}`, binary);
   return { binary, archivePath, sha256: fileSha256(archivePath), fileName: path.basename(archivePath), integrity };
 }
 
@@ -212,6 +214,39 @@ const POSTJECT_VERSION = '1.0.0-alpha.6';
  * cannot be spawned without a shell since Node's 2024 EINVAL hardening, and a
  * build step that only works on two of three platforms is a trap.
  */
+/**
+ * Remove the Authenticode certificate table from a PE file.
+ *
+ * Embedding a resource changes the bytes of the executable, so the signature
+ * that upstream Node.js ships is invalid the moment the blob goes in — postject
+ * says so itself ("The signature seems corrupted!"). Node's own SEA
+ * documentation therefore advises removing the signature before injecting and
+ * re-signing afterwards. We cannot re-sign without a code-signing certificate,
+ * so the honest state to ship is a plainly unsigned binary rather than one that
+ * carries a certificate that no longer verifies.
+ */
+function stripAuthenticodeSignature(pePath) {
+  const buffer = fs.readFileSync(pePath);
+  if (buffer.length < 0x40 || buffer.readUInt16LE(0) !== 0x5a4d) return false; // not a PE (MZ)
+  const peOffset = buffer.readUInt32LE(0x3c);
+  if (peOffset + 0x18 > buffer.length || buffer.readUInt32LE(peOffset) !== 0x00004550) return false;
+  const optionalHeader = peOffset + 0x18;
+  const magic = buffer.readUInt16LE(optionalHeader);
+  const directories = optionalHeader + (magic === 0x10b ? 96 : magic === 0x20b ? 112 : -1);
+  if (directories < 0 || directories + 5 * 8 > buffer.length) return false;
+
+  const entry = directories + 4 * 8; // IMAGE_DIRECTORY_ENTRY_SECURITY
+  const offset = buffer.readUInt32LE(entry);
+  const size = buffer.readUInt32LE(entry + 4);
+  if (!size) return false;
+
+  buffer.writeUInt32LE(0, entry);
+  buffer.writeUInt32LE(0, entry + 4);
+  const trailingSignature = offset + size === buffer.length;
+  fs.writeFileSync(pePath, trailingSignature ? buffer.subarray(0, offset) : buffer);
+  return trailingSignature ? 'removed' : 'detached';
+}
+
 async function ensurePostject(cacheDir) {
   const extractDir = path.join(cacheDir, `postject-${POSTJECT_VERSION}.extracted`);
   const apiPath = path.join(extractDir, 'package', 'dist', 'api.js');
@@ -231,8 +266,7 @@ async function ensurePostject(cacheDir) {
     if (actual !== integrity) throw new Error(`integrity mismatch for postject ${POSTJECT_VERSION}: registry ${integrity}, downloaded ${actual}`);
   }
   fs.rmSync(extractDir, { recursive: true, force: true });
-  fs.mkdirSync(extractDir, { recursive: true });
-  run('tar', ['-xzf', archivePath, '-C', extractDir]);
+  extractFromTarGz(archivePath, 'package/dist/api.js', apiPath);
   if (!fs.existsSync(apiPath)) throw new Error(`postject ${POSTJECT_VERSION} did not contain dist/api.js`);
   return apiPath;
 }
@@ -426,6 +460,12 @@ async function main() {
   const exeName = flags.name || `estatemate-bridge-${targetName}${target.extension}`;
   const exePath = path.join(outDir, exeName);
   fs.copyFileSync(targetBinary, exePath);
+  if (target.platform === 'win32') {
+    const stripped = stripAuthenticodeSignature(exePath);
+    if (stripped) {
+      log(`Removed the upstream Authenticode signature (${stripped}); the executable is unsigned — publish its SHA-256 with it.`);
+    }
+  }
 
   // postject flips the sentinel fuse and appends the resource, exactly as Node's
   // own documentation instructs. Run in-process: the same code the CLI wraps,

@@ -25,6 +25,7 @@ on:
       - 'bridge-apps/**'
       - 'apps/android/**'
       - 'scripts/package-windows-bundle.mjs'
+      - 'scripts/lib/**'
       - 'scripts/package-bridge-exe.mjs'
       - 'scripts/bridge-exe-smoke-test.mjs'
       - 'scripts/build-bridge-apk.py'
