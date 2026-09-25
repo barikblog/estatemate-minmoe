@@ -39,10 +39,13 @@ protocol documentation.
 
 1. **Portal** — sign in as Administrator → *ISAPI Bridge & Windows Agent* →
    **Register agent** (name it after the PC, platform `windows`) → copy the
-   one-time secret. Then **Link device to agent** for each terminal, entering its
-   LAN IP, port, ISAPI username and password.
-2. **Portal** — with the agent row selected, click **Download installer** and save
-   the `.ps1`. It already contains the agent id, secret and Worker URL.
+   **Agent ID** and the one-time secret, both shown in the panel that appears
+   (and afterwards in the *Registered agents* table, with **Copy ID** in the row
+   actions). Then **Link device to agent** for each terminal, entering its LAN IP,
+   port, ISAPI username and password.
+2. **Portal** — in the agent row, click **Download installer** and save the
+   `.ps1`. It already contains the agent id, secret and Worker URL, so the file is
+   the one thing worth carrying to the PC: nothing above has to be retyped.
 3. **Estate PC** — copy `estatemate-bridge.exe` and the `.ps1` to the PC, then in
    PowerShell:
 

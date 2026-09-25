@@ -14,8 +14,10 @@ foreground service, restarts it after a reboot, and shows the live log on screen
 
 1. **Portal** — sign in as Administrator → *ISAPI Bridge & Windows Agent* →
    **Register agent** (platform `windows` or `linux`; the agent record is
-   platform-neutral) → copy the one-time secret. Then **Link device to agent**
-   for each terminal, entering its LAN IP, port, ISAPI username and password.
+   platform-neutral) → copy the **Agent ID** and the one-time secret, both shown
+   in the panel that appears (and afterwards in the *Registered agents* table,
+   with **Copy ID** in the row actions). Then **Link device to agent** for each
+   terminal, entering its LAN IP, port, ISAPI username and password.
 2. **Portal** — with the agent row selected, **Download installer** and copy the
    `.ps1`/`.sh` text to the phone (email, chat, USB, anything).
 3. **Phone** — install the APK (Allow unknown sources), open **EstateMate
@@ -41,8 +43,11 @@ foreground service, restarts it after a reboot, and shows the live log on screen
    }
    ```
 
-   `estateMateDeviceId` is the id shown on the portal's *Access-control devices*
-   page; if it does not match, queued operations stay queued and the app says so.
+   `estateMateDeviceId` is the **EstateMate device ID** in the portal — it is the
+   `device_id` column of *ISAPI Bridge & Windows Agent → ISAPI device configs*, and
+   the same value appears on the *Access-control devices* page; **Copy ID** is in
+   the row actions. If it does not match what the Worker has linked to this agent,
+   queued operations stay queued and the app says so.
 4. **Phone** — **Save**, then **Test connection** (it reports the Worker, every
    terminal's model and firmware, and any terminal the portal has not linked to
    this agent yet), then **Start bridge**.

@@ -1449,7 +1449,7 @@ function Devices({ user }: { user: User }) {
       <label>Connection pattern<select name="connectionPattern"><option value="">Use profile recommendation (recommended)</option><option value="isapi_bridge">ISAPI bridge agent (cross-platform)</option><option value="windows_agent">Windows agent (ISAPI)</option><option value="isapi_windows_agent">ISAPI Windows agent (combined)</option><option value="manual_sync">Manual synchronization (no agent)</option></select></label>
       <button className="primary">Register</button>
     </FormCard>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Device'],['vendor','Vendor'],['model','Model'],['profile_key','Series profile'],['connection_pattern','Connection'],['isapi_agent_name','ISAPI agent'],['isapi_host','ISAPI host'],['last_isapi_sync_status','ISAPI sync'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['last_seen_at','Last event','date'],['pending_operations','Manual pending'],['queued_operations','Queued ops']]} action={operator?(row)=><div className="row-actions"><button className="text" onClick={()=>edit(row)}>Edit</button><button className="text danger" onClick={()=>remove(row)}>Delete</button></div>:undefined} /></ListState>
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Device'],['id','EstateMate device ID','id'],['vendor','Vendor'],['model','Model'],['profile_key','Series profile'],['connection_pattern','Connection'],['isapi_agent_name','ISAPI agent'],['isapi_host','ISAPI host'],['last_isapi_sync_status','ISAPI sync'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['last_seen_at','Last event','date'],['pending_operations','Manual pending'],['queued_operations','Queued ops']]} action={operator?(row)=><div className="row-actions"><button className="text" onClick={()=>edit(row)}>Edit</button><button className="text danger" onClick={()=>remove(row)}>Delete</button></div>:undefined} /></ListState>
   </PagePanel>;
 }
 
@@ -1463,6 +1463,7 @@ function IsapiBridge({ user }: { user: User }) {
   const [showLink, setShowLink] = useState(false);
   const [credentials, setCredentials] = useState<Row | null>(null);
   const [error, setError] = useState('');
+  const [copyNotice, copy] = useCopy();
 
   async function submitAgent(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setError('');
@@ -1475,7 +1476,9 @@ function IsapiBridge({ user }: { user: User }) {
 
   async function rotateAgent(row: Row) {
     if (!confirm(`Rotate secret for agent ${String(row.name)}? Old secret stops working immediately.`)) return;
-    try { setCredentials(await api<Row>(`/api/isapi/agents/${row.id}/rotate-secret`, { method: 'POST' })); }
+    // The rotate response carries only the new secret; keep the row's name and
+    // ID so the panel that follows can still show which agent was rotated.
+    try { setCredentials({ ...row, ...(await api<Row>(`/api/isapi/agents/${row.id}/rotate-secret`, { method: 'POST' })) }); }
     catch (reason) { setError(reason instanceof Error ? reason.message : 'Rotate failed'); }
   }
 
@@ -1530,8 +1533,19 @@ function IsapiBridge({ user }: { user: User }) {
   return <PagePanel title="ISAPI Bridge & Windows Agent" subtitle="Windows service and cross-platform ISAPI bridge for automatic card provisioning" action={operator ? <div className="row-actions"><button className="primary" onClick={() => setShowAgent(!showAgent)}>Register agent</button><button className="secondary" onClick={() => setShowLink(!showLink)}>Link device to agent</button></div> : null}>
     <Notice tone="info"><strong>What this does:</strong> Install a small agent on a Windows PC (or Linux) on the same LAN as Hikvision devices. The agent polls Cloudflare for pending card operations (facility-fee expiry, new cards) and applies them via ISAPI (HTTP Digest) directly to the device. No SDK required. Keep ISAPI devices and agent on same VLAN; never expose ISAPI to the Internet.</Notice>
     <Notice tone="warning"><strong>Connection patterns:</strong> For devices managed by this bridge, set connection pattern to <code>isapi_bridge</code>, <code>windows_agent</code>, or <code>isapi_windows_agent</code>. Operations will then be queued as <code>pending</code> instead of <code>manual_action_required</code> and picked up by the linked agent.</Notice>
+    <Notice tone="info"><strong>The two IDs the bridge needs:</strong> this agent's <strong>Agent ID</strong> (agents table below, or the panel shown right after registering) and each terminal's <strong>EstateMate device ID</strong> (device mappings below). Use <em>Copy ID</em> in the row actions. Neither has to be typed at all if you press <strong>Download installer</strong>: the generated script already contains the agent ID, the secret and the Worker URL, and the bridge reads them straight out of it.</Notice>
     {error && <Notice tone="error">{error}</Notice>}
-    {credentials && <section className="credential-box"><p className="eyebrow">COPY NOW — SHOWN ONCE</p><h3>ISAPI Agent Secret</h3><p>Name: <code>{String(credentials.name)}</code></p><p>Platform: <code>{String(credentials.platform)}</code></p>{Boolean(credentials.secret) && <p>Secret: <code>{String(credentials.secret)}</code></p>}<p>{String(credentials.warning ?? '')}</p><button className="secondary" onClick={() => navigator.clipboard.writeText(String(credentials.secret))}>Copy secret</button></section>}
+    {copyNotice && <Notice tone="success">{copyNotice}</Notice>}
+    {credentials && <section className="credential-box">
+      <p className="eyebrow">COPY NOW — SHOWN ONCE</p><h3>ISAPI Agent Credentials</h3>
+      {Boolean(credentials.id) && <p>Agent ID: <code>{String(credentials.id)}</code> <button className="secondary sm" onClick={() => copy(credentials.id, 'Agent ID')}>Copy ID</button></p>}
+      <p>Name: <code>{String(credentials.name ?? '—')}</code></p>
+      <p>Platform: <code>{String(credentials.platform ?? '—')}</code></p>
+      {Boolean(credentials.secret) && <p>Secret: <code>{String(credentials.secret)}</code> <button className="secondary sm" onClick={() => copy(credentials.secret, 'Agent secret')}>Copy secret</button></p>}
+      {Boolean(credentials.id) && Boolean(credentials.secret) && <p><button className="secondary sm" onClick={() => copy(`agentId=${String(credentials.id)}\nagentSecret=${String(credentials.secret)}`, 'Agent ID and secret')}>Copy both</button></p>}
+      <p>{String(credentials.warning ?? '')}</p>
+      <p>Both values go into the bridge's <code>agent-config.json</code> — or skip the typing: <strong>Download installer</strong> below already carries the ID, the secret and the Worker URL.</p>
+    </section>}
     {showAgent && <FormCard title="Register ISAPI bridge / Windows agent" onSubmit={submitAgent}>
       <label>Agent name<input name="name" placeholder="Estate Office Windows PC" required /></label>
       <label>Hostname<input name="hostname" placeholder="WIN-OFFICE-01 or 192.168.1.10" /></label>
@@ -1552,26 +1566,37 @@ function IsapiBridge({ user }: { user: User }) {
     </FormCard>}
 
     <section className="panel"><div className="panel-title"><div><p className="eyebrow">Registered agents</p><h3>ISAPI bridge agents</h3></div><button className="secondary sm" onClick={() => agents.reload()}>Refresh</button></div>
-      <ListState list={agents}><DataTable rows={agents.data?.items ?? []} columns={[['name','Agent'],['hostname','Hostname'],['platform','Platform'],['status','Status'],['last_seen_at','Last heartbeat','date'],['last_ip','Last IP'],['linked_devices','Linked devices'],['pending_operations','Pending ops']]} action={operator ? (row) => <div className="row-actions"><button className="text" onClick={() => downloadInstaller(row)}>Download installer</button>{user.role==='admin' && <button className="text" onClick={() => rotateAgent(row)}>Rotate secret</button>}<button className="text danger" onClick={() => removeAgent(row)}>Delete</button></div> : undefined} /></ListState>
+      <ListState list={agents}><DataTable rows={agents.data?.items ?? []} columns={[['name','Agent'],['id','Agent ID','id'],['hostname','Hostname'],['platform','Platform'],['status','Status'],['last_seen_at','Last heartbeat','date'],['last_ip','Last IP'],['linked_devices','Linked devices'],['pending_operations','Pending ops']]} action={operator ? (row) => <div className="row-actions"><button className="text" onClick={() => copy(row.id, 'Agent ID')}>Copy ID</button><button className="text" onClick={() => downloadInstaller(row)}>Download installer</button>{user.role==='admin' && <button className="text" onClick={() => rotateAgent(row)}>Rotate secret</button>}<button className="text danger" onClick={() => removeAgent(row)}>Delete</button></div> : undefined} /></ListState>
     </section>
 
     <section className="panel"><div className="panel-title"><div><p className="eyebrow">Device mappings</p><h3>ISAPI device configs</h3></div><button className="secondary sm" onClick={() => deviceConfigs.reload()}>Refresh</button></div>
-      <ListState list={deviceConfigs}><DataTable rows={deviceConfigs.data?.items ?? []} columns={[['device_name','Device'],['gate_name','Gate'],['connection_pattern','Connection'],['device_status','Device status'],['isapi_host','ISAPI host'],['isapi_port','Port'],['isapi_username','ISAPI user'],['protocol','Protocol'],['sync_enabled','Sync enabled'],['agent_name','Agent'],['agent_status','Agent status'],['last_sync_at','Last sync','date'],['last_sync_status','Sync status'],['last_error','Last error']]} action={operator ? (row) => <div className="row-actions"><button className="text danger" onClick={() => removeLink(row)}>Remove</button></div> : undefined} /></ListState>
+      <ListState list={deviceConfigs}><DataTable rows={deviceConfigs.data?.items ?? []} columns={[['device_name','Device'],['device_id','EstateMate device ID','id'],['gate_name','Gate'],['connection_pattern','Connection'],['device_status','Device status'],['isapi_host','ISAPI host'],['isapi_port','Port'],['isapi_username','ISAPI user'],['protocol','Protocol'],['sync_enabled','Sync enabled'],['agent_name','Agent'],['agent_status','Agent status'],['last_sync_at','Last sync','date'],['last_sync_status','Sync status'],['last_error','Last error']]} action={operator ? (row) => <div className="row-actions"><button className="text" onClick={() => copy(row.device_id, 'EstateMate device ID')}>Copy ID</button><button className="text danger" onClick={() => removeLink(row)}>Remove</button></div> : undefined} /></ListState>
     </section>
 
     <section className="panel"><div className="panel-title"><div><p className="eyebrow">Audit trail</p><h3>ISAPI sync logs (recent 50)</h3></div><button className="secondary sm" onClick={() => logs.reload()}>Refresh</button></div>
       <ListState list={logs}><DataTable rows={logs.data?.items ?? []} columns={[['created_at','Time','date'],['device_name','Device'],['agent_name','Agent'],['operation_type','Operation'],['status','Status'],['message','Message'],['duration_ms','Duration ms']]} /></ListState>
     </section>
 
-    <section className="panel callout"><p className="eyebrow">Windows agent quick reference</p><h3>Install on Windows (Administrator PowerShell)</h3>
+    <section className="panel callout"><p className="eyebrow">Agent quick reference</p><h3>Install the bridge on the device LAN</h3>
+      <p className="eyebrow">Windows — one file, no Node.js install</p>
       <ol>
-        <li>Register agent above and <strong>Download installer</strong> (PowerShell <code>.ps1</code>).</li>
-        <li>Run installer as Administrator: <code>powershell -ExecutionPolicy Bypass -File .\estatemate-isapi-agent-xxxx.ps1</code></li>
-        <li>Edit <code>C:\EstateMate\ISAPI-Agent\isapi-devices.json</code> with LAN IPs and ISAPI passwords.</li>
-        <li>Install Node.js 22+ and copy <code>isapi-bridge/agent.mjs</code> to agent folder, or use compiled exe.</li>
-        <li>Create service: <code>sc.exe create EstateMateISAPIAgent binPath= &quot;C:\Program Files\nodejs\node.exe C:\EstateMate\ISAPI-Agent\agent.mjs --config C:\EstateMate\ISAPI-Agent\agent-config.json&quot; start= auto</code></li>
-        <li><code>sc.exe start EstateMateISAPIAgent</code> and verify in portal that agent shows <code>online</code>.</li>
+        <li>Register the agent above, then <strong>Download installer</strong>. The script already carries the agent ID, the secret and the Worker URL, so none of them has to be retyped.</li>
+        <li><code>estatemate-bridge-win-x64.exe setup --from-installer .\estatemate-isapi-agent-xxxx.ps1</code> — or run <code>setup</code> and paste the script (blank installs start the prompts).</li>
+        <li><code>estatemate-bridge-win-x64.exe check</code> → Worker login plus every terminal's model, firmware and card count.</li>
+        <li><code>estatemate-bridge-win-x64.exe install-service</code> → starts at boot, restarts on failure. <code>status</code> shows heartbeat age, queue depth and the last error.</li>
       </ol>
+      <p className="eyebrow">Android — a phone or tablet on the terminals' LAN</p>
+      <ol>
+        <li>Install <code>estatemate-bridge-&lt;version&gt;.apk</code>, press <em>Paste installer</em> and paste the same script.</li>
+        <li>Add each terminal to the devices block — <code>estateMateDeviceId</code> from the device mappings table above, plus its LAN IP, ISAPI username and password — then <em>Save</em>.</li>
+        <li><em>Test connection</em>, then <em>Start bridge</em>, then allow the app to run without battery optimisation so gate events arrive while the screen is off.</li>
+      </ol>
+      <p className="eyebrow">Windows PowerShell bundle (older path)</p>
+      <ol>
+        <li>Unzip <code>estatemate-isapi-agent-win-x64-&lt;version&gt;.zip</code> to <code>C:\EstateMate\ISAPI-Agent</code> and run, as Administrator: <code>powershell -ExecutionPolicy Bypass -File .\install-service.ps1 -AgentId &lt;agent id&gt; -AgentSecret &lt;secret&gt;</code></li>
+        <li>Edit <code>isapi-devices.json</code> with the LAN IPs and ISAPI passwords; the bundle ships its own Node.js runtime.</li>
+      </ol>
+      <p><strong>Verify:</strong> the agent row above should reach <code>online</code> and its <em>Last heartbeat</em> should keep advancing; terminal events then appear under Gate events.</p>
       <p><strong>Test ISAPI manually:</strong> <code>curl --digest -u admin:password http://192.168.1.100/ISAPI/System/deviceInfo</code></p>
       <p><strong>Security:</strong> Keep agent and devices on same VLAN, no port forwarding. Config ACL restricted to Administrators.</p>
     </section>
@@ -1820,6 +1845,32 @@ function useList(url: string) {
   return useAsync<ListResponse<Row>>(() => api(url), [url]);
 }
 
+/**
+ * Clipboard writes that say what they did. Several pages here hand out
+ * identifiers someone has to type into another program - the bridge's
+ * agent-config.json takes the agent ID and isapi-devices.json takes one
+ * EstateMate device ID per terminal - and a 36-character UUID is not something
+ * to transcribe from a screenshot.
+ */
+function useCopy() {
+  const [notice, setNotice] = useState('');
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(''), 4000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+  const copy = useCallback((value: unknown, label = 'Value') => {
+    const text = String(value ?? '').trim();
+    if (!text) { setNotice(`Nothing to copy — ${label.toLowerCase()} is empty.`); return; }
+    if (!navigator.clipboard?.writeText) { setNotice(`Clipboard unavailable here — select the ${label.toLowerCase()} and copy it manually.`); return; }
+    navigator.clipboard.writeText(text).then(
+      () => setNotice(`${label} copied to the clipboard.`),
+      () => setNotice(`Could not copy automatically — select the ${label.toLowerCase()} and copy it manually.`),
+    );
+  }, []);
+  return [notice, copy] as const;
+}
+
 function ListState({ list, children }: { list: ReturnType<typeof useList>; children: ReactNode }) {
   if (list.loading) return <Loading />;
   if (list.error) return <Notice tone="error">{list.error} <button className="text" onClick={list.reload}>Retry</button></Notice>;
@@ -1836,7 +1887,7 @@ function FormCard({ title, onSubmit, message, children }: { title: string; onSub
   return <form className="form-card" onSubmit={onSubmit}><h3>{title}</h3>{message && <Notice tone="error">{message}</Notice>}<div className="form-grid">{children}</div></form>;
 }
 
-type Column = [string, string, ('date'|'money')?];
+type Column = [string, string, ('date'|'money'|'id')?];
 function DataTable({ rows, columns, action, exportTitle }: { rows: Row[]; columns: Column[]; action?: (row: Row) => ReactNode; exportTitle?: string }) {
   if (!rows.length) return <div className="empty"><div>◇</div><h3>Nothing here yet</h3><p>New records will appear in this view.</p></div>;
   return (
@@ -1855,9 +1906,10 @@ function DataTable({ rows, columns, action, exportTitle }: { rows: Row[]; column
   );
 }
 
-function cell(value: unknown, key: string, format?: 'date'|'money'): ReactNode {
+function cell(value: unknown, key: string, format?: 'date'|'money'|'id'): ReactNode {
   if (format === 'date') return readableDate(value);
   if (format === 'money') return money(value);
+  if (format === 'id') return <code className="id-value" title={String(value ?? '')}>{String(value ?? '—')}</code>;
   if (key === 'status' || key === 'result' || key === 'role' || key === 'direction') return <span className={`pill ${String(value ?? '').toLowerCase()}`}>{String(value ?? '—').replaceAll('_',' ')}</span>;
   if (typeof value === 'boolean') return value ? 'Yes' : 'No';
   return String(value ?? '—');
