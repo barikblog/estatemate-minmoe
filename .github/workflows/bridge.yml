@@ -203,6 +203,17 @@ jobs:
           #    into the success stream can turn it into a terminating error.
           & cmd.exe /c $launcher
           $unconfiguredExit = $LASTEXITCODE
+          # That non-zero exit is the *expected* result of this assertion, but it
+          # must not be allowed to outlive the step. GitHub's pwsh shell appends
+          #   if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }
+          # to every script it runs, and nothing below here invokes a native command
+          # that would overwrite the value. Left in place, the step exits 1 *after*
+          # printing its "smoke tests passed" notice - which is exactly what run
+          # 36129354448 did: two adjacent annotations, a pass notice then "Process
+          # completed with exit code 1.", and no assertion had failed.
+          # Assign at global scope: an unqualified `$LASTEXITCODE = 0` would create a
+          # shadowing script-scope variable and leave the global one at 1.
+          $global:LASTEXITCODE = 0
           Write-Host "unconfigured launcher exit code: $unconfiguredExit"
           if ($unconfiguredExit -eq 0) {
             throw 'launcher exited 0 with no agent-config.json - it must refuse to start'
@@ -348,9 +359,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-agent-bundle
+          # SIGNING.txt has to be a loose file alongside the zip: publish-release
+          # reads it to decide what the release notes claim about signing, and it
+          # cannot read it out of the zip. Without this path the release always
+          # reported "unsigned" - including for a correctly signed bundle.
           path: |
             *.zip
             SHA256SUMS.txt
+            bundle/SIGNING.txt
           if-no-files-found: error
           retention-days: 30
 
@@ -643,9 +659,15 @@ jobs:
             echo "Then edit \`isapi-devices.json\` with each Hikvision device's ISAPI host and credentials."
             echo
             echo "### Signing status"
-            if [ -f artifacts/windows-agent-bundle/SIGNING.txt ] && \
-               grep -q SIGNED artifacts/windows-agent-bundle/SIGNING.txt && \
-               ! grep -q UNSIGNED artifacts/windows-agent-bundle/SIGNING.txt; then
+            # Resolve by name, not by a hard-coded path: upload-artifact lays files
+            # out relative to the common root of everything it was given, so where
+            # SIGNING.txt lands under artifacts/windows-agent-bundle/ depends on the
+            # other paths uploaded alongside it. grep -q SIGNED also matches
+            # "UNSIGNED", hence the explicit negative check.
+            signing_file="$(find artifacts -type f -name SIGNING.txt -print -quit)"
+            if [ -n "$signing_file" ] && \
+               grep -q SIGNED "$signing_file" && \
+               ! grep -q UNSIGNED "$signing_file"; then
               echo "- Windows bundle: Authenticode-signed."
             else
               echo "- Windows bundle: **unsigned** (set \`WIN_CRT_PFX_BASE64\`/\`WIN_CRT_PFX_PASSWORD\` to sign)."

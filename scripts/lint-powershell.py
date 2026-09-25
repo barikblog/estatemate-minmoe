@@ -12,6 +12,8 @@ block scalar:
   * unbalanced braces or parentheses
   * `param()` appearing after a real statement (only top-of-script is legal)
   * unresolved `${{ }}` Actions expressions left inside a `run` body
+  * (workflow steps only) a captured `$LASTEXITCODE` that is never cleared, which
+    makes the step fail *after* its own last statement has already succeeded
 
 Usage:
     python3 scripts/lint-powershell.py FILE [FILE...]
@@ -27,6 +29,25 @@ import sys
 HERE_OPEN = re.compile(r"@['\"]\s*$")
 HERE_CLOSE_DQ = '"@'
 HERE_CLOSE_SQ = "'@"
+
+# GitHub's built-in pwsh/powershell shell does not merely run the script: it appends
+#
+#     if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }
+#
+# (actions/runner, ScriptHandlerHelpers.FixUpScriptContents). So a step's verdict is
+# the exit code of the last *native* command it ran, even when the script's own final
+# statement succeeded and every assertion passed. The `& tool; $code = $LASTEXITCODE`
+# idiom - capturing an exit code in order to tolerate it - leaves that value in place,
+# and if nothing afterwards runs a native command to overwrite it, the epilogue fails
+# the step. Run 36129354448 died exactly this way: a "smoke tests passed" notice and
+# "Process completed with exit code 1." as adjacent annotations.
+#
+# The reset must be `$global:LASTEXITCODE = ...`. An unqualified assignment creates a
+# shadowing script-scope variable and leaves the global one, which is what the
+# epilogue reads, untouched.
+LASTEXITCODE_CAPTURE = re.compile(
+    r'\$(?!LASTEXITCODE\b)[A-Za-z_][A-Za-z0-9_]*\s*=\s*\$LASTEXITCODE\b')
+LASTEXITCODE_CLEARED = re.compile(r'\$global:LASTEXITCODE\s*=')
 
 
 def strip_noise(line: str) -> str:
@@ -59,7 +80,7 @@ def strip_noise(line: str) -> str:
     return ''.join(out)
 
 
-def lint(text: str, label: str):
+def lint(text: str, label: str, extra_errors=None):
     errors = []
     lines = text.replace('\r\n', '\n').split('\n')
 
@@ -126,11 +147,45 @@ def lint(text: str, label: str):
             if '${{' in raw:
                 errors.append(f"line {lineno}: unresolved Actions expression in shell body: {raw.strip()[:90]}")
 
+    errors.extend(extra_errors or [])
+
     status = 'FAIL' if errors else 'OK  '
     print(f"{status} {label}")
     for e in errors:
         print(f"      {e}")
     return not errors
+
+
+def lint_lastexitcode(text: str):
+    """Return errors for a captured `$LASTEXITCODE` that is never cleared.
+
+    Only applied to Actions steps: the `exit $LASTEXITCODE` epilogue is added by the
+    runner, so a standalone .ps1 executed with `pwsh -File` has no such epilogue and
+    a stale value there is harmless.
+    """
+    # strip_noise blanks comments and string literals, so neither the comment
+    # explaining this rule nor a log message mentioning $LASTEXITCODE can trigger or
+    # satisfy it.
+    clean = [strip_noise(l) for l in text.replace('\r\n', '\n').split('\n')]
+
+    last_capture = None
+    for lineno, body in enumerate(clean, 1):
+        if LASTEXITCODE_CAPTURE.search(body):
+            last_capture = lineno
+
+    if last_capture is None:
+        return []
+    if any(LASTEXITCODE_CLEARED.search(body) for body in clean[last_capture - 1:]):
+        return []
+
+    return [
+        "line %d: captures $LASTEXITCODE into another variable but never clears "
+        "$global:LASTEXITCODE. Actions appends `if ((Test-Path -LiteralPath "
+        "variable:\\LASTEXITCODE)) { exit $LASTEXITCODE }` to every pwsh step, so a "
+        "deliberately tolerated exit code fails this step after its own last "
+        "statement succeeded. Add `$global:LASTEXITCODE = 0` once the exit code has "
+        "been consumed." % last_capture
+    ]
 
 
 def main() -> int:
@@ -160,7 +215,8 @@ def main() -> int:
                 if step.get('shell') not in ('pwsh', 'powershell') or not step.get('run'):
                     continue
                 label = f"{wf} :: {job_name}#{idx} {step.get('name', 'run')}"
-                ok &= lint(step['run'], label)
+                ok &= lint(step['run'], label,
+                           extra_errors=lint_lastexitcode(step['run']))
 
     return 0 if ok else 1
 

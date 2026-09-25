@@ -23,3 +23,5 @@ isup-gateway/sdk/
 isup-gateway/vendor/
 
 *.tsbuildinfo
+
+__pycache__/
