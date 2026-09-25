@@ -1019,6 +1019,13 @@ function Visitors({ user }: { user: User }) {
     try { const session=await api<Row>('/api/visitors/device-scan-sessions',{ method:'POST',body:JSON.stringify({ deviceId:form.get('deviceId') }) });setDeviceSession(session);setResult('Waiting for the visitor credential to be presented at the selected device…'); }
     catch(reason) { setResult(reason instanceof Error?reason.message:'Could not start device scan'); }
   }
+  async function syncActivePasses() {
+    try {
+      const synced=await api<{ passes:number;queued:number }>('/api/visitors/sync-active',{ method:'POST' });
+      setResult(`Synced ${synced.passes} active visitor pass${synced.passes===1?'':'es'}; queued ${synced.queued} hardware update${synced.queued===1?'':'s'}.`);
+      list.reload();
+    } catch(reason) { setResult(reason instanceof Error?reason.message:'Could not sync active visitor passes'); }
+  }
   useEffect(()=>{
     if (!deviceSession?.id || deviceSession.status==='captured') return;
     const timer=setInterval(()=>api<Row>(`/api/visitors/device-scan-sessions/${deviceSession.id}`).then((session)=>{
@@ -1028,8 +1035,10 @@ function Visitors({ user }: { user: User }) {
   },[deviceSession?.id,deviceSession?.status,previewCode]);
 
   const staff=user.role==='security'||user.role==='admin'||user.role==='manager';
-  return <PagePanel title="Visitors" subtitle="QR/barcode passes, preview-before-entry decisions and auditable arrivals" action={(user.role === 'resident' || user.role === 'admin' || user.role === 'manager') ? <button className="primary" onClick={() => setShow(!show)}>New pass</button> : null}>
-    {result && <Notice tone={result.includes('created')||result.includes('Accepted')?'success':result.includes('Waiting')?'info':'error'}>{result}</Notice>}
+  const canIssue=user.role === 'resident' || user.role === 'admin' || user.role === 'manager';
+  const canSync=user.role === 'admin' || user.role === 'manager';
+  return <PagePanel title="Visitors" subtitle="QR/barcode passes, preview-before-entry decisions and auditable arrivals" action={(canSync||canIssue)?<div className="row-actions">{canSync&&<button className="secondary" onClick={syncActivePasses}>Sync active passes</button>}{canIssue&&<button className="primary" onClick={() => setShow(!show)}>New pass</button>}</div>:null}>
+    {result && <Notice tone={result.includes('created')||result.includes('Accepted')||result.includes('Synced')?'success':result.includes('Waiting')?'info':'error'}>{result}</Notice>}
     <Notice tone="info"><strong>Recommended:</strong> use the QR code for phones and QR-capable readers, Code 128 as a second scanner format, and the written unique number or six-digit PIN on terminals such as DS-K1T808MFWX-B. DS-K2802 needs a compatible Wiegand reader.</Notice>
     {show && <FormCard title="Create visitor pass" onSubmit={create}>
       <label>Visitor name<input name="visitorName" required /></label>

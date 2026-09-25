@@ -228,4 +228,42 @@ describe('Hikvision ISAPI bridge and Windows agent', () => {
       }
     }
   });
+
+  it('pushes every active every-gate visitor pass to every access-control device', async () => {
+    const resident = db.one(`SELECT id FROM users WHERE email='resident@example.com'`) as { id: string };
+    const visitorRes = await call(env, 'POST', '/api/visitors', {
+      token: adminToken,
+      body: {
+        visitorName: 'Visitor before gates were linked',
+        residentId: resident.id,
+        propertyId: 'property-1',
+        validFrom: new Date().toISOString(),
+        validUntil: new Date(Date.now() + 3600000).toISOString(),
+      },
+    });
+    expect(visitorRes.status).toBe(201);
+    const visitorId = (visitorRes.json as { id: string }).id;
+    expect(db.query(`SELECT id FROM visitor_device_operations WHERE visitor_request_id=?`, visitorId)).toHaveLength(0);
+
+    for (const [name, connectionPattern] of [['Main gate', 'isapi_bridge'], ['Side gate', 'manual_sync']] as const) {
+      const device = await call(env, 'POST', '/api/access/devices', {
+        token: adminToken,
+        body: { name, gateName: name, direction: 'both', model: 'DS-K1T341CMFW', connectionPattern },
+      });
+      expect(device.status).toBe(201);
+    }
+
+    const sync = await call(env, 'POST', '/api/visitors/sync-active', { token: adminToken });
+    expect(sync.status).toBe(200);
+    expect((sync.json as { queued: number }).queued).toBe(2);
+
+    const operations = db.query(`SELECT status FROM visitor_device_operations WHERE visitor_request_id=? ORDER BY device_id`, visitorId) as { status: string }[];
+    expect(operations).toHaveLength(2);
+    expect(operations.map((row) => row.status).sort()).toEqual(['manual_action_required', 'pending']);
+
+    const secondSync = await call(env, 'POST', '/api/visitors/sync-active', { token: adminToken });
+    expect(secondSync.status).toBe(200);
+    expect((secondSync.json as { queued: number }).queued).toBe(0);
+    expect(db.query(`SELECT id FROM visitor_device_operations WHERE visitor_request_id=?`, visitorId)).toHaveLength(2);
+  });
 });
