@@ -622,6 +622,15 @@ jobs:
     permissions:
       contents: write
     steps:
+      # This job only consumes artifacts, so it looks like it needs no checkout.
+      # It does: `gh` resolves the target repository from the git remote, and
+      # `--verify-tag` below shells out to git as well. Without a .git directory
+      # both fail with "fatal: not a git repository" - which is what killed
+      # bridge-0.1.0 and bridge-0.1.1, after every artifact had already built.
+      # Checked out before download-artifact so nothing here can clean the
+      # artifacts directory.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
