@@ -25,6 +25,7 @@ on:
       - 'apps/android/**'
       - 'scripts/package-windows-bundle.mjs'
       - 'scripts/verify-android-apk.py'
+      - 'scripts/lint-powershell.py'
       - '.github/workflows/bridge.yml'
 
 permissions:
@@ -74,6 +75,21 @@ jobs:
           node --check windows-agent/agent.mjs
           node --check windows-agent/install-windows.mjs
           node --check scripts/package-windows-bundle.mjs
+          python3 -m py_compile scripts/verify-android-apk.py scripts/lint-powershell.py
+
+      # The bundle ships PowerShell this runner cannot execute, and a YAML block
+      # scalar makes it easy to indent a here-string closer or leave a bracket
+      # unbalanced. Lint it here so the error surfaces in seconds on ubuntu
+      # instead of after a windows-latest job has already burned minutes.
+      - name: Lint the PowerShell that ships in the bundle
+        run: |
+          set -euo pipefail
+          python3 scripts/lint-powershell.py --workflow .github/workflows/bridge.yml
+          node scripts/package-windows-bundle.mjs \
+            --out "$RUNNER_TEMP/lint-bundle" --version lint --commit "$GITHUB_SHA" >/dev/null
+          python3 scripts/lint-powershell.py \
+            "$RUNNER_TEMP/lint-bundle/install-service.ps1" \
+            "$RUNNER_TEMP/lint-bundle/uninstall-service.ps1"
 
       - name: Run ISAPI bridge integration checks
         run: node isapi-bridge/agent.integration.mjs
@@ -165,18 +181,103 @@ jobs:
       - name: Smoke-test the bundled runtime and launcher
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Continue'
-          $node = Join-Path bundle 'runtime\node.exe'
-          $nodeVer = (& $node --version)
-          if ($LASTEXITCODE -ne 0 -or -not $nodeVer) { throw "bundled runtime\node.exe did not run (exit $LASTEXITCODE)" }
-          Write-Host "bundled runtime reports $nodeVer"
+          $ErrorActionPreference = 'Stop'
+          $bundle = (Resolve-Path 'bundle').Path
+          Write-Host "Bundle: $bundle"
+          Get-ChildItem -Recurse $bundle | ForEach-Object { $_.FullName.Substring($bundle.Length + 1) }
 
-          # The launcher must refuse to run without a config rather than start an
-          # agent that silently cannot authenticate.
-          $out = & cmd /c "bundle\estatemate-isapi-agent.cmd" 2>&1
-          Write-Host ($out -join "`n")
-          if ($LASTEXITCODE -eq 0) { throw 'launcher exited 0 with no agent-config.json - expected it to refuse to start' }
-          Write-Host "Launcher correctly refused to start without config (exit $LASTEXITCODE)."
+          # 1. The bundled runtime must actually execute.
+          $nodeExe = Join-Path $bundle 'runtime\node.exe'
+          if (-not (Test-Path $nodeExe)) { throw "missing $nodeExe" }
+          $nodeVer = (& $nodeExe --version) | Out-String
+          $nodeVer = $nodeVer.Trim()
+          if ($LASTEXITCODE -ne 0) { throw "runtime\node.exe exited $LASTEXITCODE" }
+          if ($nodeVer -notmatch '^v\d+\.\d+\.\d+$') { throw "unexpected node --version output: '$nodeVer'" }
+          Write-Host "::notice::Bundled Node.js runtime reports $nodeVer."
+
+          $launcher = Join-Path $bundle 'estatemate-isapi-agent.cmd'
+          if (-not (Test-Path $launcher)) { throw "missing $launcher" }
+
+          # 2. It must refuse to start unconfigured, and say why. stderr is left
+          #    uncaptured on purpose: in pwsh, merging a native command's stderr
+          #    into the success stream can turn it into a terminating error.
+          & cmd.exe /c $launcher
+          $unconfiguredExit = $LASTEXITCODE
+          Write-Host "unconfigured launcher exit code: $unconfiguredExit"
+          if ($unconfiguredExit -eq 0) {
+            throw 'launcher exited 0 with no agent-config.json - it must refuse to start'
+          }
+
+          # 3. Given a valid config it must actually start, loading the core from
+          #    the flat agent-core.mjs fallback. The Worker URL is unroutable, so
+          #    this proves startup and wiring rather than connectivity.
+          $config = [ordered]@{
+            agentId                  = '00000000-0000-4000-a000-000000000009'
+            agentSecret              = 'smoke-test-secret-value'
+            workerUrl                = 'http://127.0.0.1:9'
+            syncIntervalSeconds      = 3600
+            heartbeatIntervalSeconds = 3600
+            eventStream              = $false
+            logLevel                 = 'debug'
+          }
+          ($config | ConvertTo-Json -Depth 4) | Set-Content -Path (Join-Path $bundle 'agent-config.json') -Encoding utf8
+          # At least one enabled device is required: the core exits 1 with
+          # "No enabled devices in devices file" before it ever logs its startup
+          # banner, so an empty list would fail the assertions below. The host is
+          # unroutable, so nothing is actually contacted.
+          # Built with ConvertTo-Json rather than a here-string: a here-string's
+          # closing delimiter must sit at column 0, which YAML block indentation
+          # makes impossible inside a step.
+          $smokeDevice = [ordered]@{
+            estateMateDeviceId = '11111111-1111-4111-8111-111111111111'
+            name               = 'Smoke Test Gate'
+            isapiHost          = '127.0.0.1'
+            isapiPort          = 9
+            isapiUsername      = 'admin'
+            isapiPassword      = 'smoke-test'
+            protocol           = 'http'
+            enabled            = $true
+            eventStream        = $false
+          }
+          ([ordered]@{ devices = @($smokeDevice) } | ConvertTo-Json -Depth 5) |
+            Set-Content -Path (Join-Path $bundle 'isapi-devices.json') -Encoding utf8
+
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = $env:ComSpec
+          $psi.Arguments = "/c `"$launcher`""
+          $psi.WorkingDirectory = $bundle
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+          $psi.UseShellExecute = $false
+          $proc = [System.Diagnostics.Process]::Start($psi)
+          $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+          $stderrTask = $proc.StandardError.ReadToEndAsync()
+          if (-not $proc.WaitForExit(60000)) { $proc.Kill($true); $proc.WaitForExit() }
+          $stdout = $stdoutTask.Result
+          $stderr = $stderrTask.Result
+          Write-Host "--- launcher stdout ---"
+          Write-Host $stdout
+          if ($stderr) { Write-Host "--- launcher stderr ---"; Write-Host $stderr }
+
+          try {
+            if ($stdout -notmatch 'EstateMate Windows ISAPI Agent starting') {
+              throw 'wrapper banner not emitted'
+            }
+            if ($stdout -notmatch 'Core agent: .*agent-core\.mjs') {
+              throw 'wrapper did not resolve the flat agent-core.mjs core'
+            }
+            if ($stdout -notmatch 'EstateMate ISAPI Bridge starting') {
+              throw 'core agent never started'
+            }
+          } catch {
+            Write-Host "::error::startup smoke test failed: $($_.Exception.Message)"
+            throw
+          } finally {
+            Remove-Item (Join-Path $bundle 'agent-config.json') -Force -ErrorAction SilentlyContinue
+            Remove-Item (Join-Path $bundle 'isapi-devices.json') -Force -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "::notice::Windows bundle smoke tests passed (runtime $nodeVer; refuses unconfigured; starts and loads agent-core.mjs when configured)."
 
       - name: Sign the bundle runtime (optional)
         shell: pwsh
@@ -287,19 +388,53 @@ jobs:
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "API_BASE_URL=$url"
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
 
-      - uses: android-actions/setup-android@v3
+      # Deliberately no android-actions/setup-android: v3 unconditionally runs
+      # `sdkmanager tools`, a legacy package Google removed from the SDK
+      # repository, so it exits 1 before the build ever starts. ubuntu-latest
+      # already ships the SDK with ANDROID_HOME set; use that instead.
+      - name: Locate the preinstalled Android SDK
+        id: sdk
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$sdk" ]; then
+            echo "::error::No preinstalled Android SDK found (ANDROID_HOME/ANDROID_SDK_ROOT unset)."
+            exit 1
+          fi
+          echo "root=$sdk" >> "$GITHUB_OUTPUT"
+
+          # cmdline-tools may sit under latest/ or a numbered directory.
+          sm=""
+          for candidate in \
+            "$sdk/cmdline-tools/latest/bin/sdkmanager" \
+            "$sdk/tools/bin/sdkmanager"; do
+            if [ -x "$candidate" ]; then sm="$candidate"; break; fi
+          done
+          if [ -z "$sm" ]; then
+            sm=$(find "$sdk/cmdline-tools" -maxdepth 3 -name sdkmanager -type f 2>/dev/null | sort | head -1 || true)
+          fi
+          if [ -z "$sm" ]; then
+            echo "::error::sdkmanager not found under $sdk - cannot install the targeted packages."
+            find "$sdk" -maxdepth 2 -type d | sort | head -30 || true
+            exit 1
+          fi
+          echo "sdkmanager=$sm" >> "$GITHUB_OUTPUT"
+          echo "SDK root: $sdk"
+          echo "sdkmanager: $sm"
 
       - name: Install the SDK packages this project targets
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
+          sm="${{ steps.sdk.outputs.sdkmanager }}"
+          yes | "$sm" --sdk_root="${{ steps.sdk.outputs.root }}" --licenses > /dev/null 2>&1 || true
+          "$sm" --sdk_root="${{ steps.sdk.outputs.root }}" \
+            'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
 
       - name: Decode the release keystore (optional)
         run: |

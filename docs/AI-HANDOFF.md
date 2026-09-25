@@ -107,6 +107,37 @@ syntax-checked locally (no PowerShell in the sandbox) — only the 15 bash steps
 verified with `bash -n`, plus a here-string/brace/`param()` checker run over both
 generated PowerShell scripts with negative controls.
 
+### First runner feedback (run 36126444022, PR #14)
+
+The first PR run gave two real failures, both now fixed:
+
+- **`android-actions/setup-android@v3` is broken upstream** and was removed. It
+  unconditionally runs `sdkmanager tools`, a legacy package Google removed from the SDK
+  repository, so it exits 1 in ~13s before the build starts. This is not specific to
+  this repo — the same failure is being fixed across many projects right now. The job
+  now locates the runner's preinstalled SDK (`$ANDROID_HOME`, probing
+  `cmdline-tools/latest/bin/sdkmanager`, then `tools/bin`, then a `find` fallback) and
+  installs `platform-tools`, `platforms;android-35` and `build-tools;35.0.0` itself.
+  `actions/setup-java` was bumped v4 → v5 for the same class of reason (v4 is
+  announced deprecated).
+- **The Windows smoke test was wrong, not the bundle.** Steps 4–6 passed, meaning the
+  Node runtime download, `SHASUMS256.txt` verification, Authenticode check, extraction,
+  packer and `--finalize-runtime` all work on a real runner. The smoke test asserted the
+  core agent logged its startup banner, but it was seeded with `{ "devices": [] }` and
+  `isapi-bridge/agent.mjs` exits 1 with "No enabled devices in devices file" *before*
+  that banner. Reproduced locally, and the fixture now carries one enabled device
+  pointing at an unroutable host. The step was also rewritten to test the positive path
+  (agent genuinely starts and resolves `agent-core.mjs`) rather than only refusal, to
+  use absolute paths, and to stop merging a native command's stderr into the success
+  stream, which pwsh can turn into a terminating error.
+
+Two PowerShell bugs were caught locally by the new linter before they reached a runner:
+an indented here-string closer (YAML block indentation makes column-0 `"@`/`'@`
+impossible, so the devices fixture now uses `ConvertTo-Json` instead) — and the linter
+itself needed two fixes after a positive control exposed false positives, so it is
+validated against both negative and positive controls. It is wired into the `validate`
+job so future edits are caught on ubuntu in seconds.
+
 ## Most recent migration
 
 `migrations/0014_gate_image_and_security_gate_sessions.sql`
