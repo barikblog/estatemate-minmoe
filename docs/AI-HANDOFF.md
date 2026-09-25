@@ -1,6 +1,6 @@
 # AI handoff — EstateMate
 
-Updated: 2026-09-25 (Africa/Lagos) — **Bridge apps merged onto the Device-agent portal (not yet deployed):** `bridge-apps/` (single-file Windows bridge executable + Android bridge APK) and the agent's EstateMate-device-id resolution are merged on top of main, with the one `apps/web/src/App.tsx` conflict resolved and the operator-facing portal labels brought in line with the renamed **Device agent** page — see "Bridge apps phase, merged onto the Device-agent portal". Previous: **Device-agent portal cleanup deployed:** PR #17 merged as `6795c0e`; Deploy EstateMate run `36161420893` succeeded and the cache-busted production health check returned `ok: true`. The page is now named **Device agent**, replaces implementation-level connection-pattern and queue copy with a compact on-demand setup guide, points operators to the current single-file Windows bridge and Android bridge release, removes obsolete Node.js/`sc.exe` instructions, trims status tables, and fixes the phone layout so the heading and actions stack instead of forcing horizontal overflow. Setup downloads now match explicit secret rotation and are Administrator-only in both the UI and API; Managers can still connect, disconnect, and monitor terminals. Previous: **Bridge release CI phase** added `.github/workflows/bridge.yml` (Windows agent portable bundle + the project's first real Android compile), fixed the `API_BASE_URL` placeholder and the wrong `sc.exe`/`pkg` install advice. Previous: 2026-09-24 — Portal UX phase (migration `0014`) **deployed to production** via PR #11 (`f4e543d`), Deploy EstateMate run `36074600948`: administrator-published estate gate welcome image on the login screen and dashboard, searchable card-holder picker, and gate-scoped Security login sessions. Previous phase retired every access-device transport except the EstateMate agent; production domain is `https://estatemate.estatemate.workers.dev`
+Updated: 2026-09-25 (Africa/Lagos) — **Bridge apps deployed to production:** PR #19 merged as `8615f4f`; Deploy EstateMate run `36176244534` succeeded and the production health check returned `ok: true`. `bridge-apps/` (single-file Windows bridge executable + Android bridge APK) and the agent's EstateMate-device-id resolution are live, with the one `apps/web/src/App.tsx` conflict against the renamed **Device agent** page resolved and the operator-facing portal labels corrected in both apps — see "Bridge apps phase, merged onto the Device-agent portal". Previous: **Device-agent portal cleanup deployed:** PR #17 merged as `6795c0e`; Deploy EstateMate run `36161420893` succeeded and the cache-busted production health check returned `ok: true`. The page is now named **Device agent**, replaces implementation-level connection-pattern and queue copy with a compact on-demand setup guide, points operators to the current single-file Windows bridge and Android bridge release, removes obsolete Node.js/`sc.exe` instructions, trims status tables, and fixes the phone layout so the heading and actions stack instead of forcing horizontal overflow. Setup downloads now match explicit secret rotation and are Administrator-only in both the UI and API; Managers can still connect, disconnect, and monitor terminals. Previous: **Bridge release CI phase** added `.github/workflows/bridge.yml` (Windows agent portable bundle + the project's first real Android compile), fixed the `API_BASE_URL` placeholder and the wrong `sc.exe`/`pkg` install advice. Previous: 2026-09-24 — Portal UX phase (migration `0014`) **deployed to production** via PR #11 (`f4e543d`), Deploy EstateMate run `36074600948`: administrator-published estate gate welcome image on the login screen and dashboard, searchable card-holder picker, and gate-scoped Security login sessions. Previous phase retired every access-device transport except the EstateMate agent; production domain is `https://estatemate.estatemate.workers.dev`
 
 
 
@@ -178,7 +178,7 @@ task and the raw log tail as `::error` annotations, and the Windows smoke test d
 launcher streams the same way. Annotations *are* readable through the check-runs API, so
 that is the channel a future agent will have.
 
-## Bridge apps phase, merged onto the Device-agent portal (2026-09-25)
+## Bridge apps phase, merged onto the Device-agent portal and deployed (2026-09-25)
 
 `bridge-apps/` is now part of the repository: the two hosts that put the
 access-device transport on the estate LAN, so a terminal never has to be
@@ -238,6 +238,42 @@ integration and device-id-resolution scripts, which run the real
 is the path that compiles them: `bridge-apk` runs `scripts/build-bridge-apk.py --test`
 (the 66-check protocol gate) before every APK build, and `bridge-exe` smoke-tests
 the built executable against a fake Worker and a fake Digest terminal.
+
+### Production deployment (2026-09-25)
+
+Merged to `main` as PR #19 (`8615f4f`), which is the only deploy path
+(`deploy.yml` triggers on `push: branches: [main]`).
+
+* **Deploy EstateMate run `36176244534`: `success`.** Every step green, including
+  `Run npm run build` (which is `typecheck && test && build:web`, so CI re-ran the
+  whole verification suite on the merged tree), `Apply D1 migrations` and
+  `Deploy Worker and web assets`.
+* **No new migrations.** `git diff --name-only 27a5917 8615f4f -- migrations` is
+  empty; the chain still ends at `0014_gate_image_and_security_gate_sessions.sql`,
+  applied in the portal UX phase, so the migration step had nothing to apply.
+* **Health check:** `GET https://estatemate.estatemate.workers.dev/api/health`
+  returned `{"ok":true,"app":"EstateMate","time":"2026-09-25T18:54:17.090Z",
+  "hikvisionMode":"per-device","fileStorage":"github-private"}`.
+* **The deployed bundle is the resolved one.** Production serves
+  `assets/index-DpqNYjmI.js`, and building `8615f4f` locally emits exactly that
+  content-hashed filename. As a control, building the same tree with
+  `App.tsx` taken from the pre-merge commit `27a5917` emits
+  `index-CbMVe4sE.js` instead — and asking production for that stale path
+  returns the SPA fallback HTML, not JavaScript. So the merge is what is live,
+  not merely a build that happened around the same time.
+* **Bridge CI on the PR was green before the merge:** `Validate ISAPI bridge
+  agent`, `Build the bridge APK` (its `Run the protocol tests and build the APK`
+  step compiles `bridge-apps/android/**` — the sandbox has no JDK, so this is the
+  only place that Java is compiled), `Build the bridge executable` (including
+  `Smoke-test the executable`), `Package Windows agent bundle`, and
+  `Build Android APK`.
+* `Workers Builds: estatemate` was red on the PR and is still the documented
+  pre-existing failure; it is not a required check and `deploy.yml` is the
+  authoritative path.
+* **No new client artifacts were published:** `bridge.yml` only publishes on
+  `bridge-*` tags, so the released bridge files remain those of `bridge-0.2.1`.
+  Tag `bridge-0.2.2` when the apps need redistributing — nothing in this merge
+  changed the bridge protocol, only the portal labels its messages quote.
 
 ## Most recent migration
 
