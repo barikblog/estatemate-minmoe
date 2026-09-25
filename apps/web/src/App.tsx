@@ -100,8 +100,8 @@ function PortalFooter({ portalName }: { portalName?:string }) {
 }
 
 /**
- * Second step of a Security sign-in: the officer picks which of their assigned
- * gates they are working, and that choice scopes the whole session.
+ * Second step of a Security sign-in: the officer picks the gate they are working
+ * (only their assigned posts if an administrator set any, otherwise any active gate), and that choice scopes the whole session.
  */
 function GatePicker({ config, gates, officerName, selectionToken, onSelected, onBack }: {
   config: PortalConfig;
@@ -182,7 +182,7 @@ function Login({ onLogin, config }: { onLogin: (user: User, gate?: Row | null) =
         gates?: Row[];
         selectionToken?: string;
       }>('/api/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
-      // A Security officer with assigned gates must choose one before a session
+      // Every Security officer must choose a gate before a session
       // cookie is issued, so the API hands back a short-lived selection token.
       if (result.requiresGateSelection && result.gates?.length && result.selectionToken) {
         setGateStep({ gates: result.gates, selectionToken: result.selectionToken, officerName: result.user.name });
@@ -446,7 +446,7 @@ function Dashboard({ user, config, gate, onNavigate }: { user: User; config: Por
     )}
     {user.role === 'security' && <Notice tone={gate ? 'success' : 'warning'}>{gate
       ? <>Posted at <strong>{String(gate.gate_name || gate.name)}</strong> for this session. Your visitor queue, gate activity and device list are limited to this gate.</>
-      : <>No gate has been assigned to your account yet, so you can still see every gate. Ask an administrator to assign your post under Settings → Security gate assignments to lock each session to one gate.</>}</Notice>}
+      : <>No active gate device is registered yet, so you can see every gate. Once an administrator registers a gate terminal you will choose your gate at each sign-in.</>}</Notice>}
     <section className={image ? 'hero-card has-gate-image' : 'hero-card'} style={gateImageStyle(image)}>
       <div>
         <p className="eyebrow">Estate operations</p>
@@ -1699,7 +1699,7 @@ function SecurityGateAssignments() {
       <label>Security officer<select name="securityUserId" required><option value="">Select officer</option>{(officers.data?.items ?? []).map((officer)=><option key={String(officer.id)} value={String(officer.id)}>{String(officer.name)} — {String(officer.email)}</option>)}</select></label>
       <label>Gate (access-control device)<select name="deviceId" required><option value="">Select gate</option>{(devices.data?.items ?? []).map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.gate_name)} — {String(device.name)} ({String(device.direction)})</option>)}</select></label>
       <label className="span-2">Note (shift or post detail)<input name="note" placeholder="Morning shift, Gate A pedestrian lane" maxLength={200} /></label>
-      <small className="span-2">An officer with at least one assignment must choose their gate when they sign in. That choice scopes their visitor queue, gate activity and device list to that post for the whole session, and is re-checked on every request — removing an assignment ends a live session at that gate.</small>
+      <small className="span-2">Every officer chooses a gate when they sign in. Officers with no assignment may pick any active gate; assigning an officer here restricts the choice to their assigned gates and moves anyone already signed in at another gate. The choice scopes their visitor queue, gate activity and device list to that post for the whole session, and is re-checked on every request — removing an assignment ends a live session at that gate.</small>
       <button className="primary">Assign gate</button>
     </FormCard>
     <section className="panel">

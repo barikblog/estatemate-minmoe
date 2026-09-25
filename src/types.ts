@@ -39,6 +39,11 @@ export interface JwtClaims {
    * rejected by the normal authentication middleware.
    */
   pendingGate?: boolean;
+  /**
+   * Set when an officer with no assigned posts picked the gate freely. Such a
+   * session ends as soon as an administrator assigns the officer any post.
+   */
+  openGate?: boolean;
   iat: number;
   exp: number;
 }

@@ -160,7 +160,28 @@ describe('portal UX: gate image, card-holder picker, Security gate sessions', ()
   });
 
   describe('Security gate-scoped sessions', () => {
-    it('signs an officer straight in while no gate has been assigned', async () => {
+    it('makes an unassigned officer choose from every active gate', async () => {
+      const res = await call(env, 'POST', '/api/auth/login', { body: { email: SECURITY_EMAIL, password: SECURITY_PASSWORD } });
+      expect(res.status).toBe(200);
+      expect(res.json.requiresGateSelection).toBe(true);
+      expect((res.json.gates as Array<Record<string, string>>).map((gate) => gate.id).sort()).toEqual(['device-a', 'device-b']);
+      expect(res.setCookie).toBeNull();
+      const picked = await call(env, 'POST', '/api/auth/select-gate', { body: { selectionToken: String(res.json.selectionToken), deviceId: 'device-b' } });
+      expect(picked.status).toBe(200);
+      expect(picked.setCookie).toContain('estatemate_session=');
+    });
+
+    it('forces an unassigned officer to reselect once an administrator posts them elsewhere', async () => {
+      const login = await call(env, 'POST', '/api/auth/login', { body: { email: SECURITY_EMAIL, password: SECURITY_PASSWORD } });
+      const picked = await call(env, 'POST', '/api/auth/select-gate', { body: { selectionToken: String(login.json.selectionToken), deviceId: 'device-b' } });
+      const sessionToken = String(picked.json.token);
+      expect((await call(env, 'GET', '/api/auth/me', { token: sessionToken })).status).toBe(200);
+      await call(env, 'POST', '/api/security/gate-assignments', { token: adminToken, body: { securityUserId: securityId, deviceId: 'device-a' } });
+      expect((await call(env, 'GET', '/api/auth/me', { token: sessionToken })).status).toBe(401);
+    });
+
+    it('signs an officer straight in only when the estate has no active gate', async () => {
+      db.run(`UPDATE hikvision_devices SET status='disabled'`);
       const res = await call(env, 'POST', '/api/auth/login', { body: { email: SECURITY_EMAIL, password: SECURITY_PASSWORD } });
       expect(res.status).toBe(200);
       expect(res.json.requiresGateSelection).toBeUndefined();
@@ -318,9 +339,10 @@ describe('portal UX: gate image, card-holder picker, Security gate sessions', ()
       expect((await call(env, 'DELETE', '/api/access/devices/device-a', { token: adminToken })).status).toBe(200);
       const rows = db.query(`SELECT active FROM security_gate_assignments WHERE device_id='device-a'`);
       expect(rows.map((row) => row.active)).toEqual([0]);
-      // With every post retired the officer is no longer forced through selection.
+      // With every post retired the officer chooses from the remaining active gates.
       const login = await call(env, 'POST', '/api/auth/login', { body: { email: SECURITY_EMAIL, password: SECURITY_PASSWORD } });
-      expect(login.json.requiresGateSelection).toBeUndefined();
+      expect(login.json.requiresGateSelection).toBe(true);
+      expect((login.json.gates as Array<Record<string, string>>).map((gate) => gate.id)).toEqual(['device-b']);
     });
   });
 });
