@@ -1550,6 +1550,7 @@ function IsapiBridge({ user }: { user: User }) {
   >
     <div className="agent-summary">
       <p><strong>Local connection only.</strong> Run one bridge on a Windows or Linux computer, or an Android device, that stays on the same network as the gate terminals. No inbound Internet access or port forwarding is required.</p>
+      <p className="presence-hint"><strong>How status is decided:</strong> an agent is online while it heartbeats (offline after 3 minutes of silence). A terminal is online while it forwards events (offline after 10 minutes), or immediately when its bridge reports the terminal's event stream as down. Stopping or deleting a bridge retires its terminals at once.</p>
       <details className="agent-setup">
         <summary>Setup instructions</summary>
         <ol>

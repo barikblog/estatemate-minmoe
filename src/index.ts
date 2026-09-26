@@ -38,6 +38,28 @@ const MAX_PAGE_SIZE = 100;
 const DEVICE_BODY_LIMIT = 2 * 1024 * 1024;
 const CSV_BODY_LIMIT = 2 * 1024 * 1024;
 
+/**
+ * Presence windows. A terminal proves it is alive by forwarding events through
+ * the agent; an agent proves it is alive by heartbeating. The stored `status`
+ * column is a lagging flag: it is only flipped to offline by the hourly sweep
+ * (or immediately when an agent reports a terminal's event stream as down), so
+ * every read derives the status from these windows instead of trusting the
+ * stored value. A terminal whose `last_seen_at` is NULL has never proved it was
+ * alive, so COALESCE treats it as ancient rather than invisible to the sweep.
+ */
+const DEVICE_OFFLINE_MINUTES = 10;
+const AGENT_OFFLINE_MINUTES = 3;
+
+/** SQL expression for the status a device should display right now. */
+function deviceEffectiveStatus(alias: string): string {
+  return `CASE WHEN ${alias}.status='online' AND COALESCE(${alias}.last_seen_at,'1970-01-01 00:00:00') < datetime('now','-${DEVICE_OFFLINE_MINUTES} minutes') THEN 'offline' ELSE ${alias}.status END`;
+}
+
+/** SQL expression for the status an agent should display right now. */
+function agentEffectiveStatus(alias: string): string {
+  return `CASE WHEN ${alias}.status='online' AND COALESCE(${alias}.last_seen_at,'1970-01-01 00:00:00') < datetime('now','-${AGENT_OFFLINE_MINUTES} minutes') THEN 'offline' ELSE ${alias}.status END`;
+}
+
 function jsonError(c: AppContext, status: 400 | 401 | 403 | 404 | 409 | 413 | 500 | 503, message: string) {
   return c.json({ error: message }, status);
 }
@@ -2521,7 +2543,10 @@ app.get('/api/access/profiles', requireRoles('admin','manager','security'), (c) 
 
 app.get('/api/access/device-options', async (c) => {
   const scopedGate = gateScope(c);
-  const devices=await c.env.DB.prepare(`SELECT id,name,vendor,model,gate_name,direction,profile_key,connection_pattern,status FROM hikvision_devices WHERE deleted_at IS NULL AND status!='disabled' AND (? IS NULL OR id=?) ORDER BY gate_name,name`).bind(scopedGate,scopedGate).all<Record<string,string|null>>();
+  const devices=await c.env.DB.prepare(
+    `SELECT d.id,d.name,d.vendor,d.model,d.gate_name,d.direction,d.profile_key,d.connection_pattern,${deviceEffectiveStatus('d')} AS status
+     FROM hikvision_devices d WHERE d.deleted_at IS NULL AND d.status!='disabled' AND (? IS NULL OR d.id=?) ORDER BY d.gate_name,d.name`,
+  ).bind(scopedGate,scopedGate).all<Record<string,string|null>>();
   return c.json({ items:devices.results.map((device) => {
     const profile=getHikvisionProfile(device.profile_key);
     return { ...device,authenticationMethods:profile.authenticationMethods,supportsQr:profile.authenticationMethods.includes('QR'),supportsPin:profile.authenticationMethods.includes('PIN') };
@@ -2532,10 +2557,10 @@ app.get('/api/access/devices', requireRoles('admin','manager','security'), async
   // A gate-scoped Security session manages only the terminal they are posted at.
   const scopedGate = gateScope(c);
   const devices = await c.env.DB.prepare(
-    `SELECT d.id,d.name,d.vendor,d.serial_number,d.model,d.firmware,d.mac_address,d.gate_name,d.direction,d.integration_mode,d.status,d.last_seen_at,d.profile_key,d.connection_pattern,d.profile_config_json,d.capabilities_json,
+    `SELECT d.id,d.name,d.vendor,d.serial_number,d.model,d.firmware,d.mac_address,d.gate_name,d.direction,d.integration_mode,${deviceEffectiveStatus('d')} AS status,d.last_seen_at,d.profile_key,d.connection_pattern,d.profile_config_json,d.capabilities_json,
       d.isapi_agent_id,d.isapi_sync_enabled,d.last_isapi_sync_at,d.last_isapi_sync_status,d.isapi_host,d.isapi_port,d.isapi_username,
       CASE WHEN d.isapi_password_ciphertext IS NULL THEN 0 ELSE 1 END AS isapi_password_configured,d.isapi_protocol,
-      d.created_at,d.updated_at,
+      d.created_at,d.updated_at,d.status AS stored_status,
       ap.id AS access_point_id,ap.name AS access_point_name,
       (SELECT COUNT(*) FROM device_operations o WHERE o.device_id=d.id AND o.status='manual_action_required') AS pending_operations,
       (SELECT COUNT(*) FROM device_operations o WHERE o.device_id=d.id AND o.status IN ('pending','sent','failed')) AS queued_operations,
@@ -2737,7 +2762,7 @@ app.patch('/api/access/operations/:id', requireRoles('admin','manager'), async (
 
 app.get('/api/isapi/agents', requireRoles('admin','manager'), async (c) => {
   const agents = await c.env.DB.prepare(
-    `SELECT a.id,a.name,a.hostname,a.platform,a.version,a.status,a.last_seen_at,a.last_ip,a.created_at,a.updated_at,
+    `SELECT a.id,a.name,a.hostname,a.platform,a.version,${agentEffectiveStatus('a')} AS status,a.status AS stored_status,a.last_seen_at,a.last_ip,a.created_at,a.updated_at,
        (SELECT COUNT(*) FROM isapi_device_configs cfg WHERE cfg.agent_id=a.id AND cfg.sync_enabled=1) AS linked_devices,
        (SELECT COUNT(*) FROM device_operations o JOIN isapi_device_configs cfg ON cfg.device_id=o.device_id WHERE cfg.agent_id=a.id AND o.status IN ('pending','sent','failed')) +
        (SELECT COUNT(*) FROM visitor_device_operations vo JOIN isapi_device_configs cfg ON cfg.device_id=vo.device_id WHERE cfg.agent_id=a.id AND vo.status IN ('pending','sent','failed')) AS pending_operations
@@ -2763,7 +2788,7 @@ app.post('/api/isapi/agents', requireRoles('admin'), async (c) => {
 
 app.get('/api/isapi/agents/:id', requireRoles('admin','manager'), async (c) => {
   const agent = await c.env.DB.prepare(
-    `SELECT id,name,hostname,platform,version,status,last_seen_at,last_ip,created_at,updated_at FROM isapi_agents WHERE id=? AND deleted_at IS NULL`,
+    `SELECT id,name,hostname,platform,version,${agentEffectiveStatus('isapi_agents')} AS status,last_seen_at,last_ip,created_at,updated_at FROM isapi_agents WHERE id=? AND deleted_at IS NULL`,
   ).bind(c.req.param('id')).first();
   if (!agent) return jsonError(c, 404, 'ISAPI agent not found');
   const configs = await c.env.DB.prepare(
@@ -2797,6 +2822,12 @@ app.delete('/api/isapi/agents/:id', requireRoles('admin'), async (c) => {
   if (!existing) return jsonError(c, 404, 'ISAPI agent not found');
   await c.env.DB.batch([
     c.env.DB.prepare(`UPDATE isapi_agents SET status='disabled',deleted_at=datetime('now'),updated_at=datetime('now') WHERE id=?`).bind(existing.id),
+    // Retire presence before the links are cleared: a terminal left without an
+    // agent can no longer prove it is alive.
+    c.env.DB.prepare(
+      `UPDATE hikvision_devices SET status='offline',updated_at=datetime('now') WHERE status='online'
+        AND (isapi_agent_id=? OR id IN (SELECT device_id FROM isapi_device_configs WHERE agent_id=?))`,
+    ).bind(existing.id, existing.id),
     c.env.DB.prepare(`UPDATE isapi_device_configs SET agent_id=NULL,updated_at=datetime('now') WHERE agent_id=?`).bind(existing.id),
     c.env.DB.prepare(`UPDATE hikvision_devices SET isapi_agent_id=NULL,isapi_sync_enabled=0,updated_at=datetime('now') WHERE isapi_agent_id=?`).bind(existing.id),
   ]);
@@ -2990,8 +3021,8 @@ echo "Installer completed for ${agent.name}"
 app.get('/api/isapi/device-configs', requireRoles('admin','manager'), async (c) => {
   const result = await c.env.DB.prepare(
     `SELECT cfg.id,cfg.device_id,cfg.agent_id,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol,cfg.sync_enabled,cfg.last_sync_at,cfg.last_sync_status,cfg.last_error,cfg.created_at,
-       d.name AS device_name,d.model,d.gate_name,d.connection_pattern,d.status AS device_status,
-       a.name AS agent_name,a.platform AS agent_platform,a.status AS agent_status
+       d.name AS device_name,d.model,d.gate_name,d.connection_pattern,${deviceEffectiveStatus('d')} AS device_status,
+       a.name AS agent_name,a.platform AS agent_platform,${agentEffectiveStatus('a')} AS agent_status
      FROM isapi_device_configs cfg
      JOIN hikvision_devices d ON d.id=cfg.device_id
      LEFT JOIN isapi_agents a ON a.id=cfg.agent_id
@@ -3088,7 +3119,9 @@ app.delete('/api/isapi/device-configs/:id', requireRoles('admin','manager'), asy
   if (!existing) return jsonError(c, 404, 'ISAPI config not found');
   await c.env.DB.batch([
     c.env.DB.prepare(`DELETE FROM isapi_device_configs WHERE id=?`).bind(existing.id),
-    c.env.DB.prepare(`UPDATE hikvision_devices SET isapi_agent_id=NULL,isapi_sync_enabled=0,last_isapi_sync_status=NULL,updated_at=datetime('now') WHERE id=?`).bind(existing.device_id),
+    c.env.DB.prepare(
+      `UPDATE hikvision_devices SET isapi_agent_id=NULL,isapi_sync_enabled=0,last_isapi_sync_status=NULL,status=CASE WHEN status='online' THEN 'offline' ELSE status END,updated_at=datetime('now') WHERE id=?`,
+    ).bind(existing.device_id),
   ]);
   await audit(c, 'delete', 'isapi_device_config', existing.id);
   return c.json({ ok: true });
@@ -3379,17 +3412,56 @@ async function authenticateIsapiAgent(request: Request, env: Env, agentId: strin
   return { id: row.id, name: row.name, platform: row.platform, status: row.status };
 }
 
+/**
+ * Marks a terminal offline as soon as the agent reports its event stream is
+ * down. The hourly sweep would otherwise leave a dead terminal showing online
+ * for up to an hour, and the agent process may stay alive (and heartbeating)
+ * long after the terminal on the LAN stopped answering.
+ */
+async function markTerminalStreamDown(env: Env, agentId: string, deviceId: string, reason: string): Promise<boolean> {
+  const result = await env.DB.prepare(
+    `UPDATE hikvision_devices SET status='offline',updated_at=datetime('now')
+      WHERE id=? AND status='online' AND deleted_at IS NULL
+        AND (isapi_agent_id=? OR EXISTS (
+          SELECT 1 FROM isapi_device_configs WHERE device_id=hikvision_devices.id AND agent_id=? AND sync_enabled=1
+        ))`,
+  ).bind(deviceId, agentId, agentId).run();
+  if (!Number(result.meta.changes ?? 0)) return false;
+  // One audit row per transition, not one per heartbeat.
+  await env.DB.prepare(
+    `INSERT INTO isapi_sync_logs(id,device_id,agent_id,operation_type,status,message) VALUES (?,?,?,'event_stream','failed',?)`,
+  ).bind(crypto.randomUUID(), deviceId, agentId, reason.slice(0, 1000)).run();
+  return true;
+}
+
 async function handleIsapiAgentHeartbeat(request: Request, env: Env, agentId: string): Promise<Response> {
   if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'POST' } });
   const agent = await authenticateIsapiAgent(request, env, agentId);
   if (!agent) return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Bearer realm="EstateMate ISAPI agent"' } });
-  let body: { version?: string; hostname?: string; ip?: string; stats?: unknown } = {};
+  let body: { version?: string; hostname?: string; ip?: string; stats?: unknown; devices?: unknown } = {};
   try { body = await request.json(); } catch { body = {}; }
   const ip = request.headers.get('CF-Connecting-IP') || body.ip || null;
   await env.DB.prepare(
     `UPDATE isapi_agents SET status='online',last_seen_at=datetime('now'),last_ip=?,hostname=COALESCE(?,hostname),version=COALESCE(?,version),updated_at=datetime('now') WHERE id=?`,
   ).bind(ip, body.hostname?.trim() || null, body.version?.trim() || null, agentId).run();
-  return Response.json({ ok: true, agentId, serverTime: new Date().toISOString() }, { headers: { 'Cache-Control': 'no-store' } });
+
+  // Per-terminal presence. The agent reports one entry per EstateMate device id
+  // whose alertStream it is (or is not) holding open; `stream: 'down'` retires
+  // the terminal immediately instead of waiting for the hourly sweep.
+  const reported = Array.isArray(body.devices) ? body.devices as Array<Record<string, unknown>> : [];
+  let terminalsOffline = 0;
+  for (const entry of reported.slice(0, 100)) {
+    const deviceId = typeof entry?.deviceId === 'string' ? entry.deviceId.trim() : '';
+    if (!deviceId || entry?.stream !== 'down') continue;
+    const reason = typeof entry?.lastError === 'string' && entry.lastError.trim()
+      ? `Event stream down: ${entry.lastError.trim()}`
+      : 'Event stream down: the agent cannot hold the terminal connection open';
+    if (await markTerminalStreamDown(env, agentId, deviceId, reason)) terminalsOffline += 1;
+  }
+  return Response.json(
+    { ok: true, agentId, terminalsOffline, serverTime: new Date().toISOString() },
+    { headers: { 'Cache-Control': 'no-store' } },
+  );
 }
 
 async function handleIsapiAgentDevices(request: Request, env: Env, agentId: string): Promise<Response> {
@@ -3748,9 +3820,24 @@ async function enforceFacilityFees(env: Env): Promise<void> {
     await createDeviceOperations(env, card.id, 'enable_card', { cardUid: card.card_uid, enabled: true, reason: 'facility fee cleared' });
   }
 
-  await env.DB.prepare(
-    `UPDATE hikvision_devices SET status='offline',updated_at=datetime('now') WHERE status='online' AND last_seen_at < datetime('now','-10 minutes')`,
+}
+
+/**
+ * Retires presence flags that stopped being earned. Both a stale terminal and a
+ * silent agent are marked offline here; COALESCE matters because a row that was
+ * set online without ever forwarding an event has a NULL last_seen_at, and
+ * `NULL < x` is NULL (not true) in SQLite — it would stay online forever.
+ */
+async function expireStalePresence(env: Env): Promise<{ devices: number; agents: number }> {
+  const devices = await env.DB.prepare(
+    `UPDATE hikvision_devices SET status='offline',updated_at=datetime('now')
+      WHERE status='online' AND COALESCE(last_seen_at,'1970-01-01 00:00:00') < datetime('now','-${DEVICE_OFFLINE_MINUTES} minutes')`,
   ).run();
+  const agents = await env.DB.prepare(
+    `UPDATE isapi_agents SET status='offline',updated_at=datetime('now')
+      WHERE status='online' AND deleted_at IS NULL AND COALESCE(last_seen_at,'1970-01-01 00:00:00') < datetime('now','-${AGENT_OFFLINE_MINUTES} minutes')`,
+  ).run();
+  return { devices: Number(devices.meta.changes ?? 0), agents: Number(agents.meta.changes ?? 0) };
 }
 
 export default {
@@ -3782,6 +3869,6 @@ export default {
     await consumeAccessEvents(batch, env);
   },
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(Promise.all([processPropertyLifecycle(env),enforceFacilityFees(env),pruneAccessEvents(env),syncActiveVisitorPasses(env.DB)]).then(() => undefined));
+    ctx.waitUntil(Promise.all([processPropertyLifecycle(env),enforceFacilityFees(env),expireStalePresence(env),pruneAccessEvents(env),syncActiveVisitorPasses(env.DB)]).then(() => undefined));
   },
 };

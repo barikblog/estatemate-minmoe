@@ -39,6 +39,7 @@ Run `git log -1 --oneline` and check the latest GitHub Actions run before making
 - Administrator-generated, one-time-download sample logins for every role with automatic 24-hour expiry.
 - Initiate-payment flow with POS at office, cash at office and bank transfer; the estate bank account is Administrator-editable and read-only for Residents/Cashiers. Online collection is removed from the portal and rejected by `POST /api/payments`.
 - Visitor passes shareable as a locally rendered PNG image or one-page A4 PDF, with a native share sheet where the device supports files.
+- **Derived agent/terminal presence**: agent and device status are computed at read time from proof of life (heartbeat within 3 minutes; forwarded event within 10 minutes) instead of trusting the stored `status`, which used to leave a dead terminal or a stopped agent green until the next hourly cron. The hourly sweep (`expireStalePresence`) persists the same verdict and now handles a NULL `last_seen_at`, which previously compared as NULL and never went offline. The heartbeat carries per-terminal alertStream state (`devices: [{ deviceId, stream: 'up'|'down', lastError }]`), so an agent that is still running retires an unreachable terminal immediately; deleting an agent or disconnecting a terminal does the same.
 - Estate-timezone-aware visitor validity windows (`src/datetime.ts`); resident passes default to `gate_scope='both'` and the gate picker is hidden from Residents.
 - Show/hide password on sign-in and a `Powered by sornix.com.ng` portal footer.
 
