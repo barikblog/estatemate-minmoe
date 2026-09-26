@@ -30,6 +30,8 @@ on:
       - 'scripts/bridge-exe-smoke-test.mjs'
       - 'scripts/build-bridge-apk.py'
       - 'scripts/verify-android-apk.py'
+      - 'scripts/cloudflared-remote-access.mjs'
+      - 'scripts/cloudflared-remote-access.integration.mjs'
       - 'scripts/lint-powershell.py'
       - '.github/workflows/bridge.yml'
 
@@ -80,6 +82,7 @@ jobs:
           node --check windows-agent/agent.mjs
           node --check windows-agent/install-windows.mjs
           node --check scripts/package-windows-bundle.mjs
+          node --check scripts/cloudflared-remote-access.mjs
           python3 -m py_compile scripts/verify-android-apk.py scripts/lint-powershell.py
 
       # The bundle ships PowerShell this runner cannot execute, and a YAML block

@@ -1,6 +1,7 @@
 /*
  * Shared state between the background service and the activity: counters, the
- * last error, and the bounded queue of event documents waiting to be forwarded.
+ * last error, the per-terminal alertStream states, and the bounded queue of event
+ * documents waiting to be forwarded.
  *
  * On a phone the activity can be killed at any moment without touching the
  * service, so nothing here may hold a reference to a Context or a View.
@@ -16,6 +17,17 @@ public final class BridgeRuntime {
     private static final Object QUEUE_LOCK = new Object();
     private static final ArrayList<Map<String, Object>> PENDING = new ArrayList<Map<String, Object>>();
     private static int bufferLimit = 500;
+
+    /**
+     * Per-terminal alertStream state, keyed by EstateMate device id, as
+     * {state, lastError}. The desktop agent reports the same thing with every
+     * heartbeat: an 'up' stream is proof the terminal is reachable (the Worker
+     * promotes it to online instead of leaving it on the 'pending' registration
+     * default until someone swipes a card), and a 'down' stream retires it at
+     * once rather than waiting for the hourly sweep.
+     */
+    private static final Object STREAM_LOCK = new Object();
+    private static final LinkedHashMap<String, String[]> STREAM_STATES = new LinkedHashMap<String, String[]>();
 
     private static volatile boolean running;
     private static volatile boolean workerOnline;
@@ -161,6 +173,46 @@ public final class BridgeRuntime {
         stats.put("eventsPending", Integer.valueOf(pendingCount()));
         stats.put("eventStream", Boolean.TRUE);
         return stats;
+    }
+
+    /**
+     * Records whether this bridge is, or is not, holding a terminal's alertStream
+     * open. Called by the stream loop on connect, on close, on an HTTP error and
+     * on a thrown exception; `lastError` is carried so the portal's sync log says
+     * why the stream is down.
+     */
+    public static void setStreamState(String deviceId, String state, String lastError) {
+        if (deviceId == null || deviceId.trim().isEmpty()) return;
+        if (!"up".equals(state) && !"down".equals(state)) return;
+        synchronized (STREAM_LOCK) {
+            STREAM_STATES.put(deviceId.trim(), new String[] { state, lastError });
+        }
+    }
+
+    /** The per-terminal stream states the Worker expects with each heartbeat. */
+    public static List<Map<String, Object>> streamStates() {
+        List<Map<String, Object>> items = new ArrayList<Map<String, Object>>();
+        synchronized (STREAM_LOCK) {
+            for (Map.Entry<String, String[]> entry : STREAM_STATES.entrySet()) {
+                Map<String, Object> item = new LinkedHashMap<String, Object>();
+                item.put("deviceId", entry.getKey());
+                item.put("stream", entry.getValue()[0]);
+                item.put("lastError", entry.getValue()[1]);
+                items.add(item);
+            }
+        }
+        return items;
+    }
+
+    /** How many terminals are currently streaming; for the notification and logs. */
+    public static int streamingCount() {
+        int count = 0;
+        synchronized (STREAM_LOCK) {
+            for (String[] state : STREAM_STATES.values()) {
+                if ("up".equals(state[0])) count += 1;
+            }
+        }
+        return count;
     }
 
     public static String summary() {

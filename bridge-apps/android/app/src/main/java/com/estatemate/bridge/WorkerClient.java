@@ -135,12 +135,20 @@ public final class WorkerClient {
         return get("/api/isapi/v1/agents/" + agentId + "/devices");
     }
 
-    public Reply heartbeat(String version, String hostname, String platform, Map<String, Object> stats) {
+    /**
+     * Heartbeat carrying the per-terminal alertStream states — the same payload
+     * shape as isapi-bridge/agent.mjs, so the Worker can promote a terminal whose
+     * stream is open and retire one whose stream is down without waiting for the
+     * hourly sweep. `devices` may be null when a caller only proves liveness.
+     */
+    public Reply heartbeat(String version, String hostname, String platform, Map<String, Object> stats,
+                           List<Map<String, Object>> devices) {
         Map<String, Object> payload = new LinkedHashMap<String, Object>();
         payload.put("version", version);
         payload.put("hostname", hostname);
         payload.put("platform", platform);
         payload.put("stats", stats);
+        if (devices != null) payload.put("devices", devices);
         return post("/api/isapi/v1/agents/" + agentId + "/heartbeat", Json.write(payload));
     }
 

@@ -8,6 +8,10 @@
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "skipLibCheck": true,
+    // The tooling scripts under scripts/ are plain .mjs, and their vitest suites
+    // import them directly, so their inferred types must be part of the program.
+    // They are not checked themselves (checkJs stays off).
+    "allowJs": true,
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
     "resolveJsonModule": true,

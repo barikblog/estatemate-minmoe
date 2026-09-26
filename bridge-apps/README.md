@@ -21,7 +21,9 @@ EstateMate client APK). When the files were built locally they sit in
 Both hosts speak to the Worker with the same agent key and the same three
 endpoints, so the portal cannot tell them apart:
 
-* `POST /api/isapi/v1/agents/:id/heartbeat` — the portal shows the agent online;
+* `POST /api/isapi/v1/agents/:id/heartbeat` — the portal shows the agent online,
+  and the per-terminal `devices` array in the same body tells it which terminals
+  are actually streaming (online) and which are unreachable (retired at once);
 * `GET  /api/isapi/v1/agents/:id/operations` + `POST …/operations/:opId/result` —
   queued card/visitor changes are applied to the terminal over ISAPI;
 * `POST /api/isapi/v1/agents/:id/events` — gate events from the terminal's

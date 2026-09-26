@@ -34,6 +34,12 @@ Admin or Security selects a saved device and starts a short visitor-validation s
 
 A denied unknown-card event is sufficient if the device uploads the card number.
 
+## Fingerprints
+
+A fingerprint is not a card number, so it is stored as its own credential (`fingerprint_credentials`, migration `0015`) rather than a fake card in `access_cards`. Administrators and Managers add one from a person's profile or from **Access cards & fingerprints**: the finger slot (1–10), an optional "which finger" label, the employee number the terminal knows the person by, and the terminal the finger will be captured at.
+
+The template itself is created on the terminal — the person's finger has to be on the sensor — so EstateMate queues `enroll_fingerprint` as a `manual_action_required` task with an instruction and never asks the agent to upload a template. The same applies to `enable_fingerprint`, `disable_fingerprint` and `delete_fingerprint`, which the terminal must confirm. Gate events that carry no card number are attributed to the person through `employee_no`, so set that value when enrolling a dependant.
+
 ## Model-specific behavior
 
 - **QR-capable MinMoe/K1T models:** use QR only when the exact model and firmware document QR authentication. The credential must be provisioned to the device by a supported command channel or applied from the hardware-action queue.

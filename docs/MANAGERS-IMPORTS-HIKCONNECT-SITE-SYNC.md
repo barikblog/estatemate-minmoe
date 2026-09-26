@@ -61,6 +61,8 @@ Optional: `card_label,status,expires_at`
 
 Active imported cards are placed into the existing device-operation synchronization queue.
 
+Fingerprints are **not** part of a CSV import: a CSV cannot capture a finger. They are recorded per person from **Access cards & fingerprints** or from the person's profile, and each one queues an operator task under **Hardware actions** (see [`TENANTS-DEPENDANTS-AND-TRANSFERS.md`](TENANTS-DEPENDANTS-AND-TRANSFERS.md)).
+
 ## Retired integration
 
 The Hik-Connect detail storage and the one-time ISUP site-sync installer were removed with the dedicated ISUP gateway transport (migration `0013_agent_only_transports.sql`). Managers now register devices and work the hardware-action queue; card provisioning runs through the ISAPI bridge agent. See [`ISAPI-BRIDGE-AND-WINDOWS-AGENT.md`](ISAPI-BRIDGE-AND-WINDOWS-AGENT.md).
