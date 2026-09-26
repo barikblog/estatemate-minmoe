@@ -304,7 +304,7 @@ public final class BridgeService extends Service {
     private void sendHeartbeat() {
         Map<String, Object> stats = BridgeRuntime.stats();
         stats.put("eventStream", Boolean.valueOf(config.eventStreamEnabled));
-        WorkerClient.Reply reply = worker.heartbeat(VERSION, android.os.Build.MODEL + " (" + android.os.Build.VERSION.RELEASE + ")", "android", stats);
+        WorkerClient.Reply reply = worker.heartbeat(VERSION, android.os.Build.MODEL + " (" + android.os.Build.VERSION.RELEASE + ")", "android", stats, BridgeRuntime.streamStates());
         if (reply.ok()) {
             BridgeRuntime.setWorkerOnline(true);
             BridgeRuntime.setWorkerStatus("online");
@@ -399,9 +399,12 @@ public final class BridgeService extends Service {
                     if (stream.status != 200) {
                         String body = stream.input == null ? "" : IsapiClient.readText(stream.input, 512);
                         stream.close();
+                        BridgeRuntime.setStreamState(device.estateMateDeviceId, "down",
+                                ("HTTP " + stream.status + " " + body).trim());
                         BridgeLog.append("warn", "alertStream for " + device.name + " returned HTTP " + stream.status + " " + body);
                     } else {
                         backoff = 5000;
+                        BridgeRuntime.setStreamState(device.estateMateDeviceId, "up", null);
                         BridgeLog.append("info", "event stream connected for " + device.name
                                 + (stream.contentType.contains("multipart") ? " (multipart)" : " (bare JSON)"));
                         AlertStreamReader reader = AlertStreamReader.forContentType(stream.contentType, new AlertStreamReader.Sink() {
@@ -418,11 +421,13 @@ public final class BridgeService extends Service {
                             }
                         }
                         stream.close();
+                        BridgeRuntime.setStreamState(device.estateMateDeviceId, "down", "terminal closed the event stream");
                         BridgeLog.append("warn", "event stream closed for " + device.name);
                     }
                 } catch (Exception error) {
                     if (running) {
                         String message = error.getMessage() == null ? error.toString() : error.getMessage();
+                        BridgeRuntime.setStreamState(device.estateMateDeviceId, "down", message);
                         BridgeLog.append("warn", "event stream error for " + device.name + ": " + message);
                     }
                 }

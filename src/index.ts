@@ -3413,24 +3413,72 @@ async function authenticateIsapiAgent(request: Request, env: Env, agentId: strin
 }
 
 /**
+ * The only agents allowed to speak for a terminal are the ones linked to it:
+ * either the denormalized owner (`hikvision_devices.isapi_agent_id`) or a
+ * per-device ISAPI config. Without this check any registered agent could flip
+ * another estate's terminal by guessing its id.
+ */
+const TERMINAL_AGENT_LINK_SQL = `(hikvision_devices.isapi_agent_id=? OR EXISTS (
+          SELECT 1 FROM isapi_device_configs WHERE device_id=hikvision_devices.id AND agent_id=? AND sync_enabled=1
+        ))`;
+
+/**
  * Marks a terminal offline as soon as the agent reports its event stream is
  * down. The hourly sweep would otherwise leave a dead terminal showing online
  * for up to an hour, and the agent process may stay alive (and heartbeating)
  * long after the terminal on the LAN stopped answering.
+ *
+ * 'pending' is retired here too: a terminal that was registered but never proved
+ * itself alive is exactly the one whose stream is most likely broken, and
+ * leaving it on the registration default would hide the fault.
  */
 async function markTerminalStreamDown(env: Env, agentId: string, deviceId: string, reason: string): Promise<boolean> {
   const result = await env.DB.prepare(
     `UPDATE hikvision_devices SET status='offline',updated_at=datetime('now')
-      WHERE id=? AND status='online' AND deleted_at IS NULL
-        AND (isapi_agent_id=? OR EXISTS (
-          SELECT 1 FROM isapi_device_configs WHERE device_id=hikvision_devices.id AND agent_id=? AND sync_enabled=1
-        ))`,
+      WHERE id=? AND status IN ('pending','online') AND deleted_at IS NULL
+        AND ${TERMINAL_AGENT_LINK_SQL}`,
   ).bind(deviceId, agentId, agentId).run();
   if (!Number(result.meta.changes ?? 0)) return false;
   // One audit row per transition, not one per heartbeat.
   await env.DB.prepare(
     `INSERT INTO isapi_sync_logs(id,device_id,agent_id,operation_type,status,message) VALUES (?,?,?,'event_stream','failed',?)`,
   ).bind(crypto.randomUUID(), deviceId, agentId, reason.slice(0, 1000)).run();
+  return true;
+}
+
+/**
+ * Marks a terminal online as soon as its agent proves it is holding the
+ * terminal's alertStream open.
+ *
+ * Presence used to be earned only by forwarding an access event, so a newly
+ * linked, perfectly healthy terminal sat on the schema default 'pending' until
+ * the first resident swiped a card - which an administrator reads as "the
+ * terminal is not working" while the agent next to it is plainly online. An open
+ * alertStream is proof of life: the agent authenticated to the terminal over
+ * ISAPI and the terminal is streaming.
+ *
+ * `last_seen_at` is refreshed on every report, so the ordinary
+ * DEVICE_OFFLINE_MINUTES window still retires the terminal once the agent stops
+ * reporting (agent stopped or unplugged, terminal off the network).
+ */
+async function markTerminalStreamUp(env: Env, agentId: string, deviceId: string): Promise<boolean> {
+  const previous = await env.DB.prepare(
+    `SELECT status FROM hikvision_devices
+      WHERE id=? AND deleted_at IS NULL AND status!='disabled' AND ${TERMINAL_AGENT_LINK_SQL}`,
+  ).bind(deviceId, agentId, agentId).first<{ status: string }>();
+  if (!previous) return false;
+  const statements = [
+    env.DB.prepare(
+      `UPDATE hikvision_devices SET status='online',last_seen_at=datetime('now'),updated_at=datetime('now') WHERE id=? AND status!='disabled'`,
+    ).bind(deviceId),
+  ];
+  if (previous.status !== 'online') {
+    // One audit row per transition, not one per heartbeat.
+    statements.push(env.DB.prepare(
+      `INSERT INTO isapi_sync_logs(id,device_id,agent_id,operation_type,status,message) VALUES (?,?,?,'event_stream','success',?)`,
+    ).bind(crypto.randomUUID(), deviceId, agentId, `Event stream connected; terminal moved from ${previous.status} to online`));
+  }
+  await env.DB.batch(statements);
   return true;
 }
 
@@ -3446,20 +3494,29 @@ async function handleIsapiAgentHeartbeat(request: Request, env: Env, agentId: st
   ).bind(ip, body.hostname?.trim() || null, body.version?.trim() || null, agentId).run();
 
   // Per-terminal presence. The agent reports one entry per EstateMate device id
-  // whose alertStream it is (or is not) holding open; `stream: 'down'` retires
-  // the terminal immediately instead of waiting for the hourly sweep.
+  // whose alertStream it is (or is not) holding open: `stream: 'up'` promotes the
+  // terminal the moment the stream is established, `stream: 'down'` retires it
+  // immediately instead of waiting for the hourly sweep. Both replace the old
+  // behaviour where a terminal only ever went online by forwarding an event, so a
+  // healthy but idle terminal stayed on the 'pending' registration default.
   const reported = Array.isArray(body.devices) ? body.devices as Array<Record<string, unknown>> : [];
   let terminalsOffline = 0;
+  let terminalsOnline = 0;
   for (const entry of reported.slice(0, 100)) {
     const deviceId = typeof entry?.deviceId === 'string' ? entry.deviceId.trim() : '';
-    if (!deviceId || entry?.stream !== 'down') continue;
+    const stream = typeof entry?.stream === 'string' ? entry.stream.trim().toLowerCase() : '';
+    if (!deviceId || (stream !== 'up' && stream !== 'down')) continue;
+    if (stream === 'up') {
+      if (await markTerminalStreamUp(env, agentId, deviceId)) terminalsOnline += 1;
+      continue;
+    }
     const reason = typeof entry?.lastError === 'string' && entry.lastError.trim()
       ? `Event stream down: ${entry.lastError.trim()}`
       : 'Event stream down: the agent cannot hold the terminal connection open';
     if (await markTerminalStreamDown(env, agentId, deviceId, reason)) terminalsOffline += 1;
   }
   return Response.json(
-    { ok: true, agentId, terminalsOffline, serverTime: new Date().toISOString() },
+    { ok: true, agentId, terminalsOffline, terminalsOnline, serverTime: new Date().toISOString() },
     { headers: { 'Cache-Control': 'no-store' } },
   );
 }

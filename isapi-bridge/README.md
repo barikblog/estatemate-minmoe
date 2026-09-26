@@ -42,6 +42,7 @@ How it works:
 - Events arrive as `multipart/mixed` parts (JSON or XML documents). Firmware that streams bare JSON objects is handled by a brace-depth scanner fallback.
 - Documents are buffered and flushed to `POST /api/isapi/v1/agents/:id/events` — up to 50 items per request, or every `eventFlushSeconds` (default 5 s), whichever comes first. The Worker normalizes each document with the same pipeline as direct device posts (profile aliases, granted/denied inference, idempotency on `(device_id, vendor_event_id)`), updates device last-seen, and queues the batch as **one** Queue message so the Cloudflare Workers Free plan Queues allowance (10,000 operations/day ≈ one message ≈ 3 operations) is preserved even on busy estates.
 - On connection loss the agent reconnects with 5 s → 60 s exponential backoff. A local buffer (default 500 events) rides out Worker outages; on overflow the oldest documents are dropped with a warning.
+- Each stream loop's state travels with the heartbeat (`devices: [{ deviceId, stream: 'up'|'down', lastError }]`). The Worker marks the terminal **online** as soon as the stream is `up` — so a linked terminal no longer sits on the `pending` registration default until someone happens to swipe a card — and marks it **offline** immediately on `down`, without waiting for the hourly sweep.
 
 Config knobs (`agent-config.json`):
 

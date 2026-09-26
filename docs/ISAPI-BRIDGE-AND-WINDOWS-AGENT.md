@@ -30,8 +30,9 @@ No SDK required — uses documented ISAPI endpoints available on most K1T, K26xx
 ## Presence: how online/offline is decided
 
 - **Agent** — online while it heartbeats; offline after **3 minutes** without one (3 missed default heartbeats).
-- **Terminal** — online while it forwards events; offline after **10 minutes** without one, or **immediately** when its agent reports the terminal's alertStream as `down` (unreachable, auth failure, stream closed) or when the agent shuts down.
+- **Terminal** — goes **online** as soon as the agent reports its alertStream as `up` (proof the agent authenticated to the terminal and the terminal is streaming) or when the terminal forwards an event, whichever comes first. It reads offline after **10 minutes** with neither, or **immediately** when its agent reports the alertStream as `down` (unreachable, auth failure, stream closed) or when the agent shuts down.
 - Every read derives the status from those windows — the stored `status` column is only a cache the hourly cron refreshes, so the portal can never show a stale green. A row with a NULL `last_seen_at` has never proved it was alive and reads as offline.
+- A freshly registered terminal shows the schema default **`pending`** until a bridge reports its stream `up` (or an event arrives for it). A terminal that was never proven alive and whose stream is reported `down` is retired to `offline` rather than left on `pending`, so a broken gate is never mistaken for "not seen yet". Link the terminal to an agent, and run a bridge with event streaming enabled, for either transition to happen.
 - Deleting an agent, or disconnecting a terminal from one, retires the affected terminals at once.
 
 A healthy agent host can still be holding a dead terminal, which is why per-terminal stream state travels with the heartbeat: the estate PC staying up never keeps an unreachable gate looking online.

@@ -1458,7 +1458,7 @@ function Devices({ user }: { user: User }) {
       <label>Connection pattern<select name="connectionPattern"><option value="">Use profile recommendation (recommended)</option><option value="isapi_bridge">ISAPI bridge agent (cross-platform)</option><option value="windows_agent">Windows agent (ISAPI)</option><option value="isapi_windows_agent">ISAPI Windows agent (combined)</option><option value="manual_sync">Manual synchronization (no agent)</option></select></label>
       <button className="primary">Register</button>
     </FormCard>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Device'],['id','EstateMate device ID','id'],['vendor','Vendor'],['model','Model'],['profile_key','Series profile'],['connection_pattern','Connection'],['isapi_agent_name','ISAPI agent'],['isapi_host','ISAPI host'],['last_isapi_sync_status','ISAPI sync'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['last_seen_at','Last event','date'],['pending_operations','Manual pending'],['queued_operations','Queued ops']]} action={operator?(row)=><div className="row-actions"><button className="text" onClick={()=>edit(row)}>Edit</button><button className="text danger" onClick={()=>remove(row)}>Delete</button></div>:undefined} /></ListState>
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Device'],['id','EstateMate device ID','id'],['vendor','Vendor'],['model','Model'],['profile_key','Series profile'],['connection_pattern','Connection'],['isapi_agent_name','ISAPI agent'],['isapi_host','ISAPI host'],['last_isapi_sync_status','ISAPI sync'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['last_seen_at','Last seen','date'],['pending_operations','Manual pending'],['queued_operations','Queued ops']]} action={operator?(row)=><div className="row-actions"><button className="text" onClick={()=>edit(row)}>Edit</button><button className="text danger" onClick={()=>remove(row)}>Delete</button></div>:undefined} /></ListState>
   </PagePanel>;
 }
 
@@ -1550,7 +1550,7 @@ function IsapiBridge({ user }: { user: User }) {
   >
     <div className="agent-summary">
       <p><strong>Local connection only.</strong> Run one bridge on a Windows or Linux computer, or an Android device, that stays on the same network as the gate terminals. No inbound Internet access or port forwarding is required.</p>
-      <p className="presence-hint"><strong>How status is decided:</strong> an agent is online while it heartbeats (offline after 3 minutes of silence). A terminal is online while it forwards events (offline after 10 minutes), or immediately when its bridge reports the terminal's event stream as down. Stopping or deleting a bridge retires its terminals at once.</p>
+      <p className="presence-hint"><strong>How status is decided:</strong> an agent is online while it heartbeats (offline after 3 minutes of silence). A terminal goes <strong>online</strong> as soon as its bridge holds the terminal's event stream open, or forwards an event — whichever happens first — and reads offline after 10 minutes without either, or immediately when the bridge reports the stream as down. A newly registered terminal shows <strong>pending</strong> until its bridge proves it is reachable. Stopping or deleting a bridge retires its terminals at once.</p>
       <details className="agent-setup">
         <summary>Setup instructions</summary>
         <ol>
