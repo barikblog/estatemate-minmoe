@@ -60,7 +60,7 @@ const navItems: NavItem[] = [
   { id: 'visitors', label: 'Visitors' },
   { id: 'maintenance', label: 'Maintenance', roles: ['admin','manager','resident'] },
   { id: 'notices', label: 'Estate notices' },
-  { id: 'cards', label: 'Access cards', roles: ['admin','manager','cashier','resident'] },
+  { id: 'cards', label: 'Access cards & fingerprints', roles: ['admin','manager','cashier','resident'] },
   { id: 'events', label: 'Gate activity', roles: ['admin','manager','security','resident'] },
   { id: 'devices', label: 'Access-control devices', roles: ['admin','manager','security'] },
   { id: 'isapi', label: 'Device agent', roles: ['admin','manager'] },
@@ -390,8 +390,8 @@ function SectionView({ section, user, config, gate, onNavigate }: { section: Sec
  * docs. Terminating access is a chain; skipping a step leaves a way in.
  */
 const TERMINATION_STEPS: Array<{ title: string; body: string; actionLabel: string; section: Section }> = [
-  { title: 'Revoke or suspend the access card', body: 'Open Access cards, find the person, then Suspend for a temporary stop. EstateMate queues the matching disable-card hardware action for every linked device, and records the change in the card status history.', actionLabel: 'Open Access cards', section: 'cards' },
-  { title: 'Deactivate dependants and household members', body: 'A spouse, child, relative or domestic staff member keeps gate access through their household membership. Under Tenancy & household, deactivate the member so any card issued to them stops working.', actionLabel: 'Open Tenancy & household', section: 'residency' },
+  { title: 'Revoke or suspend the access card and every fingerprint', body: 'Open Access cards & fingerprints, find the person, then Suspend for a temporary stop. EstateMate queues the matching disable-card action for every linked device, records the change in the status history, and queues a fingerprint removal task to confirm on the terminal.', actionLabel: 'Open Access cards & fingerprints', section: 'cards' },
+  { title: 'Deactivate dependants and household members', body: 'A spouse, child, relative or domestic staff member keeps gate access through their household membership. Under Tenancy & household, deactivate the member so any card or fingerprint issued to them stops working.', actionLabel: 'Open Tenancy & household', section: 'residency' },
   { title: 'End the tenancy or the resident account', body: 'Ending a tenancy removes the right to occupy; deactivating the account under People removes the login. Do both when someone moves out. Ownership, billing, card, visitor and gate-event history is preserved either way.', actionLabel: 'Open People', section: 'residents' },
   { title: 'Cancel that household’s live visitor passes', body: 'Reject any pending or checked-in pass issued by the departing household, so a visitor cannot still use an invitation that no longer holds.', actionLabel: 'Open Visitors', section: 'visitors' },
   { title: 'Retire the gate terminal itself', body: 'Under Access-control devices, disable or delete the device. It is soft-deleted so historical gate events keep their reference, and Security officers assigned to that post must select a different gate at their next login.', actionLabel: 'Open devices', section: 'devices' },
@@ -492,13 +492,18 @@ function People({ user }: { user: User }) {
     catch(reason){setMessage(reason instanceof Error?reason.message:'Could not create sample logins');}
   }
   function downloadSamples(){const quote=(value:string)=>`"${value.replaceAll('"','""')}"`;const text=`role,name,email,temporary_password\n${sampleCredentials.map((item)=>[item.role,item.name,item.email,item.temporaryPassword].map(quote).join(',')).join('\n')}\n`;const url=URL.createObjectURL(new Blob([text],{ type:'text/csv' }));const link=document.createElement('a');link.href=url;link.download='estatemate-24-hour-sample-logins.csv';link.click();URL.revokeObjectURL(url);}
-  const actions=canManage?(row:Row)=>user.role==='manager'&&['admin','manager'].includes(String(row.role))?null:<div className="row-actions"><button className="text" onClick={()=>{setEditing(row);setShowForm(false);}}>Edit</button><button className="text" onClick={()=>resetPassword(row)}>Reset password</button>{row.status==='active'?<button className="text" onClick={()=>updateStatus(row,'inactive')}>Deactivate</button>:<button className="text" onClick={()=>updateStatus(row,'active')}>Reactivate</button>}<button className="text danger" onClick={()=>remove(row)}>Delete</button></div>:undefined;
+  const accessDevices=useAsync<{ items:Row[] }>(()=>canManage?api('/api/access/device-options'):Promise.resolve({ items:[] }),[user.role]);
+  const [accessPerson,setAccessPerson]=useState<Row|null>(null);
+  const actions=canManage?(row:Row)=>user.role==='manager'&&['admin','manager'].includes(String(row.role))?null:<div className="row-actions"><button className="text" onClick={()=>{setEditing(row);setShowForm(false);setAccessPerson(null);}}>Edit</button><button className="text" onClick={()=>{setAccessPerson(row);setEditing(null);setShowForm(false);}}>Cards &amp; fingerprints</button><button className="text" onClick={()=>resetPassword(row)}>Reset password</button>{row.status==='active'?<button className="text" onClick={()=>updateStatus(row,'inactive')}>Deactivate</button>:<button className="text" onClick={()=>updateStatus(row,'active')}>Reactivate</button>}<button className="text danger" onClick={()=>remove(row)}>Delete</button></div>:undefined;
   return <PagePanel title="People" subtitle="Register, assign, import and safely manage resident and staff accounts" action={canManage?<div className="row-actions">{user.role==='admin'&&<button className="secondary" onClick={generateSamples}>Create 24-hour sample logins</button>}<button className="secondary" onClick={()=>setShowImport(!showImport)}>Import users</button><button className="primary" onClick={()=>{setShowForm(!showForm);setEditing(null);}}>Add person</button></div>:null}>
     {message&&<Notice tone={/failed|Could not|before|must|cannot|already/i.test(message)?'error':'success'}>{message}</Notice>}
     {temporaryPassword&&<section className="credential-box"><p className="eyebrow">COPY NOW — SHOWN ONCE</p><h3>Temporary password</h3><code>{temporaryPassword}</code><p>Share it securely. The user should change it immediately after signing in.</p><button className="secondary" onClick={()=>navigator.clipboard.writeText(temporaryPassword)}>Copy password</button><button className="text" onClick={()=>setTemporaryPassword('')}>Hide</button></section>}
     {sampleCredentials.length>0&&<section className="credential-box"><p className="eyebrow">24-HOUR SAMPLE LOGINS — SHOWN ONCE</p><h3>All five user categories created</h3><p>Administrator, Manager, Resident, Security and Cashier sample accounts are active for 24 hours.</p><div className="row-actions"><button className="secondary" onClick={downloadSamples}>Download login details</button><button className="text" onClick={()=>setSampleCredentials([])}>Hide</button></div></section>}
     {showForm&&<UserAccountForm actorRole={user.role} properties={available.data?.items ?? []} onDone={(notice)=>{setShowForm(false);setMessage(notice);refresh();}} />}
     {editing&&<UserAccountForm actorRole={user.role} user={editing} properties={available.data?.items ?? []} onDone={(notice)=>{setEditing(null);setMessage(notice);refresh();}} onCancel={()=>setEditing(null)} />}
+    {accessPerson&&<section className="person-access"><div className="row-actions"><button className="secondary sm" onClick={()=>setAccessPerson(null)}>Close access panel</button></div>
+      <PersonCredentials residentId={String(accessPerson.id)} personName={String(accessPerson.name)} devices={accessDevices.data?.items ?? []} onChanged={refresh} />
+    </section>}
     {showImport&&<UsersCsvImporter onDone={()=>{refresh();}} />}
     <div className="people-filters"><label>Search<input value={search} onChange={(event)=>setSearch(event.target.value)} placeholder="Name, email or phone" /></label><label>Role<select value={role} onChange={(event)=>setRole(event.target.value)}><option value="">All roles</option><option value="resident">Residents</option><option value="security">Security</option><option value="cashier">Cashiers</option><option value="manager">Managers</option><option value="admin">Administrators</option></select></label></div>
     <ListState list={list}><DataTable exportTitle="Residents & Staff" rows={list.data?.items ?? []} columns={[['name','Name'],['role','Role'],['email','Email'],['phone','Phone'],['unit_numbers','Owned'],['rented_units','Rented'],['dependant_units','Dependant at'],['property_count','Owned count'],['status','Status']]} action={actions} /></ListState>
@@ -679,6 +684,8 @@ function Residency({ user }: { user: User }) {
   const household = useList('/api/household-members?limit=100');
   const [showTenancy, setShowTenancy] = useState(false);
   const [showMember, setShowMember] = useState(false);
+  const [accessMember,setAccessMember]=useState<Row|null>(null);
+  const accessDevices=useAsync<{ items:Row[] }>(()=>operator?api('/api/access/device-options'):Promise.resolve({ items:[] }),[user.role]);
   const [message, setMessage] = useState('');
   function refresh() { properties.reload(); tenancies.reload(); household.reload(); }
   async function addTenancy(event: FormEvent<HTMLFormElement>) {
@@ -714,7 +721,8 @@ function Residency({ user }: { user: User }) {
   const pendingTenancies = tenancies.data?.items.filter((row) => row.status === 'pending') ?? [];
   const pendingMembers = household.data?.items.filter((row) => row.status === 'pending') ?? [];
   const tenancyActions = (row:Row) => <div className="row-actions"><EvidenceButton entityType="property_tenancy" entityId={row.id} count={row.proof_count} />{operator&&<>{row.status === 'pending' && <><button className="text" onClick={() => tenancyAction(row,'approve')}>Approve</button><button className="text danger" onClick={() => tenancyAction(row,'reject')}>Reject</button></>}{row.status === 'active' && <><button className="text" onClick={() => tenancyAction(row,'update')}>Billing</button><button className="text danger" onClick={() => tenancyAction(row,'end')}>End</button></>}</>}</div>;
-  const memberActions = (row:Row) => <div className="row-actions"><EvidenceButton entityType="household_member" entityId={row.id} count={row.proof_count} />{operator&&<>{row.status === 'pending' && <><button className="text" onClick={() => memberAction(row,'approve')}>Approve</button><button className="text danger" onClick={() => memberAction(row,'reject')}>Reject</button></>}{row.status === 'active' && <><button className="text" onClick={() => memberAction(row,'update')}>Permissions</button>{!row.linked_user_id && <button className="text" onClick={() => createMemberLogin(row)}>Add login</button>}<button className="text danger" onClick={() => memberAction(row,'deactivate')}>Deactivate</button></>}</>}</div>;
+  const accessMemberRow = accessMember ? household.data?.items.find((row) => String(row.id) === String(accessMember.id)) : undefined;
+  const memberActions = (row:Row) => <div className="row-actions"><EvidenceButton entityType="household_member" entityId={row.id} count={row.proof_count} />{operator&&<>{row.status === 'pending' && <><button className="text" onClick={() => memberAction(row,'approve')}>Approve</button><button className="text danger" onClick={() => memberAction(row,'reject')}>Reject</button></>}{row.status === 'active' && <><button className="text" onClick={() => memberAction(row,'update')}>Permissions</button><button className="text" onClick={() => setAccessMember(row)}>Cards &amp; fingerprints</button>{!row.linked_user_id && <button className="text" onClick={() => createMemberLogin(row)}>Add login</button>}<button className="text danger" onClick={() => memberAction(row,'deactivate')}>Deactivate</button></>}</>}</div>;
   return <PagePanel title="Tenancy & household" subtitle="Main tenants, rented apartments, dependants, domestic staff and delegated permissions" action={<div className="row-actions"><button className="secondary" onClick={() => setShowMember(!showMember)}>Add dependant</button><button className="primary" onClick={() => setShowTenancy(!showTenancy)}>{operator ? 'Assign tenant' : 'Nominate tenant'}</button></div>}>
     <Notice tone="info"><strong>Rented apartment:</strong> legal ownership remains with the owner. The approved tenant becomes the main resident for the tenancy dates. The administrator chooses whether future property bills go to the owner or tenant.</Notice>
     {message && <Notice tone={message.includes('Could not') || message.includes('failed') ? 'error' : 'success'}>{message}</Notice>}
@@ -723,6 +731,9 @@ function Residency({ user }: { user: User }) {
     {operator && (pendingTenancies.length > 0 || pendingMembers.length > 0) && <section className="approval-queue"><h3>Pending residency approvals</h3><p>{pendingTenancies.length} tenancy nomination(s) and {pendingMembers.length} household member(s) are waiting.</p></section>}
     <section className="residency-section"><h3>Tenancies</h3><ListState list={tenancies}><DataTable exportTitle="Tenancies" rows={tenancies.data?.items ?? []} columns={[['unit_number','Unit'],['owner_name','Legal owner'],['tenant_name','Main tenant'],['start_date','Starts'],['end_date','Ends'],['billing_responsibility','Bill payer'],['status','Status']]} action={tenancyActions} /></ListState></section>
     <section className="residency-section"><h3>Dependants and household members</h3><ListState list={household}><DataTable exportTitle="Household Members" rows={household.data?.items ?? []} columns={[['name','Name'],['relationship','Relationship'],['unit_number','Unit'],['primary_resident_name','Main resident'],['login_email','Login'],['can_create_visitors','Visitors'],['can_view_bills','Bills'],['status','Status']]} action={memberActions} /></ListState></section>
+    {operator && accessMemberRow && <section className="person-access"><div className="row-actions"><button className="secondary sm" onClick={() => setAccessMember(null)}>Close access panel</button></div>
+      <PersonCredentials householdMemberId={String(accessMemberRow.id)} personName={String(accessMemberRow.name)} devices={accessDevices.data?.items ?? []} onChanged={refresh} />
+    </section>}
   </PagePanel>;
 }
 
@@ -1350,12 +1361,101 @@ function PersonPicker({ picked, onPick }: { picked: PickedPerson | null; onPick:
   </div>;
 }
 
+/**
+ * One person's access credentials: cards and fingerprints, in one place.
+ *
+ * Admin/Manager only — a credential is access, not profile data. Used from the
+ * People table (main residents) and from Tenancy & household (dependants), so a
+ * person's profile gives the same controls as the Access cards & fingerprints page
+ * without hunting for them in a separate screen.
+ */
+function PersonCredentials({ residentId, householdMemberId, personName, devices, onChanged }: {
+  residentId?: string;
+  householdMemberId?: string;
+  personName: string;
+  devices: Row[];
+  onChanged?: () => void;
+}) {
+  const query = residentId ? `residentId=${encodeURIComponent(residentId)}` : `householdMemberId=${encodeURIComponent(String(householdMemberId))}`;
+  const list = useList(`/api/access/credentials?limit=50&${query}`);
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function addCard(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setMessage('');
+    const form = new FormData(event.currentTarget);
+    try {
+      await api('/api/access/cards', { method: 'POST', body: JSON.stringify({
+        ...(residentId ? { residentId } : { householdMemberId }),
+        cardUid: String(form.get('cardUid') ?? '').trim(),
+        cardLabel: String(form.get('cardLabel') ?? '').trim() || undefined,
+      }) });
+      setMessage(`Card added to ${personName}. Hardware synchronization is queued for every linked terminal.`);
+      event.currentTarget.reset(); list.reload(); onChanged?.();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not add the card'); }
+    finally { setBusy(false); }
+  }
+
+  async function addFingerprint(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setMessage('');
+    const form = new FormData(event.currentTarget);
+    try {
+      const result = await api<{ queuedActions:number }>('/api/access/fingerprints', { method: 'POST', body: JSON.stringify({
+        ...(residentId ? { residentId } : { householdMemberId }),
+        fingerNo: Number(form.get('fingerNo')),
+        fingerLabel: String(form.get('fingerLabel') ?? '').trim() || undefined,
+        employeeNo: String(form.get('employeeNo') ?? '').trim() || undefined,
+        deviceId: String(form.get('deviceId') ?? '').trim() || undefined,
+      }) });
+      setMessage(`Fingerprint recorded for ${personName}. ${result.queuedActions} terminal task(s) queued — enroll the finger on the terminal, then mark each action applied under Hardware actions.`);
+      event.currentTarget.reset(); list.reload(); onChanged?.();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not add the fingerprint'); }
+    finally { setBusy(false); }
+  }
+
+  async function change(type: unknown, id: unknown, status: string) {
+    const label = String(type) === 'fingerprint' ? 'fingerprint' : 'card';
+    if (!confirm(`Set this ${label} to ${status}?`)) return;
+    const path = String(type) === 'fingerprint' ? `/api/access/fingerprints/${id}` : `/api/access/cards/${id}`;
+    try {
+      await api(path, { method: 'PATCH', body: JSON.stringify({ status, reason: 'Portal administrator action' }) });
+      setMessage(`${label[0]!.toUpperCase()}${label.slice(1)} set to ${status}. A terminal task is queued where one is needed.`);
+      list.reload(); onChanged?.();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Status change failed'); }
+  }
+
+  const rows = list.data?.items ?? [];
+  return <section className="panel person-credentials">
+    <div className="panel-title"><div><p className="eyebrow">ACCESS</p><h3>{personName} — cards &amp; fingerprints</h3></div><button className="secondary sm" onClick={() => list.reload()}>Refresh</button></div>
+    {message && <Notice tone={/Could not|failed/i.test(message) ? 'error' : 'success'}>{message}</Notice>}
+    <p className="presence-hint">A card is written to a terminal by a linked agent. A fingerprint is captured on the terminal itself — EstateMate records the slot and queues the task, and an operator confirms it under <strong>Hardware actions</strong>.</p>
+    <ListState list={list}><DataTable rows={rows} columns={[['credential_type','Type'],['credential_reference','Card / finger'],['credential_label','Label'],['finger_no','Slot'],['employee_no','Employee no'],['enrolled_device_name','Enrolled at'],['status','Status'],['pending_operations','Open tasks'],['updated_at','Updated','date']]} action={(row) => <div className="row-actions">{String(row.status) === 'active'
+      ? <button className="text danger" onClick={() => change(row.credential_type, row.id, 'suspended')}>Suspend</button>
+      : <button className="text" onClick={() => change(row.credential_type, row.id, 'active')}>Activate</button>}</div>} /></ListState>
+    <div className="credential-forms">
+      <FormCard title={`Add an access card for ${personName}`} onSubmit={addCard}>
+        <label>Card UID / number<input name="cardUid" required placeholder="Printed card number" /></label>
+        <label>Label<input name="cardLabel" placeholder="Main card" /></label>
+        <button className="primary" disabled={busy}>Add card</button>
+      </FormCard>
+      <FormCard title={`Add a fingerprint for ${personName}`} onSubmit={addFingerprint}>
+        <label>Finger slot<select name="fingerNo" defaultValue="1">{[1,2,3,4,5,6,7,8,9,10].map((value) => <option key={value} value={value}>Finger {value}</option>)}</select><small>The slot the terminal stores this finger under (1–10).</small></label>
+        <label>Which finger<input name="fingerLabel" placeholder="Right index" /></label>
+        <label>Employee number<input name="employeeNo" placeholder={residentId ? 'Defaults to the EstateMate person ID' : 'Required for this dependant'} /><small>The terminal identifies the person by this number, so a fingerprint event can be matched to them. A dependant has no default.</small></label>
+        <label>Capture at<select name="deviceId"><option value="">Not recorded yet</option>{devices.map((device) => <option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.gate_name)}</option>)}</select></label>
+        <button className="primary" disabled={busy}>Record fingerprint</button>
+      </FormCard>
+    </div>
+  </section>;
+}
+
 function Cards({ user }: { user: User }) {
   const operator=user.role==='admin'||user.role==='manager';
-  const list = useList('/api/access/cards?limit=50');
+  const list = useList('/api/access/credentials?limit=50');
   const devices=useAsync<{ items:Row[] }>(()=>operator?api('/api/access/device-options'):Promise.resolve({ items:[] }),[user.role]);
   const [show, setShow] = useState(false);
   const [message, setMessage] = useState('');
+  const [credentialKind,setCredentialKind]=useState<'card'|'fingerprint'>('card');
   const [mode,setMode]=useState<'device'|'manual'>('device');
   const [scanSession,setScanSession]=useState<Row|null>(null);
   const [picked,setPicked]=useState<PickedPerson|null>(null);
@@ -1386,16 +1486,41 @@ function Cards({ user }: { user: User }) {
     catch(reason){setMessage(reason instanceof Error?reason.message:'Could not issue scanned card');}
   }
   async function cancelScan(){if(scanSession?.id)await api(`/api/access/card-scan-sessions/${scanSession.id}`,{ method:'DELETE' });setScanSession(null);setMessage('Card scan cancelled.');}
-  async function change(id: unknown, status: string) {
-    if (!confirm(`Set this card to ${status}?`)) return;
-    await api(`/api/access/cards/${id}`, { method: 'PATCH', body: JSON.stringify({ status, reason: 'Portal administrator action' }) }); list.reload();
+  async function removeFingerprint(row: Row) {
+    if (!confirm('Delete this fingerprint credential? The status history is preserved and a removal task is queued for the terminal.')) return;
+    try { await api(`/api/access/fingerprints/${row.id}`, { method: 'DELETE' }); setMessage('Fingerprint revoked and a terminal removal task queued.'); list.reload(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not delete the fingerprint'); }
   }
-  const actions = operator ? (row: Row) => <div className="row-actions">{row.status === 'active' ? <button className="text danger" onClick={() => change(row.id, 'suspended')}>Suspend</button> : <button className="text" onClick={() => change(row.id, 'active')}>Activate</button>}</div> : undefined;
-  return <PagePanel title="Access cards" subtitle="Enroll by tapping a selected device, or enter a known card number manually" action={operator ? <button className="primary" onClick={() => { setShow(!show); setPicked(null); setMessage(''); }}>Issue card</button> : null}>
+  async function submitFingerprint(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setMessage('');
+    if (!picked) { setMessage('Choose the person this fingerprint belongs to.'); return; }
+    const form = new FormData(event.currentTarget);
+    const person = picked.kind === 'resident' ? { residentId: picked.id } : { householdMemberId: picked.id };
+    try {
+      const result = await api<Row>('/api/access/fingerprints', { method: 'POST', body: JSON.stringify({
+        ...person,
+        fingerNo: Number(form.get('fingerNo')),
+        fingerLabel: String(form.get('fingerLabel') ?? '').trim() || undefined,
+        employeeNo: String(form.get('employeeNo') ?? '').trim() || undefined,
+        deviceId: String(form.get('deviceId') ?? '').trim() || undefined,
+      }) });
+      setShow(false); setPicked(null);
+      setMessage(String(result.instruction ?? `Fingerprint recorded for ${picked.name}.`) + ' Mark it applied under Hardware actions once the finger is enrolled.');
+      list.reload();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not record the fingerprint'); }
+  }
+  async function change(row: Row, status: string) {
+    const fingerprint = String(row.credential_type) === 'fingerprint';
+    if (!confirm(`Set this ${fingerprint ? 'fingerprint' : 'card'} to ${status}?`)) return;
+    const path = fingerprint ? `/api/access/fingerprints/${row.id}` : `/api/access/cards/${row.id}`;
+    await api(path, { method: 'PATCH', body: JSON.stringify({ status, reason: 'Portal administrator action' }) }); list.reload();
+  }
+  const actions = operator ? (row: Row) => <div className="row-actions">{row.status === 'active' ? <button className="text danger" onClick={() => change(row, 'suspended')}>Suspend</button> : <button className="text" onClick={() => change(row, 'active')}>Activate</button>}{String(row.credential_type) === 'fingerprint' && <button className="text danger" onClick={() => removeFingerprint(row)}>Delete</button>}</div> : undefined;
+  return <PagePanel title="Access cards & fingerprints" subtitle="Cards are written to a terminal by an agent; fingerprints are captured on the terminal and confirmed here" action={operator ? <button className="primary" onClick={() => { setShow(!show); setPicked(null); setMessage(''); }}>Issue card or fingerprint</button> : null}>
     {message && <Notice tone={message.includes('issued')?'success':message.includes('Waiting')?'info':'error'}>{message}</Notice>}
-    {show && <FormCard title="Issue a physical card" onSubmit={submit}><label>Enrollment method<select value={mode} onChange={(event)=>setMode(event.target.value as 'device'|'manual')}><option value="device">Tap/scan at selected device (recommended)</option><option value="manual">Enter card UID manually</option></select></label>{mode==='device'&&<label>Access-control device<select name="deviceId" required><option value="">Select device</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.model||device.vendor)} — {String(device.gate_name)}</option>)}</select></label>}<PersonPicker picked={picked} onPick={setPicked} />{mode==='manual'&&<label>Card UID / number<input name="cardUid" required /></label>}<label>Label<input name="cardLabel" placeholder="Optional card label" /></label><button className="primary">{mode==='device'?'Start scan':'Issue card'}</button></FormCard>}
+    {show && <FormCard title="Issue a card or record a fingerprint" onSubmit={credentialKind==='card'?submit:submitFingerprint}><label>Credential type<select value={credentialKind} onChange={(event)=>setCredentialKind(event.target.value as 'card'|'fingerprint')}><option value="card">Access card</option><option value="fingerprint">Fingerprint</option></select></label>{credentialKind==='card'?<><label>Enrollment method<select value={mode} onChange={(event)=>setMode(event.target.value as 'device'|'manual')}><option value="device">Tap/scan at selected device (recommended)</option><option value="manual">Enter card UID manually</option></select></label>{mode==='device'&&<label>Access-control device<select name="deviceId" required><option value="">Select device</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.model||device.vendor)} — {String(device.gate_name)}</option>)}</select></label>}<PersonPicker picked={picked} onPick={setPicked} />{mode==='manual'&&<label>Card UID / number<input name="cardUid" required /></label>}<label>Label<input name="cardLabel" placeholder="Optional card label" /></label><button className="primary">{mode==='device'?'Start scan':'Issue card'}</button></>:<><p className="form-note">A fingerprint is captured on the terminal, not through the browser: pick the person and the slot, then enroll the finger on the terminal and confirm the queued task under <strong>Hardware actions</strong>.</p><PersonPicker picked={picked} onPick={setPicked} /><label>Finger slot<select name="fingerNo" defaultValue="1">{[1,2,3,4,5,6,7,8,9,10].map((value)=><option key={value} value={value}>Finger {value}</option>)}</select></label><label>Which finger<input name="fingerLabel" placeholder="Right index" /></label><label>Employee number<input name="employeeNo" placeholder="Defaults to the EstateMate person ID" /><small>Required when the person chosen is a dependant.</small></label><label>Capture at<select name="deviceId"><option value="">Not recorded yet</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.gate_name)}</option>)}</select></label><button className="primary">Record fingerprint</button></>}</FormCard>}
     {scanSession&&<section className={`enrollment-session ${String(scanSession.status)}`}><p className="eyebrow">DEVICE CARD ENROLLMENT</p><h3>{scanSession.status==='captured'?'Card detected':'Waiting for a card…'}</h3>{Boolean(scanSession.captured_credential)&&<strong className="credential-number">{String(scanSession.captured_credential)}</strong>}<p>Present the card at the selected device. EstateMate captures the next card credential event, including a denied unknown-card event.</p><div className="row-actions">{scanSession.status==='captured'&&<button className="primary" onClick={completeScan}>Confirm and issue card</button>}<button className="secondary" onClick={cancelScan}>Cancel</button></div></section>}
-    <ListState list={list}><DataTable exportTitle="Access Cards" rows={list.data?.items ?? []} columns={[['resident_name','Main resident'],['household_member_name','Card holder'],['relationship','Relationship'],['unit_number','Unit'],['card_uid','Card UID'],['card_label','Label'],['status','Status'],['deactivated_reason','Reason'],['updated_at','Updated','date']]} action={actions} /></ListState>
+    <ListState list={list}><DataTable exportTitle="Access Credentials" rows={list.data?.items ?? []} columns={[['credential_type','Type'],['resident_name','Main resident'],['household_member_name','Holder'],['unit_number','Unit'],['credential_reference','Card / finger'],['finger_no','Slot'],['credential_label','Label'],['enrolled_device_name','Enrolled at'],['employee_no','Employee no'],['status','Status'],['deactivated_reason','Reason'],['pending_operations','Open tasks'],['updated_at','Updated','date']]} action={actions} /></ListState>
   </PagePanel>;
 }
 
@@ -1458,7 +1583,7 @@ function Devices({ user }: { user: User }) {
       <label>Connection pattern<select name="connectionPattern"><option value="">Use profile recommendation (recommended)</option><option value="isapi_bridge">ISAPI bridge agent (cross-platform)</option><option value="windows_agent">Windows agent (ISAPI)</option><option value="isapi_windows_agent">ISAPI Windows agent (combined)</option><option value="manual_sync">Manual synchronization (no agent)</option></select></label>
       <button className="primary">Register</button>
     </FormCard>}
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Device'],['id','EstateMate device ID','id'],['vendor','Vendor'],['model','Model'],['profile_key','Series profile'],['connection_pattern','Connection'],['isapi_agent_name','ISAPI agent'],['isapi_host','ISAPI host'],['last_isapi_sync_status','ISAPI sync'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['last_seen_at','Last event','date'],['pending_operations','Manual pending'],['queued_operations','Queued ops']]} action={operator?(row)=><div className="row-actions"><button className="text" onClick={()=>edit(row)}>Edit</button><button className="text danger" onClick={()=>remove(row)}>Delete</button></div>:undefined} /></ListState>
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Device'],['id','EstateMate device ID','id'],['vendor','Vendor'],['model','Model'],['profile_key','Series profile'],['connection_pattern','Connection'],['isapi_agent_name','ISAPI agent'],['isapi_host','ISAPI host'],['last_isapi_sync_status','ISAPI sync'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['last_seen_at','Last seen','date'],['pending_operations','Manual pending'],['queued_operations','Queued ops']]} action={operator?(row)=><div className="row-actions"><button className="text" onClick={()=>edit(row)}>Edit</button><button className="text danger" onClick={()=>remove(row)}>Delete</button></div>:undefined} /></ListState>
   </PagePanel>;
 }
 
@@ -1550,7 +1675,7 @@ function IsapiBridge({ user }: { user: User }) {
   >
     <div className="agent-summary">
       <p><strong>Local connection only.</strong> Run one bridge on a Windows or Linux computer, or an Android device, that stays on the same network as the gate terminals. No inbound Internet access or port forwarding is required.</p>
-      <p className="presence-hint"><strong>How status is decided:</strong> an agent is online while it heartbeats (offline after 3 minutes of silence). A terminal is online while it forwards events (offline after 10 minutes), or immediately when its bridge reports the terminal's event stream as down. Stopping or deleting a bridge retires its terminals at once.</p>
+      <p className="presence-hint"><strong>How status is decided:</strong> an agent is online while it heartbeats (offline after 3 minutes of silence). A terminal goes <strong>online</strong> as soon as its bridge holds the terminal's event stream open, or forwards an event — whichever happens first — and reads offline after 10 minutes without either, or immediately when the bridge reports the stream as down. A newly registered terminal shows <strong>pending</strong> until its bridge proves it is reachable. Stopping or deleting a bridge retires its terminals at once.</p>
       <details className="agent-setup">
         <summary>Setup instructions</summary>
         <ol>
@@ -1613,11 +1738,13 @@ function IsapiBridge({ user }: { user: User }) {
 }
 
 function Operations() {
+  const [copyNotice, copy] = useCopy();
   const list = useList('/api/access/operations?limit=100');
   async function mark(id: unknown, status: 'applied'|'failed') { await api(`/api/access/operations/${id}`, { method: 'PATCH', body: JSON.stringify({ status }) }); list.reload(); }
   return <PagePanel title="Hardware actions" subtitle="Changes that must reach each physical terminal">
-    <Notice tone="warning">With HTTP Listening only, apply these changes in the terminal UI, iVMS-4200, or an approved Hikvision cloud command channel. Then mark them applied here.</Notice>
-    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['device_name','Device'],['credential_kind','Credential'],['operation','Action'],['card_uid','Number'],['status','Status'],['created_at','Created','date'],['error_message','Error']]} action={(row) => <div className="row-actions"><button className="text" onClick={() => mark(row.id, 'applied')}>Mark applied</button><button className="text danger" onClick={() => mark(row.id, 'failed')}>Failed</button></div>} /></ListState>
+    <Notice tone="warning">Cards with a linked agent are written automatically. Fingerprints — and everything with only HTTP Listening — must be applied in the terminal UI, iVMS-4200, or an approved Hikvision cloud command channel. Then mark them applied here.</Notice>
+    {copyNotice && <Notice tone="info">{copyNotice}</Notice>}
+    <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['device_name','Device'],['credential_kind','Credential'],['operation','Action'],['credential_reference','Card / finger'],['holder_name','Holder'],['manual_instruction','What to do'],['status','Status'],['created_at','Created','date'],['error_message','Error']]} action={(row) => <div className="row-actions">{Boolean(row.manual_instruction) && <button className="text" onClick={() => copy(String(row.manual_instruction), 'Instructions')}>Copy steps</button>}<button className="text" onClick={() => mark(row.id, 'applied')}>Mark applied</button><button className="text danger" onClick={() => mark(row.id, 'failed')}>Failed</button></div>} /></ListState>
   </PagePanel>;
 }
 

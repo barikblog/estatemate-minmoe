@@ -255,6 +255,10 @@ async function deactivatePrimaryHousehold(env: Env, propertyId: string, primaryR
     `SELECT c.id,c.card_uid FROM access_cards c JOIN household_members h ON h.id=c.household_member_id
      WHERE h.property_id=? AND h.primary_resident_id=? AND c.status='active'`,
   ).bind(propertyId,primaryResidentId).all<{ id:string;card_uid:string }>();
+  const fingers = await env.DB.prepare(
+    `SELECT f.id,f.finger_no,f.employee_no FROM fingerprint_credentials f JOIN household_members h ON h.id=f.household_member_id
+     WHERE h.property_id=? AND h.primary_resident_id=? AND f.status='active'`,
+  ).bind(propertyId,primaryResidentId).all<{ id:string;finger_no:number;employee_no:string|null }>();
   await env.DB.prepare(
     `UPDATE household_members SET status='inactive',deactivated_by=?,deactivated_at=datetime('now'),updated_at=datetime('now')
      WHERE property_id=? AND primary_resident_id=? AND status IN ('pending','active')`,
@@ -265,6 +269,14 @@ async function deactivatePrimaryHousehold(env: Env, propertyId: string, primaryR
       env.DB.prepare(`INSERT INTO card_status_changes(id,card_id,old_status,new_status,reason,changed_by) VALUES (?,?,'active','suspended','main tenancy ended',?)`).bind(crypto.randomUUID(),card.id,actorId),
     ]);
     await createDeviceOperations(env,card.id,'disable_card',{ cardUid:card.card_uid,enabled:false,reason:'main tenancy ended' });
+  }
+  for (const finger of fingers.results) {
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE fingerprint_credentials SET status='suspended',deactivated_at=datetime('now'),deactivated_reason='main tenancy ended',updated_at=datetime('now') WHERE id=?`).bind(finger.id),
+      env.DB.prepare(`INSERT INTO fingerprint_status_changes(id,fingerprint_id,old_status,new_status,reason,changed_by) VALUES (?,?,'active','suspended','main tenancy ended',?)`).bind(crypto.randomUUID(),finger.id,actorId),
+    ]);
+    await createFingerprintOperations(env,finger.id,'disable_fingerprint',{ fingerprintId:finger.id,fingerNo:finger.finger_no,employeeNo:finger.employee_no,enabled:false,reason:'main tenancy ended' },
+      `Remove or disable finger ${finger.finger_no} on the terminal (main tenancy ended), then mark this action applied.`);
   }
 }
 
@@ -955,6 +967,15 @@ app.patch('/api/household-members/:id', requireRoles('admin','manager'), async (
       ]);
       await createDeviceOperations(c.env,card.id,'disable_card',{ cardUid:card.card_uid,enabled:false,reason:'household membership inactive' });
     }
+    const fingers = await c.env.DB.prepare(`SELECT id,finger_no,employee_no FROM fingerprint_credentials WHERE household_member_id=? AND status='active'`).bind(c.req.param('id')).all<{ id:string;finger_no:number;employee_no:string|null }>();
+    for (const finger of fingers.results) {
+      await c.env.DB.batch([
+        c.env.DB.prepare(`UPDATE fingerprint_credentials SET status='suspended',updated_at=datetime('now'),deactivated_at=datetime('now'),deactivated_reason='household membership inactive' WHERE id=?`).bind(finger.id),
+        c.env.DB.prepare(`INSERT INTO fingerprint_status_changes(id,fingerprint_id,old_status,new_status,reason,changed_by) VALUES (?,?,'active','suspended','household membership inactive',?)`).bind(crypto.randomUUID(),finger.id,c.get('user').id),
+      ]);
+      await createFingerprintOperations(c.env,finger.id,'disable_fingerprint',{ fingerprintId:finger.id,fingerNo:finger.finger_no,employeeNo:finger.employee_no,enabled:false,reason:'household membership inactive' },
+        `Remove or disable finger ${finger.finger_no} on the terminal (household membership inactive), then mark this action applied.`);
+    }
   }
   await audit(c, body.action, 'household_member', c.req.param('id'), { canCreateVisitors: Boolean(visitorPermission), canViewBills: Boolean(billPermission) });
   return c.json({ ok: true, status });
@@ -1213,6 +1234,17 @@ async function suspendUserCards(env:Env,userId:string,actorId:string,reason:stri
       env.DB.prepare(`INSERT INTO card_status_changes(id,card_id,old_status,new_status,reason,changed_by) VALUES (?,?,'active','suspended',?,?)`).bind(crypto.randomUUID(),card.id,reason,actorId),
     ]);
     await createDeviceOperations(env,card.id,'disable_card',{ cardUid:card.card_uid,enabled:false,reason });
+  }
+  // Suspending the person suspends every credential they use, not only the plastic
+  // one; otherwise a deactivated account keeps opening gates with a finger.
+  const fingers=await env.DB.prepare(`SELECT id,finger_no,employee_no FROM fingerprint_credentials WHERE resident_id=? AND status='active'`).bind(userId).all<{ id:string;finger_no:number;employee_no:string|null }>();
+  for (const finger of fingers.results) {
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE fingerprint_credentials SET status='suspended',deactivated_at=datetime('now'),deactivated_reason=?,updated_at=datetime('now') WHERE id=? AND status='active'`).bind(reason,finger.id),
+      env.DB.prepare(`INSERT INTO fingerprint_status_changes(id,fingerprint_id,old_status,new_status,reason,changed_by) VALUES (?,?,'active','suspended',?,?)`).bind(crypto.randomUUID(),finger.id,reason,actorId),
+    ]);
+    await createFingerprintOperations(env,finger.id,'disable_fingerprint',{ fingerprintId:finger.id,fingerNo:finger.finger_no,employeeNo:finger.employee_no,enabled:false,reason },
+      `Remove or disable finger ${finger.finger_no} on the terminal (${reason}), then mark this action applied.`);
   }
 }
 
@@ -2447,15 +2479,226 @@ app.get('/api/access/cards', async (c) => {
   const user = c.get('user');
   const { limit, offset, page: pageNumber } = page(c);
   const residentId = user.role === 'resident' ? user.id : (c.req.query('residentId') ?? null);
+  // `householdMemberId` lets a person's profile show exactly that dependant's
+  // cards rather than every card the main resident holds.
+  const householdMemberId = c.req.query('householdMemberId') ?? null;
   const result = await c.env.DB.prepare(
     `SELECT c.*,u.name AS resident_name,hm.name AS household_member_name,hm.relationship,
        COALESCE(hp.unit_number,p.unit_number) AS unit_number
      FROM access_cards c JOIN users u ON u.id=c.resident_id
      LEFT JOIN household_members hm ON hm.id=c.household_member_id
      LEFT JOIN properties hp ON hp.id=hm.property_id LEFT JOIN properties p ON p.id=u.property_id
-     WHERE (? IS NULL OR c.resident_id=? OR hm.linked_user_id=?) ORDER BY c.created_at DESC LIMIT ? OFFSET ?`,
-  ).bind(residentId,residentId,residentId,limit,offset).all();
+     WHERE (? IS NULL OR (c.resident_id=? OR hm.linked_user_id=?))
+       AND (? IS NULL OR c.household_member_id=?)
+     ORDER BY c.created_at DESC LIMIT ? OFFSET ?`,
+  ).bind(residentId,residentId,residentId,householdMemberId,householdMemberId,limit,offset).all();
   return c.json({ items: result.results, page: pageNumber, limit });
+});
+
+/**
+ * Fingerprint credentials.
+ *
+ * A fingerprint is recorded the way the terminal stores it: the person, the finger
+ * slot, and (optionally) the employee number the terminal knows them by. The
+ * hardware step is an operator enrolling the finger at the terminal — see
+ * `createFingerprintOperations` for why that is not automatic.
+ */
+const FINGERPRINT_SELECT = `SELECT f.*,u.name AS resident_name,u.email AS resident_email,u.property_id AS resident_property_id,
+   hm.name AS household_member_name,hm.relationship,
+   COALESCE(hp.unit_number,p.unit_number) AS unit_number,
+   d.name AS enrolled_device_name,d.gate_name AS enrolled_device_gate,
+   (SELECT COUNT(*) FROM device_operations o WHERE o.fingerprint_id=f.id AND o.status='manual_action_required') AS pending_operations
+ FROM fingerprint_credentials f JOIN users u ON u.id=f.resident_id
+ LEFT JOIN household_members hm ON hm.id=f.household_member_id
+ LEFT JOIN properties hp ON hp.id=hm.property_id LEFT JOIN properties p ON p.id=u.property_id
+ LEFT JOIN hikvision_devices d ON d.id=f.enrolled_device_id`;
+
+app.get('/api/access/fingerprints', async (c) => {
+  const user = c.get('user');
+  const { limit, offset, page: pageNumber } = page(c);
+  const residentId = user.role === 'resident' ? user.id : (c.req.query('residentId') ?? null);
+  const householdMemberId = c.req.query('householdMemberId') ?? null;
+  const result = await c.env.DB.prepare(
+    `${FINGERPRINT_SELECT}
+     WHERE (? IS NULL OR (f.resident_id=? OR hm.linked_user_id=?))
+       AND (? IS NULL OR f.household_member_id=?)
+     ORDER BY f.created_at DESC LIMIT ? OFFSET ?`,
+  ).bind(residentId,residentId,residentId,householdMemberId,householdMemberId,limit,offset).all();
+  return c.json({ items: result.results, page: pageNumber, limit });
+});
+
+/**
+ * Both credential types in one shape, so "Access cards & fingerprints" is a
+ * single reliable list and a resident sees their own cards and fingers together.
+ */
+app.get('/api/access/credentials', async (c) => {
+  const user = c.get('user');
+  const { limit, offset, page: pageNumber } = page(c);
+  const residentId = user.role === 'resident' ? user.id : (c.req.query('residentId') ?? null);
+  const householdMemberId = c.req.query('householdMemberId') ?? null;
+  const type = c.req.query('credentialType') ?? null;
+  if (type && !['card','fingerprint'].includes(type)) return jsonError(c, 400, 'credentialType must be card or fingerprint');
+  const result = await c.env.DB.prepare(
+    `SELECT * FROM (
+       SELECT c.id,c.resident_id,c.household_member_id,'card' AS credential_type,c.card_uid AS credential_reference,c.card_label AS credential_label,
+         NULL AS finger_no,NULL AS employee_no,NULL AS enrolled_device_name,c.status,c.issued_at AS granted_at,c.expires_at,
+         c.deactivated_reason,c.created_at,c.updated_at,
+         u.name AS resident_name,hm.name AS household_member_name,hm.relationship,COALESCE(hp.unit_number,p.unit_number) AS unit_number,
+         (SELECT COUNT(*) FROM device_operations o WHERE o.card_id=c.id AND o.status='manual_action_required') AS pending_operations
+       FROM access_cards c JOIN users u ON u.id=c.resident_id
+       LEFT JOIN household_members hm ON hm.id=c.household_member_id
+       LEFT JOIN properties hp ON hp.id=hm.property_id LEFT JOIN properties p ON p.id=u.property_id
+       WHERE (? IS NULL OR (c.resident_id=? OR hm.linked_user_id=?)) AND (? IS NULL OR c.household_member_id=?)
+       UNION ALL
+       SELECT f.id,f.resident_id,f.household_member_id,'fingerprint',COALESCE(f.finger_label,'Finger ' || f.finger_no),f.finger_label,
+         f.finger_no,f.employee_no,d.name,f.status,f.enrolled_at,f.expires_at,
+         f.deactivated_reason,f.created_at,f.updated_at,
+         u.name,hm.name,hm.relationship,COALESCE(hp.unit_number,p.unit_number),
+         (SELECT COUNT(*) FROM device_operations o WHERE o.fingerprint_id=f.id AND o.status='manual_action_required')
+       FROM fingerprint_credentials f JOIN users u ON u.id=f.resident_id
+       LEFT JOIN household_members hm ON hm.id=f.household_member_id
+       LEFT JOIN properties hp ON hp.id=hm.property_id LEFT JOIN properties p ON p.id=u.property_id
+       LEFT JOIN hikvision_devices d ON d.id=f.enrolled_device_id
+       WHERE (? IS NULL OR (f.resident_id=? OR hm.linked_user_id=?)) AND (? IS NULL OR f.household_member_id=?)
+     )
+     WHERE (? IS NULL OR credential_type=?)
+     ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+  ).bind(
+    residentId,residentId,residentId,householdMemberId,householdMemberId,
+    residentId,residentId,residentId,householdMemberId,householdMemberId,
+    type,type,limit,offset,
+  ).all();
+  return c.json({ items: result.results, page: pageNumber, limit });
+});
+
+app.post('/api/access/fingerprints', requireRoles('admin','manager'), async (c) => {
+  const body = await c.req.json<{
+    residentId?: string; householdMemberId?: string; fingerNo?: number|string; fingerLabel?: string;
+    employeeNo?: string; deviceId?: string; expiresAt?: string;
+  }>();
+  if (!body.residentId && !body.householdMemberId) return jsonError(c, 400, 'residentId or householdMemberId is required');
+  // The slot is what the terminal stores the template under; without it the record
+  // cannot be matched to a finger on the device or removed later.
+  const fingerNo = Number(body.fingerNo);
+  if (!Number.isInteger(fingerNo) || fingerNo < 1 || fingerNo > 10) return jsonError(c, 400, 'fingerNo must be a whole number between 1 and 10');
+  let residentId = body.residentId;
+  let householdMemberId: string|null = null;
+  let employeeNo = body.employeeNo?.trim() || null;
+  let personName = '';
+  if (body.householdMemberId) {
+    const member = await c.env.DB.prepare(
+      `SELECT id,primary_resident_id,name FROM household_members WHERE id=? AND status='active'`,
+    ).bind(body.householdMemberId).first<{ id:string;primary_resident_id:string;name:string }>();
+    if (!member) return jsonError(c, 404, 'Active household member not found');
+    residentId = member.primary_resident_id;
+    householdMemberId = member.id;
+    personName = member.name;
+  } else {
+    const resident = await c.env.DB.prepare(`SELECT id,name FROM users WHERE id=? AND status='active'`).bind(residentId).first<{ id:string;name:string }>();
+    if (!resident) return jsonError(c, 404, 'Active account not found');
+    personName = resident.name;
+    // Default the terminal's employee number to the EstateMate user id, which is
+    // stable and already what the portal can show on the device side.
+    employeeNo ||= resident.id;
+  }
+  let deviceId: string|null = null;
+  let deviceName = '';
+  if (body.deviceId) {
+    const device = await c.env.DB.prepare(`SELECT id,name,gate_name FROM hikvision_devices WHERE id=? AND deleted_at IS NULL AND status!='disabled'`).bind(body.deviceId).first<{ id:string;name:string;gate_name:string }>();
+    if (!device) return jsonError(c, 404, 'Active access-control device not found');
+    deviceId = device.id;
+    deviceName = device.name;
+  }
+  const duplicate = await c.env.DB.prepare(
+    `SELECT id FROM fingerprint_credentials WHERE resident_id=? AND COALESCE(household_member_id,'')=? AND finger_no=? AND status IN ('active','suspended')`,
+  ).bind(residentId, householdMemberId ?? '', fingerNo).first();
+  if (duplicate) return jsonError(c, 409, `Finger ${fingerNo} is already registered for ${personName}`);
+  const id = crypto.randomUUID();
+  const expiresAt = body.expiresAt?.trim() || null;
+  await c.env.DB.prepare(
+    `INSERT INTO fingerprint_credentials(id,resident_id,household_member_id,employee_no,finger_no,finger_label,enrolled_device_id,expires_at,created_by)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+  ).bind(id, residentId, householdMemberId, employeeNo, fingerNo, body.fingerLabel?.trim() || null, deviceId, expiresAt, c.get('user').id).run();
+  const instruction = deviceName
+    ? `Enroll ${body.fingerLabel?.trim() || `finger ${fingerNo}`} for ${personName} on ${deviceName}, using finger slot ${fingerNo}${employeeNo ? ` and employee number ${employeeNo}` : ''}. Then mark this action applied.`
+    : `Enroll ${body.fingerLabel?.trim() || `finger ${fingerNo}`} for ${personName} on the terminal, using finger slot ${fingerNo}${employeeNo ? ` and employee number ${employeeNo}` : ''}. Then mark this action applied.`;
+  const queued = await createFingerprintOperations(c.env, id, 'enroll_fingerprint', { fingerprintId:id, fingerNo, employeeNo, personName, deviceId, enabled:true }, instruction, { deviceId });
+  await audit(c, 'enroll', 'fingerprint_credential', id, { residentId, householdMemberId, fingerNo, employeeNo, deviceId });
+  return c.json({
+    id,
+    fingerNo,
+    employeeNo,
+    credentialType: 'fingerprint',
+    queuedActions: queued,
+    hardwareSync: 'manual_action_required',
+    instruction,
+  }, 201);
+});
+
+interface FingerprintRecordRow {
+  id: string;
+  status: string;
+  finger_no: number;
+  employee_no: string | null;
+  resident_id: string;
+  household_member_id: string | null;
+  label: string;
+  resident_name: string;
+}
+
+app.patch('/api/access/fingerprints/:id', requireRoles('admin','manager'), async (c) => {
+  const body = await c.req.json<{ status?: 'active'|'expired'|'suspended'|'revoked'; reason?: string; fingerLabel?: string }>();
+  const record = await c.env.DB.prepare(
+    `SELECT f.id,f.status,f.finger_no,f.employee_no,f.resident_id,f.household_member_id,COALESCE(f.finger_label,'Finger ' || f.finger_no) AS label,u.name AS resident_name
+     FROM fingerprint_credentials f JOIN users u ON u.id=f.resident_id WHERE f.id=?`,
+  ).bind(c.req.param('id')).first<FingerprintRecordRow>();
+  if (!record) return jsonError(c, 404, 'Fingerprint credential not found');
+  const status = body.status;
+  if (body.status !== undefined && !['active','expired','suspended','revoked'].includes(String(body.status))) return jsonError(c, 400, 'Invalid status');
+  if (body.status === undefined && body.fingerLabel === undefined) return jsonError(c, 400, 'Provide status or fingerLabel');
+  const statements = [];
+  if (status) {
+    statements.push(c.env.DB.prepare(
+      `UPDATE fingerprint_credentials SET status=?,deactivated_at=CASE WHEN ?='active' THEN NULL ELSE datetime('now') END,deactivated_reason=?,auto_expired=0,updated_at=datetime('now') WHERE id=?`,
+    ).bind(status, status, body.reason?.trim() || null, record.id));
+    statements.push(c.env.DB.prepare(
+      `INSERT INTO fingerprint_status_changes(id,fingerprint_id,old_status,new_status,reason,changed_by) VALUES (?,?,?,?,?,?)`,
+    ).bind(crypto.randomUUID(), record.id, String(record.status), status, body.reason?.trim() || 'portal administrator action', c.get('user').id));
+  }
+  if (body.fingerLabel !== undefined) {
+    statements.push(c.env.DB.prepare(`UPDATE fingerprint_credentials SET finger_label=?,updated_at=datetime('now') WHERE id=?`).bind(body.fingerLabel.trim() || null, record.id));
+  }
+  await c.env.DB.batch(statements);
+  let queued = 0;
+  if (status) {
+    const personName = String(record.resident_name ?? 'this person');
+    const label = String(record.label ?? `finger ${record.finger_no}`);
+    const employeeNo = record.employee_no ? ` for employee number ${record.employee_no}` : '';
+    queued = status === 'active'
+      ? await createFingerprintOperations(c.env, record.id!, 'enable_fingerprint', { fingerprintId:record.id, fingerNo:record.finger_no, employeeNo:record.employee_no, enabled:true },
+        `Re-enable ${label}${employeeNo} (${personName}) on the terminal, then mark this action applied.`)
+      : await createFingerprintOperations(c.env, record.id!, 'disable_fingerprint', { fingerprintId:record.id, fingerNo:record.finger_no, employeeNo:record.employee_no, enabled:false, reason:body.reason?.trim() || 'portal administrator action' },
+        `Remove or disable ${label}${employeeNo} (${personName}) on the terminal, then mark this action applied.`);
+  }
+  await audit(c, 'status_change', 'fingerprint_credential', record.id!, { status, reason: body.reason, queuedActions: queued });
+  return c.json({ ok: true, queuedActions: queued, hardwareSync: 'manual_action_required' });
+});
+
+app.delete('/api/access/fingerprints/:id', requireRoles('admin','manager'), async (c) => {
+  const record = await c.env.DB.prepare(
+    `SELECT f.id,f.finger_no,f.employee_no,f.status,f.resident_id,f.household_member_id,COALESCE(f.finger_label,'Finger ' || f.finger_no) AS label,u.name AS resident_name
+     FROM fingerprint_credentials f JOIN users u ON u.id=f.resident_id WHERE f.id=?`,
+  ).bind(c.req.param('id')).first<FingerprintRecordRow>();
+  if (!record) return jsonError(c, 404, 'Fingerprint credential not found');
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE fingerprint_credentials SET status='revoked',deactivated_at=datetime('now'),deactivated_reason='deleted by administrator',updated_at=datetime('now') WHERE id=?`).bind(record.id),
+    c.env.DB.prepare(`INSERT INTO fingerprint_status_changes(id,fingerprint_id,old_status,new_status,reason,changed_by) VALUES (?,?,?,'revoked','deleted by administrator',?)`).bind(crypto.randomUUID(), record.id, String(record.status), c.get('user').id),
+  ]);
+  const employeeNo = record.employee_no ? ` for employee number ${record.employee_no}` : '';
+  const queued = await createFingerprintOperations(c.env, record.id!, 'delete_fingerprint', { fingerprintId:record.id, fingerNo:record.finger_no, employeeNo:record.employee_no, enabled:false },
+    `Delete ${record.label}${employeeNo} (${record.resident_name}) from the terminal, then mark this action applied.`);
+  await audit(c, 'delete', 'fingerprint_credential', record.id!, { reason:'revoked-with-history-preserved', queuedActions: queued });
+  return c.json({ ok: true, historyPreserved: true, queuedActions: queued });
 });
 
 app.post('/api/access/cards', requireRoles('admin','manager'), async (c) => {
@@ -2736,16 +2979,22 @@ app.get('/api/access/operations', requireRoles('admin','manager'), async (c) => 
   const { limit, offset, page: pageNumber } = page(c);
   const result = await c.env.DB.prepare(
     `SELECT * FROM (
-       SELECT o.id,o.device_id,o.operation,o.payload_json,o.status,o.attempts,o.error_message,o.created_at,o.updated_at,d.name AS device_name,c.card_uid,'card' AS credential_kind
+       SELECT o.id,o.device_id,o.operation,o.payload_json,o.status,o.attempts,o.error_message,o.manual_instruction,o.created_at,o.updated_at,d.name AS device_name,c.card_uid AS credential_reference,'card' AS credential_kind,NULL AS holder_name
        FROM device_operations o JOIN hikvision_devices d ON d.id=o.device_id LEFT JOIN access_cards c ON c.id=o.card_id
-       WHERE o.status IN ('pending','manual_action_required','failed')
+       WHERE o.status IN ('pending','manual_action_required','failed') AND o.card_id IS NOT NULL
        UNION ALL
-       SELECT o.id,o.device_id,o.operation,o.payload_json,o.status,o.attempts,o.error_message,o.created_at,o.updated_at,d.name,v.credential_number,'visitor'
+       SELECT o.id,o.device_id,o.operation,o.payload_json,o.status,o.attempts,o.error_message,o.manual_instruction,o.created_at,o.updated_at,d.name,
+         'finger ' || f.finger_no,'fingerprint',u.name
+       FROM device_operations o JOIN hikvision_devices d ON d.id=o.device_id
+       JOIN fingerprint_credentials f ON f.id=o.fingerprint_id JOIN users u ON u.id=f.resident_id
+       WHERE o.status IN ('pending','manual_action_required','failed') AND o.fingerprint_id IS NOT NULL
+       UNION ALL
+       SELECT o.id,o.device_id,o.operation,o.payload_json,o.status,o.attempts,o.error_message,NULL,o.created_at,o.updated_at,d.name,v.credential_number,'visitor',v.visitor_name
        FROM visitor_device_operations o JOIN hikvision_devices d ON d.id=o.device_id JOIN visitor_requests v ON v.id=o.visitor_request_id
        WHERE o.status IN ('pending','manual_action_required','failed')
      ) ORDER BY created_at LIMIT ? OFFSET ?`,
   ).bind(limit, offset).all();
-  return c.json({ items: result.results, page: pageNumber, limit, note: 'HTTP Listening is upload-only. These operations require manual application or a supported ISUP/Hikvision cloud command bridge.' });
+  return c.json({ items: result.results, page: pageNumber, limit, note: 'Card and visitor changes are applied by a linked agent; fingerprint enrollment always happens on the terminal and is confirmed here.' });
 });
 
 app.patch('/api/access/operations/:id', requireRoles('admin','manager'), async (c) => {
@@ -3286,6 +3535,43 @@ async function createDeviceOperations(
   }));
 }
 
+/**
+ * Fingerprint hardware work, always queued for an operator.
+ *
+ * A finger has to be physically on the terminal to be captured, so enrollment can
+ * never be pushed from the cloud. Uploading or deleting a stored template over
+ * ISAPI is documented for Hikvision access control generally, but no per-model
+ * firmware evidence is recorded in `docs/device-profiles/` yet — so every
+ * fingerprint operation is queued as `manual_action_required` with the exact step
+ * and is never handed to the ISAPI agent. Automate one only after that evidence
+ * exists.
+ *
+ * Pass `deviceId` when the instruction is about one terminal (enrollment is captured
+ * at the terminal the operator chose); omit it for changes that have to reach every
+ * terminal (suspend, revoke, fee enforcement).
+ */
+async function createFingerprintOperations(
+  env: Env,
+  fingerprintId: string,
+  operation: 'enroll_fingerprint'|'enable_fingerprint'|'disable_fingerprint'|'delete_fingerprint',
+  payload: unknown,
+  manualInstruction: string,
+  options: { deviceId?: string|null } = {},
+): Promise<number> {
+  const devices = await env.DB.prepare(
+    `SELECT id FROM hikvision_devices WHERE status != 'disabled' AND deleted_at IS NULL AND (? IS NULL OR id=?)`,
+  ).bind(options.deviceId ?? null,options.deviceId ?? null).all<{ id: string }>();
+  if (!devices.results.length) return 0;
+  const payloadJson = JSON.stringify(payload);
+  const instruction = manualInstruction.slice(0, 1000);
+  const statements = devices.results.map((device) => env.DB.prepare(
+    `INSERT INTO device_operations(id,device_id,fingerprint_id,operation,payload_json,status,manual_instruction)
+     VALUES (?,?,?,?,?,'manual_action_required',?)`,
+  ).bind(crypto.randomUUID(), device.id, fingerprintId, operation, payloadJson, instruction));
+  await env.DB.batch(statements);
+  return statements.length;
+}
+
 interface VisitorOperationDevice {
   id: string;
   connection_pattern: string;
@@ -3413,24 +3699,72 @@ async function authenticateIsapiAgent(request: Request, env: Env, agentId: strin
 }
 
 /**
+ * The only agents allowed to speak for a terminal are the ones linked to it:
+ * either the denormalized owner (`hikvision_devices.isapi_agent_id`) or a
+ * per-device ISAPI config. Without this check any registered agent could flip
+ * another estate's terminal by guessing its id.
+ */
+const TERMINAL_AGENT_LINK_SQL = `(hikvision_devices.isapi_agent_id=? OR EXISTS (
+          SELECT 1 FROM isapi_device_configs WHERE device_id=hikvision_devices.id AND agent_id=? AND sync_enabled=1
+        ))`;
+
+/**
  * Marks a terminal offline as soon as the agent reports its event stream is
  * down. The hourly sweep would otherwise leave a dead terminal showing online
  * for up to an hour, and the agent process may stay alive (and heartbeating)
  * long after the terminal on the LAN stopped answering.
+ *
+ * 'pending' is retired here too: a terminal that was registered but never proved
+ * itself alive is exactly the one whose stream is most likely broken, and
+ * leaving it on the registration default would hide the fault.
  */
 async function markTerminalStreamDown(env: Env, agentId: string, deviceId: string, reason: string): Promise<boolean> {
   const result = await env.DB.prepare(
     `UPDATE hikvision_devices SET status='offline',updated_at=datetime('now')
-      WHERE id=? AND status='online' AND deleted_at IS NULL
-        AND (isapi_agent_id=? OR EXISTS (
-          SELECT 1 FROM isapi_device_configs WHERE device_id=hikvision_devices.id AND agent_id=? AND sync_enabled=1
-        ))`,
+      WHERE id=? AND status IN ('pending','online') AND deleted_at IS NULL
+        AND ${TERMINAL_AGENT_LINK_SQL}`,
   ).bind(deviceId, agentId, agentId).run();
   if (!Number(result.meta.changes ?? 0)) return false;
   // One audit row per transition, not one per heartbeat.
   await env.DB.prepare(
     `INSERT INTO isapi_sync_logs(id,device_id,agent_id,operation_type,status,message) VALUES (?,?,?,'event_stream','failed',?)`,
   ).bind(crypto.randomUUID(), deviceId, agentId, reason.slice(0, 1000)).run();
+  return true;
+}
+
+/**
+ * Marks a terminal online as soon as its agent proves it is holding the
+ * terminal's alertStream open.
+ *
+ * Presence used to be earned only by forwarding an access event, so a newly
+ * linked, perfectly healthy terminal sat on the schema default 'pending' until
+ * the first resident swiped a card - which an administrator reads as "the
+ * terminal is not working" while the agent next to it is plainly online. An open
+ * alertStream is proof of life: the agent authenticated to the terminal over
+ * ISAPI and the terminal is streaming.
+ *
+ * `last_seen_at` is refreshed on every report, so the ordinary
+ * DEVICE_OFFLINE_MINUTES window still retires the terminal once the agent stops
+ * reporting (agent stopped or unplugged, terminal off the network).
+ */
+async function markTerminalStreamUp(env: Env, agentId: string, deviceId: string): Promise<boolean> {
+  const previous = await env.DB.prepare(
+    `SELECT status FROM hikvision_devices
+      WHERE id=? AND deleted_at IS NULL AND status!='disabled' AND ${TERMINAL_AGENT_LINK_SQL}`,
+  ).bind(deviceId, agentId, agentId).first<{ status: string }>();
+  if (!previous) return false;
+  const statements = [
+    env.DB.prepare(
+      `UPDATE hikvision_devices SET status='online',last_seen_at=datetime('now'),updated_at=datetime('now') WHERE id=? AND status!='disabled'`,
+    ).bind(deviceId),
+  ];
+  if (previous.status !== 'online') {
+    // One audit row per transition, not one per heartbeat.
+    statements.push(env.DB.prepare(
+      `INSERT INTO isapi_sync_logs(id,device_id,agent_id,operation_type,status,message) VALUES (?,?,?,'event_stream','success',?)`,
+    ).bind(crypto.randomUUID(), deviceId, agentId, `Event stream connected; terminal moved from ${previous.status} to online`));
+  }
+  await env.DB.batch(statements);
   return true;
 }
 
@@ -3446,20 +3780,29 @@ async function handleIsapiAgentHeartbeat(request: Request, env: Env, agentId: st
   ).bind(ip, body.hostname?.trim() || null, body.version?.trim() || null, agentId).run();
 
   // Per-terminal presence. The agent reports one entry per EstateMate device id
-  // whose alertStream it is (or is not) holding open; `stream: 'down'` retires
-  // the terminal immediately instead of waiting for the hourly sweep.
+  // whose alertStream it is (or is not) holding open: `stream: 'up'` promotes the
+  // terminal the moment the stream is established, `stream: 'down'` retires it
+  // immediately instead of waiting for the hourly sweep. Both replace the old
+  // behaviour where a terminal only ever went online by forwarding an event, so a
+  // healthy but idle terminal stayed on the 'pending' registration default.
   const reported = Array.isArray(body.devices) ? body.devices as Array<Record<string, unknown>> : [];
   let terminalsOffline = 0;
+  let terminalsOnline = 0;
   for (const entry of reported.slice(0, 100)) {
     const deviceId = typeof entry?.deviceId === 'string' ? entry.deviceId.trim() : '';
-    if (!deviceId || entry?.stream !== 'down') continue;
+    const stream = typeof entry?.stream === 'string' ? entry.stream.trim().toLowerCase() : '';
+    if (!deviceId || (stream !== 'up' && stream !== 'down')) continue;
+    if (stream === 'up') {
+      if (await markTerminalStreamUp(env, agentId, deviceId)) terminalsOnline += 1;
+      continue;
+    }
     const reason = typeof entry?.lastError === 'string' && entry.lastError.trim()
       ? `Event stream down: ${entry.lastError.trim()}`
       : 'Event stream down: the agent cannot hold the terminal connection open';
     if (await markTerminalStreamDown(env, agentId, deviceId, reason)) terminalsOffline += 1;
   }
   return Response.json(
-    { ok: true, agentId, terminalsOffline, serverTime: new Date().toISOString() },
+    { ok: true, agentId, terminalsOffline, terminalsOnline, serverTime: new Date().toISOString() },
     { headers: { 'Cache-Control': 'no-store' } },
   );
 }
@@ -3707,16 +4050,29 @@ async function consumeAccessEvents(batch: MessageBatch<AccessEventQueuePayload>,
     batch.ackAll();
     return;
   }
+  // A card event is matched by card number; a fingerprint event carries no card
+  // number, so it falls back to the employee number the terminal knows the person
+  // by and the fingerprint credential recorded at enrollment. COALESCE keeps the
+  // card match authoritative whenever both exist.
+  const fingerprintMatch = `(SELECT resident_id FROM fingerprint_credentials WHERE employee_no=? AND employee_no IS NOT NULL
+       ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,created_at DESC LIMIT 1)`;
   const statements = events.map((event) => env.DB.prepare(
     `INSERT OR IGNORE INTO access_events(
-      id,vendor_event_id,device_id,access_point_id,card_id,resident_id,household_member_id,visitor_request_id,card_uid,employee_no,person_name,credential_type,door_no,direction,result,event_type,device_timestamp,profile_key,raw_summary
+      id,vendor_event_id,device_id,access_point_id,card_id,fingerprint_id,resident_id,household_member_id,visitor_request_id,card_uid,employee_no,person_name,credential_type,door_no,direction,result,event_type,device_timestamp,profile_key,raw_summary
      ) VALUES (?,?,?,?,
        (SELECT id FROM access_cards WHERE card_uid=? LIMIT 1),
-       (SELECT resident_id FROM access_cards WHERE card_uid=? LIMIT 1),
-       (SELECT household_member_id FROM access_cards WHERE card_uid=? LIMIT 1),
+       (SELECT id FROM fingerprint_credentials WHERE employee_no=? AND employee_no IS NOT NULL
+          ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,created_at DESC LIMIT 1),
+       COALESCE((SELECT resident_id FROM access_cards WHERE card_uid=? LIMIT 1),${fingerprintMatch}),
+       COALESCE((SELECT household_member_id FROM access_cards WHERE card_uid=? LIMIT 1),
+         (SELECT household_member_id FROM fingerprint_credentials WHERE employee_no=? AND employee_no IS NOT NULL
+          ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,created_at DESC LIMIT 1)),
        (SELECT id FROM visitor_requests WHERE credential_number=? OR pin=? LIMIT 1),?,?,?,?,?,?,?,?,?,?,?)`,
   ).bind(
-    event.id,event.vendorEventId,event.deviceId,event.accessPointId,event.cardUid,event.cardUid,event.cardUid,event.cardUid,event.cardUid,
+    event.id,event.vendorEventId,event.deviceId,event.accessPointId,
+    event.cardUid,event.employeeNo,event.cardUid,event.employeeNo,
+    event.cardUid,event.employeeNo,
+    event.cardUid,event.cardUid,
     event.cardUid,event.employeeNo,event.personName,event.credentialType,event.doorNo,event.direction,event.result,
     event.eventType,event.deviceTimestamp,event.profileKey,event.rawSummary,
   ));
@@ -3804,6 +4160,28 @@ async function enforceFacilityFees(env: Env): Promise<void> {
     await createDeviceOperations(env, card.id, 'disable_card', { cardUid: card.card_uid, enabled: false, reason: 'unpaid facility fee' });
   }
 
+  // A fingerprint is a fee-linked credential too: a resident whose facility fee is
+  // overdue must not keep gate access by pressing a finger instead of a card.
+  // `finger_no`, not a card number, identifies it on the terminal, and the terminal
+  // is where the change has to be confirmed.
+  const overdueFingers = await env.DB.prepare(
+    `SELECT f.id,f.finger_no,f.employee_no,u.name AS resident_name,b.id AS bill_id
+     FROM fingerprint_credentials f JOIN users u ON u.id=f.resident_id
+     JOIN bills b ON b.resident_id=f.resident_id
+     JOIN settings s ON s.key='facility_fee_grace_period_days'
+     WHERE f.status='active' AND b.bill_type='facility_fee' AND b.status IN ('unpaid','partial')
+       AND datetime('now') > datetime(b.due_date,'+' || CAST(s.value AS INTEGER) || ' days')
+     GROUP BY f.id`,
+  ).all<{ id:string; finger_no:number; employee_no:string|null; resident_name:string; bill_id:string }>();
+  for (const finger of overdueFingers.results) {
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE fingerprint_credentials SET status='expired',auto_expired=1,deactivated_at=datetime('now'),deactivated_reason='unpaid facility fee',updated_at=datetime('now') WHERE id=? AND status='active'`).bind(finger.id),
+      env.DB.prepare(`INSERT INTO fingerprint_status_changes(id,fingerprint_id,old_status,new_status,reason) VALUES (?,?,'active','expired','unpaid facility fee after grace period')`).bind(crypto.randomUUID(),finger.id),
+    ]);
+    await createFingerprintOperations(env, finger.id, 'disable_fingerprint', { fingerprintId:finger.id, fingerNo:finger.finger_no, employeeNo:finger.employee_no, enabled:false, reason:'unpaid facility fee' },
+      `Remove or disable finger ${finger.finger_no} for ${finger.resident_name} on the terminal (unpaid facility fee after the grace period), then mark this action applied.`);
+  }
+
   const restored = await env.DB.prepare(
     `SELECT c.id,c.card_uid FROM access_cards c WHERE c.status='expired' AND c.auto_expired=1
      AND NOT EXISTS (
@@ -3818,6 +4196,24 @@ async function enforceFacilityFees(env: Env): Promise<void> {
       env.DB.prepare(`INSERT INTO card_status_changes(id,card_id,old_status,new_status,reason) VALUES (?,?,'expired','active','facility fee cleared')`).bind(crypto.randomUUID(),card.id),
     ]);
     await createDeviceOperations(env, card.id, 'enable_card', { cardUid: card.card_uid, enabled: true, reason: 'facility fee cleared' });
+  }
+
+  const restoredFingers = await env.DB.prepare(
+    `SELECT f.id,f.finger_no,f.employee_no,u.name AS resident_name FROM fingerprint_credentials f JOIN users u ON u.id=f.resident_id
+     WHERE f.status='expired' AND f.auto_expired=1
+     AND NOT EXISTS (
+       SELECT 1 FROM bills b JOIN settings s ON s.key='facility_fee_grace_period_days'
+       WHERE b.resident_id=f.resident_id AND b.bill_type='facility_fee' AND b.status IN ('unpaid','partial')
+         AND datetime('now') > datetime(b.due_date,'+' || CAST(s.value AS INTEGER) || ' days')
+     )`,
+  ).all<{ id:string; finger_no:number; employee_no:string|null; resident_name:string }>();
+  for (const finger of restoredFingers.results) {
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE fingerprint_credentials SET status='active',auto_expired=0,deactivated_at=NULL,deactivated_reason=NULL,updated_at=datetime('now') WHERE id=?`).bind(finger.id),
+      env.DB.prepare(`INSERT INTO fingerprint_status_changes(id,fingerprint_id,old_status,new_status,reason) VALUES (?,?,'expired','active','facility fee cleared')`).bind(crypto.randomUUID(),finger.id),
+    ]);
+    await createFingerprintOperations(env, finger.id, 'enable_fingerprint', { fingerprintId:finger.id, fingerNo:finger.finger_no, employeeNo:finger.employee_no, enabled:true, reason:'facility fee cleared' },
+      `Re-enable finger ${finger.finger_no} for ${finger.resident_name} on the terminal (facility fee cleared), then mark this action applied.`);
   }
 
 }

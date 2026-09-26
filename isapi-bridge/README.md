@@ -9,6 +9,8 @@ It replaced and removed the former transports — direct HTTP Listening, the Ren
 
 ISAPI bridge uses the device's documented ISAPI endpoints (`/ISAPI/AccessControl/CardInfo/...`, `/ISAPI/Event/notification/alertStream`) which are available on most K1T, K26xx, K27xx/K28xx controllers when accessed from the LAN. It does **not** require the proprietary SDK.
 
+For off-site support access to the terminals and this host, see [`../docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md`](../docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md): a Cloudflare Tunnel on the Zero Trust Free plan routes the estate LAN to enrolled admins over WARP, publishing nothing. The agent never uses that tunnel, and an access device cannot dial into one.
+
 > **Security:** Keep ISAPI devices and this bridge on the same VLAN. Never expose ISAPI (port 80/443) to the Internet. The bridge config contains secrets — restrict file permissions to Administrators / 0600.
 
 ## Architecture
@@ -42,6 +44,7 @@ How it works:
 - Events arrive as `multipart/mixed` parts (JSON or XML documents). Firmware that streams bare JSON objects is handled by a brace-depth scanner fallback.
 - Documents are buffered and flushed to `POST /api/isapi/v1/agents/:id/events` — up to 50 items per request, or every `eventFlushSeconds` (default 5 s), whichever comes first. The Worker normalizes each document with the same pipeline as direct device posts (profile aliases, granted/denied inference, idempotency on `(device_id, vendor_event_id)`), updates device last-seen, and queues the batch as **one** Queue message so the Cloudflare Workers Free plan Queues allowance (10,000 operations/day ≈ one message ≈ 3 operations) is preserved even on busy estates.
 - On connection loss the agent reconnects with 5 s → 60 s exponential backoff. A local buffer (default 500 events) rides out Worker outages; on overflow the oldest documents are dropped with a warning.
+- Each stream loop's state travels with the heartbeat (`devices: [{ deviceId, stream: 'up'|'down', lastError }]`). The Worker marks the terminal **online** as soon as the stream is `up` — so a linked terminal no longer sits on the `pending` registration default until someone happens to swipe a card — and marks it **offline** immediately on `down`, without waiting for the hourly sweep.
 
 Config knobs (`agent-config.json`):
 
@@ -99,7 +102,7 @@ Or use **Access-control devices** → edit device → set connection pattern to 
 
 ### 4. Test
 
-- Issue a test card in portal → **Access cards** → create.
+- Issue a test card in portal → **Access cards & fingerprints** → create (a card operation is claimed by the agent; a fingerprint operation never is — fingerprints are always an operator task).
 - Check **Hardware actions** — status should be `pending` (not `manual_action_required`) when device uses ISAPI pattern.
 - On agent host, check logs: `C:\EstateMate\ISAPI-Agent\logs\` or journalctl.
 - After ~30s, operation should be claimed and applied via ISAPI, then status becomes `applied`.

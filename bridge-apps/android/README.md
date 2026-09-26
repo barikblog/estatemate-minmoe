@@ -72,7 +72,10 @@ receives under the tag `EstateMateBridge`.
   XML fallback), `disable_card` / `delete_card` (PUT `CardInfo/Delete`),
   `upsert_visitor` (XML `tempCard`);
 * heartbeats every `heartbeatIntervalSeconds` with the same stats payload the
-  Windows host sends, so the portal's agent row looks identical;
+  Windows host sends, so the portal's agent row looks identical — including the
+  per-terminal alertStream state (`devices: [{ deviceId, stream, lastError }]`),
+  which is what promotes a terminal to **online** as soon as its stream is open
+  instead of leaving it on `pending` until the first card is swiped;
 * reconnects with a 5 s → 60 s backoff and keeps running across reboots.
 
 The app is deliberately plain Java against the platform APIs only (no Kotlin, no

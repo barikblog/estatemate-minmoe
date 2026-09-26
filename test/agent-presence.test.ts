@@ -155,6 +155,54 @@ describe('Agent and terminal presence', () => {
     expect(logs[0]!.status).toBe('failed');
   });
 
+  it('a terminal holding an open event stream goes online instead of sitting on pending', async () => {
+    const { deviceId, agentId, agentSecret } = await createLinkedPair();
+    // Registration default: nothing has proved this terminal is alive yet.
+    expect(db.one(`SELECT status FROM hikvision_devices WHERE id=?`, deviceId)?.status).toBe('pending');
+
+    const res = await agentHeartbeat(env, agentId, agentSecret, { devices: [{ deviceId, stream: 'up' }] });
+    expect(res.status).toBe(200);
+    expect(res.json.terminalsOnline).toBe(1);
+    expect(res.json.terminalsOffline).toBe(0);
+    const row = db.one(`SELECT status,last_seen_at FROM hikvision_devices WHERE id=?`, deviceId);
+    expect(row?.status).toBe('online');
+    expect(row?.last_seen_at).toBeTruthy();
+
+    // The same verdict reaches both portal surfaces.
+    const list = await call(env, 'GET', '/api/access/devices', { token: adminToken });
+    const device = (list.json.items as Array<Record<string, unknown>>).find((item) => item.id === deviceId);
+    expect(device?.status).toBe('online');
+    const configs = await call(env, 'GET', '/api/isapi/device-configs', { token: adminToken });
+    const config = (configs.json.items as Array<Record<string, unknown>>).find((item) => item.device_id === deviceId);
+    expect(config?.device_status).toBe('online');
+
+    // One audit row per transition, not one per heartbeat.
+    await agentHeartbeat(env, agentId, agentSecret, { devices: [{ deviceId, stream: 'up' }] });
+    const logs = db.query(`SELECT operation_type,status FROM isapi_sync_logs WHERE device_id=? AND operation_type='event_stream'`, deviceId);
+    expect(logs.length).toBe(1);
+    expect(logs[0]!.status).toBe('success');
+  });
+
+  it('an unproven terminal whose stream is down reads offline, not pending', async () => {
+    const { deviceId, agentId, agentSecret } = await createLinkedPair();
+    expect(db.one(`SELECT status FROM hikvision_devices WHERE id=?`, deviceId)?.status).toBe('pending');
+
+    const res = await agentHeartbeat(env, agentId, agentSecret, { devices: [{ deviceId, stream: 'down', lastError: 'connect ETIMEDOUT' }] });
+    expect(res.json.terminalsOffline).toBe(1);
+    expect(db.one(`SELECT status FROM hikvision_devices WHERE id=?`, deviceId)?.status).toBe('offline');
+  });
+
+  it('a terminal that stops reporting after a live stream falls back to offline', async () => {
+    const { deviceId, agentId, agentSecret } = await createLinkedPair();
+    await agentHeartbeat(env, agentId, agentSecret, { devices: [{ deviceId, stream: 'up' }] });
+    // The agent died: the last proof of life ages past the 10-minute window.
+    db.run(`UPDATE hikvision_devices SET last_seen_at=datetime('now','-45 minutes') WHERE id=?`, deviceId);
+
+    const list = await call(env, 'GET', '/api/access/devices', { token: adminToken });
+    const device = (list.json.items as Array<Record<string, unknown>>).find((item) => item.id === deviceId);
+    expect(device?.status).toBe('offline');
+  });
+
   it('a healthy terminal is left alone and another agent cannot retire it', async () => {
     const { deviceId, agentId, agentSecret } = await createLinkedPair();
     db.run(`UPDATE hikvision_devices SET status='online',last_seen_at=datetime('now') WHERE id=?`, deviceId);
@@ -170,6 +218,12 @@ describe('Agent and terminal presence', () => {
     const hostile = await agentHeartbeat(env, otherAgent.id, otherAgent.secret, { devices: [{ deviceId, stream: 'down' }] });
     expect(hostile.json.terminalsOffline).toBe(0);
     expect(db.one(`SELECT status FROM hikvision_devices WHERE id=?`, deviceId)?.status).toBe('online');
+
+    // Nor to claim the terminal is alive: an unlinked agent cannot promote it.
+    db.run(`UPDATE hikvision_devices SET status='pending',last_seen_at=NULL WHERE id=?`, deviceId);
+    const claim = await agentHeartbeat(env, otherAgent.id, otherAgent.secret, { devices: [{ deviceId, stream: 'up' }] });
+    expect(claim.json.terminalsOnline).toBe(0);
+    expect(db.one(`SELECT status FROM hikvision_devices WHERE id=?`, deviceId)?.status).toBe('pending');
   });
 
   it('deleting an agent retires the terminals it was serving', async () => {

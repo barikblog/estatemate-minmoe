@@ -297,12 +297,30 @@ public final class ProtocolTest {
         WorkerClient client = new WorkerClient("http://127.0.0.1:" + port, AGENT_ID, AGENT_SECRET, "EstateMate-Bridge-Android/test", 8000);
         Map<String, Object> stats = new LinkedHashMap<String, Object>();
         stats.put("eventsForwarded", Long.valueOf(3));
-        WorkerClient.Reply heartbeat = client.heartbeat("0.2.0", "phone", "android", stats);
+
+        // The stream loop records one state per terminal; the heartbeat is what
+        // carries it, so a terminal leaves 'pending' as soon as its stream is up.
+        BridgeRuntime.setStreamState(DEVICE_ID, "up", null);
+        check("stream states are tracked per terminal",
+                BridgeRuntime.streamStates().size() == 1 && BridgeRuntime.streamingCount() == 1,
+                BridgeRuntime.streamStates().toString());
+
+        WorkerClient.Reply heartbeat = client.heartbeat("0.2.0", "phone", "android", stats, BridgeRuntime.streamStates());
         check("heartbeat succeeds", heartbeat.ok(), heartbeat.message());
         check("heartbeat carries the agent key and stats",
                 AGENT_SECRET.equals(worker.lastAgentKey) && worker.lastHeartbeatBody.contains("\"eventsForwarded\":3")
                         && worker.lastHeartbeatBody.contains("\"platform\":\"android\""),
                 worker.lastHeartbeatBody);
+        check("heartbeat reports each terminal's stream state",
+                worker.lastHeartbeatBody.contains("\"deviceId\":\"" + DEVICE_ID + "\"")
+                        && worker.lastHeartbeatBody.contains("\"stream\":\"up\""),
+                worker.lastHeartbeatBody);
+
+        BridgeRuntime.setStreamState(DEVICE_ID, "down", "HTTP 401 Unauthorized");
+        check("a down stream carries the reason to the Worker",
+                BridgeRuntime.streamingCount() == 0
+                        && Json.write(BridgeRuntime.streamStates().get(0)).contains("HTTP 401 Unauthorized"),
+                BridgeRuntime.streamStates().toString());
 
         WorkerClient.Reply devices = client.listDevices();
         check("device list is returned", devices.ok() && devices.json().containsKey("items"));

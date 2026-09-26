@@ -79,7 +79,16 @@ When issuing a card, administrators can enter either:
 - the main Resident ID; or
 - the Household Member ID.
 
-A dependant card displays the actual card holder but retains the main resident as the financially responsible resident. Deactivating a household member suspends active cards linked to that member and creates the normal hardware action for the terminal workflow.
+A dependant card displays the actual card holder but retains the main resident as the financially responsible resident. Deactivating a household member suspends active cards and fingerprints linked to that member and creates the normal hardware action for the terminal workflow.
+
+### Access cards and fingerprints
+
+The portal menu **Access cards & fingerprints** holds both credential types, and every person's profile has the same panel: **Cards & fingerprints** on a row in People (main residents) or in Tenancy & household (dependants). Only Administrators and Managers may add either credential.
+
+- **Card** — enter a UID, or tap the card at a selected device to capture its number.
+- **Fingerprint** — choose the finger slot (1–10), an optional "which finger" label, the employee number the terminal knows the person by (it defaults to the EstateMate person ID for a main resident) and, optionally, the terminal the finger will be captured at.
+
+A fingerprint is not a card number, so it is stored as its own credential. Hikvision terminals capture fingerprints on the device itself, so EstateMate cannot enroll one remotely: recording a fingerprint queues a task with instructions under **Hardware actions**, which an operator completes at the terminal and then marks applied. The same queue carries the removal or disable task when a fingerprint is suspended, revoked, expired for an unpaid facility fee or cleared after payment: deactivating a user or household member, ending a tenancy and facility-fee enforcement all cover cards and fingerprints alike, and the credential's status history is preserved rather than deleted.
 
 ## Ownership transfers
 

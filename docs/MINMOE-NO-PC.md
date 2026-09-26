@@ -34,6 +34,30 @@ The following were removed from the product — endpoints, packages, portal opti
 
 Do not recreate these endpoints or packages. If a future requirement genuinely cannot be met by the agent, document the evidence first and add a new migration-backed pattern — do not silently widen the attack surface.
 
+## Remote support access is not a transport (Cloudflare Tunnel)
+
+Administrators and installers sometimes need to reach the gate terminals and the
+estate host from off-site. That need is met by **Cloudflare Tunnel with WARP
+private-network routing** — `scripts/cloudflared-remote-access.mjs`, documented in
+[`CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md`](CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md) — and it
+is a *human* access path, not a device transport:
+
+- Nothing is published: the estate subnet is routed to Zero Trust-enrolled admins,
+  so there is no public hostname, no DNS record and no Internet-reachable listener.
+  A public hostname requires both `--domain` and `--allow-public-hostnames`, and
+  every such hostname must sit behind a Cloudflare Access policy.
+- Events and card operations never traverse the tunnel. The agent remains the only
+  automatic transport, so gate operation does not depend on Cloudflare, WARP or the
+  operator's home connection — which is also why this does not weaken the
+  single-security-boundary rule above.
+- **ISUP cannot use it.** ISUP/EHome is the device dialling a raw TCP platform
+  (7660, plus 8003/8004 for streams) with an EHome key; a terminal cannot run
+  `cloudflared` or WARP, cannot satisfy a Cloudflare Access login, and the free plan
+  proxies HTTP/HTTPS only. Terminating ISUP would mean a LAN host running a
+  Hikvision SDK adapter — the retired `isup-gateway/` transport — for terminals the
+  agent already handles over documented ISAPI. Record model/firmware evidence in
+  `docs/device-profiles/` before proposing any new transport.
+
 ## Required model-validation test
 
 For each terminal model/firmware:
