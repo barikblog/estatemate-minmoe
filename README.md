@@ -6,6 +6,8 @@ All access devices connect to EstateMate through one channel: the **EstateMate a
 
 > [!IMPORTANT]
 > **The agent keeps ISAPI private to the estate VLAN.** Only the agent talks to the terminals, and only the agent's outbound HTTPS reaches Cloudflare. Never port-forward a terminal's ISAPI/admin interface to the public Internet, and never run the agent anywhere except the device LAN. Devices not yet linked to an agent fall back to auditable **manual synchronization**: the Hardware actions queue lists each change for an operator to apply.
+>
+> Remote access by administrators is the one deliberate exception, and it is **private, not public**: [`docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md`](docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md) publishes the estate LAN to Zero Trust-enrolled humans over WARP, with no public hostname and no DNS record. The tunnel carries human access only; events and card operations never traverse it, so gates keep working when it is down. A Hikvision terminal cannot dial into a Cloudflare Tunnel on the free plan (public hostnames are HTTP/HTTPS only and a device can neither run WARP nor complete an Access login), which is why ISUP is not a supported transport.
 
 ## Repository status
 
@@ -33,6 +35,7 @@ Included:
 - Audited immediate or scheduled ownership transfers, downloadable property statements, and grouped street/block/zone billing.
 - Kotlin/Compose Android foundation with encrypted token storage, Retrofit/Hilt, Room event cache, role dashboard, and gate history.
 - Private GitHub-backed upload/download storage with encrypted-at-rest repository access tokens, supporting proof on ownership/tenancy/household/visitor/maintenance/payment forms, access checks, and a 4 MB per-file limit. Paid R2 storage remains disabled.
+- **Cloudflare Tunnel remote access (Free plan)** via `scripts/cloudflared-remote-access.mjs`: generates a `cloudflared` config with WARP private-network routing so administrators and installers reach the estate LAN from anywhere without publishing a terminal to the Internet, plus a `--check` validator that fails a config which would expose one. Remote *human* access only — events and card operations still flow agent-side ([`docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md`](docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md)).
 - Administrator-editable portal identity, theme colours, light/dark mode, support details, visitor defaults and scan timeout.
 - PBKDF2-SHA256 passwords and HS256 sessions implemented with Workers Web Crypto.
 - Tests for password/JWT code and Hikvision JSON/XML/multipart parsing.
@@ -44,7 +47,7 @@ Still model/account dependent:
 - Gemini enrichment, FCM delivery, large GitHub exports, and full accounting/reconciliation UI.
 - Android production signing, push configuration, and Play distribution.
 
-See [`docs/MINMOE-NO-PC.md`](docs/MINMOE-NO-PC.md), [`docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md`](docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md), and [`isapi-bridge/README.md`](isapi-bridge/README.md) before installing a device. Property workflows are in [`docs/MULTI-PROPERTY-OWNERSHIP.md`](docs/MULTI-PROPERTY-OWNERSHIP.md) and [`docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md`](docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md). Proof uploads and theming are documented in [`docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md`](docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md). Private upload setup is in [`docs/GITHUB-STORAGE.md`](docs/GITHUB-STORAGE.md), people administration is in [`docs/PEOPLE-REGISTRATION-AND-IMPORTS.md`](docs/PEOPLE-REGISTRATION-AND-IMPORTS.md), and Manager and import behavior is in [`docs/MANAGERS-IMPORTS-HIKCONNECT-SITE-SYNC.md`](docs/MANAGERS-IMPORTS-HIKCONNECT-SITE-SYNC.md). AI agents should begin with [`AGENTS.md`](AGENTS.md).
+See [`docs/MINMOE-NO-PC.md`](docs/MINMOE-NO-PC.md), [`docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md`](docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md), and [`isapi-bridge/README.md`](isapi-bridge/README.md) before installing a device. Property workflows are in [`docs/MULTI-PROPERTY-OWNERSHIP.md`](docs/MULTI-PROPERTY-OWNERSHIP.md) and [`docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md`](docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md). Proof uploads and theming are documented in [`docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md`](docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md). Private upload setup is in [`docs/GITHUB-STORAGE.md`](docs/GITHUB-STORAGE.md), people administration is in [`docs/PEOPLE-REGISTRATION-AND-IMPORTS.md`](docs/PEOPLE-REGISTRATION-AND-IMPORTS.md), and Manager and import behavior is in [`docs/MANAGERS-IMPORTS-HIKCONNECT-SITE-SYNC.md`](docs/MANAGERS-IMPORTS-HIKCONNECT-SITE-SYNC.md). Remote support access is in [`docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md`](docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md). AI agents should begin with [`AGENTS.md`](AGENTS.md).
 
 ## Architecture
 

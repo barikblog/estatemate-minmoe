@@ -9,6 +9,8 @@ It replaced and removed the former transports — direct HTTP Listening, the Ren
 
 ISAPI bridge uses the device's documented ISAPI endpoints (`/ISAPI/AccessControl/CardInfo/...`, `/ISAPI/Event/notification/alertStream`) which are available on most K1T, K26xx, K27xx/K28xx controllers when accessed from the LAN. It does **not** require the proprietary SDK.
 
+For off-site support access to the terminals and this host, see [`../docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md`](../docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md): a Cloudflare Tunnel on the Zero Trust Free plan routes the estate LAN to enrolled admins over WARP, publishing nothing. The agent never uses that tunnel, and an access device cannot dial into one.
+
 > **Security:** Keep ISAPI devices and this bridge on the same VLAN. Never expose ISAPI (port 80/443) to the Internet. The bridge config contains secrets — restrict file permissions to Administrators / 0600.
 
 ## Architecture

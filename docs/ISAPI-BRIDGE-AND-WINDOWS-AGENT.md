@@ -37,6 +37,16 @@ No SDK required — uses documented ISAPI endpoints available on most K1T, K26xx
 
 A healthy agent host can still be holding a dead terminal, which is why per-terminal stream state travels with the heartbeat: the estate PC staying up never keeps an unreachable gate looking online.
 
+## Reaching the estate from off-site
+
+The agent needs no inbound access, but administrators and installers sometimes do.
+[`CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md`](CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md) covers the
+Cloudflare Tunnel kit (Zero Trust Free plan) that publishes the estate LAN to
+enrolled admins over WARP private-network routing — no public hostname, no DNS
+record. It carries human access only: events and card operations stay agent-side, so
+gate operation never depends on the tunnel. A device cannot dial into a free tunnel,
+which is why ISUP is not a supported transport.
+
 ## Database schema (0011)
 
 - `isapi_agents` — registry of bridge agents (Windows/Linux). Fields: id, name, hostname, platform, version, status, secret_hash, last_seen_at, last_ip.
