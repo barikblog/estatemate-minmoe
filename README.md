@@ -16,10 +16,11 @@ This is a deployable foundation/MVP, not a claim that every screen in the origin
 Included:
 
 - One Cloudflare Worker serving the SPA and `/api/*`.
-- D1 schema for users, multi-property ownership and approval requests, streets/properties, billing, historical bill/payment imports, visitors, maintenance, general estate notices, access cards, access events, devices, operations, settings, and audit records.
+- D1 schema for users, multi-property ownership and approval requests, streets/properties, billing, historical bill/payment imports, visitors, maintenance, general estate notices, access cards, fingerprint credentials, access events, devices, operations, settings, and audit records.
 - LAN-agent event ingestion: the agent streams JSON/XML device events (ISAPI alertStream) to the Worker in batches; retired transports (direct HTTP Listening, Render relay, Hikvision cloud, ISUP gateway) were removed in migration 0013.
 - Per-device one-time credentials; editable/soft-deletable device inventory; Queue buffering; D1 event persistence; Durable Object live WebSocket feed.
 - Device-tap card enrollment, phone/device visitor-code scanning, QR + Code 128 visitor passes, and preview-before-entry Security decisions.
+- **Access cards & fingerprints** as one credential register: cards keep their real card number, fingerprints are their own credential with the terminal's finger slot (1–10) and employee number. Administrators and Managers add either from the person's profile (People, and Tenancy & household for dependants) or from the Access cards & fingerprints page. A finger can only be captured on the terminal itself, so every fingerprint change is queued as an operator task with instructions under Hardware actions, and gate events that carry no card are attributed back to the person through the employee number.
 - Hourly facility-fee expiry/reactivation job and hardware-action audit queue.
 - Role-aware React portal for Administrator, Manager, Resident, Cashier, and Security. Manager receives operational administration without billing, private-storage or global-settings control.
 - People management with available-property selection, validated account creation, CSV bulk registration, 24-hour sample logins, generated one-time passwords, editing, password reset, safe deactivation/reactivation and history-preserving deletion.
@@ -31,7 +32,7 @@ Included:
 - Estate-timezone-aware visitor validity windows, so a pass issued for "10:00" local time is not shifted by the Worker's UTC clock.
 - Residents can own multiple administrator-approved properties; they can request an existing unowned unit or propose a new property, while each property retains one active owner.
 - Rented-apartment workflows with owner nomination or direct administrator assignment, approval dates, one active main tenant, and owner/tenant billing responsibility.
-- Approved dependant and household profiles, optional separate logins, delegated visitor/bill permissions, and dependant access cards tied to the main resident.
+- Approved dependant and household profiles, optional separate logins, delegated visitor/bill permissions, and dependant access cards and fingerprints tied to the main resident.
 - Audited immediate or scheduled ownership transfers, downloadable property statements, and grouped street/block/zone billing.
 - Kotlin/Compose Android foundation with encrypted token storage, Retrofit/Hilt, Room event cache, role dashboard, and gate history.
 - Private GitHub-backed upload/download storage with encrypted-at-rest repository access tokens, supporting proof on ownership/tenancy/household/visitor/maintenance/payment forms, access checks, and a 4 MB per-file limit. Paid R2 storage remains disabled.
@@ -43,6 +44,7 @@ Included:
 Still model/account dependent:
 
 - Automatic terminal card/person commands in no-PC mode.
+- Automatic fingerprint template push: until per-model evidence is recorded in `docs/device-profiles/`, fingerprint enrollment, enable/disable and deletion stay operator tasks.
 - Exact MinMoe event minor-code mapping and event payload variants.
 - Gemini enrichment, FCM delivery, large GitHub exports, and full accounting/reconciliation UI.
 - Android production signing, push configuration, and Play distribution.
@@ -203,7 +205,7 @@ Production builds require your own signing key. Do not commit a keystore or its 
 - Device secrets are SHA-256 hashed with a server-side pepper. The plaintext secret is shown once.
 - Device request bodies are capped at 2 MB. User files are capped at 4 MB and stored through the GitHub Contents API in a dedicated private repository.
 - The GitHub storage token is encrypted with `STORAGE_ENCRYPTION_KEY`, never returned by the API, and should be a fine-grained token limited to the storage repository.
-- A resident’s properties, ownership requests, bills, cards, visitors, maintenance requests, files, and access events are scoped server-side.
+- A resident’s properties, ownership requests, bills, cards, fingerprints, visitors, maintenance requests, files, and access events are scoped server-side.
 - Device events are idempotent on `(device_id, vendor_event_id)`.
 - Images embedded in multipart device events are not stored in this MVP; only normalized event metadata is retained.
 - The Worker returns HTTP 200 quickly after Queue acceptance because many Hikvision devices retry events when acknowledgement is delayed.

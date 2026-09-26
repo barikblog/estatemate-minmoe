@@ -102,7 +102,7 @@ Or use **Access-control devices** → edit device → set connection pattern to 
 
 ### 4. Test
 
-- Issue a test card in portal → **Access cards** → create.
+- Issue a test card in portal → **Access cards & fingerprints** → create (a card operation is claimed by the agent; a fingerprint operation never is — fingerprints are always an operator task).
 - Check **Hardware actions** — status should be `pending` (not `manual_action_required`) when device uses ISAPI pattern.
 - On agent host, check logs: `C:\EstateMate\ISAPI-Agent\logs\` or journalctl.
 - After ~30s, operation should be claimed and applied via ISAPI, then status becomes `applied`.

@@ -14,7 +14,7 @@ Many estates already have a Windows PC (CCTV, accounting) on same LAN as devices
 The ISAPI bridge is a small Node.js agent that runs on the same LAN as Hikvision devices (Windows, Linux, macOS). It:
 
 1. Polls Cloudflare Worker for pending operations:
-   - `GET /api/isapi/v1/agents/:id/operations` — card upsert/enable/disable/delete, visitor upsert
+   - `GET /api/isapi/v1/agents/:id/operations` — card upsert/enable/disable/delete, visitor upsert. Fingerprint operations are **not** in this list: a finger is captured on the terminal, so they are queued as `manual_action_required` operator tasks instead (migration `0015`)
    - Auth: `X-EstateMate-Agent-Key: <secret>` or `Authorization: Bearer <secret>`
 2. Applies them via Hikvision ISAPI (HTTP Digest Auth) to the device:
    - `POST /ISAPI/AccessControl/CardInfo/Record?format=json`
