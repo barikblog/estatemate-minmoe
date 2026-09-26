@@ -27,6 +27,15 @@ The ISAPI bridge is a small Node.js agent that runs on the same LAN as Hikvision
 
 No SDK required — uses documented ISAPI endpoints available on most K1T, K26xx, K27xx/K28xx when accessed from LAN.
 
+## Presence: how online/offline is decided
+
+- **Agent** — online while it heartbeats; offline after **3 minutes** without one (3 missed default heartbeats).
+- **Terminal** — online while it forwards events; offline after **10 minutes** without one, or **immediately** when its agent reports the terminal's alertStream as `down` (unreachable, auth failure, stream closed) or when the agent shuts down.
+- Every read derives the status from those windows — the stored `status` column is only a cache the hourly cron refreshes, so the portal can never show a stale green. A row with a NULL `last_seen_at` has never proved it was alive and reads as offline.
+- Deleting an agent, or disconnecting a terminal from one, retires the affected terminals at once.
+
+A healthy agent host can still be holding a dead terminal, which is why per-terminal stream state travels with the heartbeat: the estate PC staying up never keeps an unreachable gate looking online.
+
 ## Database schema (0011)
 
 - `isapi_agents` — registry of bridge agents (Windows/Linux). Fields: id, name, hostname, platform, version, status, secret_hash, last_seen_at, last_ip.
@@ -60,7 +69,7 @@ Indexes added for agent status, device lookups, and sync logs.
 
 ### Machine-authenticated (agent → Cloudflare)
 
-- `POST /api/isapi/v1/agents/:id/heartbeat` — agent heartbeat, updates last_seen_at, last_ip, version
+- `POST /api/isapi/v1/agents/:id/heartbeat` — agent heartbeat, updates last_seen_at, last_ip, version. Body may include `devices: [{ deviceId, stream: 'up'|'down', lastError? }]`; a `down` entry retires that terminal immediately (and writes one `event_stream` sync log per transition) instead of waiting for the hourly sweep. The agent sends this on every heartbeat and again while shutting down.
 - `GET /api/isapi/v1/agents/:id/devices` — list devices assigned to agent
 - `GET /api/isapi/v1/agents/:id/operations?limit=20` — poll pending operations (claims them as sent)
 - `POST /api/isapi/v1/agents/:id/operations/:opId/result` — report applied/failed

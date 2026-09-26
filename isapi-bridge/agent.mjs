@@ -207,6 +207,9 @@ async function heartbeat() {
           eventsPending: pendingEvents.length,
           eventStream: eventStreamEnabled,
         },
+        // Per-terminal liveness: 'down' retires the terminal in the portal at
+        // once rather than waiting for the hourly offline sweep.
+        devices: heartbeatDeviceStates(),
       }),
     });
     if (!res.ok) log('warn', 'Heartbeat failed', res.status, json);
@@ -326,6 +329,36 @@ const eventStats = { forwarded: 0, dropped: 0 };
 const pendingEvents = [];
 let flushTimer = null;
 let flushing = false;
+
+/**
+ * Per-terminal alertStream state, keyed by EstateMate device id.
+ *
+ * The agent staying online does not mean a terminal is reachable: the agent
+ * heartbeats on its own timer, and a terminal that stopped answering ISAPI
+ * leaves the agent looping in backoff while the portal still shows it online.
+ * Each stream loop records up/down here and the heartbeat carries it to the
+ * Worker, which retires the terminal immediately instead of waiting for the
+ * hourly sweep to notice that no events arrived.
+ */
+const streamStates = new Map();
+
+function setStreamState(deviceId, stream, lastError = null) {
+  if (!deviceId) return;
+  const previous = streamStates.get(deviceId);
+  streamStates.set(deviceId, {
+    stream,
+    lastError: lastError ? String(lastError).slice(0, 300) : null,
+    since: previous && previous.stream === stream ? previous.since : new Date().toISOString(),
+  });
+}
+
+function heartbeatDeviceStates() {
+  return [...streamStates.entries()].map(([deviceId, state]) => ({
+    deviceId,
+    stream: state.stream,
+    lastError: state.lastError,
+  }));
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -508,14 +541,17 @@ async function deviceEventLoop(device) {
       if (res.status !== 200) {
         const snippet = await res.text().catch(() => '');
         log('warn', `Alert stream unavailable for ${device.name}: HTTP ${res.status} ${snippet.slice(0, 200)}`);
+        setStreamState(device.estateMateDeviceId, 'down', `HTTP ${res.status} ${snippet.slice(0, 200)}`.trim());
       } else {
         const contentType = res.headers.get('content-type') || '';
         const boundary = /boundary\s*=\s*"?([^";]+)"?/i.exec(contentType)?.[1] || null;
         backoffMs = 5000;
         if (!res.body) {
           log('warn', `Alert stream for ${device.name} returned no body`);
+          setStreamState(device.estateMateDeviceId, 'down', 'terminal returned no stream body');
         } else {
           log('info', `Event stream connected for ${device.name}${boundary ? ' (multipart)' : ' (bare JSON)'}`);
+          setStreamState(device.estateMateDeviceId, 'up');
           const decoder = new TextDecoder();
           const feed = boundary
             ? createMultipartEventParser(boundary, (document) => queueEvent(device.estateMateDeviceId, document))
@@ -525,10 +561,12 @@ async function deviceEventLoop(device) {
             feed(decoder.decode(chunk, { stream: true }));
           }
           log('warn', `Event stream closed for ${device.name}`);
+          setStreamState(device.estateMateDeviceId, 'down', 'terminal closed the event stream');
         }
       }
     } catch (err) {
       log('warn', `Event stream error for ${device.name}`, err.message);
+      setStreamState(device.estateMateDeviceId, 'down', err.message);
     }
     if (shutdownRequested) break;
     await sleep(backoffMs);
@@ -709,7 +747,15 @@ async function main() {
     if (shutdownRequested) return;
     shutdownRequested = true;
     log('info', 'Shutting down...');
-    flushEvents().finally(() => process.exit(0));
+    // Report the terminals as down first: an orderly stop should not leave the
+    // portal showing gates as online while the agent is no longer watching them.
+    for (const deviceId of [...streamStates.keys()]) {
+      setStreamState(deviceId, 'down', 'agent shutting down');
+    }
+    heartbeat()
+      .catch(() => undefined)
+      .then(() => flushEvents())
+      .finally(() => process.exit(0));
     setTimeout(() => process.exit(0), 8000).unref();
   };
   process.on('SIGINT', shutdown);
@@ -729,6 +775,9 @@ export {
   main,
   pendingEvents,
   eventStats,
+  streamStates,
+  setStreamState,
+  heartbeatDeviceStates,
   // Exported for sibling hosts that need to talk to a device without starting
   // the main loops: bridge-apps/windows runs `bridge check` in standby mode and
   // reuses the digest/basic ISAPI client instead of reimplementing it, so there

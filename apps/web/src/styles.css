@@ -320,6 +320,8 @@ tbody tr:hover { background: #fafcff; }
    agent and terminal status remain the focus of the page. */
 .agent-summary { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px 20px; margin: 0 0 18px; padding: 14px 16px; border: 1px solid #cfe1fc; border-radius: 12px; background: #f4f8ff; }
 .agent-summary > p { margin: 0; color: #385675; font-size: 13px; line-height: 1.6; }
+/* Presence rules sit under both columns so they never squeeze the setup help. */
+.agent-summary > .presence-hint { grid-column: 1 / -1; padding-top: 12px; border-top: 1px dashed #cfe1fc; font-size: 12.5px; }
 .agent-setup summary { list-style: none; cursor: pointer; border-radius: 9px; padding: 9px 13px; background: #e3edfc; color: var(--blue); font-size: 12px; font-weight: 800; white-space: nowrap; }
 .agent-setup summary::-webkit-details-marker { display: none; }
 .agent-setup summary::after { content: ' +'; }
@@ -332,6 +334,7 @@ tbody tr:hover { background: #fafcff; }
 .agent-section { margin-top: 16px; box-shadow: none; }
 .page-actions { flex-wrap: wrap; white-space: normal; }
 :root[data-theme="dark"] .agent-summary { background: #17253a; border-color: #30415c; }
+:root[data-theme="dark"] .agent-summary > .presence-hint { border-top-color: #30415c; }
 :root[data-theme="dark"] .agent-summary > p, :root[data-theme="dark"] .agent-setup ol { color: #b7c4d6; }
 :root[data-theme="dark"] .agent-setup summary { background: #243854; color: #9cc4ff; }
 :root[data-theme="dark"] .agent-setup ol { border-color: #30415c; }

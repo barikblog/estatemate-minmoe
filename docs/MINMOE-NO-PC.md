@@ -10,7 +10,7 @@ Every access device reaches EstateMate through the **EstateMate agent** (`isapi-
 Why one transport:
 
 - **One security boundary.** Only the agent touches a terminal's ISAPI interface, and only on the VLAN. Nothing about a terminal is exposed to the Internet, and the agent needs no inbound firewall rule.
-- **One thing to monitor.** The agent heartbeats (`isapi_agents.status`, `last_seen_at`); if the LAN host dies, the portal shows the agent offline and devices stop updating — visible within minutes via the heartbeat.
+- **One thing to monitor.** The agent heartbeats (`isapi_agents.status`, `last_seen_at`); if the LAN host dies, the portal shows the agent offline and devices stop updating — visible within 3 minutes of the last heartbeat, and a terminal whose event stream drops is retired immediately rather than waiting for the hourly sweep.
 - **Free-tier headroom.** Agent batches collapse into one Queue message (~3 Queue operations) per flush, and the hourly cron prunes old events, so a busy estate stays far inside the Workers Free plan.
 
 Connection patterns in the registry:
