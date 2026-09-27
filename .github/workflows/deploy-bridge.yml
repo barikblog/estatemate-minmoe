@@ -122,13 +122,33 @@ jobs:
         run: |
           set -euo pipefail
           url="$(grep -oE 'https://[a-zA-Z0-9.-]+\.workers\.dev[^ )]*' /tmp/bridge-deploy.out | head -1 || true)"
+          # Wrangler prints the Worker URL with a trailing slash; trim it so
+          # "$url/health" does not become "//health".
+          url="${url%/}"
           if [ -z "$url" ]; then
             echo "::error::could not read the workers.dev URL from the deploy output"
             exit 1
           fi
           echo "Bridge URL: $url"
-          health="$(curl -sS --fail-with-body --max-time 30 "$url/health")"
-          echo "$health"
-          grep -q '"ok":true' <<<"$health"
-          grep -q '"tunnelConfigured":true' <<<"$health"
+          # A brand-new workers.dev subdomain can 404 for a short while after
+          # the first deploy — poll for up to ~60s before failing.
+          status="000"
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if status="$(curl -sS -o /tmp/health.json -w '%{http_code}' --max-time 30 "$url/health")"; then
+              :
+            else
+              status="000"
+            fi
+            if [ "$status" = "200" ]; then break; fi
+            echo "attempt $attempt: status=$status body=$(head -c 300 /tmp/health.json 2>/dev/null || true)"
+            sleep 6
+          done
+          echo "final: status=$status"
+          cat /tmp/health.json; echo
+          if [ "$status" != "200" ]; then
+            echo "::error::GET /health did not return 200 (status=$status)"
+            exit 1
+          fi
+          grep -q '"ok":true' /tmp/health.json
+          grep -q '"tunnelConfigured":true' /tmp/health.json
           echo "Deployed bridge is healthy at $url"

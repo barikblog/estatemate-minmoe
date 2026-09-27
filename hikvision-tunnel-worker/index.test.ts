@@ -12,8 +12,23 @@ import {
   collectAcsEvents,
   extractChallenge,
   md5Hex,
+  normalizePath,
   toSyncUser,
 } from './index';
+
+describe('normalizePath', () => {
+  it('routes the CI health probe (trailing slash on the base URL → double slash)', () => {
+    expect(normalizePath('//health')).toBe('/health');
+    expect(normalizePath('/health/')).toBe('/health');
+    expect(normalizePath('/pull-logs/')).toBe('/pull-logs');
+  });
+
+  it('keeps the root route and ordinary paths', () => {
+    expect(normalizePath('/')).toBe('/');
+    expect(normalizePath('')).toBe('/');
+    expect(normalizePath('/access-logs')).toBe('/access-logs');
+  });
+});
 
 describe('md5Hex (RFC 1321 vectors)', () => {
   it('hashes the empty string', () => {
