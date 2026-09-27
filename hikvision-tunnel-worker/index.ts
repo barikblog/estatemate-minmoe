@@ -915,9 +915,18 @@ async function handleAccessLogs(request: Request, env: Env, cors: Record<string,
 // Handler entry points
 // ---------------------------------------------------------------------------
 
+/**
+ * Route path normalisation: collapses duplicate slashes (wrangler prints the
+ * Worker URL with a trailing slash, so CI probes arrive as `//health`) and
+ * strips trailing slashes, so `/health`, `/health/` and `//health` all route.
+ */
+export function normalizePath(pathname: string): string {
+  return pathname.replace(/\/{2,}/g, '/').replace(/\/+$/, '') || '/';
+}
+
 async function route(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
-  const path = url.pathname.replace(/\/+$/, '') || '/';
+  const path = normalizePath(url.pathname);
   const cors = corsHeaders(request, env);
 
   if (request.method === 'OPTIONS') {
