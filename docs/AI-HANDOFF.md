@@ -1,5 +1,41 @@
 # AI handoff — EstateMate
 
+## Access-operations operator script + fingerprint slot uniqueness fix (2026-09-27)
+
+Requested as: "Retry the failed card jobs. Suspend and restore any card that was
+restored under person '1'. Delete and re-add fingerprints whose number is a user ID
+or shared with someone else, then enroll them on the terminal under the new number."
+
+- **Operator script:** `scripts/access-operations.mjs` — dependency-free Node 18+
+  tool that performs those three administrator actions through the portal's own
+  admin API (so everything is audit-logged and hardware tasks queue the same way
+  as from the portal). Dry run by default; `--execute` (typed EXECUTE, or `--yes`
+  headless) applies. Credentials come from `ESTATEMATE_ADMIN_EMAIL` /
+  `ESTATEMATE_ADMIN_PASSWORD` env vars and are never printed or logged. Flags:
+  `--base`, `--person <id|email|name|unit>` (exact match; ambiguous names are
+  refused), `--card`, `--include-household`, `--kinds card,fingerprint,door,visitor`
+  (default `card`), `--number-base` (default 10001), `--log`. Task 3 assigns each
+  re-registered finger a fresh employee number that collides with no existing
+  employee number and no user id, and the queued enrollment instruction names the
+  new number. Validated end-to-end against `wrangler dev --local` with a seeded
+  fixture (failed card op, restored cards, user-id-number and shared-number
+  fingerprints): dry run, execute, follow-up idempotent dry run, and DB-state
+  checks all pass. The operator must run it from a machine with internet — the
+  Arena sandbox has no egress to Cloudflare and no session.
+- **Bug found and fixed by that validation (migration `0017`):** 0015 created
+  `idx_fingerprints_person_slot` as a table-wide unique index on
+  `(resident_id, household member, finger_no)`, but the documented (and app-level
+  checked) rule only covers live credentials (`status IN ('active','suspended')`).
+  Because DELETE keeps the row `revoked` for history, the documented
+  "delete and re-add the same finger slot" flow **always failed** with a
+  unique-constraint violation (409/500 from the INSERT). `0017` replaces the
+  index with the partial unique index `idx_fingerprints_person_slot_live`
+  (`WHERE status IN ('active','suspended')`): live duplicates stay impossible,
+  re-enrollment after revocation works. No data altered. **Not yet in
+  production** — it ships when this branch is merged to `main` (the deploy
+  workflow applies pending migrations). Task 3 of the script is blocked on that
+  deploy; tasks 1–2 work on the currently deployed schema.
+
 ## Access control remote (2026-09-27)
 
 Administrators have an **Access control remote** page. It queues door commands (`remote_open`, `remote_close`, `remote_always_open`, `remote_always_close`, `remote_resume`), suspends or restores a person's cards and fingerprints, syncs or revokes visitor passes, retries failed commands, and assigns security gate posts. Delivery is the estate agent over ISAPI on the LAN. It is not ISUP and it does not send commands through a Cloudflare Tunnel. Automatic door control is best-effort: no device profile records a verified remote-door command, so a terminal rejection stays in Hardware actions for an operator. Fingerprints are still captured on the terminal. An already-installed bridge (tag `bridge-0.2.1` and earlier) does not know `remote_*` or `revoke_visitor`; those commands fail as unknown until that agent is rebuilt. Card enable/disable uses the existing operation kinds and works on the installed agent.
@@ -365,11 +401,22 @@ Merged to `main` as PR #19 (`8615f4f`), which is the only deploy path
 
 ## Most recent migration
 
-`migrations/0015_fingerprint_credentials.sql`
+`migrations/0017_fingerprint_slot_live_unique.sql`
 
-It adds the fingerprint credential register:
+It fixes the fingerprint slot uniqueness to match what the application enforces
+(see "Access-operations operator script + fingerprint slot uniqueness fix"
+above): the 0015 table-wide unique index on `(resident_id, household member,
+finger_no)` made the documented delete-then-re-add flow for a finger slot
+impossible, because a revoked historical row still occupied the slot key. 0017
+replaces it with the partial unique index `idx_fingerprints_person_slot_live`
+covering only `active`/`suspended` rows. No data is altered.
 
-- `fingerprint_credentials`: `resident_id` (always the main resident), optional `household_member_id`, `employee_no`, `finger_no` (CHECK 1–10), `finger_label`, `enrolled_device_id`, `status`/`expires_at`/`auto_expired`/`deactivated_*`, `created_by`. A unique index on `(resident_id, COALESCE(household_member_id,''), finger_no)` stops the same slot being recorded twice for one person while still allowing a new record after a revocation.
+The previous migration, `migrations/0016_remote_door_commands.sql`, rebuilt
+`device_operations` to carry the `remote_*` door commands. Before that,
+`migrations/0015_fingerprint_credentials.sql` added the fingerprint credential
+register:
+
+- `fingerprint_credentials`: `resident_id` (always the main resident), optional `household_member_id`, `employee_no`, `finger_no` (CHECK 1–10), `finger_label`, `enrolled_device_id`, `status`/`expires_at`/`auto_expired`/`deactivated_*`, `created_by`. A unique index on `(resident_id, COALESCE(household_member_id,''), finger_no)` stops the same slot being recorded twice for one person while still allowing a new record after a revocation — the original table-wide index broke the second half (a revoked row kept the slot key forever); 0017 replaced it with the partial index over live rows.
 - `fingerprint_status_changes`: the audit trail for enrollment, suspension, expiry/restore and deletion.
 - `access_events.fingerprint_id`: which finger opened the gate, so a cardless event is attributable.
 - `device_operations` is **rebuilt data-preservingly** (SQLite cannot widen a CHECK constraint): every 0011 column is carried over and `fingerprint_id` plus `manual_instruction` are added, with `enroll_fingerprint`/`enable_fingerprint`/`disable_fingerprint`/`delete_fingerprint` allowed alongside the existing card and visitor kinds.
