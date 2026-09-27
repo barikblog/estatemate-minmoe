@@ -36,10 +36,16 @@ or shared with someone else, then enroll them on the terminal under the new numb
   unique-constraint violation (409/500 from the INSERT). `0017` replaces the
   index with the partial unique index `idx_fingerprints_person_slot_live`
   (`WHERE status IN ('active','suspended')`): live duplicates stay impossible,
-  re-enrollment after revocation works. No data altered. **Not yet in
-  production** — it ships when this branch is merged to `main` (the deploy
-  workflow applies pending migrations). Task 3 of the script is blocked on that
-  deploy; tasks 1–2 work on the currently deployed schema.
+  re-enrollment after revocation works. No data altered. **Deployed to production**
+  via PR #33 (`c0bf038`) in Deploy EstateMate run `36334539912` (migration applied
+  to D1 `estatemate-db`).
+- **One-off Actions runner (`.github/workflows/access-operations.yml`):** PR #34
+  (`468e041`, Deploy EstateMate run `36337255300`) added the Actions runner for
+  `scripts/access-operations.mjs` and `--remove-from-devices` support, allowing
+  an operator to run dry-run and execution passes directly from GitHub Actions
+  (where runners have clean TLS egress to `*.workers.dev`) using repository secrets
+  `ESTATEMATE_ADMIN_EMAIL` and `ESTATEMATE_ADMIN_PASSWORD`. Production smoke test
+  run `36337312742` succeeded.
 
 ## Access control remote (2026-09-27)
 
