@@ -242,6 +242,18 @@ public final class ProtocolTest {
         check("upsert_visitor succeeds", visitorResult.success, String.valueOf(visitorResult.error));
         check("upsert_visitor posts the XML tempCard", fake.visitorRecords.size() == 1 && fake.visitorRecords.get(0).contains("tempCard"), fake.visitorRecords.toString());
 
+        Map<String, Object> revoke = new LinkedHashMap<String, Object>();
+        revoke.put("credentialNumber", "VIS-7");
+        IsapiClient.OpResult revokeResult = client.applyOperation(device, "revoke_visitor", revoke);
+        check("revoke_visitor succeeds", revokeResult.success, String.valueOf(revokeResult.error));
+        check("revoke_visitor deletes the visitor card", fake.deleteRequests.size() == 2 && fake.deleteRequests.get(1).contains("VIS-7"), fake.deleteRequests.toString());
+
+        Map<String, Object> door = new LinkedHashMap<String, Object>();
+        door.put("doorNo", Integer.valueOf(2));
+        IsapiClient.OpResult doorResult = client.applyOperation(device, "remote_open", door);
+        check("remote_open succeeds", doorResult.success, String.valueOf(doorResult.error));
+        check("remote_open uses the RemoteControl door path", fake.doorRequests.size() == 1 && fake.doorRequests.get(0).contains("/door/2") && fake.doorRequests.get(0).contains("open"), fake.doorRequests.toString());
+
         IsapiClient.OpResult unknown = client.applyOperation(device, "teleport_resident", payload);
         check("unknown operations fail cleanly", !unknown.success && unknown.error.contains("Unknown operation"));
 
@@ -383,6 +395,7 @@ public final class ProtocolTest {
         final List<String> xmlCardRecords = new ArrayList<String>();
         final List<String> deleteRequests = new ArrayList<String>();
         final List<String> visitorRecords = new ArrayList<String>();
+        final List<String> doorRequests = new ArrayList<String>();
     }
 
     private static final class DeviceHandler implements HttpHandler {
@@ -437,6 +450,11 @@ public final class ProtocolTest {
             }
             if (path.equals("/ISAPI/AccessControl/CardInfo/Delete")) {
                 device.deleteRequests.add(exchange.getRequestMethod() + " " + body);
+                respond(exchange, 200, "{\"statusCode\":1,\"statusString\":\"OK\"}");
+                return;
+            }
+            if (path.startsWith("/ISAPI/AccessControl/RemoteControl/door/")) {
+                device.doorRequests.add(exchange.getRequestMethod() + " " + path + " " + body);
                 respond(exchange, 200, "{\"statusCode\":1,\"statusString\":\"OK\"}");
                 return;
             }

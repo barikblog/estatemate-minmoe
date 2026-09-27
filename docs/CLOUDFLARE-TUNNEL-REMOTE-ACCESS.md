@@ -100,6 +100,7 @@ the free plan cannot proxy it.
 
 ## What this kit deliberately does not do
 
+- **No device commands.** The administrator Access control remote page queues door, card and visitor commands for the estate agent. Those commands never travel through this tunnel.
 - **No ISUP.** ISUP/EHome is the device dialling a raw TCP platform (7660, with
   8003/8004 for streams) and authenticating with an EHome key. A K1T terminal
   cannot run `cloudflared` or WARP, cannot present a Cloudflare Access identity,

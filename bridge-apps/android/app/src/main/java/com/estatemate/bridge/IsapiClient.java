@@ -364,6 +364,25 @@ public final class IsapiClient {
                 return judge(response, true);
             }
 
+            if (op.equals("revoke_visitor")) {
+                String credential = firstNonEmpty(Json.string(payload, "credentialNumber", null), cardUid);
+                if (credential == null) return new OpResult(false, "Missing credential number");
+                Map<String, Object> cardRef = new LinkedHashMap<String, Object>();
+                cardRef.put("CardNo", credential);
+                java.util.ArrayList<Object> list = new java.util.ArrayList<Object>();
+                list.add(cardRef);
+                Map<String, Object> jsonBody = new LinkedHashMap<String, Object>();
+                jsonBody.put("CardNoList", list);
+                Response response = request(device, "PUT", "/ISAPI/AccessControl/CardInfo/Delete?format=json", Json.write(jsonBody), false);
+                if (response.status >= 400) {
+                    String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CardInfoDelCond>\n"
+                            + "  <CardNoList>\n    <CardNo>" + credential + "</CardNo>\n  </CardNoList>\n"
+                            + "</CardInfoDelCond>";
+                    response = request(device, "PUT", "/ISAPI/AccessControl/CardInfo/Delete", xml, true);
+                }
+                return judge(response, true);
+            }
+
             if (op.equals("upsert_visitor")) {
                 String credential = firstNonEmpty(Json.string(payload, "credentialNumber", null), cardUid);
                 if (credential == null) return new OpResult(false, "Missing credential number");
@@ -373,6 +392,22 @@ public final class IsapiClient {
                         + "  <cardType>tempCard</cardType>\n"
                         + "</CardInfo>";
                 Response response = request(device, "POST", "/ISAPI/AccessControl/CardInfo/Record", xml, true);
+                return judge(response, false);
+            }
+
+            String doorCmd = doorCommand(op);
+            if (doorCmd != null) {
+                int door = Json.integer(payload, "doorNo", 1);
+                if (door < 1 || door > 8) return new OpResult(false, "doorNo must be 1-8");
+                Map<String, Object> cmd = new LinkedHashMap<String, Object>();
+                cmd.put("cmd", doorCmd);
+                Map<String, Object> jsonBody = new LinkedHashMap<String, Object>();
+                jsonBody.put("RemoteControlDoor", cmd);
+                Response response = request(device, "PUT", "/ISAPI/AccessControl/RemoteControl/door/" + door + "?format=json", Json.write(jsonBody), false);
+                if (response.status >= 400) {
+                    String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<RemoteControlDoor><cmd>" + doorCmd + "</cmd></RemoteControlDoor>";
+                    response = request(device, "PUT", "/ISAPI/AccessControl/RemoteControl/door/" + door, xml, true);
+                }
                 return judge(response, false);
             }
 
@@ -398,6 +433,15 @@ public final class IsapiClient {
         }
         String snippet = body.length() > 200 ? body.substring(0, 200) : body;
         return new OpResult(false, "ISAPI " + response.status + ": " + snippet);
+    }
+
+    private static String doorCommand(String operation) {
+        if ("remote_open".equals(operation)) return "open";
+        if ("remote_close".equals(operation)) return "close";
+        if ("remote_always_open".equals(operation)) return "alwaysOpen";
+        if ("remote_always_close".equals(operation)) return "alwaysClose";
+        if ("remote_resume".equals(operation)) return "resume";
+        return null;
     }
 
     private static String firstNonEmpty(String... values) {
