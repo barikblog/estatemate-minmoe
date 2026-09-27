@@ -42,7 +42,11 @@
     { "tag": "v1", "new_sqlite_classes": ["AccessLiveFeed"] }
   ],
   "triggers": {
-    "crons": ["15 * * * *"]
+    // Hourly estate housekeeping, plus a per-minute sweep that deletes visitor
+    // device accounts as soon as their validity ends. Cloudflare's cron
+    // granularity is one minute, so this is the fastest automatic release
+    // available; both schedules fit the free plan's three-trigger limit.
+    "crons": ["15 * * * *", "* * * * *"]
   },
   "vars": {
     "APP_NAME": "EstateMate",

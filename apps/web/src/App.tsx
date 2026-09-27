@@ -444,9 +444,9 @@ function SectionView({ section, user, config, gate, onNavigate }: { section: Sec
     case 'dependants': return <DependantsManager user={user} onNavigate={onNavigate} />;
     case 'staff': return <StaffManagement user={user} />;
     case 'bookings': return <FacilityBookings user={user} />;
-    case 'emergency': return <EmergencyContacts />;
-    case 'information': return <InformationHub onNavigate={onNavigate} />;
-    case 'legal': return <LegalGovernance />;
+    case 'emergency': return <EmergencyContacts user={user} />;
+    case 'information': return <InformationHub user={user} onNavigate={onNavigate} />;
+    case 'legal': return <LegalGovernance user={user} />;
   }
 }
 
@@ -579,7 +579,7 @@ function People({ user }: { user: User }) {
   const list=useList(`/api/users?limit=100&search=${encodeURIComponent(search)}${role?`&role=${role}`:''}`);
   const available=useAsync<{ items:Row[] }>(()=>canManage?api('/api/properties/available'):Promise.resolve({ items:[] }),[user.role]);
   const imports=useAsync<ListResponse<Row>>(()=>canManage?api('/api/imports?kind=users&limit=20'):Promise.resolve({ items:[],page:1,limit:20 }),[user.role]);
-  const [showForm,setShowForm]=useState(false);const [showImport,setShowImport]=useState(false);const [editing,setEditing]=useState<Row|null>(null);const [message,setMessage]=useState('');const [temporaryPassword,setTemporaryPassword]=useState('');const [sampleCredentials,setSampleCredentials]=useState<Array<{ role:string;name:string;email:string;temporaryPassword:string }>>([]);
+  const [showForm,setShowForm]=useState(false);const [showImport,setShowImport]=useState(false);const [showBulk,setShowBulk]=useState(false);const [editing,setEditing]=useState<Row|null>(null);const [message,setMessage]=useState('');const [temporaryPassword,setTemporaryPassword]=useState('');const [sampleCredentials,setSampleCredentials]=useState<Array<{ role:string;name:string;email:string;temporaryPassword:string }>>([]);
   function refresh(){list.reload();available.reload();imports.reload();}
   async function updateStatus(row:Row,status:'active'|'inactive') {
     if(status==='inactive'&&!confirm(`Deactivate ${String(row.name)}? Login will stop and active cards will be suspended. Ownership or tenancy must be resolved first.`))return;
@@ -605,7 +605,7 @@ function People({ user }: { user: User }) {
   const accessDevices=useAsync<{ items:Row[] }>(()=>canManage?api('/api/access/device-options'):Promise.resolve({ items:[] }),[user.role]);
   const [accessPerson,setAccessPerson]=useState<Row|null>(null);
   const actions=canManage?(row:Row)=>user.role==='manager'&&['admin','manager'].includes(String(row.role))?null:<div className="row-actions"><button className="text" onClick={()=>{setEditing(row);setShowForm(false);setAccessPerson(null);}}>Edit</button><button className="text" onClick={()=>{setAccessPerson(row);setEditing(null);setShowForm(false);}}>Cards &amp; fingerprints</button><button className="text" onClick={()=>resetPassword(row)}>Reset password</button>{row.status==='active'?<button className="text" onClick={()=>updateStatus(row,'inactive')}>Deactivate</button>:<button className="text" onClick={()=>updateStatus(row,'active')}>Reactivate</button>}<button className="text danger" onClick={()=>remove(row)}>Delete</button></div>:undefined;
-  return <PagePanel title="People" subtitle="Register, assign, import and safely manage resident and staff accounts" action={canManage?<div className="row-actions">{user.role==='admin'&&<button className="secondary" onClick={generateSamples}>Create 24-hour sample logins</button>}<button className="secondary" onClick={()=>setShowImport(!showImport)}>Import users</button><button className="primary" onClick={()=>{setShowForm(!showForm);setEditing(null);}}>Add person</button></div>:null}>
+  return <PagePanel title="People" subtitle="Register, assign, import and safely manage resident and staff accounts" action={canManage?<div className="row-actions">{user.role==='admin'&&<button className="secondary" onClick={generateSamples}>Create 24-hour sample logins</button>}<button className="secondary" onClick={()=>setShowImport(!showImport)}>Import users</button><button className="secondary" onClick={()=>setShowBulk(!showBulk)}>Bulk tools</button><button className="primary" onClick={()=>{setShowForm(!showForm);setEditing(null);}}>Add person</button></div>:null}>
     {message&&<Notice tone={/failed|Could not|before|must|cannot|already/i.test(message)?'error':'success'}>{message}</Notice>}
     {temporaryPassword&&<section className="credential-box"><p className="eyebrow">COPY NOW — SHOWN ONCE</p><h3>Temporary password</h3><code>{temporaryPassword}</code><p>Share it securely. The user should change it immediately after signing in.</p><button className="secondary" onClick={()=>navigator.clipboard.writeText(temporaryPassword)}>Copy password</button><button className="text" onClick={()=>setTemporaryPassword('')}>Hide</button></section>}
     {sampleCredentials.length>0&&<section className="credential-box"><p className="eyebrow">24-HOUR SAMPLE LOGINS — SHOWN ONCE</p><h3>All five user categories created</h3><p>Administrator, Manager, Resident, Security and Cashier sample accounts are active for 24 hours.</p><div className="row-actions"><button className="secondary" onClick={downloadSamples}>Download login details</button><button className="text" onClick={()=>setSampleCredentials([])}>Hide</button></div></section>}
@@ -615,8 +615,9 @@ function People({ user }: { user: User }) {
       <PersonCredentials residentId={String(accessPerson.id)} personName={String(accessPerson.name)} devices={accessDevices.data?.items ?? []} onChanged={refresh} />
     </section>}
     {showImport&&<UsersCsvImporter onDone={()=>{refresh();}} />}
+    {showBulk&&<PeopleBulkTools onDone={()=>{refresh();}} />}
     <div className="people-filters"><label>Search<input value={search} onChange={(event)=>setSearch(event.target.value)} placeholder="Name, email or phone" /></label><label>Role<select value={role} onChange={(event)=>setRole(event.target.value)}><option value="">All roles</option><option value="resident">Residents</option><option value="security">Security</option><option value="cashier">Cashiers</option><option value="manager">Managers</option><option value="admin">Administrators</option></select></label></div>
-    <ListState list={list}><DataTable exportTitle="Residents & Staff" rows={list.data?.items ?? []} columns={[['name','Name'],['role','Role'],['email','Email'],['phone','Phone'],['unit_numbers','Owned'],['rented_units','Rented'],['dependant_units','Dependant at'],['property_count','Owned count'],['status','Status']]} action={actions} /></ListState>
+    <ListState list={list}><DataTable exportTitle="Residents & Staff" rows={list.data?.items ?? []} columns={[['name','Name'],['role','Role'],['employee_id','Employee ID'],['email','Email'],['phone','Phone'],['unit_numbers','Owned'],['rented_units','Rented'],['dependant_units','Dependant at'],['property_count','Owned count'],['status','Status']]} action={actions} /></ListState>
     {canManage&&imports.data&&imports.data.items.length>0&&<section className="import-history"><h3>User import history</h3><DataTable rows={imports.data.items} columns={[['filename','File'],['status','Status'],['total_rows','Rows'],['successful_rows','Created'],['error_rows','Errors'],['created_at','Uploaded','date']]} action={(row)=>row.storage_key?<a className="text" href={`/api/files/${encodeURIComponent(String(row.storage_key))}`}>Download source</a>:null} /></section>}
   </PagePanel>;
 }
@@ -631,6 +632,7 @@ function UserAccountForm({ actorRole,user,properties,onDone,onCancel }: { actorR
   }
   return <FormCard title={user?`Edit ${String(user.name)}`:'New account'} onSubmit={submit} message={message}>
     <label>Name<input name="name" defaultValue={String(user?.name ?? '')} required /></label><label>Email<input name="email" type="email" defaultValue={String(user?.email ?? '')} required /></label><label>Phone<input name="phone" defaultValue={String(user?.phone ?? '')} /></label>
+    <label>Employee ID<input name="employeeId" defaultValue={String(user?.employee_id ?? '')} maxLength={32} pattern="[A-Za-z0-9._/\-]{1,32}" placeholder="Auto-generated" /><small>The person's identity on access-control devices. Max 32 characters; left blank, EstateMate generates one.</small></label>
     <label>Role<select name="role" value={role} onChange={(event)=>setRole(event.target.value)}><option value="resident">Resident</option><option value="security">Security</option><option value="cashier">Cashier</option>{actorRole==='admin'&&<><option value="manager">Manager</option><option value="admin">Administrator</option></>}</select></label>
     {user&&<label>Status<select name="status" defaultValue={String(user.status ?? 'active')}><option value="active">Active</option><option value="inactive">Inactive</option></select></label>}
     {role==='resident'&&<label>{user?'Assign another available property (optional)':'Available property (optional)'}<select name="propertyId"><option value="">No property assignment</option>{properties.map((property)=><option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)} — {String(property.address)}</option>)}</select><small>Only properties without an approved owner are listed. Existing ownership is not replaced.</small></label>}
@@ -639,9 +641,70 @@ function UserAccountForm({ actorRole,user,properties,onDone,onCancel }: { actorR
   </FormCard>;
 }
 
+/**
+ * The four bulk verbs for the whole person register — accounts and dependants —
+ * because both hold credentials on the same terminals. Upload and edit are CSV
+ * files archived against an import job; delete and resynchronise act on a pasted
+ * list of Employee IDs (or every person, for a full re-push).
+ */
+function PeopleBulkTools({ onDone }: { onDone:()=>void }) {
+  const [uploadResult,setUploadResult]=useState('');const [editResult,setEditResult]=useState('');
+  const [otherResult,setOtherResult]=useState('');const [busy,setBusy]=useState(false);
+  const [deleteIds,setDeleteIds]=useState('');const [resyncIds,setResyncIds]=useState('');
+  const [credentials,setCredentials]=useState<Array<{ name:string;email:string;employeeId:string;temporaryPassword:string }>>([]);
+  const uploadTemplate='person_type,name,email,phone,role,employee_id,unit_number,relationship,primary_resident_email\naccount,Ada Resident,ada@example.com,+2348000000000,resident,EMP-0001,A-01,,\naccount,Gate Officer,security@example.com,+2348000000001,security,EMP-0002,,,\ndependant,Nanny One,,+2348000000002,,EMP-0003,,domestic_staff,ada@example.com\n';
+  const editTemplate='employee_id,name,phone,new_employee_id,status\nEMP-0001,Ada Resident,+2348000000099,,active\nEMP-0003,,+2348000000100,DEP-2024,,inactive\n';
+  function download(name:string,text:string){const url=URL.createObjectURL(new Blob([text],{type:'text/csv'}));const link=document.createElement('a');link.href=url;link.download=name;link.click();URL.revokeObjectURL(url);}
+  function downloadCredentials(){const quote=(value:string)=>`"${value.replaceAll('"','""')}"`;download('estatemate-bulk-people-credentials.csv',`name,email,employee_id,temporary_password\n${credentials.map((item)=>[item.name,item.email,item.employeeId,item.temporaryPassword].map(quote).join(',')).join('\n')}\n`);}
+  function parseIds(raw:string):string[]{return [...new Set(raw.split(/[\s,;]+/).map((value)=>value.trim()).filter(Boolean))];}
+  async function submitCsv(event:FormEvent<HTMLFormElement>,path:string,setResult:(value:string)=>void) {
+    event.preventDefault();setResult('');setBusy(true);const input=event.currentTarget.elements.namedItem('file') as HTMLInputElement;const file=input.files?.[0];
+    if(!file){setResult('Choose a CSV file.');setBusy(false);return;}
+    try {
+      const response=await api<{ totalRows:number;accountsCreated?:number;dependantsCreated?:number;successfulRows:number;errorRows:number;errors:Array<{row:number;error:string}>;credentials?:Array<{ name:string;email:string;employeeId:string;temporaryPassword:string }>;notice?:string }>(path,{method:'POST',body:await file.text(),headers:{'Content-Type':'text/csv','X-Filename':file.name}});
+      if(response.credentials?.length)setCredentials(response.credentials);
+      const first=response.errors[0]?` First error: row ${response.errors[0].row} — ${response.errors[0].error}`:'';
+      const created=[response.accountsCreated?`${response.accountsCreated} account(s)`:null,response.dependantsCreated?`${response.dependantsCreated} dependant(s)`:null].filter(Boolean).join(', ');
+      setResult(`${response.successfulRows} succeeded${created?` (${created})`:''}; ${response.errorRows} row error(s).${first}${response.notice?` ${response.notice}`:''}`);
+      onDone();
+    } catch(reason){setResult(reason instanceof Error?reason.message:'Bulk operation failed');}
+    finally{setBusy(false);}
+  }
+  async function bulkDelete() {
+    const ids=parseIds(deleteIds);if(!ids.length){setOtherResult('Paste at least one Employee ID to delete.');return;}
+    if(!confirm(`Delete ${ids.length} person(s)? EstateMate uses a safe soft delete: access stops everywhere, history is preserved.`))return;
+    setBusy(true);setOtherResult('');
+    try {
+      const response=await api<{ totalRows:number;successfulRows:number;errorRows:number;errors:Array<{row:number;error:string}>;notice:string }>('/api/people/bulk-delete',{method:'POST',body:JSON.stringify({confirm:'DELETE_PEOPLE',employeeIds:ids})});
+      const first=response.errors[0]?` First error: ${response.errors[0].error}`:'';
+      setOtherResult(`${response.successfulRows} deleted; ${response.errorRows} skipped.${first} ${response.notice}`);setDeleteIds('');onDone();
+    } catch(reason){setOtherResult(reason instanceof Error?reason.message:'Bulk delete failed');}
+    finally{setBusy(false);}
+  }
+  async function bulkResync(scope:'all'|'people') {
+    const ids=parseIds(resyncIds);
+    if(scope==='people'&&!ids.length){setOtherResult('Paste Employee IDs to resynchronise, or press "Resynchronise everyone".');return;}
+    if(scope==='all'&&!confirm('Re-push every credential of every person to all access-control devices? Open commands are reused, not duplicated.'))return;
+    setBusy(true);setOtherResult('');
+    try {
+      const response=await api<{ people:number;queued:number;manual:number;skipped:number;notice:string }>('/api/people/bulk-resync',{method:'POST',body:JSON.stringify(scope==='all'?{scope}:{scope:'people',employeeIds:ids})});
+      setOtherResult(`${response.people} person(s): ${response.queued} command(s) queued for the agent, ${response.manual} fingerprint task(s) for an operator, ${response.skipped} already open.`);
+      onDone();
+    } catch(reason){setOtherResult(reason instanceof Error?reason.message:'Bulk resynchronise failed');}
+    finally{setBusy(false);}
+  }
+  return <section className="import-grid">
+    <form className="form-card import-card" onSubmit={(event)=>submitCsv(event,'/api/people/bulk-upload',setUploadResult)}><h3>Bulk upload people</h3><p>Accounts and dependants in one CSV. Accounts need email and role; dependants need a relationship and the main resident’s email or Employee ID. Employee IDs are optional but max 32 characters. Temporary passwords are returned once.</p><input name="file" type="file" accept=".csv,text/csv" required /><div className="row-actions"><button type="button" className="secondary" onClick={()=>download('people-upload-template.csv',uploadTemplate)}>Download template</button><button className="primary" disabled={busy}>{busy?'Uploading…':'Upload people'}</button>{credentials.length>0&&<button type="button" className="secondary" onClick={downloadCredentials}>Download credentials</button>}</div>{uploadResult&&<Notice tone={/error|failed|First error/i.test(uploadResult)?'warning':'success'}>{uploadResult}</Notice>}</form>
+    <form className="form-card import-card" onSubmit={(event)=>submitCsv(event,'/api/people/bulk-edit',setEditResult)}><h3>Bulk edit people</h3><p>Match each row by employee_id (email is a fallback). Only the columns you fill change. new_employee_id re-points a terminal identity — resynchronise afterwards so hardware agrees.</p><input name="file" type="file" accept=".csv,text/csv" required /><div className="row-actions"><button type="button" className="secondary" onClick={()=>download('people-edit-template.csv',editTemplate)}>Download template</button><button className="primary" disabled={busy}>{busy?'Saving…':'Apply edits'}</button></div>{editResult&&<Notice tone={/error|failed|First error/i.test(editResult)?'warning':'success'}>{editResult}</Notice>}</form>
+    <div className="form-card import-card"><h3>Bulk delete</h3><p>Paste Employee IDs, one per line. Safe soft delete: gate access stops on every device and billing, access-event and audit history is preserved.</p><textarea rows={4} value={deleteIds} onChange={(event)=>setDeleteIds(event.target.value)} placeholder={'EMP-0001\nEMP-0002'} /><div className="row-actions"><button className="primary danger" onClick={bulkDelete} disabled={busy}>{busy?'Deleting…':'Delete these people'}</button></div></div>
+    <div className="form-card import-card"><h3>Resynchronise into all access controls</h3><p>Re-push every credential of the selected people — or of everyone holding a credential — to every terminal. Active cards are refreshed with the current Employee ID; inactive ones are disabled; fingerprints are queued as operator tasks.</p><textarea rows={3} value={resyncIds} onChange={(event)=>setResyncIds(event.target.value)} placeholder={'Optional: EMP-0001 EMP-0002'} /><div className="row-actions"><button className="primary" onClick={()=>bulkResync('people')} disabled={busy}>{busy?'Working…':'Resynchronise listed'}</button><button className="secondary" onClick={()=>bulkResync('all')} disabled={busy}>Resynchronise everyone</button></div></div>
+    {otherResult&&<div className="span-2"><Notice tone={/failed|skipped|error/i.test(otherResult)?'warning':'success'}>{otherResult}</Notice></div>}
+  </section>;
+}
+
 function UsersCsvImporter({ onDone }: { onDone:()=>void }) {
   const [result,setResult]=useState('');const [busy,setBusy]=useState(false);const [credentials,setCredentials]=useState<Array<{ name:string;email:string;temporaryPassword:string }>>([]);
-  const template='name,email,phone,role,unit_number,status\nAda Resident,ada@example.com,+2348000000000,resident,A-01,active\nGate Officer,security@example.com,+2348000000001,security,,active\n';
+  const template='name,email,phone,role,unit_number,status,employee_id\nAda Resident,ada@example.com,+2348000000000,resident,A-01,active,EMP-0001\nGate Officer,security@example.com,+2348000000001,security,,active,\n';
   function download(name:string,text:string) { const url=URL.createObjectURL(new Blob([text],{ type:'text/csv' }));const link=document.createElement('a');link.href=url;link.download=name;link.click();URL.revokeObjectURL(url); }
   function downloadCredentials() { const quote=(value:string)=>`"${value.replaceAll('"','""')}"`;download('estatemate-new-user-credentials.csv',`name,email,temporary_password\n${credentials.map((item)=>[item.name,item.email,item.temporaryPassword].map(quote).join(',')).join('\n')}\n`); }
   async function upload(event:FormEvent<HTMLFormElement>) {
@@ -1096,7 +1159,7 @@ function Visitors({ user }: { user: User }) {
       const created = await api<Row>('/api/visitors', { method: 'POST', body: JSON.stringify({ ...raw,proofKeys }) });
       const property=properties.data?.items.find((item)=>item.id===raw.propertyId);
       setSelectedPass({ ...raw,...created,visitor_name:raw.visitorName,valid_from:created.validFrom ?? raw.validFrom,valid_until:created.validUntil ?? raw.validUntil,resident_name:user.role==='resident'?user.name:raw.residentId,unit_number:property?.unit_number,street:property?.street });
-      setResult('Pass created. Share the QR/barcode and unique number with the visitor.');setShow(false);list.reload();
+      setResult('Pass created and the visitor account is live on the estate terminals. It is deleted from all of them automatically when validity ends; the pass record stays. Share the QR/barcode and unique number with the visitor.');setShow(false);list.reload();
     } catch (reason) { setResult(reason instanceof Error ? reason.message : 'Failed'); }
   }
   const previewCode=useCallback(async(code:string,source:'phone_camera'|'device'|'manual')=>{
@@ -1147,6 +1210,14 @@ function Visitors({ user }: { user: User }) {
       list.reload();
     } catch(reason) { setResult(reason instanceof Error?reason.message:'Could not sync active visitor passes'); }
   }
+  const deviceAccounts=useAsync<{ summary:Row;items:Row[];retention:string }>(()=>['admin','manager'].includes(user.role)?api('/api/visitors/device-accounts'):Promise.resolve({ summary:{},items:[],retention:'' }),[user.role]);
+  async function releaseDeviceAccounts() {
+    try {
+      const released=await api<{ passes:number;queued:number;notice:string }>('/api/visitors/release-device-accounts',{ method:'POST' });
+      setResult(released.notice);
+      list.reload();deviceAccounts.reload();
+    } catch(reason) { setResult(reason instanceof Error?reason.message:'Could not release visitor device accounts'); }
+  }
   useEffect(()=>{
     if (!deviceSession?.id || deviceSession.status==='captured') return;
     const timer=setInterval(()=>api<Row>(`/api/visitors/device-scan-sessions/${deviceSession.id}`).then((session)=>{
@@ -1158,7 +1229,7 @@ function Visitors({ user }: { user: User }) {
   const staff=user.role==='security'||user.role==='admin'||user.role==='manager';
   const canIssue=user.role === 'resident' || user.role === 'admin' || user.role === 'manager';
   const canSync=user.role === 'admin' || user.role === 'manager';
-  return <PagePanel title="Visitors" subtitle="QR/barcode passes, preview-before-entry decisions and auditable arrivals" action={(canSync||canIssue)?<div className="row-actions">{canSync&&<button className="secondary" onClick={syncActivePasses}>Sync active passes</button>}{canIssue&&<button className="primary" onClick={() => setShow(!show)}>New pass</button>}</div>:null}>
+  return <PagePanel title="Visitors" subtitle="QR/barcode passes, preview-before-entry decisions and auditable arrivals" action={(canSync||canIssue)?<div className="row-actions">{canSync&&<button className="secondary" onClick={syncActivePasses}>Sync active passes</button>}{canSync&&<button className="secondary" onClick={releaseDeviceAccounts}>Release expired accounts</button>}{canIssue&&<button className="primary" onClick={() => setShow(!show)}>New pass</button>}</div>:null}>
     {result && <Notice tone={result.includes('created')||result.includes('Accepted')||result.includes('Synced')?'success':result.includes('Waiting')?'info':'error'}>{result}</Notice>}
     <Notice tone="info"><strong>Recommended:</strong> use the QR code for phones and QR-capable readers, Code 128 as a second scanner format, and the written unique number or six-digit PIN on terminals such as DS-K1T808MFWX-B. DS-K2802 needs a compatible Wiegand reader.</Notice>
     {show && <FormCard title="Create visitor pass" onSubmit={create}>
@@ -1180,7 +1251,16 @@ function Visitors({ user }: { user: User }) {
     </FormCard>}
     {staff&&<section className="scan-grid"><form className="form-card" onSubmit={manualPreview}><h3>Phone or manual scan</h3><label>QR, barcode, unique number or PIN<input name="code" required /></label><div className="row-actions"><button className="primary">Preview details</button><button type="button" className="secondary" onClick={()=>setCamera(!camera)}>Use phone camera</button></div>{camera&&<CameraCodeScanner onCode={(code)=>previewCode(code,'phone_camera')} onClose={()=>setCamera(false)} />}</form><form className="form-card" onSubmit={startDeviceScan}><h3>Scan at an access-control device</h3><label>Device<select name="deviceId" required><option value="">Select device</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.gate_name)}</option>)}</select></label><button className="primary">Start device scan</button><small>The next credential event from this device is captured for review. No entry is accepted automatically.</small></form></section>}
     {preview&&<section className={`visitor-preview ${preview.valid?'valid':'invalid'}`}><p className="eyebrow">VISITOR PASS PREVIEW — NO ENTRY ACCEPTED YET</p><h3>{String(preview.visitor_name)}</h3><dl><div><dt>Host</dt><dd>{String(preview.resident_name)}</dd></div><div><dt>Property</dt><dd>{String(preview.unit_number)} — {String(preview.street)}</dd></div><div><dt>Phone</dt><dd>{String(preview.visitor_phone??'—')}</dd></div><div><dt>Valid</dt><dd>{readableDate(preview.valid_from)} to {readableDate(preview.valid_until)}</dd></div><div><dt>Gates</dt><dd>{String(preview.gate_scope ?? 'both')==='gate'?String(preview.device_name ?? 'Selected device'):'Every gate, entry and exit'}</dd></div><div><dt>Gate verification</dt><dd>{Number(preview.require_gate_id_verification) === 1 ? '⚠️ Mandatory ID/invitation verification required' : 'Optional'}</dd></div><div><dt>Status</dt><dd>{String(preview.status)}</dd></div></dl>{Boolean((preview.proofs as Row[])?.length)&&<div className="span-2"><p className="eyebrow">RESIDENT UPLOADED VISITOR ID / INVITATION PROOF</p>{(preview.proofs as Row[]).map((p)=><a key={String(p.storage_key)} className="evidence-link" href={`/api/files/${encodeURIComponent(String(p.storage_key))}`} target="_blank" rel="noreferrer">🖼️ Host-uploaded {String(p.original_name)} ({Math.ceil(Number(p.size_bytes)/1024)} KB)</a>)}</div>}{!preview.valid&&<Notice tone="error">{String(preview.invalid_reason||'This pass is not valid.')}</Notice>}{Boolean(preview.valid)&&<label className="span-2"><span>Upload gate verification photo {Number(preview.require_gate_id_verification) === 1 ? '(REQUIRED before entry)' : '(optional)'}</span><input id="gateVerificationFile" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" /><small>Capture the visitor physical ID card, driver license, or physical invitation presented at the gate.</small></label>}<div className="row-actions">{Boolean(preview.valid)&&<><button className="primary" onClick={()=>decide('accepted','in')}>Accept check-in</button>{preview.status==='checked_in'&&<button className="secondary" onClick={()=>decide('accepted','out')}>Accept check-out</button>}</>}<button className="secondary" onClick={()=>decide('rejected')}>Reject</button></div></section>}
-    <ListState list={list}><DataTable exportTitle="Visitor Passes" rows={(list.data?.items ?? []).map((row)=>({ ...row,gates:String(row.gate_scope ?? 'both')==='gate'?'Selected gate only':'Every gate, entry and exit' }))} columns={[['visitor_name','Visitor'],['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['credential_number','Unique number'],...(staff?[['gates','Gates'],['device_name','Preferred device']] as Column[]:[]),['status','Status'],['valid_until','Valid until','date']]} action={(row)=><div className="row-actions"><button className="text" onClick={()=>setSelectedPass(row)}>View pass</button><EvidenceButton entityType="visitor_request" entityId={row.id} count={row.proof_count} /></div>} /></ListState>
+    {canSync&&deviceAccounts.data&&(
+      <div className="stat-grid">
+        <article className="stat-card"><p>Slots held on terminals</p><strong>{Number(deviceAccounts.data.summary.active_slots ?? 0)}</strong></article>
+        <article className="stat-card"><p>Awaiting release</p><strong>{Number(deviceAccounts.data.summary.awaiting_release ?? 0)}</strong></article>
+        <article className="stat-card"><p>Removal in flight</p><strong>{Number(deviceAccounts.data.summary.removal_queued ?? 0)}</strong></article>
+        <article className="stat-card"><p>Operator removals left</p><strong>{Number(deviceAccounts.data.summary.manual_removals ?? 0)}</strong></article>
+        <article className="stat-card"><p>Fully released</p><strong>{Number(deviceAccounts.data.summary.released ?? 0)}</strong></article>
+      </div>
+    )}
+    <ListState list={list}><DataTable exportTitle="Visitor Passes" rows={(list.data?.items ?? []).map((row)=>({ ...row,gates:String(row.gate_scope ?? 'both')==='gate'?'Selected gate only':'Every gate, entry and exit' }))} columns={[['visitor_name','Visitor'],['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['credential_number','Unique number'],...(staff?[['gates','Gates'],['device_name','Preferred device'],['device_account_state','Device account']] as Column[]:[]),['status','Status'],['valid_until','Valid until','date']]} action={(row)=><div className="row-actions"><button className="text" onClick={()=>setSelectedPass(row)}>View pass</button><EvidenceButton entityType="visitor_request" entityId={row.id} count={row.proof_count} /></div>} /></ListState>
     {selectedPass&&<VisitorPass pass={selectedPass} onClose={()=>setSelectedPass(null)} branding={{ portalName:portal.data?.portal_name||'EstateMate',shortName:portal.data?.portal_short_name||'EM' }} />}
   </PagePanel>;
 }
@@ -2348,119 +2428,443 @@ function navIcon(section: Section): string {
   })[section] ?? '•';
 }
 
-// ---------------------------------------------------------------------------
-// New module surfaces — placeholders that render real navigation surfaces and
-// invite the user into the feature. Backend wiring (DB tables, API routes,
-// migrations, permission model) is added in follow-up PRs; these stubs keep
-// the new grouped menu useful today instead of showing a blank state.
-// ---------------------------------------------------------------------------
+function DependantsManager({ user, onNavigate: _onNavigate }: { user: User; onNavigate?: (s: Section) => void }) {
+  const canManage = user.role === 'admin' || user.role === 'manager';
+  const [search, setSearch] = useState('');
+  const [status, setStatus] = useState('');
+  const [relationship, setRelationship] = useState('');
+  const roster = useList(`/api/dependants?limit=100&search=${encodeURIComponent(search)}${status ? `&status=${status}` : ''}${relationship ? `&relationship=${relationship}` : ''}`);
+  const [message, setMessage] = useState('');
+  function refresh() { roster.reload(); }
+  async function decide(row: Row, action: string, promptText?: string) {
+    const note = promptText ? prompt(promptText) : null;
+    if (promptText && note === null) return;
+    if (action === 'deactivate' && !confirm(`Deactivate ${String(row.name)}? Their cards and fingerprints are suspended on every terminal; the record stays.`)) return;
+    try {
+      await api(`/api/household-members/${row.id}`, { method: 'PATCH', body: JSON.stringify({ action, reviewNote: note || undefined }) });
+      setMessage(action === 'approve' ? 'Dependant approved.' : action === 'deactivate' ? 'Dependant deactivated; all their credentials were suspended.' : 'Dependant updated.');
+      refresh();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Dependant update failed'); }
+  }
+  const summary = roster.data?.summary as Record<string, unknown> | undefined;
+  const actions = (row: Row) => (
+    <div className="row-actions">
+      {canManage && String(row.status) === 'pending' && <button className="text" onClick={() => decide(row, 'approve')}>Approve</button>}
+      {canManage && String(row.status) === 'pending' && <button className="text" onClick={() => decide(row, 'reject', 'Reason for rejecting this dependant')}>Reject</button>}
+      {canManage && String(row.status) !== 'inactive'
+        ? <button className="text" onClick={() => decide(row, 'deactivate')}>Deactivate</button>
+        : canManage && <button className="text" onClick={() => decide(row, 'update')}>Reactivate</button>}
+    </div>
+  );
+  return <PagePanel title="Dependants manager" subtitle="Every spouse, child, relative and domestic worker across every household — with their live access picture" action={canManage ? <span className="eyebrow">Bulk uploads: Residents & staff → People → Bulk tools</span> : undefined}>
+    {message && <Notice tone={/failed|Could not/i.test(message) ? 'error' : 'success'}>{message}</Notice>}
+    {summary && <div className="stat-grid">
+      <article className="stat-card"><p>All dependants</p><strong>{Number(summary.total ?? 0)}</strong></article>
+      <article className="stat-card"><p>Active</p><strong>{Number(summary.active ?? 0)}</strong></article>
+      <article className="stat-card"><p>Pending approval</p><strong>{Number(summary.pending ?? 0)}</strong></article>
+      <article className="stat-card"><p>Domestic staff &amp; caregivers</p><strong>{Number(summary.domestic_staff ?? 0)}</strong></article>
+      <article className="stat-card"><p>With their own login</p><strong>{Number(summary.with_logins ?? 0)}</strong></article>
+    </div>}
+    <div className="people-filters">
+      <label>Search<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Name, email, phone, Employee ID or main resident" /></label>
+      <label>Status<select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All statuses</option><option value="active">Active</option><option value="pending">Pending</option><option value="inactive">Inactive</option><option value="rejected">Rejected</option></select></label>
+      <label>Relationship<select value={relationship} onChange={(event) => setRelationship(event.target.value)}><option value="">All relationships</option><option value="spouse">Spouse</option><option value="child">Child</option><option value="parent">Parent</option><option value="relative">Relative</option><option value="domestic_staff">Domestic staff</option><option value="caregiver">Caregiver</option><option value="other">Other</option></select></label>
+    </div>
+    <ListState list={roster}>
+      <DataTable exportTitle="Dependants" rows={roster.data?.items ?? []} columns={[
+        ['name', 'Name'], ['relationship', 'Relationship'], ['employee_id', 'Employee ID'],
+        ['primary_resident_name', 'Main resident'], ['unit_number', 'Unit'],
+        ['active_cards', 'Cards live'], ['active_fingerprints', 'Fingers live'],
+        ['gate_events', 'Gate events'], ['last_gate_event_at', 'Last gate use', 'date'],
+        ['status', 'Status'],
+      ]} action={actions} />
+    </ListState>
+    <Notice tone="info">A deactivated dependant keeps their record, bills and gate history; only their credentials stop working. Register new dependants from Tenancy &amp; household, or in bulk from People → Bulk tools.</Notice>
+  </PagePanel>;
+}
 
-type ModuleTone = 'blue' | 'green' | 'amber' | 'violet' | 'slate';
+function StaffManagement({ user }: { user: User }) {
+  const [search, setSearch] = useState('');
+  const [role, setRole] = useState('');
+  const staff = useList(`/api/staff?limit=100&search=${encodeURIComponent(search)}${role ? `&role=${role}` : ''}`);
+  const shifts = useList('/api/staff/shifts?limit=100');
+  const people = useAsync<{ items: Row[] }>(() => api('/api/users?limit=100'), []);
+  const devices = useAsync<{ items: Row[] }>(() => api('/api/access/device-options'), []);
+  const [showShiftForm, setShowShiftForm] = useState(false);
+  const [message, setMessage] = useState('');
+  function refresh() { staff.reload(); shifts.reload(); }
+  async function submitShift(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setMessage('');
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    if (!values.deviceId) delete values.deviceId;
+    try {
+      await api('/api/staff/shifts', { method: 'POST', body: JSON.stringify(values) });
+      setShowShiftForm(false); setMessage('Shift scheduled.'); refresh();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not schedule shift'); }
+  }
+  async function shiftStatus(row: Row, status: string) {
+    try {
+      await api(`/api/staff/shifts/${row.id}`, { method: 'PATCH', body: JSON.stringify({ status }) });
+      setMessage(`Shift marked ${status}.`); refresh();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Shift update failed'); }
+  }
+  async function removeShift(row: Row) {
+    if (!confirm('Delete this scheduled shift? Only future scheduled shifts can be removed.')) return;
+    try { await api(`/api/staff/shifts/${row.id}`, { method: 'DELETE' }); setMessage('Shift removed.'); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not delete shift'); }
+  }
+  const summary = staff.data?.summary as Record<string, unknown> | undefined;
+  const staffOnly = (people.data?.items ?? []).filter((row) => String(row.role) !== 'resident');
+  return <PagePanel title="Staff management" subtitle="Administrators, managers, cashiers and security officers — postings, shifts and accountability" action={<button className="primary" onClick={() => setShowShiftForm(!showShiftForm)}>Schedule shift</button>}>
+    {message && <Notice tone={/failed|Could not/i.test(message) ? 'error' : 'success'}>{message}</Notice>}
+    {summary && <div className="stat-grid">
+      <article className="stat-card"><p>Staff accounts</p><strong>{Number(summary.total ?? 0)}</strong></article>
+      <article className="stat-card"><p>Active</p><strong>{Number(summary.active ?? 0)}</strong></article>
+      <article className="stat-card"><p>Security officers</p><strong>{Number(summary.security_officers ?? 0)}</strong></article>
+      <article className="stat-card"><p>Cashiers</p><strong>{Number(summary.cashiers ?? 0)}</strong></article>
+      <article className="stat-card"><p>Managers &amp; admins</p><strong>{Number(summary.managers ?? 0) + Number(summary.administrators ?? 0)}</strong></article>
+    </div>}
+    {showShiftForm && <FormCard title="Schedule a shift" onSubmit={submitShift} message="">
+      <label>Staff member<select name="staffUserId" required><option value="">Select staff…</option>{staffOnly.map((row) => <option key={String(row.id)} value={String(row.id)}>{String(row.name)} — {String(row.role)}</option>)}</select></label>
+      <label>Date<input name="shiftDate" type="date" required /></label>
+      <label>Starts<input name="startsAt" type="time" required /></label>
+      <label>Ends<input name="endsAt" type="time" required /></label>
+      <label>Duty<select name="duty"><option value="gate">Gate</option><option value="patrol">Patrol</option><option value="office">Office</option><option value="cashier">Cashier</option><option value="supervisor">Supervisor</option><option value="standby">Standby</option></select></label>
+      <label>Gate / post (optional)<select name="deviceId"><option value="">No specific gate</option>{(devices.data?.items ?? []).map((row) => <option key={String(row.id)} value={String(row.id)}>{String(row.name)}{row.gate_name ? ` (${String(row.gate_name)})` : ''}</option>)}</select></label>
+      <label className="span-2">Note<input name="note" placeholder="Optional instruction" /></label>
+      <div className="row-actions"><button className="primary">Schedule</button><button type="button" className="secondary" onClick={() => setShowShiftForm(false)}>Cancel</button></div>
+    </FormCard>}
+    <div className="people-filters">
+      <label>Search<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Name, email, phone or Employee ID" /></label>
+      <label>Role<select value={role} onChange={(event) => setRole(event.target.value)}><option value="">All staff roles</option><option value="admin">Administrators</option><option value="manager">Managers</option><option value="cashier">Cashiers</option><option value="security">Security</option></select></label>
+    </div>
+    <ListState list={staff}>
+      <DataTable exportTitle="Staff" rows={staff.data?.items ?? []} columns={[
+        ['name', 'Name'], ['role', 'Role'], ['employee_id', 'Employee ID'], ['phone', 'Phone'],
+        ['gates', 'Gate postings'], ['upcoming_shifts', 'Upcoming shifts'], ['next_shift', 'Next shift'],
+        ['audit_entries', 'Actions on record'], ['last_action_at', 'Last action', 'date'], ['status', 'Status'],
+      ]} />
+    </ListState>
+    <h3>Shift roster</h3>
+    <ListState list={shifts}>
+      <DataTable exportTitle="Shift roster" rows={shifts.data?.items ?? []} columns={[
+        ['shift_date', 'Date'], ['starts_at', 'From'], ['ends_at', 'To'], ['staff_name', 'Staff'], ['staff_role', 'Role'],
+        ['duty', 'Duty'], ['gate_name', 'Gate'], ['status', 'Status'],
+      ]} action={(row) => (
+        <div className="row-actions">
+          {String(row.status) === 'scheduled' && <button className="text" onClick={() => shiftStatus(row, 'worked')}>Worked</button>}
+          {String(row.status) === 'scheduled' && <button className="text" onClick={() => shiftStatus(row, 'cancelled')}>Cancel</button>}
+          {String(row.status) === 'scheduled' && <button className="text danger" onClick={() => removeShift(row)}>Delete</button>}
+        </div>
+      )} />
+    </ListState>
+    <Notice tone="info">Gate postings (which terminal an officer may operate) are managed under Access control → Remote door control. Roles and passwords are edited from the People page. Every staff action remains in the audit log.</Notice>
+  </PagePanel>;
+}
 
-function ModulePage({ title, eyebrow, description, icon, tone = 'blue', children, action }: {
-  title: string; eyebrow: string; description: string; icon: string; tone?: ModuleTone;
-  children?: ReactNode; action?: ReactNode;
-}) {
+function FacilityBookings({ user }: { user: User }) {
+  const canOperate = user.role === 'admin' || user.role === 'manager';
+  const canBook = ['admin', 'manager', 'resident'].includes(user.role);
+  const facilities = useList('/api/facilities');
+  const [statusFilter, setStatusFilter] = useState('');
+  const bookings = useList(`/api/facility-bookings?limit=100${statusFilter ? `&status=${statusFilter}` : ''}${!canOperate ? '&mine=1' : ''}`);
+  const [message, setMessage] = useState('');
+  const [showFacilityForm, setShowFacilityForm] = useState(false);
+  const [editingFacility, setEditingFacility] = useState<Row | null>(null);
+  const [showBookForm, setShowBookForm] = useState(false);
+  const [rateValue, setRateValue] = useState('');
+  function refresh() { facilities.reload(); bookings.reload(); }
+  async function submitFacility(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setMessage('');
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    const body = {
+      name: values.name, description: values.description, location: values.location,
+      capacity: values.capacity === '' ? undefined : Number(values.capacity),
+      hourlyRateMinor: Math.round(Number(values.hourlyRate || 0) * 100),
+      depositMinor: Math.round(Number(values.deposit || 0) * 100),
+      requiresApproval: values.requiresApproval === '1', requiresPayment: values.requiresPayment === '1',
+      minNoticeHours: Number(values.minNoticeHours || 0), maxHoursPerBooking: Number(values.maxHoursPerBooking || 8),
+      rules: values.rules,
+    };
+    try {
+      await api(editingFacility ? `/api/facilities/${editingFacility.id}` : '/api/facilities', { method: editingFacility ? 'PATCH' : 'POST', body: JSON.stringify(body) });
+      setShowFacilityForm(false); setEditingFacility(null); setMessage(editingFacility ? 'Facility updated.' : 'Facility added.'); refresh();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not save facility'); }
+  }
+  async function submitBooking(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setMessage('');
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    try {
+      const result = await api<{ status: string }>('/api/facility-bookings', { method: 'POST', body: JSON.stringify({ ...values, attendees: values.attendees === '' ? undefined : Number(values.attendees) }) });
+      setShowBookForm(false);
+      setMessage(result.status === 'approved' ? 'Booking confirmed.' : 'Booking requested — an administrator or manager will confirm it.');
+      refresh();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Booking request failed'); }
+  }
+  async function decide(row: Row, action: string) {
+    const note = action === 'decline' ? prompt('Reason to share with the resident:') : null;
+    if (action === 'decline' && note === null) return;
+    try {
+      const result = await api<{ billId?: string }>(`/api/facility-bookings/${row.id}`, { method: 'PATCH', body: JSON.stringify({ action, note: note ?? undefined }) });
+      setMessage(action === 'approve' ? `Booking approved${result.billId ? ' and the fee billed' : ''}.` : `Booking ${action === 'decline' ? 'declined' : 'cancelled'}.`);
+      refresh();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Booking decision failed'); }
+  }
+  const facilityItems = (facilities.data?.items ?? []) as Row[];
+  const pendingCount = facilityItems.reduce((sum, row) => sum + Number(row.pending_bookings ?? 0), 0);
+  return <PagePanel title="Facility bookings" subtitle="Reserve shared amenities — request, approval, billing and one calendar" action={<div className="row-actions">{canOperate && <button className="secondary" onClick={() => { setShowFacilityForm(!showFacilityForm); setEditingFacility(null); setRateValue(''); }}>Add facility</button>}{canBook && <button className="primary" onClick={() => setShowBookForm(!showBookForm)}>Request booking</button>}</div>}>
+    {message && <Notice tone={/failed|refused|Could not/i.test(message) ? 'error' : 'success'}>{message}</Notice>}
+    {pendingCount > 0 && canOperate && <Notice tone="warning">{pendingCount} booking request(s) are waiting for a decision below.</Notice>}
+    {showFacilityForm && <FormCard title={editingFacility ? `Edit ${String(editingFacility.name)}` : 'Add a facility'} onSubmit={submitFacility} message="">
+      <label>Name<input name="name" defaultValue={String(editingFacility?.name ?? '')} required /></label>
+      <label>Location<input name="location" defaultValue={String(editingFacility?.location ?? '')} /></label>
+      <label>Capacity<input name="capacity" type="number" min="1" defaultValue={String(editingFacility?.capacity ?? '')} /></label>
+      <label>Hourly rate (₦)<input name="hourlyRate" type="number" min="0" step="0.01" value={rateValue} onChange={(event) => setRateValue(event.target.value)} placeholder="0.00" /></label>
+      <label>Refundable deposit (₦)<input name="deposit" type="number" min="0" step="0.01" defaultValue={editingFacility ? String(Number(editingFacility.deposit_minor ?? 0) / 100) : '0'} /></label>
+      <label>Approval<select name="requiresApproval" defaultValue={String(editingFacility?.requires_approval ?? 1) === String(1) || Number(editingFacility?.requires_approval ?? 1) ? '1' : '0'}><option value="1">Approval required</option><option value="0">Auto-approve</option></select></label>
+      <label>Payment<select name="requiresPayment" defaultValue={Number(editingFacility?.requires_payment ?? 0) ? '1' : '0'}><option value="0">Free to book</option><option value="1">Bill the requester</option></select></label>
+      <label>Minimum notice (hours)<input name="minNoticeHours" type="number" min="0" defaultValue={Number(editingFacility?.min_notice_hours ?? 0)} /></label>
+      <label>Max hours per booking<input name="maxHoursPerBooking" type="number" min="1" defaultValue={Number(editingFacility?.max_hours_per_booking ?? 8)} /></label>
+      <label className="span-2">Rules<input name="rules" defaultValue={String(editingFacility?.rules ?? '')} placeholder="Noise curfew, guest count, cleanup…" /></label>
+      <label className="span-2">Description<input name="description" defaultValue={String(editingFacility?.description ?? '')} /></label>
+      <div className="row-actions"><button className="primary">{editingFacility ? 'Save facility' : 'Add facility'}</button><button type="button" className="secondary" onClick={() => { setShowFacilityForm(false); setEditingFacility(null); }}>Cancel</button></div>
+    </FormCard>}
+    {showBookForm && <FormCard title="Request a booking" onSubmit={submitBooking} message="">
+      <label>Facility<select name="facilityId" required><option value="">Choose…</option>{facilityItems.map((row) => <option key={String(row.id)} value={String(row.id)}>{String(row.name)}{row.location ? ` — ${String(row.location)}` : ''}{Number(row.hourly_rate_minor) ? ` (₦${(Number(row.hourly_rate_minor) / 100).toLocaleString()}/hr)` : ''}</option>)}</select></label>
+      <label>Starts<input name="startsAt" type="datetime-local" required /></label>
+      <label>Ends<input name="endsAt" type="datetime-local" required /></label>
+      <label>Purpose<input name="purpose" placeholder="Birthday, meeting…" /></label>
+      <label>Attendees<input name="attendees" type="number" min="1" /></label>
+      <label>Contact phone<input name="contactPhone" /></label>
+      <div className="row-actions"><button className="primary">Send request</button><button type="button" className="secondary" onClick={() => setShowBookForm(false)}>Cancel</button></div>
+    </FormCard>}
+    <h3>Facilities</h3>
+    <ListState list={facilities}>
+      <DataTable rows={facilityItems} columns={[
+        ['name', 'Name'], ['location', 'Location'], ['capacity', 'Capacity'],
+        ['hourly_rate_minor', 'Hourly rate', 'money'], ['deposit_minor', 'Deposit', 'money'],
+        ['upcoming_bookings', 'Upcoming'], ['pending_bookings', 'Waiting decision'], ['status', 'Status'],
+      ]} action={canOperate ? (row) => <div className="row-actions"><button className="text" onClick={() => { setEditingFacility(row); setShowFacilityForm(true); setRateValue(String(Number(row.hourly_rate_minor ?? 0) / 100)); }}>Edit</button>
+        {String(row.status) === 'active'
+          ? <button className="text" onClick={async () => { await api(`/api/facilities/${row.id}`, { method: 'PATCH', body: JSON.stringify({ status: 'inactive' }) }); refresh(); }}>Retire</button>
+          : <button className="text" onClick={async () => { await api(`/api/facilities/${row.id}`, { method: 'PATCH', body: JSON.stringify({ status: 'active' }) }); refresh(); }}>Restore</button>}</div> : undefined} />
+    </ListState>
+    <div className="people-filters">
+      <label>Booking status<select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">All bookings</option><option value="pending">Pending</option><option value="approved">Approved</option><option value="declined">Declined</option><option value="cancelled">Cancelled</option><option value="completed">Completed</option></select></label>
+    </div>
+    <h3>Bookings</h3>
+    <ListState list={bookings}>
+      <DataTable exportTitle="Facility bookings" rows={bookings.data?.items ?? []} columns={[
+        ['facility_name', 'Facility'], ['requester_name', 'Requested by'], ['unit_number', 'Unit'],
+        ['starts_at', 'Starts', 'date'], ['ends_at', 'Ends', 'date'], ['purpose', 'Purpose'],
+        ['estimated_cost_minor', 'Est. cost', 'money'], ['payment_status', 'Payment'], ['status', 'Status'],
+      ]} action={(row) => (
+        <div className="row-actions">
+          {canOperate && String(row.status) === 'pending' && <button className="text" onClick={() => decide(row, 'approve')}>Approve</button>}
+          {canOperate && String(row.status) === 'pending' && <button className="text" onClick={() => decide(row, 'decline')}>Decline</button>}
+          {(canOperate || String(row.requester_id) === user.id) && ['pending', 'approved'].includes(String(row.status)) && <button className="text danger" onClick={() => decide(row, 'cancel')}>Cancel</button>}
+        </div>
+      )} />
+    </ListState>
+    <Notice tone="info">Approving a paid booking raises an ordinary bill — cashiers clear it in Bills &amp; payments like any other. Cancelling before payment voids the bill. Deposits are included in the billed total and refunded manually.</Notice>
+  </PagePanel>;
+}
+
+function EmergencyContacts({ user }: { user: User }) {
+  const canManage = user.role === 'admin' || user.role === 'manager';
+  const [category, setCategory] = useState('');
+  const contacts = useList(`/api/emergency-contacts${category ? `?category=${category}` : ''}`);
+  const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState<Row | null>(null);
+  const [message, setMessage] = useState('');
+  const categories = ['security', 'medical', 'fire', 'police', 'utility', 'management', 'neighbour', 'other'];
+  function refresh() { contacts.reload(); }
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setMessage('');
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    try {
+      await api(editing ? `/api/emergency-contacts/${editing.id}` : '/api/emergency-contacts', {
+        method: editing ? 'PATCH' : 'POST',
+        body: JSON.stringify({ ...values, priority: values.priority === '' ? undefined : Number(values.priority) }),
+      });
+      setShowForm(false); setEditing(null);
+      setMessage(editing ? 'Contact updated.' : 'Contact added.');
+      refresh();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not save contact'); }
+  }
+  async function setStatus(row: Row, status: string) {
+    try { await api(`/api/emergency-contacts/${row.id}`, { method: 'PATCH', body: JSON.stringify({ status }) }); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Update failed'); }
+  }
+  async function remove(row: Row) {
+    if (!confirm(`Remove ${String(row.name)} from the emergency directory?`)) return;
+    try { await api(`/api/emergency-contacts/${row.id}`, { method: 'DELETE' }); setMessage('Contact removed.'); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not remove contact'); }
+  }
+  return <PagePanel title="Emergency contacts" subtitle="One-tap directory for estate security, medical, fire, utility and management response lines" action={canManage ? <button className="primary" onClick={() => { setShowForm(!showForm); setEditing(null); }}>Add contact</button> : undefined}>
+    {message && <Notice tone={/failed|Could not/i.test(message) ? 'error' : 'success'}>{message}</Notice>}
+    <div className="people-filters">
+      <label>Category<select value={category} onChange={(event) => setCategory(event.target.value)}><option value="">All categories</option>{categories.map((item) => <option key={item} value={item}>{item[0]!.toUpperCase() + item.slice(1)}</option>)}</select></label>
+    </div>
+    {showForm && <FormCard title={editing ? `Edit ${String(editing.name)}` : 'Add an emergency contact'} onSubmit={submit} message="">
+      <label>Name<input name="name" defaultValue={String(editing?.name ?? '')} required /></label>
+      <label>Category<select name="category" defaultValue={String(editing?.category ?? 'security')}>{categories.map((item) => <option key={item} value={item}>{item[0]!.toUpperCase() + item.slice(1)}</option>)}</select></label>
+      <label>Role / label<input name="roleTitle" defaultValue={String(editing?.role_title ?? '')} placeholder="24/7 response desk" /></label>
+      <label>Phone<input name="phone" type="tel" defaultValue={String(editing?.phone ?? '')} /></label>
+      <label>Alternate phone<input name="alternatePhone" type="tel" defaultValue={String(editing?.alternate_phone ?? '')} /></label>
+      <label>Email<input name="email" type="email" defaultValue={String(editing?.email ?? '')} /></label>
+      <label>Available hours<input name="availableHours" defaultValue={String(editing?.available_hours ?? '')} placeholder="24 hours" /></label>
+      <label>Priority (lower shows first)<input name="priority" type="number" min="1" max="999" defaultValue={Number(editing?.priority ?? 100)} /></label>
+      <label>Visible to<select name="visibleTo" defaultValue={String(editing?.visible_to ?? 'everyone')}><option value="everyone">Everyone</option><option value="staff">Staff only</option><option value="residents">Residents only</option></select></label>
+      <label className="span-2">Address / location<input name="address" defaultValue={String(editing?.address ?? '')} /></label>
+      <div className="row-actions"><button className="primary">{editing ? 'Save contact' : 'Add contact'}</button><button type="button" className="secondary" onClick={() => { setShowForm(false); setEditing(null); }}>Cancel</button></div>
+    </FormCard>}
+    <ListState list={contacts}>
+      <section className="contact-grid">
+        {(contacts.data?.items ?? []).map((row) => (
+          <article className="panel contact-card" key={String(row.id)}>
+            <p className="eyebrow">{String(row.category)} · {String(row.role_title || row.available_hours || '')}</p>
+            <h3>{row.phone ? <a className="contact-tel" href={`tel:${String(row.phone)}`}>{String(row.name)}</a> : String(row.name)}</h3>
+            {Boolean(row.phone) && <p><a className="contact-tel" href={`tel:${String(row.phone)}`}>{String(row.phone)}</a>{row.alternate_phone ? <span> · alt <a className="contact-tel" href={`tel:${String(row.alternate_phone)}`}>{String(row.alternate_phone)}</a></span> : null}</p>}
+            {Boolean(row.available_hours) && <p>{String(row.available_hours)}</p>}
+            {Boolean(row.address) && <p>{String(row.address)}</p>}
+            {String(row.visible_to) !== 'everyone' && <p className="eyebrow">Visible to {String(row.visible_to)}</p>}
+            {String(row.status) !== 'active' && <p className="eyebrow">Inactive</p>}
+            {canManage && <div className="row-actions">
+              <button className="text" onClick={() => { setEditing(row); setShowForm(true); }}>Edit</button>
+              {String(row.status) === 'active'
+                ? <button className="text" onClick={() => setStatus(row, 'inactive')}>Hide</button>
+                : <button className="text" onClick={() => setStatus(row, 'active')}>Show</button>}
+              <button className="text danger" onClick={() => remove(row)}>Delete</button>
+            </div>}
+          </article>
+        ))}
+        {contacts.data && contacts.data.items.length === 0 && <div className="empty"><div>◇</div><h3>No contacts here</h3><p>Add the first emergency contact for this category.</p></div>}
+      </section>
+    </ListState>
+    <Notice tone="info">Bookmark this page on every guard post. Numbers marked “staff only” are hidden from residents; guard posts sign in as Security, which counts as staff. Tap a number on a mobile device to call it.</Notice>
+  </PagePanel>;
+}
+
+/** One library renders both menu surfaces; `set` keeps the collections apart. */
+function DocumentLibrary({ user, set, title, subtitle, categories }: { user: User; set: 'info' | 'legal'; title: string; subtitle: string; categories: Array<[string, string]> }) {
+  const canManage = user.role === 'admin' || user.role === 'manager';
+  const [search, setSearch] = useState('');
+  const [category, setCategory] = useState('');
+  const docs = useList(`/api/documents?set=${set}&search=${encodeURIComponent(search)}${category ? `&category=${category}` : ''}`);
+  const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState<Row | null>(null);
+  const [message, setMessage] = useState('');
+  const [acks, setAcks] = useState<{ id: string; items: Row[] } | null>(null);
+  function refresh() { docs.reload(); }
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setMessage('');
+    const form = event.currentTarget;
+    const values = Object.fromEntries(new FormData(form));
+    const fileInput = form.elements.namedItem('file') as HTMLInputElement;
+    let fileKey: string | undefined;
+    if (fileInput?.files?.[0]) {
+      const file = fileInput.files[0];
+      try {
+        const stored = await api<{ key: string }>('/api/files', { method: 'POST', body: file, headers: { 'Content-Type': file.type || 'application/pdf', 'X-Filename': file.name, 'X-File-Category': 'documents' } });
+        fileKey = stored.key;
+      } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'File upload failed'); return; }
+    }
+    try {
+      await api(editing ? `/api/documents/${editing.id}` : '/api/documents', {
+        method: editing ? 'PATCH' : 'POST',
+        body: JSON.stringify({
+          category: values.category, title: values.title, summary: values.summary, body: values.body,
+          externalUrl: values.externalUrl || undefined, version: values.version || undefined,
+          effectiveDate: values.effectiveDate || undefined, audience: values.audience,
+          requiresAcknowledgement: values.requiresAcknowledgement === '1',
+          status: values.status, proofKeys: fileKey ? [fileKey] : undefined,
+        }),
+      });
+      setShowForm(false); setEditing(null);
+      setMessage(editing ? 'Document updated.' : 'Document published.');
+      refresh();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not save document'); }
+  }
+  async function acknowledge(row: Row) {
+    try { await api(`/api/documents/${row.id}/acknowledge`, { method: 'POST' }); setMessage(`You have acknowledged ${String(row.title)}.`); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not acknowledge'); }
+  }
+  async function setStatus(row: Row, status: string) {
+    try { await api(`/api/documents/${row.id}`, { method: 'PATCH', body: JSON.stringify({ status }) }); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Update failed'); }
+  }
+  async function remove(row: Row) {
+    if (!confirm(`Remove ${String(row.title)}? Documents with acknowledgements are archived instead.`)) return;
+    try { const result = await api<{ notice?: string }>(`/api/documents/${row.id}`, { method: 'DELETE' }); setMessage(result.notice ?? 'Document removed.'); refresh(); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not remove document'); }
+  }
+  async function showAcks(row: Row) {
+    try { const result = await api<{ items: Row[] }>(`/api/documents/${row.id}/acknowledgements`); setAcks({ id: String(row.id), items: result.items }); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not load acknowledgements'); }
+  }
+  return <PagePanel title={title} subtitle={subtitle} action={canManage ? <button className="primary" onClick={() => { setShowForm(!showForm); setEditing(null); }}>Publish document</button> : undefined}>
+    {message && <Notice tone={/failed|Could not/i.test(message) ? 'error' : 'success'}>{message}</Notice>}
+    {showForm && <FormCard title={editing ? `Edit ${String(editing.title)}` : 'Publish a document'} onSubmit={submit} message="">
+      <label>Category<select name="category" defaultValue={String(editing?.category ?? categories[0]![0])}>{categories.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+      <label>Title<input name="title" defaultValue={String(editing?.title ?? '')} required /></label>
+      <label>Version<input name="version" defaultValue={String(editing?.version ?? '1.0')} /></label>
+      <label>Effective date<input name="effectiveDate" type="date" defaultValue={String(editing?.effective_date ?? '')} /></label>
+      <label>Audience<select name="audience" defaultValue={String(editing?.audience ?? 'everyone')}><option value="everyone">Everyone</option><option value="residents">Residents</option><option value="staff">Staff</option><option value="managers">Managers</option></select></label>
+      <label>Status<select name="status" defaultValue={String(editing?.status ?? 'published')}><option value="published">Published</option><option value="draft">Draft</option><option value="archived">Archived</option></select></label>
+      <label>Acknowledgement<select name="requiresAcknowledgement" defaultValue={Number(editing?.requires_acknowledgement ?? 0) ? '1' : '0'}><option value="0">No read receipt</option><option value="1">Require acknowledgement</option></select></label>
+      <label>External link<input name="externalUrl" type="url" defaultValue={String(editing?.external_url ?? '')} placeholder="https://…" /></label>
+      <label className="span-2">Summary<input name="summary" defaultValue={String(editing?.summary ?? '')} /></label>
+      <label className="span-2">Document text<textarea name="body" rows={5} defaultValue={String(editing?.body ?? '')} placeholder="Paste the document text here — or upload a file or link instead" /></label>
+      <label className="span-2">Or upload a file<input name="file" type="file" accept="image/jpeg,image/png,image/webp,application/pdf" /></label>
+      <div className="row-actions"><button className="primary">{editing ? 'Save document' : 'Publish document'}</button><button type="button" className="secondary" onClick={() => { setShowForm(false); setEditing(null); }}>Cancel</button></div>
+    </FormCard>}
+    <div className="people-filters">
+      <label>Search<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Title or summary" /></label>
+      <label>Category<select value={category} onChange={(event) => setCategory(event.target.value)}><option value="">All categories</option>{categories.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+    </div>
+    <ListState list={docs}>
+      <DataTable exportTitle={title} rows={docs.data?.items ?? []} columns={[
+        ['title', 'Title'], ['category', 'Category'], ['version', 'Version'], ['effective_date', 'Effective', 'date'],
+        ['audience', 'Audience'], ['acknowledgements', 'Acknowledged'], ['acknowledged_by_me', 'You read'], ['status', 'Status'],
+      ]} action={(row) => (
+        <div className="row-actions">
+          {Boolean(row.file_key) && <a className="text" href={`/api/files/${encodeURIComponent(String(row.file_key))}`}>Open file</a>}
+          {Boolean(row.external_url) && <a className="text" href={String(row.external_url)} target="_blank" rel="noreferrer noopener">Open link</a>}
+          {Number(row.requires_acknowledgement) === 1 && Number(row.acknowledged_by_me) === 0 && <button className="text" onClick={() => acknowledge(row)}>Acknowledge</button>}
+          {canManage && <button className="text" onClick={() => { setEditing(row); setShowForm(true); }}>Edit</button>}
+          {canManage && Number(row.acknowledgements) > 0 && <button className="text" onClick={() => showAcks(row)}>Readers ({String(row.acknowledgements)})</button>}
+          {canManage && String(row.status) === 'draft' && <button className="text" onClick={() => setStatus(row, 'published')}>Publish</button>}
+          {canManage && String(row.status) === 'published' && <button className="text" onClick={() => setStatus(row, 'archived')}>Archive</button>}
+          {canManage && <button className="text danger" onClick={() => remove(row)}>Delete</button>}
+        </div>
+      )} />
+    </ListState>
+    {(docs.data?.items ?? []).some((row) => row.body) && <section className="panel">
+      <h3>Document texts</h3>
+      {(docs.data?.items ?? []).filter((row) => row.body).map((row) => (
+        <details key={String(row.id)} className="document-body"><summary>{String(row.title)} <small>({String(row.version)})</small></summary><p>{String(row.body)}</p></details>
+      ))}
+    </section>}
+    {acks && <div className="modal-backdrop" role="dialog" aria-modal="true"><section className="notice-modal">
+      <p className="eyebrow">READ ACKNOWLEDGEMENTS</p><h2>Who has read it</h2>
+      <ul className="document-acks">{acks.items.map((row) => <li key={String(row.user_id)}>{String(row.name)} <small>· {String(row.role)} · {readableDate(row.acknowledged_at)}</small></li>)}</ul>
+      <button className="secondary wide" onClick={() => setAcks(null)}>Close</button>
+    </section></div>}
+  </PagePanel>;
+}
+
+function InformationHub({ user, onNavigate }: { user: User; onNavigate?: (s: Section) => void }) {
   return <>
-    <section className={`module-hero tone-${tone}`}>
-      <div className="module-hero-icon">{icon}</div>
-      <div>
-        <p className="eyebrow">{eyebrow}</p>
-        <h2>{title}</h2>
-        <p className="module-hero-desc">{description}</p>
-      </div>
-      {action && <div className="module-hero-action">{action}</div>}
-    </section>
-    {children}
-    <section className="panel">
-      <Notice tone="info">This module is being rolled out. Early access surfaces are visible now; record forms, approvals and reporting will unlock in the next deployment.</Notice>
-    </section>
+    <DocumentLibrary user={user} set="info" title="Information hub" subtitle="Resident guides, forms, service documents and estate communications" categories={[
+      ['guide', 'Resident guide'], ['form', 'Form'], ['other', 'Other'],
+    ]} />
+    <InformationShortcuts onNavigate={onNavigate} />
   </>;
 }
 
-function DependantsManager({ user, onNavigate }: { user: User; onNavigate?: (s: Section) => void }) {
-  return <ModulePage
-    eyebrow="Residents & staff"
-    title="Dependants manager"
-    description="Register, edit and deactivate spouses, children, relatives and domestic staff tied to a resident household. Each dependant inherits access only while their household is active."
-    icon="♟"
-    tone="violet"
-    action={onNavigate && <button className="secondary" onClick={() => onNavigate('residency')}>Open Tenancy & household →</button>}
-  >
-    <section className="panel">
-      <div className="panel-title"><div><p className="eyebrow">Quick navigation</p><h3>Where dependants live today</h3></div></div>
-      <p>Household members are managed from <button className="text" onClick={() => onNavigate?.('residency')}>Tenancy & household</button> — open any household to add dependants, issue cards and capture fingerprints. This page will grow into a cross-household roster with bulk import, age-bracket filters and access audit per dependant.</p>
-    </section>
-  </ModulePage>;
-}
-
-function StaffManagement({ user: _user }: { user: User }) {
-  return <ModulePage
-    eyebrow="Residents & staff"
-    title="Staff management"
-    description="Administrator, manager, cashier and security accounts with gate assignments, shifts and audit of every action. Use the People list to change roles today."
-    icon="✦"
-    tone="blue"
-  >
-    <section className="feature-grid">
-      {[
-        ['Roles', 'Admin · Manager · Cashier · Security · Resident — each role gates menus and APIs.'],
-        ['Gate postings', 'Security officers pick a gate at sign-in; assignments are visible on devices.'],
-        ['Audit trail', 'Every login, card change and gate decision is recorded against the acting staff id.'],
-        ['Coming soon', 'Shift rosters, leave management and performance reports.'],
-      ].map(([t, b]) => <article className="panel" key={t}><p className="eyebrow">{t}</p><p>{b}</p></article>)}
-    </section>
-  </ModulePage>;
-}
-
-function FacilityBookings({ user: _user }: { user: User }) {
-  return <ModulePage
-    eyebrow="Estate management"
-    title="Facility bookings"
-    description="Let residents reserve the clubhouse, event hall, tennis court, gym or guest suites — with approval, payment and calendar availability."
-    icon="▦"
-    tone="green"
-  >
-    <section className="feature-grid">
-      {[
-        ['Calendar view', 'See every approved booking across facilities for the next 30 days.'],
-        ['Approval queue', 'Managers approve or decline requests; cashiers confirm payment.'],
-        ['Rates & rules', 'Per-facility hourly rates, deposits, blackout dates and capacity.'],
-        ['Resident self-service', 'Residents request bookings from the same portal they pay bills.'],
-      ].map(([t, b]) => <article className="panel" key={t}><p className="eyebrow">{t}</p><p>{b}</p></article>)}
-    </section>
-  </ModulePage>;
-}
-
-function EmergencyContacts() {
-  const contacts: Array<[string, string, string]> = [
-    ['Estate Security Office', '24/7 response desk', 'Call via estate intercom'],
-    ['Facility Manager', 'On-duty manager', 'Contact through support phone (Settings)'],
-    ['Medical / Ambulance', 'Emergencies only', '112 / 199'],
-    ['Police', 'Emergencies only', '112 / 199'],
-    ['Fire Service', 'Emergencies only', '112 / 199'],
-    ['Power / Utility Fault', 'Outage reporting', 'Log a Service Operations request'],
-  ];
-  return <ModulePage
-    eyebrow="Estate management"
-    title="Emergency contacts"
-    description="One-tap directory for estate security, medical, fire, utility and management response lines. Bookmark this page on every guard post."
-    icon="✚"
-    tone="amber"
-  >
-    <section className="contact-grid">
-      {contacts.map(([name, role, detail]) => (
-        <article className="panel contact-card" key={name}>
-          <p className="eyebrow">{role}</p>
-          <h3>{name}</h3>
-          <p>{detail}</p>
-        </article>
-      ))}
-    </section>
-  </ModulePage>;
-}
-
-function InformationHub({ onNavigate }: { onNavigate?: (s: Section) => void }) {
+/** The hub's quick-route cards remain alongside the real library. */
+function InformationShortcuts({ onNavigate }: { onNavigate?: (s: Section) => void }) {
   const cards: Array<[Section, string, string]> = [
     ['notices', 'Estate notices', 'Announcements, policy updates and urgent broadcasts pushed to every resident.'],
     ['maintenance', 'Service operations', 'Open maintenance requests, fault reports and resolution status.'],
@@ -2469,44 +2873,23 @@ function InformationHub({ onNavigate }: { onNavigate?: (s: Section) => void }) {
     ['visitors', 'Visitor management', 'Invite guests, issue passes and review arrival history.'],
     ['legal', 'Legal & governance', 'Estate by-laws, house rules, data handling and governance documents.'],
   ];
-  return <ModulePage
-    eyebrow="Information resources"
-    title="Information hub"
-    description="Your starting point for resident-facing documents, communications and estate services."
-    icon="ⓘ"
-    tone="slate"
-  >
-    <section className="feature-grid">
-      {cards.map(([id, title, body]) => (
-        <button key={id} className="panel hub-card" onClick={() => onNavigate?.(id)}>
-          <span className="hub-icon">{navIcon(id)}</span>
-          <p className="eyebrow">Go to</p>
-          <h3>{title}</h3>
-          <p>{body}</p>
-          <span className="hub-arrow">→</span>
-        </button>
-      ))}
-    </section>
-  </ModulePage>;
+  return <section className="feature-grid">
+    {cards.map(([id, title, body]) => (
+      <button key={id} className="panel hub-card" onClick={() => onNavigate?.(id)}>
+        <span className="hub-icon">{navIcon(id)}</span>
+        <p className="eyebrow">Go to</p>
+        <h3>{title}</h3>
+        <p>{body}</p>
+        <span className="hub-arrow">→</span>
+      </button>
+    ))}
+  </section>;
 }
 
-function LegalGovernance() {
-  return <ModulePage
-    eyebrow="Information resources"
-    title="Legal & governance"
-    description="Estate by-laws, house rules, residents' agreement, privacy notice, data-handling policy and the minutes of estate meetings."
-    icon="§"
-    tone="slate"
-  >
-    <section className="feature-grid">
-      {[
-        ['Residents’ agreement', 'Terms that govern occupancy, fees and conduct on the estate.'],
-        ['House rules', 'Day-to-day rules — noise, pets, parking, waste, visitors.'],
-        ['Privacy & data', 'How personal data, credentials and gate events are stored, encrypted and retained.'],
-        ['Estate meetings', 'AGM minutes, Exco resolutions and voted policy changes.'],
-      ].map(([t, b]) => <article className="panel" key={t}><p className="eyebrow">{t}</p><p>{b}</p></article>)}
-    </section>
-  </ModulePage>;
+function LegalGovernance({ user }: { user: User }) {
+  return <DocumentLibrary user={user} set="legal" title="Legal & governance" subtitle="By-laws, house rules, residents’ agreement, privacy and data-handling notices, AGM minutes and Exco resolutions" categories={[
+    ['bylaw', 'By-law'], ['house_rule', 'House rule'], ['privacy', 'Privacy & data'], ['agreement', 'Residents’ agreement'], ['minutes', 'Meeting minutes'], ['policy', 'Policy'],
+  ]} />;
 }
 
 export default App;
