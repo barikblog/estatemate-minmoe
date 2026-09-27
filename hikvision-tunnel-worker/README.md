@@ -163,6 +163,24 @@ Rows pushed from D1 are marked `synced`/`failed` in `device_users`
 * `GET /sync-user` — the D1 queue that still needs pushing.
 * `GET /health` — configuration flags + last pull status (unauthenticated liveness probe).
 
+## Deployment via CI (recommended)
+
+`.github/workflows/deploy-bridge.yml` (**Deploy Hikvision tunnel bridge**) deploys
+this Worker with the repository's existing `CLOUDFLARE_API_TOKEN` /
+`CLOUDFLARE_ACCOUNT_ID` Actions secrets:
+
+1. **Merge to `main`** (with changes under `hikvision-tunnel-worker/`) provisions (or reuses) the D1
+   database, patches `database_id` in the runner, applies `schema.sql`, deploys the
+   Worker, pushes whichever of `HIK_USER`, `HIK_PASS`, `API_TOKEN`,
+   `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET` exist as repository secrets, and
+   smoke-tests `GET /health` on the new `*.workers.dev` URL.
+2. **Configuration inputs** (highest wins): workflow-dispatch `tunnel_url` →
+   repository variable `BRIDGE_TUNNEL_URL` → `wrangler.toml` `[vars]`.
+3. **Repository secrets to set** (Settings → Secrets and variables → Actions), then
+   re-run the workflow: `HIK_USER`, `HIK_PASS`, `API_TOKEN` (plus the Access pair if
+   used). Until they exist the Worker deploys but reports
+   `"deviceAuthConfigured":false` and every device call fails closed with a 401/502.
+
 ## Cloudflare Pages integration
 
 The Pages frontend only needs the worker URL and the token (keep the token in a

@@ -1,0 +1,134 @@
+name: Deploy Hikvision tunnel bridge
+
+# Deploys the standalone `hikvision-tunnel-worker/` Worker with its own D1
+# database, using the same Cloudflare credentials as "Deploy EstateMate".
+#
+# Runs on:
+#   - every push to main that touches hikvision-tunnel-worker/** (i.e. right
+#     after its PR merges), and
+#   - manual dispatch, optionally with a real `tunnel_url` (otherwise the
+#     repository variable BRIDGE_TUNNEL_URL, otherwise wrangler.toml's [vars]).
+#
+# Secrets are optional but the bridge is inert without them. Set these
+# repository secrets (Settings → Secrets and variables → Actions), then
+# re-run this workflow:
+#   HIK_USER, HIK_PASS          — Hikvision ISAPI credentials
+#   API_TOKEN                   — bearer token for /pull-logs, /sync-user, /access-logs
+#   CF_ACCESS_CLIENT_ID/SECRET  — only if the tunnel hostname sits behind Access
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "hikvision-tunnel-worker/**"
+      - ".github/workflows/deploy-bridge.yml"
+  workflow_dispatch:
+    inputs:
+      tunnel_url:
+        description: "Tunnel origin for TUNNEL_URL (e.g. https://gate.example.com); falls back to vars.BRIDGE_TUNNEL_URL then wrangler.toml"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hikvision-tunnel-bridge-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: hikvision-tunnel-worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Provision or locate the D1 database
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          # Create on first run; "already exists" is expected afterwards.
+          npx wrangler --config wrangler.toml d1 create hikvision-bridge-db || true
+          db_id="$(npx wrangler --config wrangler.toml d1 list --json \
+            | jq -r '.[] | select(.name=="hikvision-bridge-db") | .uuid' | head -1)"
+          if [ -z "$db_id" ]; then
+            echo "::error::hikvision-bridge-db not found and could not be created. Check that CLOUDFLARE_API_TOKEN allows D1 edit, or run: npx wrangler --config wrangler.toml d1 create hikvision-bridge-db"
+            exit 1
+          fi
+          sed -i "s/^database_id = \".*\"/database_id = \"$db_id\"/" wrangler.toml
+          echo "Using D1 database_id=$db_id"
+
+      - name: Resolve TUNNEL_URL
+        env:
+          INPUT_TUNNEL_URL: ${{ inputs.tunnel_url || vars.BRIDGE_TUNNEL_URL }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TUNNEL_URL:-}" ]; then
+            sed -i "s|^TUNNEL_URL = .*|TUNNEL_URL = \"$INPUT_TUNNEL_URL\"|" wrangler.toml
+            echo "TUNNEL_URL override applied (wrangler.toml patched in the runner only)"
+          else
+            echo "No tunnel_url input/variable — deploying the wrangler.toml [vars] default"
+          fi
+          grep -E "^TUNNEL_URL" wrangler.toml | sed 's|=.*|= <configured>|'
+
+      - name: Apply schema
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler --config wrangler.toml d1 execute hikvision-bridge-db --remote --file schema.sql
+
+      - name: Deploy Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler --config wrangler.toml deploy 2>&1 | tee /tmp/bridge-deploy.out
+
+      - name: Push secrets (only those configured as repository secrets)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          HIK_USER: ${{ secrets.HIK_USER }}
+          HIK_PASS: ${{ secrets.HIK_PASS }}
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in HIK_USER HIK_PASS API_TOKEN CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET; do
+            value="${!name:-}"
+            if [ -n "$value" ]; then
+              printf '%s' "$value" | npx wrangler --config wrangler.toml secret put "$name"
+            else
+              echo "::notice::repository secret $name is not set — skipping (set it, then re-run this workflow)"
+              missing=1
+            fi
+          done
+          if [ "$missing" -eq 1 ]; then
+            echo "::warning::bridge deployed with incomplete credentials — set the missing repository secrets and re-run"
+          fi
+
+      - name: Smoke test the deployed bridge
+        run: |
+          set -euo pipefail
+          url="$(grep -oE 'https://[a-zA-Z0-9.-]+\.workers\.dev[^ )]*' /tmp/bridge-deploy.out | head -1 || true)"
+          if [ -z "$url" ]; then
+            echo "::error::could not read the workers.dev URL from the deploy output"
+            exit 1
+          fi
+          echo "Bridge URL: $url"
+          health="$(curl -sS --fail-with-body --max-time 30 "$url/health")"
+          echo "$health"
+          grep -q '"ok":true' <<<"$health"
+          grep -q '"tunnelConfigured":true' <<<"$health"
+          echo "Deployed bridge is healthy at $url"
