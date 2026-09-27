@@ -125,7 +125,9 @@ curl -i http://192.168.1.100/ISAPI/System/deviceInfo --digest -u admin:password
 - **401 Unauthorized**: Check ISAPI username/password, device allows digest auth, IP not blocked.
 - **No operations**: Device not linked to agent, or connection pattern still `manual_sync`. Set it to `isapi_bridge` / `windows_agent` and link it.
 - **Operation stuck in sent**: Agent not reporting result. Check agent logs, network to Cloudflare, secret.
-- **Card not opening door**: Card added but not assigned to access group / door. Some models require separate Person + Card + Access Group linking. This bridge currently does simple card add; for full person management, extend `applyCardOperation` to create Person first (`/ISAPI/AccessControl/UserInfo/Record`).
+- **"operation has no valid EstateMate employee number"**: the card operation reached the agent without the holder's employee number. The Worker issues one per person and stamps it on every card operation when the agent collects it, so this means the Worker predates migration `0017` — deploy it, then retry the operation. The agent deliberately does not guess (it used to fall back to the 36-character resident id, which terminals refuse, or to `"1"`, which filed the card under the wrong person).
+- **Failure reasons**: a terminal rejection is reported as the ResponseStatus the terminal returned, e.g. `ISAPI 400: Invalid Content / badParameters / employeeNo`, plus the XML retry's answer when older-firmware XML was tried too.
+- **Card not opening door**: Card added but not assigned to access group / door. Some models require separate Person + Card + Access Group linking. This bridge currently does simple card add; for full person management, extend `applyCardOperation` to create Person first (`/ISAPI/AccessControl/UserInfo/Record`) under the operation's `employeeNo` (EstateMate-issued, nine digits).
 
 ## Extending for full Person/Access Group
 

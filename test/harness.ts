@@ -107,20 +107,39 @@ export interface TestDatabase {
   query(sql: string, ...values: SqlValue[]): SqliteRow[];
   one(sql: string, ...values: SqlValue[]): SqliteRow | undefined;
   run(sql: string, ...values: SqlValue[]): void;
+  /** Applies the migrations not applied yet (see `createTestDatabase({ before })`). */
+  migrate(): Promise<void>;
 }
 
-export async function createTestDatabase(): Promise<TestDatabase> {
+async function migrationFiles(): Promise<{ fs: NodeFs; files: string[] }> {
   const fs = await nodeModule<NodeFs>('fs');
+  const files = fs.readdirSync('migrations').filter((file) => file.endsWith('.sql')).sort();
+  if (!files.length) throw new Error('No migrations were found; run tests from the repository root');
+  return { fs, files };
+}
+
+/**
+ * An in-memory database with every migration applied. Pass `before` (a
+ * migration file-name prefix such as `'0017'`) to stop short of that migration,
+ * seed rows the way an older production database holds them, then call
+ * `migrate()` to upgrade — the path a real deployment takes.
+ */
+export async function createTestDatabase(options: { before?: string } = {}): Promise<TestDatabase> {
+  const { fs, files } = await migrationFiles();
   const { DatabaseSync } = await nodeModule<{ DatabaseSync: new (path: string) => SqliteDatabase }>('sqlite');
   const db = new DatabaseSync(':memory:');
-  const migrations = fs.readdirSync('migrations').filter((file) => file.endsWith('.sql')).sort();
-  if (!migrations.length) throw new Error('No migrations were found; run tests from the repository root');
-  for (const file of migrations) db.exec(fs.readFileSync(`migrations/${file}`, 'utf8'));
+  const applied = new Set<string>();
+  const apply = (file: string) => { db.exec(fs.readFileSync(`migrations/${file}`, 'utf8')); applied.add(file); };
+  for (const file of files) {
+    if (options.before && file >= options.before) break;
+    apply(file);
+  }
   return {
     d1: asD1Database(db),
     query: (sql, ...values) => db.prepare(sql).all(...values),
     one: (sql, ...values) => db.prepare(sql).get(...values),
     run: (sql, ...values) => { db.prepare(sql).run(...values); },
+    migrate: async () => { for (const file of files) if (!applied.has(file)) apply(file); },
   };
 }
 

@@ -11,6 +11,7 @@
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 import worker from '../src/index';
+import { isEmployeeNumber } from '../src/employee-number';
 import { createTestDatabase, createTestEnv, seedEstate, tokenFor, call, queueSendsOf } from './harness';
 import type { Env, AccessEventQueuePayload } from '../src/types';
 
@@ -80,9 +81,12 @@ describe('Fingerprint credentials', () => {
     expect(finger?.finger_label).toBe('Right index');
     expect(finger?.resident_id).toBe(estate.residentId);
     expect(finger?.enrolled_device_id).toBe(deviceId);
-    // The terminal identifies the person by employee number; it defaults to the
-    // EstateMate user id so a cardless event can be attributed later.
-    expect(finger?.employee_no).toBe(estate.residentId);
+    // The terminal identifies the person by employee number, which EstateMate
+    // issues (nine digits with a check digit) so a cardless event can be
+    // attributed later. It is never the 36-character user id.
+    expect(isEmployeeNumber(finger?.employee_no)).toBe(true);
+    expect(finger?.employee_no).toBe(response.json.employeeNo);
+    expect(String(response.json.instruction)).toContain(`employee number ${String(response.json.employeeNo)}`);
 
     const operations = db.query(`SELECT * FROM device_operations WHERE fingerprint_id=?`, String(response.json.id));
     expect(operations.length).toBe(1);
@@ -92,14 +96,24 @@ describe('Fingerprint credentials', () => {
     expect(operations[0]!.device_id).toBe(deviceId);
   });
 
-  it('keeps the terminal identity the operator supplied and resolves a dependant to the main resident', async () => {
+  it('issues a dependant their own terminal identity and resolves them to the main resident', async () => {
     addHouseholdMember();
-    const response = await addFingerprint({ householdMemberId: 'member-1', fingerNo: 2, employeeNo: '2002' });
+    const main = await addFingerprint({ fingerNo: 1 });
+    const response = await addFingerprint({ householdMemberId: 'member-1', fingerNo: 2 });
     expect(response.status).toBe(201);
     const finger = db.one(`SELECT * FROM fingerprint_credentials WHERE id=?`, String(response.json.id));
     expect(finger?.household_member_id).toBe('member-1');
     expect(finger?.resident_id).toBe(estate.residentId);
-    expect(finger?.employee_no).toBe('2002');
+    expect(isEmployeeNumber(finger?.employee_no)).toBe(true);
+    expect(finger?.employee_no).not.toBe(main.json.employeeNo);
+  });
+
+  it('refuses an employee number the operator tries to choose', async () => {
+    addHouseholdMember();
+    const response = await addFingerprint({ householdMemberId: 'member-1', fingerNo: 2, employeeNo: '2002' });
+    expect(response.status).toBe(400);
+    expect(String(response.json.error)).toMatch(/issued by EstateMate/);
+    expect(db.one(`SELECT COUNT(*) AS total FROM fingerprint_credentials`)?.total).toBe(0);
   });
 
   it('validates the person and the finger slot', async () => {
@@ -260,13 +274,14 @@ describe('Fingerprint credentials', () => {
     const { agentId, agentSecret } = await linkAgent(deviceId);
     await addFingerprint({ fingerNo: 2, deviceId });
     addHouseholdMember();
-    const dependant = await addFingerprint({ householdMemberId: 'member-1', fingerNo: 5, employeeNo: '3003' });
+    const dependant = await addFingerprint({ householdMemberId: 'member-1', fingerNo: 5 });
+    const dependantNo = String(dependant.json.employeeNo);
 
     await ingest(deviceId, agentId, agentSecret, terminalEvent({
-      employeeNoString: '3003', name: 'Ben Dependant', currentVerifyMode: 'fingerprint',
+      employeeNoString: dependantNo, name: 'Ben Dependant', currentVerifyMode: 'fingerprint',
     }));
 
-    const event = db.one(`SELECT * FROM access_events WHERE employee_no='3003'`);
+    const event = db.one(`SELECT * FROM access_events WHERE employee_no=?`, dependantNo);
     expect(event?.credential_type).toBe('fingerprint');
     expect(event?.fingerprint_id).toBe(String(dependant.json.id));
     expect(event?.resident_id).toBe(estate.residentId);
@@ -281,16 +296,18 @@ describe('Fingerprint credentials', () => {
     db.run(`INSERT INTO users(id,name,email,password_hash,role,is_manager,status) VALUES ('user-other','Ola Other','other@example.com','pbkdf2-sha256$100000$x$y','resident',0,'active')`);
     const card = await call(env, 'POST', '/api/access/cards', { token: adminToken, body: { residentId: 'user-other', cardUid: '99999999' } });
     expect(card.status).toBe(201);
-    await addFingerprint({ fingerNo: 1, employeeNo: '99999999' });
+    const finger = await addFingerprint({ fingerNo: 1 });
 
     await ingest(deviceId, agentId, agentSecret, terminalEvent({
-      cardNo: '99999999', employeeNoString: '99999999', currentVerifyMode: 'card',
+      cardNo: '99999999', employeeNoString: String(finger.json.employeeNo), currentVerifyMode: 'card',
     }));
 
     const event = db.one(`SELECT * FROM access_events WHERE card_uid='99999999'`);
     expect(event?.card_id).toBe(String(card.json.id));
     expect(event?.resident_id).toBe('user-other');
     expect(event?.household_member_id).toBeNull();
+    // The card decided who it was, so no fingerprint of a different person is linked.
+    expect(event?.fingerprint_id).toBeNull();
   });
 
   it('expires a fingerprint when the facility fee is overdue and restores it when cleared', async () => {

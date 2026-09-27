@@ -36,9 +36,20 @@ A denied unknown-card event is sufficient if the device uploads the card number.
 
 ## Fingerprints
 
-A fingerprint is not a card number, so it is stored as its own credential (`fingerprint_credentials`, migration `0015`) rather than a fake card in `access_cards`. Administrators and Managers add one from a person's profile or from **Access cards & fingerprints**: the finger slot (1–10), an optional "which finger" label, the employee number the terminal knows the person by, and the terminal the finger will be captured at.
+A fingerprint is not a card number, so it is stored as its own credential (`fingerprint_credentials`, migration `0015`) rather than a fake card in `access_cards`. Administrators and Managers add one from a person's profile or from **Access cards & fingerprints**: the finger slot (1–10), an optional "which finger" label, and the terminal the finger will be captured at.
 
-The template itself is created on the terminal — the person's finger has to be on the sensor — so EstateMate queues `enroll_fingerprint` as a `manual_action_required` task with an instruction and never asks the agent to upload a template. The same applies to `enable_fingerprint`, `disable_fingerprint` and `delete_fingerprint`, which the terminal must confirm. Gate events that carry no card number are attributed to the person through `employee_no`, so set that value when enrolling a dependant.
+The template itself is created on the terminal — the person's finger has to be on the sensor — so EstateMate queues `enroll_fingerprint` as a `manual_action_required` task with an instruction and never asks the agent to upload a template. The same applies to `enable_fingerprint`, `disable_fingerprint` and `delete_fingerprint`, which the terminal must confirm. Gate events that carry no card number are attributed to the person through `employee_no`.
+
+### Terminal employee numbers
+
+The employee number is the person ID a terminal files cards and fingers under and reports in every gate event, so it decides whose name an event is recorded under. EstateMate issues it (migration `0017`, `src/employee-number.ts`); nobody types it:
+
+- **Format:** nine digits, never starting with 0, the last one a Damm check digit. Hikvision documents the person ID as 1–32 bytes and some controllers restrict its characters; nine digits fit every terminal and survive firmware that stores it as an integer. The check digit catches any single mistyped digit or two swapped neighbours when an operator keys it in at the terminal.
+- **One per person:** a main resident and each household member get their own number, shared by all of that person's cards and fingers. A dependant no longer borrows the main resident's identity on the terminal.
+- **Random, immutable, permanent:** numbers come from the platform CSPRNG, so nobody can pre-create a terminal person under the next number. The database refuses to update or delete an issued number, so it can never be moved to or reissued for someone else.
+- **Not negotiable through the API:** `POST /api/access/fingerprints` refuses an `employeeNo` other than the person's own issued number, and the database refuses a fingerprint row carrying anything else. Card operations carry the holder's number and the Worker re-stamps it when the agent collects the operation; the agents fail an operation with no valid number instead of guessing one.
+- **Enrolling a finger:** the enrollment task names the number — find or create the person on the terminal under exactly that number, then store the finger in the slot shown.
+- **Records from before `0017`:** fingerprint rows keep the employee number they were created with, as history. An event carrying such a legacy number is only attributed while exactly one person holds it; if two people share a typed-in number, the event stays unattributed until one of them is revoked and re-recorded, which issues a proper number.
 
 ## Model-specific behavior
 

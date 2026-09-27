@@ -5,6 +5,7 @@ import type { CsvTable } from './csv';
 import { DEFAULT_ESTATE_TIMEZONE, normalizeTimeZone, parseEstateInstantMs } from './datetime';
 import { AccessLiveFeed } from './live-feed';
 import { evaluateVisitorPass } from './visitor-pass';
+import { findEmployeeNumber, issueEmployeeNumber, issueEmployeeNumberForCard } from './employee-number';
 import { normalizeHikvisionDocument } from './hikvision';
 import { HIKVISION_PROFILES, getHikvisionProfile, isConnectionSupported, resolveHikvisionProfile } from './hikvision-profiles';
 import {
@@ -2541,7 +2542,10 @@ app.get('/api/access/credentials', async (c) => {
   const result = await c.env.DB.prepare(
     `SELECT * FROM (
        SELECT c.id,c.resident_id,c.household_member_id,'card' AS credential_type,c.card_uid AS credential_reference,c.card_label AS credential_label,
-         NULL AS finger_no,NULL AS employee_no,NULL AS enrolled_device_name,c.status,c.issued_at AS granted_at,c.expires_at,
+         NULL AS finger_no,
+         (SELECT e.employee_no FROM employee_numbers e WHERE (c.household_member_id IS NULL AND e.household_member_id IS NULL AND e.resident_id=c.resident_id)
+            OR (c.household_member_id IS NOT NULL AND e.household_member_id=c.household_member_id)) AS employee_no,
+         NULL AS enrolled_device_name,c.status,c.issued_at AS granted_at,c.expires_at,
          c.deactivated_reason,c.created_at,c.updated_at,
          u.name AS resident_name,hm.name AS household_member_name,hm.relationship,COALESCE(hp.unit_number,p.unit_number) AS unit_number,
          (SELECT COUNT(*) FROM device_operations o WHERE o.card_id=c.id AND o.status='manual_action_required') AS pending_operations
@@ -2581,9 +2585,13 @@ app.post('/api/access/fingerprints', requireRoles('admin','manager'), async (c) 
   // cannot be matched to a finger on the device or removed later.
   const fingerNo = Number(body.fingerNo);
   if (!Number.isInteger(fingerNo) || fingerNo < 1 || fingerNo > 10) return jsonError(c, 400, 'fingerNo must be a whole number between 1 and 10');
-  let residentId = body.residentId;
+  // The terminal's employee number is issued by EstateMate, never chosen by the
+  // caller (see src/employee-number.ts): it decides whose name a gate event is
+  // filed under. A client may echo the person's issued number back; any other
+  // value is refused before anything is written.
+  const suppliedEmployeeNo = body.employeeNo === undefined || body.employeeNo === null ? '' : String(body.employeeNo).trim();
+  let residentId = '';
   let householdMemberId: string|null = null;
-  let employeeNo = body.employeeNo?.trim() || null;
   let personName = '';
   if (body.householdMemberId) {
     const member = await c.env.DB.prepare(
@@ -2594,12 +2602,14 @@ app.post('/api/access/fingerprints', requireRoles('admin','manager'), async (c) 
     householdMemberId = member.id;
     personName = member.name;
   } else {
-    const resident = await c.env.DB.prepare(`SELECT id,name FROM users WHERE id=? AND status='active'`).bind(residentId).first<{ id:string;name:string }>();
+    const resident = await c.env.DB.prepare(`SELECT id,name FROM users WHERE id=? AND status='active'`).bind(body.residentId).first<{ id:string;name:string }>();
     if (!resident) return jsonError(c, 404, 'Active account not found');
+    residentId = resident.id;
     personName = resident.name;
-    // Default the terminal's employee number to the EstateMate user id, which is
-    // stable and already what the portal can show on the device side.
-    employeeNo ||= resident.id;
+  }
+  const person = { residentId, householdMemberId };
+  if (suppliedEmployeeNo && suppliedEmployeeNo !== await findEmployeeNumber(c.env.DB, person)) {
+    return jsonError(c, 400, 'Employee numbers are issued by EstateMate and cannot be chosen or changed. Leave the employee number out.');
   }
   let deviceId: string|null = null;
   let deviceName = '';
@@ -2613,15 +2623,16 @@ app.post('/api/access/fingerprints', requireRoles('admin','manager'), async (c) 
     `SELECT id FROM fingerprint_credentials WHERE resident_id=? AND COALESCE(household_member_id,'')=? AND finger_no=? AND status IN ('active','suspended')`,
   ).bind(residentId, householdMemberId ?? '', fingerNo).first();
   if (duplicate) return jsonError(c, 409, `Finger ${fingerNo} is already registered for ${personName}`);
+  // One number per person, shared by all their fingers and cards; the database
+  // refuses a fingerprint row that carries anything else (migration 0017).
+  const employeeNo = await issueEmployeeNumber(c.env.DB, person, c.get('user').id);
   const id = crypto.randomUUID();
   const expiresAt = body.expiresAt?.trim() || null;
   await c.env.DB.prepare(
     `INSERT INTO fingerprint_credentials(id,resident_id,household_member_id,employee_no,finger_no,finger_label,enrolled_device_id,expires_at,created_by)
      VALUES (?,?,?,?,?,?,?,?,?)`,
   ).bind(id, residentId, householdMemberId, employeeNo, fingerNo, body.fingerLabel?.trim() || null, deviceId, expiresAt, c.get('user').id).run();
-  const instruction = deviceName
-    ? `Enroll ${body.fingerLabel?.trim() || `finger ${fingerNo}`} for ${personName} on ${deviceName}, using finger slot ${fingerNo}${employeeNo ? ` and employee number ${employeeNo}` : ''}. Then mark this action applied.`
-    : `Enroll ${body.fingerLabel?.trim() || `finger ${fingerNo}`} for ${personName} on the terminal, using finger slot ${fingerNo}${employeeNo ? ` and employee number ${employeeNo}` : ''}. Then mark this action applied.`;
+  const instruction = `Enroll ${body.fingerLabel?.trim() || `finger ${fingerNo}`} for ${personName} on ${deviceName || 'the terminal'}, using finger slot ${fingerNo} and employee number ${employeeNo} — issued by EstateMate: enter it exactly and do not change it. Then mark this action applied.`;
   const queued = await createFingerprintOperations(c.env, id, 'enroll_fingerprint', { fingerprintId:id, fingerNo, employeeNo, personName, deviceId, enabled:true }, instruction, { deviceId });
   await audit(c, 'enroll', 'fingerprint_credential', id, { residentId, householdMemberId, fingerNo, employeeNo, deviceId });
   return c.json({
@@ -2719,9 +2730,9 @@ app.post('/api/access/cards', requireRoles('admin','manager'), async (c) => {
   }
   const id = crypto.randomUUID();
   await c.env.DB.prepare(`INSERT INTO access_cards(id,resident_id,household_member_id,card_uid,card_label) VALUES (?,?,?,?,?)`).bind(id,residentId,householdMemberId,body.cardUid.trim(),label).run();
-  await createDeviceOperations(c.env,id,'upsert_card',{ cardUid:body.cardUid.trim(),residentId,householdMemberId,enabled:true });
-  await audit(c, 'issue', 'access_card', id, { ...body, residentId, householdMemberId });
-  return c.json({ id, hardwareSync: 'manual_action_required' }, 201);
+  const employeeNo = await createDeviceOperations(c.env,id,'upsert_card',{ cardUid:body.cardUid.trim(),residentId,householdMemberId,enabled:true });
+  await audit(c, 'issue', 'access_card', id, { ...body, residentId, householdMemberId, employeeNo });
+  return c.json({ id, employeeNo, hardwareSync: 'manual_action_required' }, 201);
 });
 
 app.patch('/api/access/cards/:id', requireRoles('admin','manager'), async (c) => {
@@ -3776,22 +3787,36 @@ function isPendingPattern(pattern: string | null | undefined): boolean {
   return PENDING_OPERATION_PATTERNS.includes(pattern);
 }
 
+/**
+ * Card hardware work for every enabled terminal.
+ *
+ * Every card operation names the person the terminal files the card under, by
+ * the holder's EstateMate-issued employee number (a main resident and each
+ * household member have their own). Agents used to fall back to the 36-character
+ * user id — longer than the 1-32 bytes a Hikvision person ID allows, so the
+ * terminal refused the card — or to a literal "1", which attached a re-enabled
+ * card to whoever terminal person 1 was. The agent never has to guess now; the
+ * number is re-stamped from the registry again at hand-over time.
+ */
 async function createDeviceOperations(
   env: Env,
   cardId: string,
   operation: 'upsert_card'|'enable_card'|'disable_card'|'delete_card',
-  payload: unknown,
-): Promise<void> {
+  payload: Record<string, unknown>,
+): Promise<string|null> {
+  const employeeNo = await issueEmployeeNumberForCard(env.DB, cardId, null);
   const devices = await env.DB.prepare(`SELECT id,connection_pattern FROM hikvision_devices WHERE status != 'disabled' AND deleted_at IS NULL`).all<{ id: string; connection_pattern: string }>();
-  if (!devices.results.length) return;
+  if (!devices.results.length) return employeeNo;
+  const payloadJson = JSON.stringify({ ...payload, employeeNo });
   await env.DB.batch(devices.results.map((device) => {
     const status = isPendingPattern(device.connection_pattern)
       ? 'pending'
       : 'manual_action_required';
     return env.DB.prepare(
       `INSERT INTO device_operations(id,device_id,card_id,operation,payload_json,status) VALUES (?,?,?,?,?,?)`,
-    ).bind(crypto.randomUUID(), device.id, cardId, operation, JSON.stringify(payload), status);
+    ).bind(crypto.randomUUID(), device.id, cardId, operation, payloadJson, status);
   }));
+  return employeeNo;
 }
 
 /**
@@ -4193,6 +4218,7 @@ type GatewayOperationKind = 'card'|'visitor';
 type GatewayOperationRow = {
   id: string;
   kind: GatewayOperationKind;
+  card_id: string | null;
   operation: string;
   payload_json: string;
   attempts: number;
@@ -4208,13 +4234,13 @@ async function handleIsapiAgentOperations(request: Request, env: Env, agentId: s
   const limit = Math.min(100, Math.max(1, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : 20));
   const result = await env.DB.prepare(
     `SELECT * FROM (
-       SELECT o.id,CASE WHEN o.operation IN ('remote_open','remote_close','remote_always_open','remote_always_close','remote_resume') THEN 'door' ELSE 'card' END AS kind,o.device_id,o.operation,o.payload_json,o.attempts,o.created_at,o.updated_at,d.name AS device_name,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol
+       SELECT o.id,CASE WHEN o.operation IN ('remote_open','remote_close','remote_always_open','remote_always_close','remote_resume') THEN 'door' ELSE 'card' END AS kind,o.card_id,o.device_id,o.operation,o.payload_json,o.attempts,o.created_at,o.updated_at,d.name AS device_name,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol
        FROM device_operations o
        JOIN isapi_device_configs cfg ON cfg.device_id=o.device_id
        JOIN hikvision_devices d ON d.id=o.device_id
        WHERE cfg.agent_id=? AND cfg.sync_enabled=1 AND (o.status='pending' OR (o.status='sent' AND o.updated_at<datetime('now','-2 minutes')))
        UNION ALL
-       SELECT vo.id,'visitor' AS kind,vo.device_id,vo.operation,vo.payload_json,vo.attempts,vo.created_at,vo.updated_at,d.name AS device_name,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol
+       SELECT vo.id,'visitor' AS kind,NULL AS card_id,vo.device_id,vo.operation,vo.payload_json,vo.attempts,vo.created_at,vo.updated_at,d.name AS device_name,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol
        FROM visitor_device_operations vo
        JOIN isapi_device_configs cfg ON cfg.device_id=vo.device_id
        JOIN hikvision_devices d ON d.id=vo.device_id
@@ -4235,6 +4261,17 @@ async function handleIsapiAgentOperations(request: Request, env: Env, agentId: s
     claimed = result.results.filter((_, i) => Number(claims[i]?.meta.changes ?? 0) > 0);
   }
 
+  // The employee number an agent writes to a terminal comes from the registry at
+  // hand-over time, not from the stored payload: an operation queued before
+  // numbers were issued — including a failed one retried from Access control
+  // remote — still reaches the terminal with the holder's one issued number.
+  const employeeNumbers = new Map<string, string>();
+  for (const op of claimed) {
+    if (op.kind !== 'card' || !op.card_id) continue;
+    const employeeNo = await issueEmployeeNumberForCard(env.DB, op.card_id, null);
+    if (employeeNo) employeeNumbers.set(op.id, employeeNo);
+  }
+
   return Response.json({
     agentId,
     serverTime: new Date().toISOString(),
@@ -4242,6 +4279,8 @@ async function handleIsapiAgentOperations(request: Request, env: Env, agentId: s
     items: claimed.map((op) => {
       let payload: unknown;
       try { payload = JSON.parse(op.payload_json); } catch { payload = {}; }
+      const employeeNo = employeeNumbers.get(op.id);
+      if (employeeNo) payload = { ...(payload && typeof payload === 'object' ? payload : {}), employeeNo };
       return {
         id: op.id,
         kind: op.kind,
@@ -4320,29 +4359,49 @@ async function consumeAccessEvents(batch: MessageBatch<AccessEventQueuePayload>,
     batch.ackAll();
     return;
   }
-  // A card event is matched by card number; a fingerprint event carries no card
-  // number, so it falls back to the employee number the terminal knows the person
-  // by and the fingerprint credential recorded at enrollment. COALESCE keeps the
-  // card match authoritative whenever both exist.
-  const fingerprintMatch = `(SELECT resident_id FROM fingerprint_credentials WHERE employee_no=? AND employee_no IS NOT NULL
-       ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,created_at DESC LIMIT 1)`;
+  // One event, one person. A card that matches decides who it was. Otherwise the
+  // employee number the terminal reported does: an EstateMate-issued number
+  // names exactly one person (migration 0017). A number typed onto a
+  // fingerprint before numbers were issued is trusted only while exactly one
+  // person holds it — a number shared by two people means one of them was
+  // entered by mistake or on purpose, so the event stays unattributed instead of
+  // being filed under whichever record happens to be newest. The resident and
+  // household member always come from the same source, never mixed.
   const statements = events.map((event) => env.DB.prepare(
     `INSERT OR IGNORE INTO access_events(
       id,vendor_event_id,device_id,access_point_id,card_id,fingerprint_id,resident_id,household_member_id,visitor_request_id,card_uid,employee_no,person_name,credential_type,door_no,direction,result,event_type,device_timestamp,profile_key,raw_summary
-     ) VALUES (?,?,?,?,
-       (SELECT id FROM access_cards WHERE card_uid=? LIMIT 1),
-       (SELECT id FROM fingerprint_credentials WHERE employee_no=? AND employee_no IS NOT NULL
-          ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,created_at DESC LIMIT 1),
-       COALESCE((SELECT resident_id FROM access_cards WHERE card_uid=? LIMIT 1),${fingerprintMatch}),
-       COALESCE((SELECT household_member_id FROM access_cards WHERE card_uid=? LIMIT 1),
-         (SELECT household_member_id FROM fingerprint_credentials WHERE employee_no=? AND employee_no IS NOT NULL
-          ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,created_at DESC LIMIT 1)),
-       (SELECT id FROM visitor_requests WHERE credential_number=? OR pin=? LIMIT 1),?,?,?,?,?,?,?,?,?,?,?)`,
+     )
+     WITH ev AS (SELECT ? AS card_uid, ? AS employee_no),
+     card AS (
+       SELECT c.id,c.resident_id,c.household_member_id FROM access_cards c JOIN ev ON c.card_uid=ev.card_uid LIMIT 1
+     ),
+     issued AS (
+       SELECT e.resident_id,e.household_member_id FROM employee_numbers e JOIN ev ON e.employee_no=ev.employee_no
+     ),
+     legacy AS (
+       SELECT f.resident_id,f.household_member_id FROM fingerprint_credentials f JOIN ev ON f.employee_no=ev.employee_no
+       WHERE (SELECT COUNT(DISTINCT g.resident_id || '|' || COALESCE(g.household_member_id,'')) FROM fingerprint_credentials g WHERE g.employee_no=ev.employee_no)=1
+       LIMIT 1
+     ),
+     person AS (
+       SELECT resident_id,household_member_id,0 AS by_employee_no FROM card
+       UNION ALL SELECT resident_id,household_member_id,1 FROM issued WHERE NOT EXISTS (SELECT 1 FROM card)
+       UNION ALL SELECT resident_id,household_member_id,1 FROM legacy WHERE NOT EXISTS (SELECT 1 FROM card) AND NOT EXISTS (SELECT 1 FROM issued)
+       LIMIT 1
+     )
+     SELECT ?,?,?,?,
+       (SELECT id FROM card),
+       (SELECT f.id FROM fingerprint_credentials f JOIN person p ON p.by_employee_no=1 AND (
+            (p.household_member_id IS NOT NULL AND f.household_member_id=p.household_member_id)
+            OR (p.household_member_id IS NULL AND f.household_member_id IS NULL AND f.resident_id=p.resident_id))
+        ORDER BY f.employee_no=(SELECT employee_no FROM ev) DESC,CASE f.status WHEN 'active' THEN 0 ELSE 1 END,f.created_at DESC LIMIT 1),
+       (SELECT resident_id FROM person),
+       (SELECT household_member_id FROM person),
+       (SELECT v.id FROM visitor_requests v JOIN ev ON v.credential_number=ev.card_uid OR v.pin=ev.card_uid LIMIT 1),
+       ?,?,?,?,?,?,?,?,?,?,?`,
   ).bind(
-    event.id,event.vendorEventId,event.deviceId,event.accessPointId,
-    event.cardUid,event.employeeNo,event.cardUid,event.employeeNo,
     event.cardUid,event.employeeNo,
-    event.cardUid,event.cardUid,
+    event.id,event.vendorEventId,event.deviceId,event.accessPointId,
     event.cardUid,event.employeeNo,event.personName,event.credentialType,event.doorNo,event.direction,event.result,
     event.eventType,event.deviceTimestamp,event.profileKey,event.rawSummary,
   ));
