@@ -1,0 +1,11 @@
+# Local development secrets for `npx wrangler dev` (copied by wrangler automatically).
+# Values here are PLACEHOLDERS — production values live in `wrangler secret put …`.
+TUNNEL_URL=https://mydomain.com
+HIK_USER=admin
+HIK_PASS=replace-with-the-device-password
+HIK_AUTH_MODE=digest
+HIK_EVENT_LOOKBACK_MINUTES=10
+API_TOKEN=generate-a-long-random-token-for-the-pages-frontend
+# PAGES_ORIGIN=https://your-pages-project.pages.dev
+# CF_ACCESS_CLIENT_ID=
+# CF_ACCESS_CLIENT_SECRET=
