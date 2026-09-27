@@ -39,7 +39,7 @@ public final class BridgeService extends Service {
     public static final String ACTION_START = "com.estatemate.bridge.action.START";
     public static final String ACTION_STOP = "com.estatemate.bridge.action.STOP";
     public static final String CHANNEL_ID = "estatemate-bridge";
-    public static final String VERSION = "0.2.1";
+    public static final String VERSION = "0.2.3";
 
     private static final String TAG = "EstateMateBridge";
     private static final int NOTIFICATION_ID = 41;
@@ -48,6 +48,7 @@ public final class BridgeService extends Service {
     private static final String ALERT_STREAM_PATH = "/ISAPI/Event/notification/alertStream?format=json";
 
     private volatile boolean running;
+    private volatile boolean starting;
     private PowerManager.WakeLock wakeLock;
     private BridgeConfig config;
     private WorkerClient worker;
@@ -55,6 +56,7 @@ public final class BridgeService extends Service {
     private final List<Thread> deviceThreads = new ArrayList<Thread>();
     private Thread supervisor;
     private Thread flusher;
+    private Thread starterThread;
     private long lastNotificationUpdate;
 
     @Override
@@ -124,74 +126,107 @@ public final class BridgeService extends Service {
     // ------------------------------------------------------------- lifecycle --
 
     private void startBridge() {
-        if (running) return;
-        config = readConfig();
+        if (running || starting) return;
+        starting = true;
+        acquireWakeLock();
+        startForeground(NOTIFICATION_ID, notification("Starting…", "Initialising bridge…"));
 
-        // Devices configured by LAN address alone get their EstateMate device id
-        // from the portal: it is the Worker's key for a terminal, and asking an
-        // installer to copy a UUID per gate is where setups go wrong. The check
-        // is deliberately two-pass so the only configuration that fails is the
-        // one that cannot work.
-        List<String> problems = config.problems();
-        if (problems.isEmpty()) {
-            List<String> portalIds = resolveFromPortal();
-            problems = config.problems(portalIds);
-            if (!problems.isEmpty() && portalIds == null) {
-                problems.add("and the portal could not be reached to look the id up — check the Worker URL and this device's network, then start the bridge again");
+        starterThread = new Thread(new Runnable() {
+            public void run() {
+                initAndRun();
             }
-        }
-        if (!problems.isEmpty()) {
-            String message = BridgeConfig.describe(problems);
-            BridgeLog.append("error", "cannot start: " + message);
+        }, "bridge-starter");
+        starterThread.start();
+    }
+
+    private synchronized void initAndRun() {
+        try {
+            config = readConfig();
+
+            // Devices configured by LAN address alone get their EstateMate device id
+            // from the portal: it is the Worker's key for a terminal, and asking an
+            // installer to copy a UUID per gate is where setups go wrong. The check
+            // is deliberately two-pass so the only configuration that fails is the
+            // one that cannot work.
+            List<String> problems = config.problems();
+            if (problems.isEmpty()) {
+                List<String> portalIds = resolveFromPortal();
+                problems = config.problems(portalIds);
+                if (!problems.isEmpty() && portalIds == null) {
+                    problems.add("and the portal could not be reached to look the id up — check the Worker URL and this device's network, then start the bridge again");
+                }
+            }
+            if (!problems.isEmpty()) {
+                String message = BridgeConfig.describe(problems);
+                BridgeLog.append("error", "cannot start: " + message);
+                BridgeRuntime.setLastError(message);
+                BridgeRuntime.setRunning(false);
+                NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                if (manager != null) {
+                    manager.notify(NOTIFICATION_ID, notification("Configuration incomplete", message));
+                }
+                starting = false;
+                releaseWakeLock();
+                stopSelf();
+                return;
+            }
+
+            running = true;
+            starting = false;
+            BridgeRuntime.setRunning(true);
+            BridgeRuntime.setBufferLimit(config.eventBufferLimit);
+            BridgeRuntime.setConfiguredDevices(config.deviceCount());
+            BridgeRuntime.setWorkerOnline(false);
+            BridgeRuntime.setWorkerStatus("connecting…");
+            BridgeRuntime.setLastError("");
+            isapi = new IsapiClient(config.isapiTimeoutMs);
+
+            NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (manager != null) {
+                manager.notify(NOTIFICATION_ID, notification("Running", config.deviceCount() + " terminal(s) configured"));
+            }
+            BridgeLog.append("info", "bridge started · " + config.deviceCount() + " terminal(s) · " + config.maskedSecret());
+
+            supervisor = new Thread(new Runnable() {
+                public void run() {
+                    supervise();
+                }
+            }, "bridge-supervisor");
+            supervisor.start();
+
+            flusher = new Thread(new Runnable() {
+                public void run() {
+                    flushLoop();
+                }
+            }, "bridge-flusher");
+            flusher.start();
+
+            for (Device device : config.devices()) {
+                if (!device.enabled || !config.eventStreamEnabled || !device.eventStream) {
+                    BridgeLog.append("info", "event stream disabled for " + device.name);
+                    continue;
+                }
+                Thread thread = new Thread(new StreamTask(device), "stream-" + device.isapiHost);
+                thread.start();
+                deviceThreads.add(thread);
+            }
+        } catch (Exception error) {
+            String message = error.getMessage() == null ? error.toString() : error.getMessage();
+            BridgeLog.append("error", "startup error: " + message);
             BridgeRuntime.setLastError(message);
             BridgeRuntime.setRunning(false);
-            startForeground(NOTIFICATION_ID, notification("Configuration incomplete", message));
+            starting = false;
+            releaseWakeLock();
             stopSelf();
-            return;
-        }
-
-        running = true;
-        BridgeRuntime.setRunning(true);
-        BridgeRuntime.setBufferLimit(config.eventBufferLimit);
-        BridgeRuntime.setConfiguredDevices(config.deviceCount());
-        BridgeRuntime.setWorkerOnline(false);
-        BridgeRuntime.setWorkerStatus("connecting…");
-        BridgeRuntime.setLastError("");
-        isapi = new IsapiClient(config.isapiTimeoutMs);
-
-        startForeground(NOTIFICATION_ID, notification("Starting…", config.deviceCount() + " terminal(s) configured"));
-        acquireWakeLock();
-        BridgeLog.append("info", "bridge started · " + config.deviceCount() + " terminal(s) · " + config.maskedSecret());
-
-        supervisor = new Thread(new Runnable() {
-            public void run() {
-                supervise();
-            }
-        }, "bridge-supervisor");
-        supervisor.start();
-
-        flusher = new Thread(new Runnable() {
-            public void run() {
-                flushLoop();
-            }
-        }, "bridge-flusher");
-        flusher.start();
-
-        for (Device device : config.devices()) {
-            if (!device.enabled || !config.eventStreamEnabled || !device.eventStream) {
-                BridgeLog.append("info", "event stream disabled for " + device.name);
-                continue;
-            }
-            Thread thread = new Thread(new StreamTask(device), "stream-" + device.isapiHost);
-            thread.start();
-            deviceThreads.add(thread);
         }
     }
 
     private void shutdown() {
-        boolean wasRunning = running;
+        boolean wasRunning = running || starting;
         running = false;
+        starting = false;
         BridgeRuntime.setRunning(false);
+        if (starterThread != null) starterThread.interrupt();
         for (Thread thread : deviceThreads) thread.interrupt();
         deviceThreads.clear();
         if (supervisor != null) supervisor.interrupt();
