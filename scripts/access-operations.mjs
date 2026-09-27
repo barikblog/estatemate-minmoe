@@ -21,6 +21,13 @@
  *        disable_card + enable_card pair for each card. Cards that are
  *        already suspended are listed for context but never touched.
  *
+ *   2b. Remove named persons from the terminals (--remove-from-devices)
+ *        Revokes the person's cards (terminal disable task queued) and
+ *        deletes their fingerprints (terminal delete task queued). They are
+ *        never re-added, and they are excluded from the task 3 re-add as
+ *        well as from the task 2 cycle. Use the literal value "admin" to
+ *        target the single active administrator account.
+ *
  *   3. Re-register fingerprints whose employee number is a user id or is
  *      shared with someone else
  *        Finds every active/suspended fingerprint credential whose
@@ -38,10 +45,15 @@
  *   node scripts/access-operations.mjs [options]
  *
  *   --base <url>            API base (default: https://estatemate.estatemate.workers.dev)
- *   --person <id|email|name|unit>
+ *   --person <id|email|name|unit|admin>
  *                           Whose active cards get the suspend/restore cycle (task 2).
- *                           Exact user id, email, full name, or unit number. Required
- *                           for task 2; pass --skip-person to run tasks 1 and 3 only.
+ *                           Exact user id, email, full name, or unit number ("admin"
+ *                           resolves the single active administrator). Required for
+ *                           task 2; pass --skip-person to run the other tasks only.
+ *   --remove-from-devices <id|email|name|unit|admin>
+ *                           Repeatable. Revokes the person's cards and deletes their
+ *                           fingerprints (terminal tasks queued), never re-adds them,
+ *                           and excludes them from the task 2 cycle and task 3 re-add.
  *   --card <card number>    Restrict task 2 to specific card numbers (repeatable).
  *   --include-household     Also cycle cards of the person's linked household members.
  *   --kinds <list>          Failed-job kinds to retry in task 1, comma-separated:
@@ -92,6 +104,7 @@ const opts = {
   base: DEFAULT_BASE,
   person: null,
   skipPerson: false,
+  removeFromDevices: [],
   cards: [],
   includeHousehold: false,
   kinds: DEFAULT_KINDS.slice(),
@@ -113,6 +126,7 @@ for (let i = 0; i < argv.length; i += 1) {
     case '--base': opts.base = next().replace(/\/+$/, ''); break;
     case '--person': opts.person = next().trim(); break;
     case '--skip-person': opts.skipPerson = true; break;
+    case '--remove-from-devices': opts.removeFromDevices.push(next().trim()); break;
     case '--skip-fingerprints': opts.skipFingerprints = true; break;
     case '--card': opts.cards.push(next().trim()); break;
     case '--include-household': opts.includeHousehold = true; break;
@@ -236,6 +250,14 @@ async function runRetries(token, selected) {
 
 function resolvePerson(users, query) {
   const q = query.toLowerCase();
+  // "admin" targets the single active administrator account, so an operator
+  // does not need to know the account's exact name or email.
+  if (q === 'admin') {
+    const admins = users.filter((u) => u.role === 'admin' && u.status === 'active');
+    if (admins.length === 0) throw new Error('no active administrator account found');
+    if (admins.length > 1) throw new Error(`"${query}" is ambiguous (${admins.length} active administrators: ${admins.map((u) => u.email).join(', ')}) — pass the email or user id`);
+    return { user: admins[0], via: 'admin role' };
+  }
   const exactId = users.filter((u) => u.id.toLowerCase() === q);
   if (exactId.length) {
     if (exactId.length > 1) throw new Error(`user id "${query}" matched ${exactId.length} users`);
@@ -284,9 +306,46 @@ async function runCycle(token, plan) {
   }
 }
 
+// ── removal: take named persons off the terminals ──────────────────
+
+const REMOVE_REASON = 'Removed from devices by administrator';
+
+async function planRemovals(token, users) {
+  const persons = opts.removeFromDevices.map((query) => resolvePerson(users, query));
+  const byUser = new Map(persons.map(({ user }) => [user.id, user]));
+  const plans = [];
+  for (const { user, via } of persons) {
+    const cards = await allItems(token, `/api/access/cards?residentId=${encodeURIComponent(user.id)}`);
+    // The person's own credentials only — dependant rows carry this person's
+    // resident_id plus a household_member_id and belong to the dependant.
+    const cardTargets = cards.filter((c) => c.resident_id === user.id && !c.household_member_id && (c.status === 'active' || c.status === 'suspended'));
+    const fingers = await allItems(token, `/api/access/fingerprints?residentId=${encodeURIComponent(user.id)}`);
+    const fingerTargets = fingers.filter((f) => f.resident_id === user.id && !f.household_member_id && (f.status === 'active' || f.status === 'suspended'));
+    plans.push({ user, via, cards: cardTargets, fingers: fingerTargets });
+  }
+  return { plans, byUser };
+}
+
+async function runRemovals(token, { plans }) {
+  for (const plan of plans) {
+    for (const card of plan.cards) {
+      const label = `${card.card_uid}${card.card_label ? ` (${card.card_label})` : ''}`;
+      await api(`/api/access/cards/${card.id}`, { method: 'PATCH', token, body: { status: 'revoked', reason: REMOVE_REASON } });
+      console.log(`  ✔ ${label} [${card.status}]: revoked (terminal disable task queued)`);
+      logStep({ task: 'remove-card', cardId: card.id, cardUid: card.card_uid, from: card.status, to: 'revoked' });
+    }
+    for (const finger of plan.fingers) {
+      const label = `${finger.finger_label || `finger ${finger.finger_no}`} (number ${finger.employee_no ?? '—'})`;
+      await api(`/api/access/fingerprints/${finger.id}`, { method: 'DELETE', token });
+      console.log(`  ✔ ${label} [${finger.status}]: deleted (terminal delete task queued)`);
+      logStep({ task: 'remove-finger', fingerId: finger.id, from: finger.status, to: 'revoked' });
+    }
+  }
+}
+
 // ── task 3: re-register colliding fingerprints ─────────────────────
 
-async function planFingerprints(token, users) {
+async function planFingerprints(token, users, removedUserIds = new Set()) {
   const fingers = await allItems(token, '/api/access/fingerprints');
   const userIds = new Set(users.map((u) => u.id));
   const existingNumbers = new Set(
@@ -305,7 +364,11 @@ async function planFingerprints(token, users) {
 
   const live = fingers.filter((f) => f.status === 'active' || f.status === 'suspended');
   const matches = [];
+  let removedSkipped = 0;
   for (const f of live) {
+    // Persons being taken off the terminals are deleted outright (no re-add),
+    // so their colliding fingers must not also be re-registered here.
+    if (removedUserIds.has(f.resident_id) && !f.household_member_id) { removedSkipped += 1; continue; }
     const n = f.employee_no;
     if (n == null || String(n).trim() === '') continue;
     const reasons = [];
@@ -325,7 +388,7 @@ async function planFingerprints(token, users) {
     plan.push({ ...f, newNumber: String(next) });
     next += 1;
   }
-  return { plan, clean: live.length - matches.length, total: live.length };
+  return { plan, clean: live.length - matches.length, total: live.length, removedSkipped };
 }
 
 async function runFingerprints(token, plan) {
@@ -364,6 +427,10 @@ async function main() {
   line(`Loaded ${users.length} user accounts.`);
   line();
 
+  // Removals (people taken off the terminals: revoke cards, delete fingers, no re-add)
+  const removal = opts.removeFromDevices.length ? await planRemovals(session.token, users) : { plans: [], byUser: new Map() };
+  const removedUserIds = new Set([...removal.byUser.keys()]);
+
   // Task 1
   const retries = await planRetries(session.token);
   line(`Task 1 — retry failed ${opts.kinds.join('+')} job(s)`);
@@ -382,36 +449,63 @@ async function main() {
   if (opts.skipPerson) {
     line('  skipped (--skip-person).');
   } else {
-    cyclePlan = await planCycle(session.token, users);
-    const { user, via } = cyclePlan;
-    line(`  person: ${user.name} <${maskEmail(user.email)}> (matched by ${via})`);
-    if (cyclePlan.target.length === 0) {
-      line(`  no active cards to cycle${opts.cards.length ? ` — none of --card ${opts.cards.join(', ')} is active for this person` : ''}.`);
+    const prospective = resolvePerson(users, opts.person);
+    if (removedUserIds.has(prospective.user.id)) {
+      line(`  skipped — ${prospective.user.name} is being removed from the terminals (--remove-from-devices), so a cycle would be undone by the removal.`);
     } else {
-      for (const card of cyclePlan.target) {
-        line(`  - ${card.card_uid}${card.card_label ? ` (${card.card_label})` : ''} [status: ${card.status}]`);
+      cyclePlan = await planCycle(session.token, users);
+      const { user, via } = cyclePlan;
+      line(`  person: ${user.name} <${maskEmail(user.email)}> (matched by ${via})`);
+      if (cyclePlan.target.length === 0) {
+        line(`  no active cards to cycle${opts.cards.length ? ` — none of --card ${opts.cards.join(', ')} is active for this person` : ''}.`);
+      } else {
+        for (const card of cyclePlan.target) {
+          line(`  - ${card.card_uid}${card.card_label ? ` (${card.card_label})` : ''} [status: ${card.status}]`);
+        }
+      }
+      if (cyclePlan.suspended.length > 0) {
+        line(`  (already suspended, left alone: ${cyclePlan.suspended.map((c) => c.card_uid).join(', ')})`);
+      }
+      if (cyclePlan.household.length > 0 && !opts.includeHousehold) {
+        line(`  (household cards not included — ${cyclePlan.household.map((c) => c.card_uid).join(', ')}; add --include-household to cover them)`);
+      }
+      if (cyclePlan.unknown.length > 0) {
+        line(`  (warning: --card numbers not found among this person's active cards: ${cyclePlan.unknown.join(', ')})`);
       }
     }
-    if (cyclePlan.suspended.length > 0) {
-      line(`  (already suspended, left alone: ${cyclePlan.suspended.map((c) => c.card_uid).join(', ')})`);
-    }
-    if (cyclePlan.household.length > 0 && !opts.includeHousehold) {
-      line(`  (household cards not included — ${cyclePlan.household.map((c) => c.card_uid).join(', ')}; add --include-household to cover them)`);
-    }
-    if (cyclePlan.unknown.length > 0) {
-      line(`  (warning: --card numbers not found among this person's active cards: ${cyclePlan.unknown.join(', ')})`);
+  }
+  line();
+
+  // Removals
+  line('Removal — take named person(s) off the terminals (no re-add)');
+  if (removal.plans.length === 0) {
+    line('  none requested.');
+  } else {
+    for (const plan of removal.plans) {
+      line(`  person: ${plan.user.name} <${maskEmail(plan.user.email)}> (matched by ${plan.via})`);
+      if (plan.cards.length === 0) line('    no live cards to revoke.');
+      for (const card of plan.cards) {
+        line(`    - card ${card.card_uid}${card.card_label ? ` (${card.card_label})` : ''} [status: ${card.status}] → revoked (terminal disable task)`);
+      }
+      if (plan.fingers.length === 0) line('    no live fingerprints to delete.');
+      for (const finger of plan.fingers) {
+        line(`    - ${finger.finger_label || `finger ${finger.finger_no}`} (number ${finger.employee_no ?? '—'}) [status: ${finger.status}] → deleted (terminal delete task)`);
+      }
     }
   }
   line();
 
   // Task 3
-  let fp = { plan: [], clean: 0, total: 0 };
+  let fp = { plan: [], clean: 0, total: 0, removedSkipped: 0 };
   line('Task 3 — delete + re-add fingerprints with a user-id or shared employee number');
   if (opts.skipFingerprints) {
     line('  skipped (--skip-fingerprints). Re-run without it once migration 0017 is live.');
   } else {
-    fp = await planFingerprints(session.token, users);
+    fp = await planFingerprints(session.token, users, removedUserIds);
     line(`  ${fp.total} live fingerprint credential(s) checked; ${fp.clean} clean, ${fp.plan.length} matching.`);
+    if (fp.removedSkipped > 0) {
+      line(`  (${fp.removedSkipped} finger(s) of a removal target excluded — handled by the removal above, no re-add)`);
+    }
     for (const f of fp.plan) {
       const who = f.household_member_name ? `${f.household_member_name} (dependant of ${f.resident_name})` : f.resident_name;
       const where = f.enrolled_device_name ? ` on ${f.enrolled_device_name}` : '';
@@ -421,9 +515,11 @@ async function main() {
   }
   line();
 
+  const removalWrites = removal.plans.reduce((sum, p) => sum + p.cards.length + p.fingers.length, 0);
   const willWrite =
     retries.selected.length +
     (cyclePlan ? cyclePlan.target.length * 2 : 0) +
+    removalWrites +
     fp.plan.length * 2;
 
   if (!opts.execute) {
@@ -458,6 +554,9 @@ async function main() {
   if (!cyclePlan) line('  (skipped)');
   else if (cyclePlan.target.length === 0) line('  (nothing to do)');
   else await runCycle(session.token, cyclePlan);
+  line('Removal:');
+  if (removal.plans.length === 0) line('  (nothing to do)');
+  else await runRemovals(session.token, removal);
   line('Task 3:');
   if (opts.skipFingerprints) line('  (skipped — run without --skip-fingerprints once migration 0017 is live)');
   else if (fp.plan.length === 0) line('  (nothing to do)');

@@ -1,0 +1,85 @@
+# One-off operator run of scripts/access-operations.mjs against a deployed
+# EstateMate. GitHub runners have clean egress to *.workers.dev (the same
+# egress the production smoke test uses), so an administrator can run the
+# operator tool without any local machine.
+#
+# One-time setup (repository → Settings → Secrets and variables → Actions):
+#   ESTATEMATE_ADMIN_EMAIL   — the administrator account's email
+#   ESTATEMATE_ADMIN_PASSWORD — that account's password
+# Credentials come from repository secrets only: never committed, and they
+# never appear in run logs (the script never prints them).
+#
+# Run from: Actions → "Access operations (one-off)" → Run workflow.
+# Keep execute = false for the first run: the full plan is printed to the job
+# log and the run summary, and nothing is changed. Only run with execute = true
+# after the plan has been reviewed.
+
+name: Access operations (one-off)
+
+on:
+  workflow_dispatch:
+    inputs:
+      person:
+        description: 'Task 2 — person whose active cards get the suspend/restore cycle (user id, email, full name, unit, or "admin"; leave blank to skip task 2)'
+        required: false
+        default: ''
+      remove_from_devices:
+        description: 'Person(s) to remove from the terminals — cards revoked, fingerprints deleted, never re-added (comma-separated; "admin" allowed; leave blank for none)'
+        required: false
+        default: ''
+      skip_fingerprints:
+        description: 'Skip the fingerprint re-registration task (only needed on deployments predating migration 0017)'
+        type: boolean
+        default: false
+      kinds:
+        description: 'Failed-job kinds to retry (task 1): card,fingerprint,door,visitor'
+        required: false
+        default: 'card'
+      number_base:
+        description: 'First new fingerprint employee number'
+        required: false
+        default: '10001'
+      execute:
+        description: 'APPLY the changes (keep false for the planning run — nothing is changed until this is true)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run access-operations
+        env:
+          ESTATEMATE_ADMIN_EMAIL: ${{ secrets.ESTATEMATE_ADMIN_EMAIL }}
+          ESTATEMATE_ADMIN_PASSWORD: ${{ secrets.ESTATEMATE_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ESTATEMATE_ADMIN_EMAIL}" ] || [ -z "${ESTATEMATE_ADMIN_PASSWORD}" ]; then
+            echo "error: repository secrets ESTATEMATE_ADMIN_EMAIL / ESTATEMATE_ADMIN_PASSWORD are not set" >&2
+            exit 2
+          fi
+          ARGS=( --base https://estatemate.estatemate.workers.dev --kinds "${{ inputs.kinds }}" --number-base "${{ inputs.number_base }}" )
+          if [ "${{ inputs.execute }}" = "true" ]; then ARGS+=( --execute --yes ); fi
+          if [ "${{ inputs.skip_fingerprints }}" = "true" ]; then ARGS+=( --skip-fingerprints ); fi
+          if [ -n "${{ inputs.person }}" ]; then ARGS+=( --person "${{ inputs.person }}" ); else ARGS+=( --skip-person ); fi
+          IFS=',' read -r -a REMOVE <<< "${{ inputs.remove_from_devices }}"
+          for p in "${REMOVE[@]}"; do
+            p="${p# }"; p="${p% }"
+            if [ -n "$p" ]; then ARGS+=( --remove-from-devices "$p" ); fi
+          done
+          node scripts/access-operations.mjs "${ARGS[@]}" | tee /tmp/access-operations.out
+      - name: Publish report to run summary
+        if: always()
+        run: |
+          {
+            echo '## Access-operations run report'
+            echo ''
+            echo '```'
+            cat /tmp/access-operations.out 2>/dev/null || echo '(no output — see the job log)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
