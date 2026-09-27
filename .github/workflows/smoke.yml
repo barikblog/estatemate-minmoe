@@ -1,0 +1,81 @@
+name: Production smoke test
+
+# The unauthenticated half of the post-deploy smoke test named in
+# docs/AI-HANDOFF.md. GitHub's runners have clean TLS egress to *.workers.dev
+# (unlike the deploy job's wrangler environment), so this proves from outside
+# that the deployed portal answers, that D1 answers, and — the check that
+# matters to an operator with a sign-in problem — that POST /api/auth/login
+# responds with JSON instead of a network failure. Dummy credentials only:
+# this never authenticates and must never receive a real secret.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: Production base URL to smoke-test
+        required: false
+        default: https://estatemate.estatemate.workers.dev
+  workflow_run:
+    workflows: [Deploy EstateMate]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: estatemate-production-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    env:
+      BASE_URL: ${{ inputs.base_url || 'https://estatemate.estatemate.workers.dev' }}
+    steps:
+      - name: API health answers ok:true
+        shell: bash
+        run: |
+          set -euo pipefail
+          body="$(curl -sS --fail-with-body --max-time 30 "$BASE_URL/api/health")"
+          echo "$body"
+          grep -q '"ok":true' <<<"$body"
+
+      - name: Portal config is served from D1
+        shell: bash
+        run: |
+          set -euo pipefail
+          body="$(curl -sS --fail-with-body --max-time 30 "$BASE_URL/api/portal-config")"
+          echo "$body" | head -c 500; echo
+          grep -q '"estate_name"' <<<"$body"
+
+      - name: Sign-in page shell is served
+        shell: bash
+        run: |
+          set -euo pipefail
+          body="$(curl -sS --fail-with-body --max-time 30 "$BASE_URL/")"
+          grep -q '<div id="root">' <<<"$body"
+          grep -q '<title>EstateMate</title>' <<<"$body"
+
+      - name: Login endpoint answers JSON for dummy credentials (never "Failed to fetch")
+        shell: bash
+        run: |
+          set -euo pipefail
+          status="$(curl -sS --max-time 30 -o /tmp/login-body.json -w '%{http_code}' \
+            -X POST "$BASE_URL/api/auth/login" \
+            -H 'Content-Type: application/json' \
+            --data '{"email":"smoke-test@example.com","password":"not-a-real-password"}')"
+          echo "status=$status body=$(cat /tmp/login-body.json)"
+          [ "$status" = "401" ] || { echo "expected 401 for dummy credentials, got $status"; exit 1; }
+          grep -q 'Invalid email or password' /tmp/login-body.json
+
+      - name: Login endpoint rejects a malformed payload with JSON too
+        shell: bash
+        run: |
+          set -euo pipefail
+          status="$(curl -sS --max-time 30 -o /tmp/login-malformed.json -w '%{http_code}' \
+            -X POST "$BASE_URL/api/auth/login" \
+            -H 'Content-Type: application/json' \
+            --data '{}')"
+          echo "status=$status body=$(cat /tmp/login-malformed.json)"
+          [ "$status" = "400" ] || { echo "expected 400 for a payload without credentials, got $status"; exit 1; }
