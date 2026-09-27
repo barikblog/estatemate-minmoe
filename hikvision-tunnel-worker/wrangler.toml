@@ -1,0 +1,45 @@
+# wrangler configuration for the standalone Hikvision tunnel bridge Worker.
+# Run all wrangler commands from this directory: `cd hikvision-tunnel-worker && npx wrangler …`
+#
+# NOTE: the main EstateMate app uses wrangler.jsonc at the repository root —
+# this worker is a separate deployment with its own D1 database.
+
+name = "hikvision-tunnel-bridge"
+main = "index.ts"
+compatibility_date = "2026-09-01"
+workers_dev = true
+observability = { enabled = true }
+
+# OPERATION 1 on a schedule: every 5 minutes pull AcsEvents into D1.
+# The 10-minute look-back (HIK_EVENT_LOOKBACK_MINUTES) plus idempotent
+# upserts on event_id make overlapping polls safe.
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+# Public origin of the Cloudflare Tunnel that publishes the Hikvision terminal.
+TUNNEL_URL = "https://mydomain.com"
+# digest (default, challenge/response) or basic (pre-emptive).
+HIK_AUTH_MODE = "digest"
+# How far back the POST-search fallback looks when the firmware rejects GET.
+HIK_EVENT_LOOKBACK_MINUTES = "10"
+# Optional: restricts CORS to your Cloudflare Pages origin(s).
+# Use "*" or leave unset to reflect any origin (endpoints still need API_TOKEN).
+# PAGES_ORIGIN = "https://your-pages-project.pages.dev"
+
+# Secrets — never put these in [vars]:
+#   npx wrangler secret put HIK_USER              # Hikvision ISAPI username
+#   npx wrangler secret put HIK_PASS              # Hikvision ISAPI password
+#   npx wrangler secret put API_TOKEN             # bearer token for /pull-logs, /sync-user, /access-logs
+# Optional Cloudflare Access service token (when the tunnel hostname sits
+# behind a Zero Trust Access application — strongly recommended):
+#   npx wrangler secret put CF_ACCESS_CLIENT_ID
+#   npx wrangler secret put CF_ACCESS_CLIENT_SECRET
+
+# Cloudflare D1 binding:
+#   npx wrangler d1 create hikvision-bridge-db     # copy the returned database_id below
+#   npx wrangler d1 execute hikvision-bridge-db --remote --file schema.sql
+[[d1_databases]]
+binding = "DB"
+database_name = "hikvision-bridge-db"
+database_id = "00000000-0000-0000-0000-000000000000" # ← replace after `wrangler d1 create`
