@@ -240,7 +240,7 @@ task and the raw log tail as `::error` annotations, and the Windows smoke test d
 launcher streams the same way. Annotations *are* readable through the check-runs API, so
 that is the channel a future agent will have.
 
-## Bridge apps phase, merged onto the Device-agent portal (2026-09-25)
+## Bridge apps phase, merged onto the Device-agent portal and deployed (2026-09-25)
 
 `bridge-apps/` is now part of the repository: the two hosts that put the
 access-device transport on the estate LAN, so a terminal never has to be
@@ -302,6 +302,46 @@ is the path that compiles them: `bridge-apk` runs `scripts/build-bridge-apk.py -
 the built executable against a fake Worker and a fake Digest terminal.
 
 ### Production deployment (2026-09-25)
+
+Two merges landed that day, minutes apart, and each one deployed.
+
+#### PR #19 -> `8615f4f` (Deploy EstateMate run `36176244534`)
+
+Merged to `main` as PR #19 (`8615f4f`), which is the only deploy path
+(`deploy.yml` triggers on `push: branches: [main]`).
+
+* **Deploy EstateMate run `36176244534`: `success`.** Every step green, including
+  `Run npm run build` (which is `typecheck && test && build:web`, so CI re-ran the
+  whole verification suite on the merged tree), `Apply D1 migrations` and
+  `Deploy Worker and web assets`.
+* **No new migrations.** `git diff --name-only 27a5917 8615f4f -- migrations` is
+  empty; the chain still ends at `0014_gate_image_and_security_gate_sessions.sql`,
+  applied in the portal UX phase, so the migration step had nothing to apply.
+* **Health check:** `GET https://estatemate.estatemate.workers.dev/api/health`
+  returned `{"ok":true,"app":"EstateMate","time":"2026-09-25T18:54:17.090Z",
+  "hikvisionMode":"per-device","fileStorage":"github-private"}`.
+* **The deployed bundle is the resolved one.** Production serves
+  `assets/index-DpqNYjmI.js`, and building `8615f4f` locally emits exactly that
+  content-hashed filename. As a control, building the same tree with
+  `App.tsx` taken from the pre-merge commit `27a5917` emits
+  `index-CbMVe4sE.js` instead — and asking production for that stale path
+  returns the SPA fallback HTML, not JavaScript. So the merge is what is live,
+  not merely a build that happened around the same time.
+* **Bridge CI on the PR was green before the merge:** `Validate ISAPI bridge
+  agent`, `Build the bridge APK` (its `Run the protocol tests and build the APK`
+  step compiles `bridge-apps/android/**` — the sandbox has no JDK, so this is the
+  only place that Java is compiled), `Build the bridge executable` (including
+  `Smoke-test the executable`), `Package Windows agent bundle`, and
+  `Build Android APK`.
+* `Workers Builds: estatemate` was red on the PR and is still the documented
+  pre-existing failure; it is not a required check and `deploy.yml` is the
+  authoritative path.
+* **No new client artifacts were published:** `bridge.yml` only publishes on
+  `bridge-*` tags, so the released bridge files remain those of `bridge-0.2.1`.
+  Tag `bridge-0.2.2` when the apps need redistributing — nothing in this merge
+  changed the bridge protocol, only the portal labels its messages quote.
+
+#### PR #21 -> `a094d93` (Deploy EstateMate run `36178112448`)
 
 - PR #21 merged to `main` as `a094d93`; **Deploy EstateMate run `36178112448`
   succeeded** (job `deploy`, 39 s, all steps green: `npm run build`,
