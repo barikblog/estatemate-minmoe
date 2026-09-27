@@ -31,7 +31,13 @@
     "bindings": [{ "name": "LIVE_FEED", "class_name": "AccessLiveFeed" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccessLiveFeed"] }],
-  "triggers": { "crons": ["15 * * * *"] },
+  // Two schedules. The hourly one runs property lifecycle, facility-fee
+  // enforcement, presence expiry, retention pruning and visitor provisioning; the
+  // per-minute one only releases visitor device accounts whose validity has just
+  // ended, so a terminal slot is freed as close to expiry as Cloudflare's
+  // one-minute cron granularity allows. Both stay inside the free plan's
+  // three-trigger limit.
+  "triggers": { "crons": ["15 * * * *", "* * * * *"] },
   "vars": {
     "APP_NAME": "EstateMate",
     "ALLOWED_ORIGINS": "",

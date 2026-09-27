@@ -206,6 +206,43 @@ export async function tokenFor(env: Env, id: string, role: Role, name = 'Test Us
   return signJwt(env, { id, role, name });
 }
 
+/**
+ * Configures private-GitHub storage against a stubbed GitHub API. CSV import
+ * endpoints archive their source file through `uploadToPrivateGitHub`, which
+ * performs a real `fetch` — without this helper they would answer 503 in tests.
+ * The stub answers any api.github.com call with what the storage code needs and
+ * delegates everything else to the real implementation.
+ */
+export async function enableTestStorage(db: TestDatabase, env: Env): Promise<void> {
+  const { encryptStorageToken } = await import('../src/github-storage');
+  const { vi } = await import('vitest');
+  const encrypted = await encryptStorageToken(env.JWT_SECRET, 'test-storage-token');
+  db.run(
+    `INSERT INTO github_storage_settings(id,enabled,owner,repository,branch,base_path,token_ciphertext,token_iv)
+     VALUES ('default',1,'test-owner','test-repo','main','uploads',?,?)
+     ON CONFLICT(id) DO UPDATE SET enabled=1,owner=excluded.owner,repository=excluded.repository,branch=excluded.branch,
+       base_path=excluded.base_path,token_ciphertext=excluded.token_ciphertext,token_iv=excluded.token_iv`,
+    encrypted.ciphertext, encrypted.iv,
+  );
+  const realFetch = globalThis.fetch;
+  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.startsWith('https://api.github.com/repos/test-owner/test-repo/contents/')) {
+      return new Response(JSON.stringify({ content: { sha: `sha-${Math.random().toString(36).slice(2)}` } }), {
+        status: 201,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    if (url === 'https://api.github.com/repos/test-owner/test-repo') {
+      return new Response(JSON.stringify({ private: true, default_branch: 'main' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    return realFetch(input, init);
+  });
+}
+
 export interface ApiResponse {
   status: number;
   json: Record<string, unknown>;

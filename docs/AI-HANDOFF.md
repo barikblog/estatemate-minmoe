@@ -1,5 +1,60 @@
 # AI handoff — EstateMate
 
+## Employee ID (32-char rule), bulk people toolkit, visitor device-account lifecycle, and the six estate modules (2026-09-27)
+
+Requested as: cap the Employee ID at 32 characters; add bulk person
+upload/edit/delete/resynchronise into all access controls; automatically create
+a visitor account on the terminals when a pass is requested and automatically
+delete it from all devices when validity expires — while the app record stays;
+and complete all six modules being rolled out.
+
+- **Migration `0018` (deploy with PR):** person-level `employee_id` on `users`
+  and `household_members` with `CHECK (length BETWEEN 1 AND 32)` + unique
+  partial indexes, backfilled deterministically (a UUID without hyphens is
+  exactly 32 chars); triggers enforce the cap on the predating
+  `fingerprint_credentials.employee_no` column; visitor device-account state
+  (`none/provisioned/removal_queued/removed` + timestamps) with backfill from
+  existing operations; new tables `staff_shifts`, `facilities`,
+  `facility_bookings`, `emergency_contacts` (+ six seeded defaults with fixed
+  ids), `estate_documents`, `document_acknowledgements`; import ledger kinds
+  extended (`people_upload`, `people_edit`, `people_delete`).
+- **Employee ID is person-level** (`src/employee-id.ts`): one terminal identity
+  per human, shared by their cards and fingerprints, unique across both people
+  tables, max 32 chars, charset letters/digits/.-_/ (XML/CSV safe). Fixes the
+  real bug where a fingerprint's employee number defaulted to the raw
+  36-char UUID — always over the ISAPI limit. Card upserts now carry the
+  person's employee number; a linked dependant login gets its own identity.
+- **Bulk people toolkit** (`/api/people/bulk-upload|bulk-edit|bulk-delete|bulk-resync`,
+  UI: People → Bulk tools): accounts + dependants in one workflow. Upload is
+  CSV/import-ledger-backed and caps new login accounts at 25 per file (PBKDF2
+  cost — same reason as the users import). Delete is the existing safe soft
+  delete repeated per row with per-row blockers. Resync re-pushes every
+  credential of selected people to every terminal, reusing open commands;
+  fingerprints stay operator tasks (no per-model template-upload evidence).
+- **Visitor device accounts** (`VISITOR-DEVICE-ACCOUNTS.md`): created on
+  request (`upsert_visitor` with `employeeNo = visitor-<credential>`, ≤32 chars);
+  deleted from **every** device by `releaseExpiredVisitorDeviceAccounts` once
+  validity ends (idempotent `revoke_visitor` queue; agent-delivered where
+  linked, Hardware actions otherwise); `removed` only when every device
+  confirms. The pass row is NEVER deleted by this feature. A `checked_in` pass
+  is deliberately not status-flipped (a stranded visitor must remain
+  checkable-out; the decision route now also accepts expired-but-was-inside).
+  Runs on the new **per-minute cron** (`* * * * *`, cheap + bounded, stays
+  inside free-plan limits), hourly catch-up, opportunistically on visitor
+  list/scan, and via a manual admin sweep button. Operator strip at
+  `GET /api/visitors/device-accounts`.
+- **Six modules live** (`ESTATE-MODULES.md`): dependants roster with access
+  audit, staff + shift roster, facility bookings (double-booking refusal,
+  approval queue, bill on approval, cancel voids unpaid bill), editable
+  emergency-contact directory (visibility-scoped), document library with
+  audience + acknowledgements behind Information hub and Legal & governance.
+- **Tests:** 221 passing (43 new): employee-id units, person-level API
+  behaviour, bulk CRUD/resync incl. 25-account cap and idempotent resync,
+  visitor lifecycle incl. minute-cron state machine and overstay checkout, all
+  six modules. Harness gained `enableTestStorage()` (stubbed private-GitHub API)
+  for CSV endpoints.
+
+
 ## Access-operations operator script + fingerprint slot uniqueness fix (2026-09-27)
 
 Requested as: "Retry the failed card jobs. Suspend and restore any card that was
