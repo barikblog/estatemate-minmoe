@@ -46,6 +46,9 @@
  *   --include-household     Also cycle cards of the person's linked household members.
  *   --kinds <list>          Failed-job kinds to retry in task 1, comma-separated:
  *                           card,fingerprint,door,visitor (default: card).
+ *   --skip-fingerprints     Run tasks 1–2 only. Needed against a deployment
+ *                           that predates migration 0017, where the re-add in
+ *                           task 3 fails after the delete (schema fix pending).
  *   --number-base <n>       First new fingerprint employee number (default: 10001;
  *                           the script skips any value already used by a fingerprint
  *                           or equal to any user id).
@@ -92,6 +95,7 @@ const opts = {
   cards: [],
   includeHousehold: false,
   kinds: DEFAULT_KINDS.slice(),
+  skipFingerprints: false,
   numberBase: NUMBER_BASE_DEFAULT,
   execute: false,
   yes: false,
@@ -109,6 +113,7 @@ for (let i = 0; i < argv.length; i += 1) {
     case '--base': opts.base = next().replace(/\/+$/, ''); break;
     case '--person': opts.person = next().trim(); break;
     case '--skip-person': opts.skipPerson = true; break;
+    case '--skip-fingerprints': opts.skipFingerprints = true; break;
     case '--card': opts.cards.push(next().trim()); break;
     case '--include-household': opts.includeHousehold = true; break;
     case '--kinds':
@@ -400,14 +405,19 @@ async function main() {
   line();
 
   // Task 3
-  const fp = await planFingerprints(session.token, users);
+  let fp = { plan: [], clean: 0, total: 0 };
   line('Task 3 — delete + re-add fingerprints with a user-id or shared employee number');
-  line(`  ${fp.total} live fingerprint credential(s) checked; ${fp.clean} clean, ${fp.plan.length} matching.`);
-  for (const f of fp.plan) {
-    const who = f.household_member_name ? `${f.household_member_name} (dependant of ${f.resident_name})` : f.resident_name;
-    const where = f.enrolled_device_name ? ` on ${f.enrolled_device_name}` : '';
-    line(`  - ${f.finger_label || `finger ${f.finger_no}`} for ${who} [status: ${f.status}]: ${f.reasons.join('; ')}${where}`);
-    line(`      ${f.number}  →  new number ${f.newNumber} (the enrollment task names the new number)`);
+  if (opts.skipFingerprints) {
+    line('  skipped (--skip-fingerprints). Re-run without it once migration 0017 is live.');
+  } else {
+    fp = await planFingerprints(session.token, users);
+    line(`  ${fp.total} live fingerprint credential(s) checked; ${fp.clean} clean, ${fp.plan.length} matching.`);
+    for (const f of fp.plan) {
+      const who = f.household_member_name ? `${f.household_member_name} (dependant of ${f.resident_name})` : f.resident_name;
+      const where = f.enrolled_device_name ? ` on ${f.enrolled_device_name}` : '';
+      line(`  - ${f.finger_label || `finger ${f.finger_no}`} for ${who} [status: ${f.status}]: ${f.reasons.join('; ')}${where}`);
+      line(`      ${f.number}  →  new number ${f.newNumber} (the enrollment task names the new number)`);
+    }
   }
   line();
 
@@ -449,7 +459,8 @@ async function main() {
   else if (cyclePlan.target.length === 0) line('  (nothing to do)');
   else await runCycle(session.token, cyclePlan);
   line('Task 3:');
-  if (fp.plan.length === 0) line('  (nothing to do)');
+  if (opts.skipFingerprints) line('  (skipped — run without --skip-fingerprints once migration 0017 is live)');
+  else if (fp.plan.length === 0) line('  (nothing to do)');
   else await runFingerprints(session.token, fp.plan);
 
   line();

@@ -14,7 +14,9 @@ or shared with someone else, then enroll them on the terminal under the new numb
   `ESTATEMATE_ADMIN_PASSWORD` env vars and are never printed or logged. Flags:
   `--base`, `--person <id|email|name|unit>` (exact match; ambiguous names are
   refused), `--card`, `--include-household`, `--kinds card,fingerprint,door,visitor`
-  (default `card`), `--number-base` (default 10001), `--log`. Task 3 assigns each
+  (default `card`), `--skip-fingerprints` (tasks 1–2 only; use against a
+  deployment still predating 0017, where the task-3 re-add would fail after the
+  delete), `--number-base` (default 10001), `--log`. Task 3 assigns each
   re-registered finger a fresh employee number that collides with no existing
   employee number and no user id, and the queued enrollment instruction names the
   new number. Validated end-to-end against `wrangler dev --local` with a seeded
