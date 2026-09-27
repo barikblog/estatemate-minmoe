@@ -4,7 +4,7 @@ import type { PassShareSource } from './pass-export';
 import { exportRecordsToExcel, exportRecordsToPdf } from './records-export';
 
 type Row = Record<string, unknown>;
-type Section = 'dashboard' | 'residents' | 'properties' | 'residency' | 'imports' | 'bills' | 'visitors' | 'maintenance' | 'notices' | 'cards' | 'events' | 'devices' | 'isapi' | 'operations' | 'settings';
+type Section = 'dashboard' | 'residents' | 'properties' | 'residency' | 'imports' | 'bills' | 'visitors' | 'maintenance' | 'notices' | 'cards' | 'events' | 'devices' | 'remote' | 'isapi' | 'operations' | 'settings';
 
 interface NavItem { id: Section; label: string; roles?: User['role'][] }
 type PortalConfig = Record<string,string>;
@@ -63,6 +63,7 @@ const navItems: NavItem[] = [
   { id: 'cards', label: 'Access cards & fingerprints', roles: ['admin','manager','cashier','resident'] },
   { id: 'events', label: 'Gate activity', roles: ['admin','manager','security','resident'] },
   { id: 'devices', label: 'Access-control devices', roles: ['admin','manager','security'] },
+  { id: 'remote', label: 'Access control remote', roles: ['admin'] },
   { id: 'isapi', label: 'Device agent', roles: ['admin','manager'] },
   { id: 'operations', label: 'Hardware actions', roles: ['admin','manager'] },
   { id: 'settings', label: 'Settings', roles: ['admin'] },
@@ -378,6 +379,7 @@ function SectionView({ section, user, config, gate, onNavigate }: { section: Sec
     case 'cards': return <Cards user={user} />;
     case 'events': return <AccessEvents user={user} />;
     case 'devices': return <Devices user={user} />;
+    case 'remote': return <RemoteAccess onNavigate={onNavigate} />;
     case 'isapi': return <IsapiBridge user={user} />;
     case 'operations': return <Operations />;
     case 'settings': return <Settings />;
@@ -1737,12 +1739,180 @@ function IsapiBridge({ user }: { user: User }) {
   </PagePanel>;
 }
 
+type RemoteTab = 'terminals' | 'doors' | 'access' | 'visitors' | 'commands' | 'posts';
+type RemoteSnapshot = {
+  note?: string;
+  isupSupported?: boolean;
+  commandsUseTunnel?: boolean;
+  summary?: Record<string, number>;
+  terminals?: Row[];
+  agents?: Row[];
+  doorCommands?: Array<{ operation: string; label: string }>;
+  recentDoorCommands?: Row[];
+};
+
+function RemoteAccess({ onNavigate }: { onNavigate?: (section: Section) => void }) {
+  const remote = useAsync(() => api<RemoteSnapshot>('/api/access/remote'), []);
+  const operations = useList('/api/access/operations?limit=100');
+  const visitors = useList('/api/visitors?limit=30');
+  const events = useList('/api/access/events?limit=8');
+  const [tab, setTab] = useState<RemoteTab>('terminals');
+  const [error, setError] = useState('');
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [person, setPerson] = useState<PickedPerson | null>(null);
+  const snapshot = remote.data;
+  const summary = snapshot?.summary ?? {};
+  const terminals = snapshot?.terminals ?? [];
+  const doorCommands = snapshot?.doorCommands ?? [];
+
+  function refresh() {
+    remote.reload();
+    operations.reload();
+    visitors.reload();
+    events.reload();
+  }
+
+  async function run(action: () => Promise<unknown>, ok: string) {
+    setBusy(true); setError(''); setMessage('');
+    try { await action(); setMessage(ok); refresh(); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : 'Command failed'); }
+    finally { setBusy(false); }
+  }
+
+  async function sendDoor(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const values = Object.fromEntries(new FormData(form)) as Record<string, string>;
+    const command = (event.nativeEvent as Event & { submitter?: HTMLButtonElement }).submitter?.value || values.command;
+    const label = doorCommands.find((item) => item.operation === command)?.label ?? command;
+    const terminal = terminals.find((item) => item.id === values.deviceId);
+    if (command === 'remote_always_open' || command === 'remote_always_close') {
+      if (!confirm(`${label} on ${String(terminal?.name ?? 'this terminal')} until someone resumes the schedule?`)) return;
+    }
+    await run(() => api('/api/access/remote/door', { method: 'POST', body: JSON.stringify({ deviceId: values.deviceId, doorNo: Number(values.doorNo || 1), command, reason: values.reason }) }), `${label} queued for the estate agent.`);
+  }
+
+  async function changeAccess(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const values = Object.fromEntries(new FormData(form)) as Record<string, string>;
+    const action = (event.nativeEvent as Event & { submitter?: HTMLButtonElement }).submitter?.value || 'suspend';
+    if (!person) { setError('Choose the person whose access should change'); return; }
+    if (action === 'suspend' && !confirm('Suspend this person\'s cards and fingerprints on every linked terminal?')) return;
+    await run(() => api('/api/access/remote/access', {
+      method: 'POST',
+      body: JSON.stringify({
+        residentId: person.kind === 'resident' ? person.id : undefined,
+        householdMemberId: person.kind === 'household_member' ? person.id : undefined,
+        action,
+        reason: values.reason,
+        includeHousehold: form.querySelector<HTMLInputElement>('[name=includeHousehold]')?.checked ?? false,
+      }),
+    }), action === 'suspend' ? 'Access suspended and queued for the terminals.' : 'Suspended access restored and queued for the terminals.');
+  }
+
+  async function revokeVisitor(row: Row) {
+    const reason = prompt(`Revoke the pass for ${String(row.visitor_name)}? This stops the pass in the portal and asks the agent to remove it from the terminals.`, 'Revoked by administrator');
+    if (!reason || reason.trim().length < 3) return;
+    await run(() => api(`/api/access/remote/visitors/${row.id}/revoke`, { method: 'POST', body: JSON.stringify({ reason: reason.trim() }) }), `Pass for ${String(row.visitor_name)} revoked.`);
+  }
+
+  async function retry(id: unknown) {
+    await run(() => api(`/api/access/remote/operations/${id}/retry`, { method: 'POST' }), 'Command queued again.');
+  }
+
+  async function mark(id: unknown, status: 'applied' | 'failed') {
+    await run(() => api(`/api/access/operations/${id}`, { method: 'PATCH', body: JSON.stringify({ status }) }), status === 'applied' ? 'Marked applied.' : 'Marked failed.');
+  }
+
+  const tabs: Array<[RemoteTab, string]> = [['terminals', 'Terminals'], ['doors', 'Doors'], ['access', 'Cards & fingerprints'], ['visitors', 'Visitor passes'], ['commands', 'Command queue'], ['posts', 'Gate posts']];
+  return <PagePanel title="Access control remote" subtitle="Control gates, cards, fingerprints and visitor passes from anywhere the agent can reach the terminals" action={<button className="secondary" onClick={refresh}>Refresh</button>}>
+    <Notice tone="info">{snapshot?.note ?? 'Commands travel through the estate agent on the LAN. A free Cloudflare Tunnel cannot carry ISUP, and this page never publishes a terminal or sends a command through a tunnel.'}</Notice>
+    {error && <Notice tone="warning">{error}</Notice>}
+    {message && <Notice tone="success">{message}</Notice>}
+    {remote.error && <Notice tone="warning">{remote.error}</Notice>}
+    <div className="stat-grid">
+      <article className="stat-card"><p>Terminals online</p><strong>{summary.online ?? 0}/{summary.terminals ?? 0}</strong><small>Agent delivery only</small></article>
+      <article className="stat-card"><p>Agents online</p><strong>{summary.agentsOnline ?? 0}</strong><small>LAN bridge hosts</small></article>
+      <article className="stat-card"><p>Waiting commands</p><strong>{summary.pendingCommands ?? 0}</strong><small>Pending or in flight</small></article>
+      <article className="stat-card"><p>Failed commands</p><strong>{summary.failedCommands ?? 0}</strong><small>Retry from the queue</small></article>
+      <article className="stat-card"><p>ISUP / tunnel</p><strong>{snapshot?.isupSupported || snapshot?.commandsUseTunnel ? 'On' : 'Off'}</strong><small>Not used for commands</small></article>
+    </div>
+    <div className="remote-tabs" role="tablist">
+      {tabs.map(([id, label]) => <button key={id} type="button" role="tab" aria-selected={tab === id} onClick={() => setTab(id)}>{label}</button>)}
+    </div>
+    {tab === 'terminals' && <>
+      {remote.loading ? <Loading /> : <DataTable rows={terminals} columns={[['name','Terminal'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['connection_pattern','Connection'],['agent_name','Agent'],['last_seen_at','Last seen','date'],['open_commands','Open']]} />}
+      <div className="split-grid" style={{ marginTop: 16 }}>
+        <section className="panel">
+          <h3>Recent gate activity</h3>
+          <ListState list={events}><DataTable rows={events.data?.items ?? []} columns={[['resident_name','Resident'],['visitor_name','Visitor'],['device_name','Terminal'],['event_type','Event'],['direction','Direction'],['result','Result'],['device_timestamp','Time','date']]} /></ListState>
+        </section>
+        <section className="panel">
+          <h3>What this page can and cannot do</h3>
+          <p>Momentary open, close, remain open, remain closed and resume schedule are queued for the estate agent. Card enable, disable and revoke, visitor sync and visitor revoke follow the same path. Fingerprints can be suspended here, but a new fingerprint still has to be captured on the terminal.</p>
+          <p>Automatic door control is best-effort until that terminal's firmware is recorded in device profiles. A rejection stays in the command queue for someone on site. ISUP over a free tunnel is not available, and these commands are not sent through the Cloudflare Tunnel.</p>
+          <div className="row-actions">
+            <button className="text" type="button" onClick={() => onNavigate?.('isapi')}>Device agent</button>
+            <button className="text" type="button" onClick={() => onNavigate?.('devices')}>Terminals</button>
+            <button className="text" type="button" onClick={() => onNavigate?.('events')}>Gate activity</button>
+          </div>
+        </section>
+      </div>
+    </>}
+    {tab === 'doors' && <form className="form-card" onSubmit={sendDoor}>
+      <h3>Send a door command</h3>
+      <p>The agent applies this over ISAPI on the estate LAN. It is not a public remote and not ISUP. Automatic door control is best-effort until the terminal firmware is recorded in device profiles.</p>
+      <div className="form-grid">
+        <label>Terminal
+          <select name="deviceId" required defaultValue="">
+            <option value="" disabled>Choose a terminal</option>
+            {terminals.map((device) => <option key={String(device.id)} value={String(device.id)}>{String(device.gate_name)} — {String(device.name)} ({String(device.status)})</option>)}
+          </select>
+        </label>
+        <label>Door number<input name="doorNo" type="number" min={1} max={8} defaultValue={1} required /></label>
+        <label className="span-2">Reason<input name="reason" required minLength={3} maxLength={200} placeholder="Why this door is being controlled" /></label>
+        <div className="row-actions span-2">
+          {doorCommands.map((command) => <button key={command.operation} className={command.operation === 'remote_always_close' ? 'secondary' : 'primary'} name="command" value={command.operation} disabled={busy}>{command.label}</button>)}
+        </div>
+      </div>
+      <DataTable rows={snapshot?.recentDoorCommands ?? []} columns={[['created_at','When','date'],['device_name','Terminal'],['gate_name','Gate'],['operation','Command'],['doorNo','Door'],['reason','Reason'],['status','Status'],['error_message','Error']]} />
+    </form>}
+    {tab === 'access' && <>
+      <form className="form-card" onSubmit={changeAccess}>
+        <h3>Suspend or restore a person</h3>
+        <p>Every matching card is enabled or disabled on linked terminals. Fingerprints are queued as a terminal task because the agent cannot write a finger template.</p>
+        <div className="form-grid">
+          <div className="span-2"><PersonPicker picked={person} onPick={setPerson} /></div>
+          <label className="span-2">Reason<input name="reason" required minLength={3} maxLength={200} placeholder="Why access is changing" /></label>
+          <label className="check"><input name="includeHousehold" type="checkbox" defaultChecked /> Include dependants when a resident is selected</label>
+          <div className="row-actions span-2">
+            <button className="secondary" name="action" value="suspend" disabled={busy}>Suspend all access</button>
+            <button className="primary" name="action" value="restore" disabled={busy}>Restore suspended access</button>
+          </div>
+        </div>
+      </form>
+      <p>To issue a new card or capture a fingerprint, use <button className="text" type="button" onClick={() => onNavigate?.('cards')}>Access cards & fingerprints</button>. A new finger still has to be captured on the terminal.</p>
+    </>}
+    {tab === 'visitors' && <>
+      <div className="row-actions" style={{ marginBottom: 12 }}>
+        <button className="primary" disabled={busy} onClick={() => run(() => api('/api/visitors/sync-active', { method: 'POST' }), 'Active passes queued for every linked terminal.')}>Sync active passes</button>
+        <button className="text" type="button" onClick={() => onNavigate?.('visitors')}>Open Visitors</button>
+      </div>
+      <ListState list={visitors}><DataTable rows={(visitors.data?.items ?? []).filter((row) => ['active','checked_in','pending'].includes(String(row.status)))} columns={[['visitor_name','Visitor'],['resident_name','Host'],['unit_number','Unit'],['status','Status'],['valid_until','Until','date'],['device_name','Terminal']]} action={(row) => <button className="text danger" onClick={() => revokeVisitor(row)}>Revoke</button>} /></ListState>
+    </>}
+    {tab === 'commands' && <ListState list={operations}><DataTable rows={operations.data?.items ?? []} columns={[['device_name','Terminal'],['credential_kind','Kind'],['operation','Action'],['credential_reference','Reference'],['holder_name','Who / why'],['status','Status'],['error_message','Error'],['created_at','Created','date']]} action={(row) => <div className="row-actions">{row.status === 'failed' && <button className="text" onClick={() => retry(row.id)}>Retry</button>}<button className="text" onClick={() => mark(row.id, 'applied')}>Mark applied</button><button className="text danger" onClick={() => mark(row.id, 'failed')}>Failed</button></div>} /></ListState>}
+    {tab === 'posts' && <SecurityGateAssignments />}
+  </PagePanel>;
+}
+
 function Operations() {
   const [copyNotice, copy] = useCopy();
   const list = useList('/api/access/operations?limit=100');
   async function mark(id: unknown, status: 'applied'|'failed') { await api(`/api/access/operations/${id}`, { method: 'PATCH', body: JSON.stringify({ status }) }); list.reload(); }
   return <PagePanel title="Hardware actions" subtitle="Changes that must reach each physical terminal">
-    <Notice tone="warning">Cards with a linked agent are written automatically. Fingerprints — and everything with only HTTP Listening — must be applied in the terminal UI, iVMS-4200, or an approved Hikvision cloud command channel. Then mark them applied here.</Notice>
+    <Notice tone="warning">Cards, visitor passes and door commands with a linked agent are written automatically. Fingerprints — and everything with only HTTP Listening — must be applied in the terminal UI or iVMS-4200. Door commands are queued from Access control remote and are never sent through a public tunnel. Then mark them applied here.</Notice>
     {copyNotice && <Notice tone="info">{copyNotice}</Notice>}
     <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['device_name','Device'],['credential_kind','Credential'],['operation','Action'],['credential_reference','Card / finger'],['holder_name','Holder'],['manual_instruction','What to do'],['status','Status'],['created_at','Created','date'],['error_message','Error']]} action={(row) => <div className="row-actions">{Boolean(row.manual_instruction) && <button className="text" onClick={() => copy(String(row.manual_instruction), 'Instructions')}>Copy steps</button>}<button className="text" onClick={() => mark(row.id, 'applied')}>Mark applied</button><button className="text danger" onClick={() => mark(row.id, 'failed')}>Failed</button></div>} /></ListState>
   </PagePanel>;
@@ -2059,7 +2229,7 @@ function nested(source: Row | null, objectKey: string, key: string): unknown {
 function localDateTime(date:Date):string { const offset=date.getTimezoneOffset()*60000;return new Date(date.valueOf()-offset).toISOString().slice(0,16); }
 function initials(name: string): string { return name.split(/\s+/).slice(0,2).map((part) => part[0]).join('').toUpperCase(); }
 function navIcon(section: Section): string {
-  return ({ dashboard: '◫', residents: '●', properties: '⌂', residency: '♙', imports: '⇩', bills: '₦', visitors: '↔', maintenance: '◇', notices: '!', cards: '▤', events: '⌁', devices: '▣', isapi: '⧉', operations: '↻', settings: '⚙' })[section] ?? '•';
+  return ({ dashboard: '◫', residents: '●', properties: '⌂', residency: '♙', imports: '⇩', bills: '₦', visitors: '↔', maintenance: '◇', notices: '!', cards: '▤', events: '⌁', devices: '▣', remote: '◎', isapi: '⧉', operations: '↻', settings: '⚙' })[section] ?? '•';
 }
 
 export default App;

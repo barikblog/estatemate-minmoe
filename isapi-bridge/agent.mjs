@@ -648,6 +648,17 @@ async function applyCardOperation(device, operation) {
         if (result.body.includes('not exist') || result.body.includes('not found') || result.status === 404) return { success: true };
         return { success: false, error: `ISAPI ${result.status}: ${result.body.slice(0, 200)}` };
       }
+    } else if (op === 'revoke_visitor') {
+      const visitorCard = payload.credentialNumber || cardUid;
+      if (!visitorCard) return { success: false, error: 'Missing credential number' };
+      let result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/CardInfo/Delete?format=json', JSON.stringify({ CardNoList: [{ CardNo: visitorCard }] }), false);
+      if (result.status >= 400) {
+        const deleteXml = `<?xml version="1.0" encoding="UTF-8"?>\n<CardInfoDelCond>\n  <CardNoList>\n    <CardNo>${visitorCard}</CardNo>\n  </CardNoList>\n</CardInfoDelCond>`;
+        result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/CardInfo/Delete', deleteXml, true);
+      }
+      if (result.status >= 200 && result.status < 300) return { success: true };
+      if (result.body.includes('not exist') || result.body.includes('not found') || result.status === 404) return { success: true };
+      return { success: false, error: `Visitor revoke ISAPI ${result.status}: ${result.body.slice(0, 200)}` };
     } else if (op === 'upsert_visitor') {
       // Visitor credential - map to temporary card or visitor via ISAPI
       // This is highly model-dependent. We log and mark as applied with note.
@@ -664,6 +675,29 @@ async function applyCardOperation(device, operation) {
       let result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/CardInfo/Record', visitorXml, true);
       if (result.status >= 200 && result.status < 300) return { success: true };
       return { success: false, error: `Visitor ISAPI ${result.status}` };
+    }
+
+    const doorCmd = {
+      remote_open: 'open',
+      remote_close: 'close',
+      remote_always_open: 'alwaysOpen',
+      remote_always_close: 'alwaysClose',
+      remote_resume: 'resume',
+    }[op];
+    if (doorCmd) {
+      const doorNo = Number(payload.doorNo || 1);
+      if (!Number.isInteger(doorNo) || doorNo < 1 || doorNo > 8) return { success: false, error: 'doorNo must be 1-8' };
+      // Best-effort Hikvision RemoteControl. Not verified per firmware in
+      // docs/device-profiles/; a rejection is reported so an operator can apply it.
+      const jsonBody = JSON.stringify({ RemoteControlDoor: { cmd: doorCmd } });
+      let result = await isapiRequest(device, 'PUT', `/ISAPI/AccessControl/RemoteControl/door/${doorNo}?format=json`, jsonBody, false);
+      if (result.status >= 400) {
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<RemoteControlDoor><cmd>${doorCmd}</cmd></RemoteControlDoor>`;
+        result = await isapiRequest(device, 'PUT', `/ISAPI/AccessControl/RemoteControl/door/${doorNo}`, xml, true);
+      }
+      if (result.status >= 200 && result.status < 300) return { success: true };
+      if (result.body.includes('ok') || result.body.includes('success')) return { success: true };
+      return { success: false, error: `Door ISAPI ${result.status}: ${result.body.slice(0, 200)}` };
     }
 
     return { success: false, error: `Unknown operation ${op}` };

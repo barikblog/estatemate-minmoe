@@ -34,6 +34,10 @@ DS-K1T808MFWX-B ── alertStream (persistent ISAPI HTTP) ──▶ ISAPI bridg
 - **Commands (seconds–minutes):** agent polls `GET /api/isapi/v1/agents/:id/operations`, applies
   card upsert/enable/disable via `/ISAPI/AccessControl/CardInfo/*` with Digest auth, reports
   results. Facility-fee expiry auto-disable works automatically.
+- **Remote door commands are not verified on this model.** Access control remote may queue
+  `RemoteControl/door/{n}` (`open`, `close`, `alwaysOpen`, `alwaysClose`, `resume`). The
+  datasheet does not document that path. Until an on-site check records the firmware response
+  here, treat a rejection as expected and apply the door on the terminal.
 - **Fallback event path:** if the agent host is down, configure the terminal's HTTP Listening
   (Network → Advanced → HTTP Listening) to the Worker per-device endpoint — firmware permitting.
 - **Removed alternative:** the dedicated ISUP gateway transport (which could have used the

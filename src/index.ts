@@ -2975,6 +2975,242 @@ app.get('/api/security/gate-sessions', requireRoles('admin','manager','security'
 });
 
 
+app.get('/api/access/remote', requireRoles('admin'), async (c) => {
+  const terminals = await c.env.DB.prepare(
+    `SELECT d.id,d.name,d.gate_name,d.direction,d.model,d.connection_pattern,${deviceEffectiveStatus('d')} AS status,d.last_seen_at,
+       (SELECT a.name FROM isapi_agents a WHERE a.id=d.isapi_agent_id AND a.deleted_at IS NULL) AS agent_name,
+       (SELECT COUNT(*) FROM device_operations o WHERE o.device_id=d.id AND o.status IN ('pending','sent','failed','manual_action_required'))
+         + (SELECT COUNT(*) FROM visitor_device_operations vo WHERE vo.device_id=d.id AND vo.status IN ('pending','sent','failed','manual_action_required')) AS open_commands
+     FROM hikvision_devices d WHERE d.deleted_at IS NULL ORDER BY d.gate_name,d.name`,
+  ).all<Record<string, string | number | null>>();
+  const agents = await c.env.DB.prepare(
+    `SELECT a.id,a.name,a.platform,${agentEffectiveStatus('a')} AS status,a.last_seen_at FROM isapi_agents a WHERE a.deleted_at IS NULL ORDER BY a.name`,
+  ).all<Record<string, string | null>>();
+  const doorCommands = await c.env.DB.prepare(
+    `SELECT o.id,o.device_id,o.operation,o.payload_json,o.status,o.error_message,o.manual_instruction,o.created_at,d.name AS device_name,d.gate_name
+     FROM device_operations o JOIN hikvision_devices d ON d.id=o.device_id
+     WHERE o.operation IN ('remote_open','remote_close','remote_always_open','remote_always_close','remote_resume') ORDER BY o.created_at DESC LIMIT 20`,
+  ).all<Record<string, string | null>>();
+  const openCommands = await c.env.DB.prepare(
+    `SELECT
+       (SELECT COUNT(*) FROM device_operations WHERE status IN ('pending','sent'))
+         + (SELECT COUNT(*) FROM visitor_device_operations WHERE status IN ('pending','sent')) AS pending,
+       (SELECT COUNT(*) FROM device_operations WHERE status='failed')
+         + (SELECT COUNT(*) FROM visitor_device_operations WHERE status='failed') AS failed`,
+  ).first<{ pending: number; failed: number }>();
+  const rows = terminals.results;
+  return c.json({
+    transport: 'agent',
+    isupSupported: false,
+    commandsUseTunnel: false,
+    note: 'Door, card and visitor commands are delivered by the estate agent on the LAN. A free Cloudflare Tunnel cannot carry ISUP, and this page never sends a command through a tunnel or a public terminal address. Automatic door control is best-effort until the terminal firmware is recorded in device profiles; a rejected command stays in the queue for an operator. Door open and visitor removal need an agent built from this release — an older installed agent reports those commands as unknown, and they can be retried after the agent is updated.',
+    doorCommands: (Object.entries(REMOTE_DOOR_COMMANDS) as Array<[RemoteDoorOperation, { isapi: string; label: string }]>).map(([operation, command]) => ({
+      operation,
+      isapiCmd: command.isapi,
+      label: command.label,
+    })),
+    summary: {
+      terminals: rows.length,
+      online: rows.filter((row) => row.status === 'online').length,
+      offline: rows.filter((row) => row.status === 'offline').length,
+      pendingCommands: openCommands?.pending ?? 0,
+      failedCommands: openCommands?.failed ?? 0,
+      agentsOnline: agents.results.filter((row) => row.status === 'online').length,
+    },
+    terminals: rows,
+    agents: agents.results,
+    recentDoorCommands: doorCommands.results.map((row) => {
+      let payload: Record<string, unknown> = {};
+      try { payload = JSON.parse(String(row.payload_json ?? '{}')) as Record<string, unknown>; } catch { payload = {}; }
+      return { ...row, payload_json: undefined, doorNo: payload.doorNo ?? null, reason: payload.reason ?? null };
+    }),
+  });
+});
+
+app.post('/api/access/remote/door', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<{ deviceId?: string; doorNo?: number | string; command?: string; reason?: string }>();
+  const command = body.command?.trim() ?? '';
+  if (!isRemoteDoorOperation(command)) return jsonError(c, 400, 'command must be remote_open, remote_close, remote_always_open, remote_always_close or remote_resume');
+  const deviceId = body.deviceId?.trim();
+  if (!deviceId) return jsonError(c, 400, 'deviceId is required');
+  const doorNo = Number(body.doorNo ?? 1);
+  if (!Number.isInteger(doorNo) || doorNo < 1 || doorNo > 8) return jsonError(c, 400, 'doorNo must be a whole number from 1 to 8');
+  const reason = body.reason?.trim() ?? '';
+  if (reason.length < 3 || reason.length > 200) return jsonError(c, 400, 'A reason between 3 and 200 characters is required');
+  const device = await c.env.DB.prepare(
+    `SELECT id,name,gate_name,connection_pattern,status FROM hikvision_devices WHERE id=? AND deleted_at IS NULL`,
+  ).bind(deviceId).first<{ id: string; name: string; gate_name: string; connection_pattern: string; status: string }>();
+  if (!device) return jsonError(c, 404, 'Access-control device not found');
+  if (device.status === 'disabled') return jsonError(c, 409, 'That terminal is disabled');
+  const duplicate = await c.env.DB.prepare(
+    `SELECT id FROM device_operations WHERE device_id=? AND operation=? AND status IN ('pending','sent') AND json_extract(payload_json,'$.doorNo')=? LIMIT 1`,
+  ).bind(deviceId, command, doorNo).first();
+  if (duplicate) return jsonError(c, 409, 'That door command is already waiting to be applied');
+  const spec = REMOTE_DOOR_COMMANDS[command];
+  const linked = await deviceHasLinkedAgent(c.env.DB, deviceId);
+  const automatic = linked && isPendingPattern(device.connection_pattern);
+  const status = automatic ? 'pending' : 'manual_action_required';
+  const instruction = `${spec.label} door ${doorNo} on ${device.name} (${device.gate_name}). Reason: ${reason}. ${automatic
+    ? 'The estate agent will try this over ISAPI on the LAN. If the terminal rejects it, apply it on the terminal or in iVMS-4200 and mark this action applied.'
+    : 'No linked agent can deliver this automatically. Apply it on the terminal or in iVMS-4200, then mark this action applied.'} Do not publish the terminal to the Internet.`;
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare(
+    `INSERT INTO device_operations(id,device_id,operation,payload_json,status,manual_instruction) VALUES (?,?,?,?,?,?)`,
+  ).bind(id, deviceId, command, JSON.stringify({ doorNo, command: spec.isapi, reason, requestedBy: c.get('user').id }), status, instruction.slice(0, 1000)).run();
+  await audit(c, 'remote_door', 'hikvision_device', deviceId, { operationId: id, command, doorNo, reason, delivery: automatic ? 'agent' : 'manual' });
+  return c.json({
+    id,
+    command,
+    doorNo,
+    delivery: automatic ? 'agent' : 'manual',
+    status,
+    hardwareSync: status,
+    warning: automatic
+      ? 'Queued for the estate agent. Automatic door control is not verified for every firmware; a rejection stays in Hardware actions.'
+      : 'Queued as a manual terminal task because this device is not linked to an agent.',
+  }, 201);
+});
+
+app.post('/api/access/remote/access', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<{ residentId?: string; householdMemberId?: string; action?: string; reason?: string; includeHousehold?: boolean }>();
+  const action = body.action?.trim();
+  if (action !== 'suspend' && action !== 'restore') return jsonError(c, 400, 'action must be suspend or restore');
+  const reason = body.reason?.trim() ?? '';
+  if (reason.length < 3 || reason.length > 200) return jsonError(c, 400, 'A reason between 3 and 200 characters is required');
+  let residentId = body.residentId?.trim() || '';
+  const householdMemberId = body.householdMemberId?.trim() || null;
+  let personName = '';
+  if (householdMemberId) {
+    const member = await c.env.DB.prepare(
+      `SELECT id,primary_resident_id,name FROM household_members WHERE id=? AND status='active'`,
+    ).bind(householdMemberId).first<{ id: string; primary_resident_id: string; name: string }>();
+    if (!member) return jsonError(c, 404, 'Active household member not found');
+    residentId = member.primary_resident_id;
+    personName = member.name;
+  } else {
+    const resident = await c.env.DB.prepare(
+      `SELECT id,name FROM users WHERE id=? AND role='resident' AND status='active'`,
+    ).bind(residentId).first<{ id: string; name: string }>();
+    if (!resident) return jsonError(c, 404, 'Active resident not found');
+    personName = resident.name;
+  }
+  const includeHousehold = householdMemberId ? false : body.includeHousehold !== false;
+  const fromStatus = action === 'suspend' ? 'active' : 'suspended';
+  const toStatus = action === 'suspend' ? 'suspended' : 'active';
+  const cards = await c.env.DB.prepare(
+    `SELECT id,card_uid,status,household_member_id FROM access_cards WHERE resident_id=? AND status=?`,
+  ).bind(residentId, fromStatus).all<{ id: string; card_uid: string; status: string; household_member_id: string | null }>();
+  const fingers = await c.env.DB.prepare(
+    `SELECT id,finger_no,employee_no,status,household_member_id,COALESCE(finger_label,'Finger ' || finger_no) AS label FROM fingerprint_credentials WHERE resident_id=? AND status=?`,
+  ).bind(residentId, fromStatus).all<{ id: string; finger_no: number; employee_no: string | null; status: string; household_member_id: string | null; label: string }>();
+  const matches = (memberId: string | null) => householdMemberId ? memberId === householdMemberId : includeHousehold || !memberId;
+  const chosenCards = cards.results.filter((row) => matches(row.household_member_id));
+  const chosenFingers = fingers.results.filter((row) => matches(row.household_member_id));
+  if (!chosenCards.length && !chosenFingers.length) {
+    return jsonError(c, 409, action === 'suspend' ? 'That person has no active card or fingerprint to suspend' : 'That person has no suspended card or fingerprint to restore');
+  }
+  const statements: D1PreparedStatement[] = [];
+  for (const card of chosenCards) {
+    statements.push(c.env.DB.prepare(
+      `UPDATE access_cards SET status=?,deactivated_at=CASE WHEN ?='active' THEN NULL ELSE datetime('now') END,deactivated_reason=?,auto_expired=0,updated_at=datetime('now') WHERE id=?`,
+    ).bind(toStatus, toStatus, reason, card.id));
+    statements.push(c.env.DB.prepare(
+      `INSERT INTO card_status_changes(id,card_id,old_status,new_status,reason,changed_by) VALUES (?,?,?,?,?,?)`,
+    ).bind(crypto.randomUUID(), card.id, card.status, toStatus, reason, c.get('user').id));
+  }
+  for (const finger of chosenFingers) {
+    statements.push(c.env.DB.prepare(
+      `UPDATE fingerprint_credentials SET status=?,deactivated_at=CASE WHEN ?='active' THEN NULL ELSE datetime('now') END,deactivated_reason=?,auto_expired=0,updated_at=datetime('now') WHERE id=?`,
+    ).bind(toStatus, toStatus, reason, finger.id));
+    statements.push(c.env.DB.prepare(
+      `INSERT INTO fingerprint_status_changes(id,fingerprint_id,old_status,new_status,reason,changed_by) VALUES (?,?,?,?,?,?)`,
+    ).bind(crypto.randomUUID(), finger.id, finger.status, toStatus, reason, c.get('user').id));
+  }
+  await c.env.DB.batch(statements);
+  for (const card of chosenCards) {
+    await createDeviceOperations(c.env, card.id, action === 'suspend' ? 'disable_card' : 'enable_card', { cardUid: card.card_uid, enabled: action === 'restore', reason });
+  }
+  let fingerprintTasks = 0;
+  for (const finger of chosenFingers) {
+    const verb = action === 'suspend' ? 'Disable' : 'Re-enable';
+    fingerprintTasks += await createFingerprintOperations(
+      c.env,
+      finger.id,
+      action === 'suspend' ? 'disable_fingerprint' : 'enable_fingerprint',
+      { fingerprintId: finger.id, fingerNo: finger.finger_no, employeeNo: finger.employee_no, enabled: action === 'restore', reason },
+      `${verb} ${finger.label} for ${personName}${finger.employee_no ? ` (employee ${finger.employee_no})` : ''} on the terminal, then mark this action applied. Reason: ${reason}`,
+    );
+  }
+  await audit(c, action === 'suspend' ? 'remote_suspend_access' : 'remote_restore_access', 'user', residentId, {
+    householdMemberId, includeHousehold, reason, cards: chosenCards.length, fingerprints: chosenFingers.length,
+  });
+  return c.json({
+    ok: true,
+    action,
+    personName,
+    cards: chosenCards.length,
+    fingerprints: chosenFingers.length,
+    fingerprintTasks,
+    hardwareSync: 'queued',
+  });
+});
+
+app.post('/api/access/remote/visitors/:id/revoke', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<{ reason?: string }>().catch(() => ({ reason: '' }));
+  const reason = body.reason?.trim() ?? '';
+  if (reason.length < 3 || reason.length > 200) return jsonError(c, 400, 'A reason between 3 and 200 characters is required');
+  const visitor = await c.env.DB.prepare(
+    `SELECT id,visitor_name,credential_number,status,device_id,gate_scope FROM visitor_requests WHERE id=?`,
+  ).bind(c.req.param('id')).first<{ id: string; visitor_name: string; credential_number: string | null; status: string; device_id: string | null; gate_scope: string }>();
+  if (!visitor) return jsonError(c, 404, 'Visitor pass not found');
+  if (!['active','checked_in','pending'].includes(visitor.status)) return jsonError(c, 409, 'Only a live pass can be revoked from here');
+  await c.env.DB.prepare(
+    `UPDATE visitor_requests SET status='revoked',rejected_at=datetime('now'),rejected_by=?,rejection_note=? WHERE id=?`,
+  ).bind(c.get('user').id, reason, visitor.id).run();
+  const devices = visitor.gate_scope === 'gate' && visitor.device_id
+    ? await c.env.DB.prepare(`SELECT id,connection_pattern FROM hikvision_devices WHERE id=? AND deleted_at IS NULL AND status!='disabled'`).bind(visitor.device_id).all<{ id: string; connection_pattern: string }>()
+    : await c.env.DB.prepare(`SELECT id,connection_pattern FROM hikvision_devices WHERE deleted_at IS NULL AND status!='disabled'`).all<{ id: string; connection_pattern: string }>();
+  const payload = JSON.stringify({ credentialNumber: visitor.credential_number, visitorName: visitor.visitor_name, enabled: false, reason });
+  let queued = 0;
+  const statements: D1PreparedStatement[] = [];
+  for (const device of devices.results) {
+    const waiting = await c.env.DB.prepare(
+      `SELECT id FROM visitor_device_operations WHERE visitor_request_id=? AND device_id=? AND operation='revoke_visitor' AND status IN ('pending','sent') LIMIT 1`,
+    ).bind(visitor.id, device.id).first();
+    if (waiting) continue;
+    const delivery = isPendingPattern(device.connection_pattern) && await deviceHasLinkedAgent(c.env.DB, device.id) ? 'pending' : 'manual_action_required';
+    statements.push(c.env.DB.prepare(
+      `INSERT INTO visitor_device_operations(id,visitor_request_id,device_id,operation,payload_json,status) VALUES (?,?,?,'revoke_visitor',?,?)`,
+    ).bind(crypto.randomUUID(), visitor.id, device.id, payload, delivery));
+    queued += 1;
+  }
+  if (statements.length) await c.env.DB.batch(statements);
+  await audit(c, 'remote_revoke_visitor', 'visitor_request', visitor.id, { reason, queued });
+  return c.json({ ok: true, status: 'revoked', queued, visitorName: visitor.visitor_name });
+});
+
+app.post('/api/access/remote/operations/:id/retry', requireRoles('admin'), async (c) => {
+  const id = c.req.param('id');
+  const card = await c.env.DB.prepare(
+    `SELECT o.id,o.device_id,o.operation,o.fingerprint_id,d.connection_pattern FROM device_operations o JOIN hikvision_devices d ON d.id=o.device_id WHERE o.id=? AND o.status='failed'`,
+  ).bind(id).first<{ id: string; device_id: string; operation: string; fingerprint_id: string | null; connection_pattern: string }>();
+  if (card) {
+    const automatic = !card.fingerprint_id && !card.operation.startsWith('enroll_fingerprint') && !card.operation.startsWith('enable_fingerprint') && !card.operation.startsWith('disable_fingerprint') && !card.operation.startsWith('delete_fingerprint') && isPendingPattern(card.connection_pattern) && await deviceHasLinkedAgent(c.env.DB, card.device_id);
+    const status = card.fingerprint_id || card.operation.includes('fingerprint') ? 'manual_action_required' : automatic ? 'pending' : 'manual_action_required';
+    await c.env.DB.prepare(`UPDATE device_operations SET status=?,error_message=NULL,updated_at=datetime('now') WHERE id=?`).bind(status, id).run();
+    await audit(c, 'retry_operation', 'device_operation', id, { status });
+    return c.json({ ok: true, status });
+  }
+  const visitor = await c.env.DB.prepare(
+    `SELECT o.id,o.device_id,d.connection_pattern FROM visitor_device_operations o JOIN hikvision_devices d ON d.id=o.device_id WHERE o.id=? AND o.status='failed'`,
+  ).bind(id).first<{ id: string; device_id: string; connection_pattern: string }>();
+  if (!visitor) return jsonError(c, 404, 'Failed command not found');
+  const status = isPendingPattern(visitor.connection_pattern) && await deviceHasLinkedAgent(c.env.DB, visitor.device_id) ? 'pending' : 'manual_action_required';
+  await c.env.DB.prepare(`UPDATE visitor_device_operations SET status=?,error_message=NULL,updated_at=datetime('now') WHERE id=?`).bind(status, id).run();
+  await audit(c, 'retry_operation', 'visitor_device_operation', id, { status });
+  return c.json({ ok: true, status });
+});
+
 app.get('/api/access/operations', requireRoles('admin','manager'), async (c) => {
   const { limit, offset, page: pageNumber } = page(c);
   const result = await c.env.DB.prepare(
@@ -2989,12 +3225,17 @@ app.get('/api/access/operations', requireRoles('admin','manager'), async (c) => 
        JOIN fingerprint_credentials f ON f.id=o.fingerprint_id JOIN users u ON u.id=f.resident_id
        WHERE o.status IN ('pending','manual_action_required','failed') AND o.fingerprint_id IS NOT NULL
        UNION ALL
+       SELECT o.id,o.device_id,o.operation,o.payload_json,o.status,o.attempts,o.error_message,o.manual_instruction,o.created_at,o.updated_at,d.name,
+         'door ' || COALESCE(json_extract(o.payload_json,'$.doorNo'), 1),'door',json_extract(o.payload_json,'$.reason')
+       FROM device_operations o JOIN hikvision_devices d ON d.id=o.device_id
+       WHERE o.status IN ('pending','manual_action_required','failed') AND o.operation IN ('remote_open','remote_close','remote_always_open','remote_always_close','remote_resume')
+       UNION ALL
        SELECT o.id,o.device_id,o.operation,o.payload_json,o.status,o.attempts,o.error_message,NULL,o.created_at,o.updated_at,d.name,v.credential_number,'visitor',v.visitor_name
        FROM visitor_device_operations o JOIN hikvision_devices d ON d.id=o.device_id JOIN visitor_requests v ON v.id=o.visitor_request_id
        WHERE o.status IN ('pending','manual_action_required','failed')
      ) ORDER BY created_at LIMIT ? OFFSET ?`,
   ).bind(limit, offset).all();
-  return c.json({ items: result.results, page: pageNumber, limit, note: 'Card and visitor changes are applied by a linked agent; fingerprint enrollment always happens on the terminal and is confirmed here.' });
+  return c.json({ items: result.results, page: pageNumber, limit, note: 'Card, visitor and door commands are applied by a linked agent. Fingerprint enrollment always happens on the terminal and is confirmed here. Door commands are never sent through a public tunnel.' });
 });
 
 app.patch('/api/access/operations/:id', requireRoles('admin','manager'), async (c) => {
@@ -3512,6 +3753,24 @@ const PENDING_OPERATION_PATTERNS = [
   'isapi_windows_agent',
 ];
 
+/**
+ * Door commands an administrator can queue from Access control remote.
+ * `isapi` is the Hikvision RemoteControlDoor cmd. Delivery is best-effort:
+ * no per-model firmware evidence is recorded in docs/device-profiles/ yet, so
+ * the portal must not claim a terminal will honour the command. The agent
+ * tries ISAPI on the LAN; a terminal that rejects it stays in the queue for
+ * an operator. These commands never cross a Cloudflare Tunnel and are not ISUP.
+ */
+const REMOTE_DOOR_COMMANDS = {
+  remote_open: { isapi: 'open', label: 'Momentary open' },
+  remote_close: { isapi: 'close', label: 'Close' },
+  remote_always_open: { isapi: 'alwaysOpen', label: 'Remain open' },
+  remote_always_close: { isapi: 'alwaysClose', label: 'Remain closed' },
+  remote_resume: { isapi: 'resume', label: 'Resume schedule' },
+} as const;
+
+type RemoteDoorOperation = keyof typeof REMOTE_DOOR_COMMANDS;
+
 function isPendingPattern(pattern: string | null | undefined): boolean {
   if (!pattern) return false;
   return PENDING_OPERATION_PATTERNS.includes(pattern);
@@ -3570,6 +3829,17 @@ async function createFingerprintOperations(
   ).bind(crypto.randomUUID(), device.id, fingerprintId, operation, payloadJson, instruction));
   await env.DB.batch(statements);
   return statements.length;
+}
+
+function isRemoteDoorOperation(value: string): value is RemoteDoorOperation {
+  return Object.prototype.hasOwnProperty.call(REMOTE_DOOR_COMMANDS, value);
+}
+
+async function deviceHasLinkedAgent(db: D1Database, deviceId: string): Promise<boolean> {
+  const linked = await db.prepare(
+    `SELECT 1 AS ok FROM isapi_device_configs WHERE device_id=? AND agent_id IS NOT NULL AND sync_enabled=1 LIMIT 1`,
+  ).bind(deviceId).first();
+  return Boolean(linked);
 }
 
 interface VisitorOperationDevice {
@@ -3938,7 +4208,7 @@ async function handleIsapiAgentOperations(request: Request, env: Env, agentId: s
   const limit = Math.min(100, Math.max(1, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : 20));
   const result = await env.DB.prepare(
     `SELECT * FROM (
-       SELECT o.id,'card' AS kind,o.device_id,o.operation,o.payload_json,o.attempts,o.created_at,o.updated_at,d.name AS device_name,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol
+       SELECT o.id,CASE WHEN o.operation IN ('remote_open','remote_close','remote_always_open','remote_always_close','remote_resume') THEN 'door' ELSE 'card' END AS kind,o.device_id,o.operation,o.payload_json,o.attempts,o.created_at,o.updated_at,d.name AS device_name,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol
        FROM device_operations o
        JOIN isapi_device_configs cfg ON cfg.device_id=o.device_id
        JOIN hikvision_devices d ON d.id=o.device_id
@@ -3957,9 +4227,9 @@ async function handleIsapiAgentOperations(request: Request, env: Env, agentId: s
   if (result.results.length) {
     const claims = await env.DB.batch(result.results.map((op) =>
       env.DB.prepare(
-        op.kind === 'card'
-          ? `UPDATE device_operations SET status='sent',attempts=attempts+1,agent_id=?,updated_at=datetime('now') WHERE id=? AND device_id=? AND (status='pending' OR (status='sent' AND updated_at<datetime('now','-2 minutes')))`
-          : `UPDATE visitor_device_operations SET status='sent',attempts=attempts+1,agent_id=?,updated_at=datetime('now') WHERE id=? AND device_id=? AND (status='pending' OR (status='sent' AND updated_at<datetime('now','-2 minutes')))`,
+        op.kind === 'visitor'
+          ? `UPDATE visitor_device_operations SET status='sent',attempts=attempts+1,agent_id=?,updated_at=datetime('now') WHERE id=? AND device_id=? AND (status='pending' OR (status='sent' AND updated_at<datetime('now','-2 minutes')))`
+          : `UPDATE device_operations SET status='sent',attempts=attempts+1,agent_id=?,updated_at=datetime('now') WHERE id=? AND device_id=? AND (status='pending' OR (status='sent' AND updated_at<datetime('now','-2 minutes')))`,
       ).bind(agentId, op.id, op.device_id),
     ));
     claimed = result.results.filter((_, i) => Number(claims[i]?.meta.changes ?? 0) > 0);
@@ -3993,8 +4263,8 @@ async function handleIsapiAgentOperationResult(request: Request, env: Env, agent
   if (!agent) return new Response('Unauthorized', { status: 401 });
   let body: { kind?: GatewayOperationKind; status?: 'applied'|'failed'; errorMessage?: string; durationMs?: number };
   try { body = await request.json(); } catch { return Response.json({ error: 'JSON body required' }, { status: 400 }); }
-  if (!body.kind || !['card','visitor'].includes(body.kind) || !body.status || !['applied','failed'].includes(body.status)) {
-    return Response.json({ error: 'kind must be card or visitor and status must be applied or failed' }, { status: 400 });
+  if (!body.kind || !['card','visitor','door'].includes(body.kind) || !body.status || !['applied','failed'].includes(body.status)) {
+    return Response.json({ error: 'kind must be card, visitor or door and status must be applied or failed' }, { status: 400 });
   }
   const errorMessage = body.status === 'failed' ? (body.errorMessage?.trim().slice(0, 1000) || 'ISAPI agent reported failure') : null;
   const duration = body.durationMs && Number.isFinite(body.durationMs) ? Math.max(0, Math.floor(body.durationMs)) : null;
