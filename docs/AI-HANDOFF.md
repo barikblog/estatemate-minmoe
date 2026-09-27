@@ -4,7 +4,7 @@
 
 Administrators have an **Access control remote** page. It queues door commands (`remote_open`, `remote_close`, `remote_always_open`, `remote_always_close`, `remote_resume`), suspends or restores a person's cards and fingerprints, syncs or revokes visitor passes, retries failed commands, and assigns security gate posts. Delivery is the estate agent over ISAPI on the LAN. It is not ISUP and it does not send commands through a Cloudflare Tunnel. Automatic door control is best-effort: no device profile records a verified remote-door command, so a terminal rejection stays in Hardware actions for an operator. Fingerprints are still captured on the terminal. An already-installed bridge (tag `bridge-0.2.1` and earlier) does not know `remote_*` or `revoke_visitor`; those commands fail as unknown until that agent is rebuilt. Card enable/disable uses the existing operation kinds and works on the installed agent.
 
-Updated: 2026-09-27 (Africa/Lagos) — **NEW: standalone Hikvision tunnel bridge worker** (`hikvision-tunnel-worker/`): a separately deployed Cloudflare Worker that pulls ISAPI AcsEvents into D1 `access_logs` (cron + `POST /pull-logs`, HTTP Digest over `TUNNEL_URL`) and pushes users to `/ISAPI/AccessControl/UserInfo/Record` (`POST /sync-user`); it does not change EstateMate's agent-only transport rule — see "Standalone Hikvision tunnel bridge worker". Previous: **Access cards & fingerprints phase (migration `0015_fingerprint_credentials.sql`):** the portal menu is now **Access cards & fingerprints** and lists cards and fingerprints from one endpoint; every person's profile (People and Tenancy & household) has a **Cards & fingerprints** panel where an Administrator or Manager can add either credential. A fingerprint is its own credential with the terminal's finger slot and employee number, and because a finger can only be captured on the terminal, every fingerprint operation is queued `manual_action_required` with instructions and is never handed to the agent. See "Access cards and fingerprints". Previous: **Cloudflare Tunnel remote-access kit (Free plan)** shipped as `86886f7` on PR #25 — `scripts/cloudflared-remote-access.mjs` generates a WARP private-routing config with a `--check` policy validator; ISUP was proven impossible on the free plan (the terminal cannot dial Cloudflare or complete an Access login). Previous: **Terminal presence promotion** (`c6d1ab3`): a heartbeat `stream:'up'` promotes a linked terminal from the `pending` registration default to `online`, `'down'` retires it (including a still-`pending` terminal), and the hourly sweep derives status from proof of life. Previous: **Bridge apps phase deployed to production:** `bridge-apps/` (single-file Windows bridge executable + Android bridge APK) and the agent's EstateMate-device-id resolution are on `main` as `a094d93` (PR #21) and Deploy EstateMate run `36178112448` deployed them successfully; production `GET /api/health` returns `ok: true` and the portal login screen renders. The earlier wording on this line ("not yet deployed") was stale and is corrected here — that phase is live. The merge kept the one `apps/web/src/App.tsx` conflict resolution and the operator-facing portal labels brought in line with the renamed **Device agent** page — see "Bridge apps phase, merged onto the Device-agent portal". Previous: **Device-agent portal cleanup deployed:** PR #17 merged as `6795c0e`; Deploy EstateMate run `36161420893` succeeded and the cache-busted production health check returned `ok: true`. The page is now named **Device agent**, replaces implementation-level connection-pattern and queue copy with a compact on-demand setup guide, points operators to the current single-file Windows bridge and Android bridge release, removes obsolete Node.js/`sc.exe` instructions, trims status tables, and fixes the phone layout so the heading and actions stack instead of forcing horizontal overflow. Setup downloads now match explicit secret rotation and are Administrator-only in both the UI and API; Managers can still connect, disconnect, and monitor terminals. Previous: **Bridge release CI phase** added `.github/workflows/bridge.yml` (Windows agent portable bundle + the project's first real Android compile), fixed the `API_BASE_URL` placeholder and the wrong `sc.exe`/`pkg` install advice. Previous: 2026-09-24 — Portal UX phase (migration `0014`) **deployed to production** via PR #11 (`f4e543d`), Deploy EstateMate run `36074600948`: administrator-published estate gate welcome image on the login screen and dashboard, searchable card-holder picker, and gate-scoped Security login sessions. Previous phase retired every access-device transport except the EstateMate agent; production domain is `https://estatemate.estatemate.workers.dev`
+Updated: 2026-09-27 (Africa/Lagos) — **NEW: standalone Hikvision tunnel bridge worker** (`hikvision-tunnel-worker/`): a separately deployed Cloudflare Worker that pulls ISAPI AcsEvents into D1 `access_logs` (cron + `POST /pull-logs`, HTTP Digest over `TUNNEL_URL`) and pushes users to `/ISAPI/AccessControl/UserInfo/Record` (`POST /sync-user`); it does not change EstateMate's agent-only transport rule — see "Standalone Hikvision tunnel bridge worker". Previous: **Access cards & fingerprints phase (migration `0015_fingerprint_credentials.sql`):** the portal menu is now **Access cards & fingerprints** and lists cards and fingerprints from one endpoint; every person's profile (People and Tenancy & household) has a **Cards & fingerprints** panel where an Administrator or Manager can add either credential. A fingerprint is its own credential with the terminal's finger slot and employee number, and because a finger can only be captured on the terminal, every fingerprint operation is queued `manual_action_required` with instructions and is never handed to the agent. See "Access cards and fingerprints". Previous: **Cloudflare Tunnel remote-access kit (Free plan)** shipped as `86886f7` on PR #25 — `scripts/cloudflared-remote-access.mjs` generates a WARP private-routing config with a `--check` policy validator; ISUP was proven impossible on the free plan (the terminal cannot dial Cloudflare or complete an Access login). Previous: **Terminal presence promotion** (`c6d1ab3`): a heartbeat `stream:'up'` promotes a linked terminal from the `pending` registration default to `online`, `'down'` retires it (including a still-`pending` terminal), and the hourly sweep derives status from proof of life. Previous: **Bridge apps phase deployed to production:** `bridge-apps/` (single-file Windows bridge executable + Android bridge APK) and the agent's EstateMate-device-id resolution are on `main` as `a094d93` (PR #21) and Deploy EstateMate run `36178112448` deployed them successfully; production `GET /api/health` returns `ok: true` and the portal login screen renders. The earlier wording on this line ("not yet deployed") was stale and is corrected here — that phase is live. The merge kept the one `apps/web/src/App.tsx` conflict resolution and the operator-facing portal labels brought in line with the renamed **Device agent** page — see "Bridge apps phase, merged onto the Device-agent portal". Previous: **Device-agent portal cleanup deployed:** PR #17 merged as `6795c0e`; Deploy EstateMate run `36161420893` succeeded and the cache-busted production health check returned `ok: true`. The page is now named **Device agent**, replaces implementation-level connection-pattern and queue copy with a compact on-demand setup guide, points operators to the current single-file Windows bridge and Android bridge release, removes obsolete Node.js/`sc.exe` instructions, trims status tables, and fixes the phone layout so the heading and actions stack instead of forcing horizontal overflow. Setup downloads now match explicit secret rotation and are Administrator-only in both the UI and API; Managers can still connect, disconnect, and monitor terminals. Previous: **Bridge release CI phase** added `.github/workflows/bridge.yml` (Windows agent portable bundle + the project's first real Android compile), fixed the `API_BASE_URL` placeholder and the wrong `sc.exe`/`pkg` install advice. Previous: 2026-09-24 — Portal UX phase (migration `0014`) **deployed to production** via PR #11 (`f4e543d`), Deploy EstateMate run `36074600948`: administrator-published estate gate welcome image on the login screen and dashboard, searchable card-holder picker, and gate-scoped Security login sessions. Previous phase retired every access-device transport except the EstateMate agent; production domain is `https://estatemate.estatemate.workers.dev` Previous: **Credential-free `CI` gate for pull requests** (`.github/workflows/ci.yml` + `scripts/ci-checks.sh`) — see "Continuous integration".
 
 
 
@@ -240,7 +240,7 @@ task and the raw log tail as `::error` annotations, and the Windows smoke test d
 launcher streams the same way. Annotations *are* readable through the check-runs API, so
 that is the channel a future agent will have.
 
-## Bridge apps phase, merged onto the Device-agent portal (2026-09-25)
+## Bridge apps phase, merged onto the Device-agent portal and deployed (2026-09-25)
 
 `bridge-apps/` is now part of the repository: the two hosts that put the
 access-device transport on the estate LAN, so a terminal never has to be
@@ -302,6 +302,46 @@ is the path that compiles them: `bridge-apk` runs `scripts/build-bridge-apk.py -
 the built executable against a fake Worker and a fake Digest terminal.
 
 ### Production deployment (2026-09-25)
+
+Two merges landed that day, minutes apart, and each one deployed.
+
+#### PR #19 -> `8615f4f` (Deploy EstateMate run `36176244534`)
+
+Merged to `main` as PR #19 (`8615f4f`), which is the only deploy path
+(`deploy.yml` triggers on `push: branches: [main]`).
+
+* **Deploy EstateMate run `36176244534`: `success`.** Every step green, including
+  `Run npm run build` (which is `typecheck && test && build:web`, so CI re-ran the
+  whole verification suite on the merged tree), `Apply D1 migrations` and
+  `Deploy Worker and web assets`.
+* **No new migrations.** `git diff --name-only 27a5917 8615f4f -- migrations` is
+  empty; the chain still ends at `0014_gate_image_and_security_gate_sessions.sql`,
+  applied in the portal UX phase, so the migration step had nothing to apply.
+* **Health check:** `GET https://estatemate.estatemate.workers.dev/api/health`
+  returned `{"ok":true,"app":"EstateMate","time":"2026-09-25T18:54:17.090Z",
+  "hikvisionMode":"per-device","fileStorage":"github-private"}`.
+* **The deployed bundle is the resolved one.** Production serves
+  `assets/index-DpqNYjmI.js`, and building `8615f4f` locally emits exactly that
+  content-hashed filename. As a control, building the same tree with
+  `App.tsx` taken from the pre-merge commit `27a5917` emits
+  `index-CbMVe4sE.js` instead — and asking production for that stale path
+  returns the SPA fallback HTML, not JavaScript. So the merge is what is live,
+  not merely a build that happened around the same time.
+* **Bridge CI on the PR was green before the merge:** `Validate ISAPI bridge
+  agent`, `Build the bridge APK` (its `Run the protocol tests and build the APK`
+  step compiles `bridge-apps/android/**` — the sandbox has no JDK, so this is the
+  only place that Java is compiled), `Build the bridge executable` (including
+  `Smoke-test the executable`), `Package Windows agent bundle`, and
+  `Build Android APK`.
+* `Workers Builds: estatemate` was red on the PR and is still the documented
+  pre-existing failure; it is not a required check and `deploy.yml` is the
+  authoritative path.
+* **No new client artifacts were published:** `bridge.yml` only publishes on
+  `bridge-*` tags, so the released bridge files remain those of `bridge-0.2.1`.
+  Tag `bridge-0.2.2` when the apps need redistributing — nothing in this merge
+  changed the bridge protocol, only the portal labels its messages quote.
+
+#### PR #21 -> `a094d93` (Deploy EstateMate run `36178112448`)
 
 - PR #21 merged to `main` as `a094d93`; **Deploy EstateMate run `36178112448`
   succeeded** (job `deploy`, 39 s, all steps green: `npm run build`,
@@ -465,6 +505,17 @@ Extends `isapi-bridge/agent.mjs` to v1.1.0 and the Worker so a Hikvision termina
 - New connection patterns supported: `isapi_bridge`, `windows_agent`, `isapi_windows_agent` (all treated as pending, not manual_action_required).
 
 The previous migration, `migrations/0010_maintenance_billing_and_verification.sql`, adds maintenance scope (personal/street/block/zone/estate), status workflow (in_progress, needs_verification), charging fields, gate ID verification for visitors, and bill_batches audience targeting.
+
+## Continuous integration
+
+- `.github/workflows/ci.yml` (`CI`) runs on `pull_request` against `main` and on `workflow_dispatch`. It is credential-free and cannot deploy.
+- Gates: `npm ci`, `npm run typecheck`, `npm test` (Vitest + the ISAPI bridge and cloudflared-kit integration scripts), `npm run build:web`, the whole migration chain replayed into an empty SQLite database, `bash scripts/ci-checks.sh`, and `npx wrangler deploy --dry-run` (offline bundle + binding/assets validation).
+- `scripts/ci-checks.sh` enforces the repository rules that were previously convention-only, diffed against `merge-base(origin/main, HEAD)` rather than the raw PR base so a branch lagging behind main is not blamed for other people's merged commits: no whitespace/conflict markers, no modification or deletion of deployed migrations, no committed credential files, and no `ghp_*`/`github_pat_*`/`vCP_*`/`AKIA*`/`xox*`/private-key-block shapes on added lines. Matched values are redacted before being printed, so a leak cannot be copied out of the Actions log by the check that reports it.
+- CI has no JDK or Android SDK; a PR touching `apps/android` emits a notice that Kotlin was not compiled.
+- Unchanged: `Deploy EstateMate` still owns remote migrations and deploys, and still fails before touching D1 if `npm run build` fails.
+- **Found while validating CI: production has two ship paths.** The Cloudflare Builds app (`cloudflare-workers-and-pages`) is connected to the same `estatemate` Worker service. On `main` tip `9658e37` both `Deploy EstateMate` and `Workers Builds: estatemate` succeeded, i.e. the Worker was built twice for one push; on `dd3764f` the Cloudflare build failed while `CI` passed. Its build and deploy commands live in the Cloudflare dashboard, not this repository, so they can drift from `wrangler.jsonc`. Unresolved decision: keep exactly one deploy path (`Deploy EstateMate` is the documented one) and disable the other, because two runners applying D1 migrations or shipping different bundles is how environments drift. Meanwhile a red `Workers Builds` check on a pull request is Cloudflare noise, not a CI failure.
+
+## Validation recorded for this phase
 
 ### 0011 validation record
 
