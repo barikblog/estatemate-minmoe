@@ -4,9 +4,22 @@ import type { PassShareSource } from './pass-export';
 import { exportRecordsToExcel, exportRecordsToPdf } from './records-export';
 
 type Row = Record<string, unknown>;
-type Section = 'dashboard' | 'residents' | 'properties' | 'residency' | 'imports' | 'bills' | 'visitors' | 'maintenance' | 'notices' | 'cards' | 'events' | 'devices' | 'remote' | 'isapi' | 'operations' | 'settings';
+type Section =
+  // Overview
+  | 'dashboard'
+  // Access control
+  | 'cards' | 'events' | 'devices' | 'remote' | 'isapi' | 'operations'
+  // People & households
+  | 'residents' | 'residency' | 'dependants' | 'staff'
+  // Property & estate
+  | 'properties' | 'bills' | 'maintenance' | 'bookings' | 'notices' | 'emergency'
+  // Information & compliance
+  | 'information' | 'legal' | 'visitors'
+  // Administration
+  | 'imports' | 'settings';
 
-interface NavItem { id: Section; label: string; roles?: User['role'][] }
+type NavGroup = { id: string; label: string; items: NavItem[] };
+interface NavItem { id: Section; label: string; roles?: User['role'][]; badge?: string }
 type PortalConfig = Record<string,string>;
 const defaultPortalConfig: PortalConfig = {
   portal_name:'EstateMate',estate_name:'EstateMate Estate',portal_short_name:'EM',portal_tagline:'One estate. One secure view.',
@@ -50,24 +63,46 @@ function applyPortalTheme(config: PortalConfig) {
   root.dataset.theme=mode || 'light';
 }
 
-const navItems: NavItem[] = [
-  { id: 'dashboard', label: 'Overview' },
-  { id: 'residents', label: 'People', roles: ['admin','manager','cashier','security'] },
-  { id: 'properties', label: 'Properties', roles: ['admin','manager','cashier','security','resident'] },
-  { id: 'residency', label: 'Tenancy & household', roles: ['admin','manager','resident'] },
-  { id: 'imports', label: 'Import centre', roles: ['admin','manager'] },
-  { id: 'bills', label: 'Bills & payments', roles: ['admin','cashier','resident'] },
-  { id: 'visitors', label: 'Visitors' },
-  { id: 'maintenance', label: 'Maintenance', roles: ['admin','manager','resident'] },
-  { id: 'notices', label: 'Estate notices' },
-  { id: 'cards', label: 'Access cards & fingerprints', roles: ['admin','manager','cashier','resident'] },
-  { id: 'events', label: 'Gate activity', roles: ['admin','manager','security','resident'] },
-  { id: 'devices', label: 'Access-control devices', roles: ['admin','manager','security'] },
-  { id: 'remote', label: 'Access control remote', roles: ['admin'] },
-  { id: 'isapi', label: 'Device agent', roles: ['admin','manager'] },
-  { id: 'operations', label: 'Hardware actions', roles: ['admin','manager'] },
-  { id: 'settings', label: 'Settings', roles: ['admin'] },
+const navGroups: NavGroup[] = [
+  { id: 'overview', label: 'Overview', items: [
+    { id: 'dashboard', label: 'Dashboard' },
+  ]},
+  { id: 'access', label: 'Access control', items: [
+    { id: 'cards', label: 'Cards & fingerprints', roles: ['admin','manager','cashier','resident'] },
+    { id: 'events', label: 'Gate activity', roles: ['admin','manager','security','resident'] },
+    { id: 'devices', label: 'Terminals & devices', roles: ['admin','manager','security'] },
+    { id: 'remote', label: 'Remote door control', roles: ['admin'] },
+    { id: 'isapi', label: 'Device agent', roles: ['admin','manager'] },
+    { id: 'operations', label: 'Hardware actions', roles: ['admin','manager'] },
+  ]},
+  { id: 'people', label: 'Residents & staff', items: [
+    { id: 'residents', label: 'Resident manager', roles: ['admin','manager','cashier','security'] },
+    { id: 'residency', label: 'Tenancy & household', roles: ['admin','manager','resident'] },
+    { id: 'dependants', label: 'Dependants manager', roles: ['admin','manager','cashier','resident'] },
+    { id: 'staff', label: 'Staff management', roles: ['admin','manager'] },
+  ]},
+  { id: 'estate', label: 'Estate management', items: [
+    { id: 'properties', label: 'Property administration', roles: ['admin','manager','cashier','security','resident'] },
+    { id: 'bills', label: 'Bills & payments', roles: ['admin','cashier','resident'] },
+    { id: 'maintenance', label: 'Service operations', roles: ['admin','manager','resident'] },
+    { id: 'bookings', label: 'Facility bookings', roles: ['admin','manager','cashier','resident'] },
+    { id: 'notices', label: 'Estate notices' },
+    { id: 'emergency', label: 'Emergency contacts' },
+  ]},
+  { id: 'visitors', label: 'Visitors', items: [
+    { id: 'visitors', label: 'Visitor management' },
+  ]},
+  { id: 'info', label: 'Information resources', items: [
+    { id: 'information', label: 'Information hub' },
+    { id: 'legal', label: 'Legal & governance' },
+  ]},
+  { id: 'admin', label: 'Administration', items: [
+    { id: 'imports', label: 'Import centre', roles: ['admin','manager'] },
+    { id: 'settings', label: 'Settings', roles: ['admin'] },
+  ]},
 ];
+
+const allNavItems: NavItem[] = navGroups.flatMap((g) => g.items);
 
 function useAsync<T>(loader: () => Promise<T>, dependencies: unknown[]) {
   const [data, setData] = useState<T | null>(null);
@@ -343,14 +378,36 @@ function App() {
   if (checking) return <div className="splash"><div className="brand-mark">{portalConfig.portal_short_name}</div><span>Loading {portalConfig.portal_name}…</span></div>;
   if (!user) return <Login config={portalConfig} onLogin={(nextUser, nextGate) => { setUser(nextUser); setGate(nextGate ?? null); }} />;
 
-  const availableNav = navItems.filter((item) => !item.roles || item.roles.includes(user.role));
-  const current = availableNav.find((item) => item.id === section) ?? availableNav[0]!;
+  const visibleGroups: NavGroup[] = navGroups
+    .map((g) => ({ ...g, items: g.items.filter((item) => !item.roles || item.roles.includes(user.role)) }))
+    .filter((g) => g.items.length > 0);
+  const flatAvailable = visibleGroups.flatMap((g) => g.items);
+  const current = flatAvailable.find((item) => item.id === section) ?? flatAvailable[0]!;
 
   return <div className="app-shell">
     <aside className={menuOpen ? 'sidebar open' : 'sidebar'}>
       <header className="side-brand"><span className="mini-logo">{portalConfig.portal_short_name}</span><strong>{portalConfig.portal_name}</strong><button className="icon-button close-menu" onClick={() => setMenuOpen(false)}>×</button></header>
-      <p className="nav-caption">WORKSPACE</p>
-      <nav>{availableNav.map((item) => <button key={item.id} className={current.id === item.id ? 'nav-active' : ''} onClick={() => { setSection(item.id); setMenuOpen(false); }}><span className="nav-icon">{navIcon(item.id)}</span>{item.label}{item.id === 'maintenance' && isOperator && openMaintCount > 0 && <span className="nav-badge">{openMaintCount}</span>}</button>)}</nav>
+      <nav className="nav-groups">
+        {visibleGroups.map((group) => (
+          <section className="nav-group" key={group.id}>
+            <p className="nav-caption">{group.label}</p>
+            <div className="nav-group-items">
+              {group.items.map((item) => (
+                <button
+                  key={item.id}
+                  className={current.id === item.id ? 'nav-active' : ''}
+                  onClick={() => { setSection(item.id); setMenuOpen(false); }}
+                  title={item.label}
+                >
+                  <span className="nav-icon">{navIcon(item.id)}</span>
+                  <span className="nav-label">{item.label}</span>
+                  {item.id === 'maintenance' && isOperator && openMaintCount > 0 && <span className="nav-badge">{openMaintCount}</span>}
+                </button>
+              ))}
+            </div>
+          </section>
+        ))}
+      </nav>
       <footer className="user-card"><span className="avatar">{initials(user.name)}</span><span><strong>{user.name}</strong><small>{user.role}</small></span><button className="icon-button" title="Sign out" onClick={logout}>↗</button></footer>
     </aside>
     {menuOpen && <button className="scrim" aria-label="Close menu" onClick={() => setMenuOpen(false)} />}
@@ -383,6 +440,13 @@ function SectionView({ section, user, config, gate, onNavigate }: { section: Sec
     case 'isapi': return <IsapiBridge user={user} />;
     case 'operations': return <Operations />;
     case 'settings': return <Settings />;
+    // New module pages (placeholder/information surfaces; backend wiring to follow):
+    case 'dependants': return <DependantsManager user={user} onNavigate={onNavigate} />;
+    case 'staff': return <StaffManagement user={user} />;
+    case 'bookings': return <FacilityBookings user={user} />;
+    case 'emergency': return <EmergencyContacts />;
+    case 'information': return <InformationHub onNavigate={onNavigate} />;
+    case 'legal': return <LegalGovernance />;
   }
 }
 
@@ -459,10 +523,54 @@ function Dashboard({ user, config, gate, onNavigate }: { user: User; config: Por
       <div className="hero-orb"><span>{config.portal_short_name || 'EM'}</span></div>
     </section>
     <section className="stat-grid">{cards.map(([label, value, detail]) => <article className="stat-card" key={String(label)}><p>{label}</p><strong>{String(value ?? 0)}</strong><small>{detail}</small></article>)}</section>
+
+    {/* Quick-action shortcuts grouped by the new menu categories — helps
+        mobile users reach any module in one tap from the dashboard. */}
+    <section className="quick-grid">
+      {buildQuickActions(user.role, isOperator).map((group) => (
+        <article className="panel quick-group" key={group.title}>
+          <p className="eyebrow">{group.title}</p>
+          <div className="quick-tiles">
+            {group.items.map((item) => (
+              <button key={item.id} className="quick-tile" onClick={() => onNavigate?.(item.id)}>
+                <span className="quick-tile-icon">{navIcon(item.id)}</span>
+                <span className="quick-tile-label">{item.label}</span>
+              </button>
+            ))}
+          </div>
+        </article>
+      ))}
+    </section>
+
     {isOperator && <AccessTerminationGuide onNavigate={onNavigate} />}
     {user.role === 'resident' && Boolean(data?.latestNotice) && <section className="panel"><div className="panel-title"><div><p className="eyebrow">Latest estate notice</p><h3>{String((data?.latestNotice as Row).title)}</h3></div></div><p>{String((data?.latestNotice as Row).body)}</p></section>}
     {user.role !== 'resident' && <section className="split-grid"><article className="panel callout"><p className="eyebrow">HARDWARE MODE</p><h3>Direct MinMoe event upload</h3><p>Terminals post gate events straight to Cloudflare. Card changes remain in the hardware-action queue until a supported command channel is confirmed.</p></article><article className="panel"><p className="eyebrow">OPERATIONS TIP</p><h3>Check unresolved device actions</h3><p>HTTP Listening is upload-only on most firmware. Mark each manual terminal update as applied to preserve an accurate audit trail.</p></article></section>}
   </>;
+}
+
+function buildQuickActions(role: User['role'], isOperator: boolean): Array<{ title: string; items: Array<{ id: Section; label: string }> }> {
+  const groups: Array<{ title: string; items: Array<{ id: Section; label: string }> }> = [
+    { title: 'Access control', items: [{ id: 'cards', label: 'Cards & fingers' }, { id: 'events', label: 'Gate activity' }, { id: 'operations', label: 'Hardware' }] },
+    { title: 'Residents & staff', items: [{ id: 'residents', label: 'Residents' }, { id: 'residency', label: 'Tenancy' }, { id: 'dependants', label: 'Dependants' }] },
+    { title: 'Estate', items: [{ id: 'properties', label: 'Properties' }, { id: 'bills', label: 'Bills' }, { id: 'maintenance', label: 'Service' }] },
+    { title: 'Resources', items: [{ id: 'visitors', label: 'Visitors' }, { id: 'notices', label: 'Notices' }, { id: 'emergency', label: 'Emergency' }, { id: 'information', label: 'Info hub' }] },
+  ];
+  // Filter items by role visibility (best-effort; mirroring the sidebar rules).
+  const can = (id: Section) => {
+    if (id === 'residents') return ['admin','manager','cashier','security'].includes(role);
+    if (id === 'residency') return ['admin','manager','resident'].includes(role);
+    if (id === 'dependants') return ['admin','manager','cashier','resident'].includes(role);
+    if (id === 'properties') return ['admin','manager','cashier','security','resident'].includes(role);
+    if (id === 'bills') return ['admin','cashier','resident'].includes(role);
+    if (id === 'maintenance') return ['admin','manager','resident'].includes(role);
+    if (id === 'cards') return ['admin','manager','cashier','resident'].includes(role);
+    if (id === 'events') return ['admin','manager','security','resident'].includes(role);
+    if (id === 'operations') return isOperator;
+    return true;
+  };
+  return groups
+    .map((g) => ({ ...g, items: g.items.filter((i) => can(i.id)) }))
+    .filter((g) => g.items.length > 0);
 }
 
 function People({ user }: { user: User }) {
@@ -2229,7 +2337,176 @@ function nested(source: Row | null, objectKey: string, key: string): unknown {
 function localDateTime(date:Date):string { const offset=date.getTimezoneOffset()*60000;return new Date(date.valueOf()-offset).toISOString().slice(0,16); }
 function initials(name: string): string { return name.split(/\s+/).slice(0,2).map((part) => part[0]).join('').toUpperCase(); }
 function navIcon(section: Section): string {
-  return ({ dashboard: '◫', residents: '●', properties: '⌂', residency: '♙', imports: '⇩', bills: '₦', visitors: '↔', maintenance: '◇', notices: '!', cards: '▤', events: '⌁', devices: '▣', remote: '◎', isapi: '⧉', operations: '↻', settings: '⚙' })[section] ?? '•';
+  return ({
+    dashboard: '◫',
+    cards: '▤', events: '⌁', devices: '▣', remote: '◎', isapi: '⧉', operations: '↻',
+    residents: '●', residency: '♙', dependants: '♟', staff: '✦',
+    properties: '⌂', bills: '₦', maintenance: '◇', bookings: '▦', notices: '!', emergency: '✚',
+    visitors: '↔',
+    information: 'ⓘ', legal: '§',
+    imports: '⇩', settings: '⚙',
+  })[section] ?? '•';
+}
+
+// ---------------------------------------------------------------------------
+// New module surfaces — placeholders that render real navigation surfaces and
+// invite the user into the feature. Backend wiring (DB tables, API routes,
+// migrations, permission model) is added in follow-up PRs; these stubs keep
+// the new grouped menu useful today instead of showing a blank state.
+// ---------------------------------------------------------------------------
+
+type ModuleTone = 'blue' | 'green' | 'amber' | 'violet' | 'slate';
+
+function ModulePage({ title, eyebrow, description, icon, tone = 'blue', children, action }: {
+  title: string; eyebrow: string; description: string; icon: string; tone?: ModuleTone;
+  children?: ReactNode; action?: ReactNode;
+}) {
+  return <>
+    <section className={`module-hero tone-${tone}`}>
+      <div className="module-hero-icon">{icon}</div>
+      <div>
+        <p className="eyebrow">{eyebrow}</p>
+        <h2>{title}</h2>
+        <p className="module-hero-desc">{description}</p>
+      </div>
+      {action && <div className="module-hero-action">{action}</div>}
+    </section>
+    {children}
+    <section className="panel">
+      <Notice tone="info">This module is being rolled out. Early access surfaces are visible now; record forms, approvals and reporting will unlock in the next deployment.</Notice>
+    </section>
+  </>;
+}
+
+function DependantsManager({ user, onNavigate }: { user: User; onNavigate?: (s: Section) => void }) {
+  return <ModulePage
+    eyebrow="Residents & staff"
+    title="Dependants manager"
+    description="Register, edit and deactivate spouses, children, relatives and domestic staff tied to a resident household. Each dependant inherits access only while their household is active."
+    icon="♟"
+    tone="violet"
+    action={onNavigate && <button className="secondary" onClick={() => onNavigate('residency')}>Open Tenancy & household →</button>}
+  >
+    <section className="panel">
+      <div className="panel-title"><div><p className="eyebrow">Quick navigation</p><h3>Where dependants live today</h3></div></div>
+      <p>Household members are managed from <button className="text" onClick={() => onNavigate?.('residency')}>Tenancy & household</button> — open any household to add dependants, issue cards and capture fingerprints. This page will grow into a cross-household roster with bulk import, age-bracket filters and access audit per dependant.</p>
+    </section>
+  </ModulePage>;
+}
+
+function StaffManagement({ user: _user }: { user: User }) {
+  return <ModulePage
+    eyebrow="Residents & staff"
+    title="Staff management"
+    description="Administrator, manager, cashier and security accounts with gate assignments, shifts and audit of every action. Use the People list to change roles today."
+    icon="✦"
+    tone="blue"
+  >
+    <section className="feature-grid">
+      {[
+        ['Roles', 'Admin · Manager · Cashier · Security · Resident — each role gates menus and APIs.'],
+        ['Gate postings', 'Security officers pick a gate at sign-in; assignments are visible on devices.'],
+        ['Audit trail', 'Every login, card change and gate decision is recorded against the acting staff id.'],
+        ['Coming soon', 'Shift rosters, leave management and performance reports.'],
+      ].map(([t, b]) => <article className="panel" key={t}><p className="eyebrow">{t}</p><p>{b}</p></article>)}
+    </section>
+  </ModulePage>;
+}
+
+function FacilityBookings({ user: _user }: { user: User }) {
+  return <ModulePage
+    eyebrow="Estate management"
+    title="Facility bookings"
+    description="Let residents reserve the clubhouse, event hall, tennis court, gym or guest suites — with approval, payment and calendar availability."
+    icon="▦"
+    tone="green"
+  >
+    <section className="feature-grid">
+      {[
+        ['Calendar view', 'See every approved booking across facilities for the next 30 days.'],
+        ['Approval queue', 'Managers approve or decline requests; cashiers confirm payment.'],
+        ['Rates & rules', 'Per-facility hourly rates, deposits, blackout dates and capacity.'],
+        ['Resident self-service', 'Residents request bookings from the same portal they pay bills.'],
+      ].map(([t, b]) => <article className="panel" key={t}><p className="eyebrow">{t}</p><p>{b}</p></article>)}
+    </section>
+  </ModulePage>;
+}
+
+function EmergencyContacts() {
+  const contacts: Array<[string, string, string]> = [
+    ['Estate Security Office', '24/7 response desk', 'Call via estate intercom'],
+    ['Facility Manager', 'On-duty manager', 'Contact through support phone (Settings)'],
+    ['Medical / Ambulance', 'Emergencies only', '112 / 199'],
+    ['Police', 'Emergencies only', '112 / 199'],
+    ['Fire Service', 'Emergencies only', '112 / 199'],
+    ['Power / Utility Fault', 'Outage reporting', 'Log a Service Operations request'],
+  ];
+  return <ModulePage
+    eyebrow="Estate management"
+    title="Emergency contacts"
+    description="One-tap directory for estate security, medical, fire, utility and management response lines. Bookmark this page on every guard post."
+    icon="✚"
+    tone="amber"
+  >
+    <section className="contact-grid">
+      {contacts.map(([name, role, detail]) => (
+        <article className="panel contact-card" key={name}>
+          <p className="eyebrow">{role}</p>
+          <h3>{name}</h3>
+          <p>{detail}</p>
+        </article>
+      ))}
+    </section>
+  </ModulePage>;
+}
+
+function InformationHub({ onNavigate }: { onNavigate?: (s: Section) => void }) {
+  const cards: Array<[Section, string, string]> = [
+    ['notices', 'Estate notices', 'Announcements, policy updates and urgent broadcasts pushed to every resident.'],
+    ['maintenance', 'Service operations', 'Open maintenance requests, fault reports and resolution status.'],
+    ['bookings', 'Facility bookings', 'Reserve estate amenities and view the upcoming events calendar.'],
+    ['emergency', 'Emergency contacts', 'Quick access to security, medical, fire and utility response lines.'],
+    ['visitors', 'Visitor management', 'Invite guests, issue passes and review arrival history.'],
+    ['legal', 'Legal & governance', 'Estate by-laws, house rules, data handling and governance documents.'],
+  ];
+  return <ModulePage
+    eyebrow="Information resources"
+    title="Information hub"
+    description="Your starting point for resident-facing documents, communications and estate services."
+    icon="ⓘ"
+    tone="slate"
+  >
+    <section className="feature-grid">
+      {cards.map(([id, title, body]) => (
+        <button key={id} className="panel hub-card" onClick={() => onNavigate?.(id)}>
+          <span className="hub-icon">{navIcon(id)}</span>
+          <p className="eyebrow">Go to</p>
+          <h3>{title}</h3>
+          <p>{body}</p>
+          <span className="hub-arrow">→</span>
+        </button>
+      ))}
+    </section>
+  </ModulePage>;
+}
+
+function LegalGovernance() {
+  return <ModulePage
+    eyebrow="Information resources"
+    title="Legal & governance"
+    description="Estate by-laws, house rules, residents' agreement, privacy notice, data-handling policy and the minutes of estate meetings."
+    icon="§"
+    tone="slate"
+  >
+    <section className="feature-grid">
+      {[
+        ['Residents’ agreement', 'Terms that govern occupancy, fees and conduct on the estate.'],
+        ['House rules', 'Day-to-day rules — noise, pets, parking, waste, visitors.'],
+        ['Privacy & data', 'How personal data, credentials and gate events are stored, encrypted and retained.'],
+        ['Estate meetings', 'AGM minutes, Exco resolutions and voted policy changes.'],
+      ].map(([t, b]) => <article className="panel" key={t}><p className="eyebrow">{t}</p><p>{b}</p></article>)}
+    </section>
+  </ModulePage>;
 }
 
 export default App;
