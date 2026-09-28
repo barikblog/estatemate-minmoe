@@ -12,10 +12,11 @@
     "build": "npm run typecheck && npm run test && npm run build:web",
     "build:web": "npm --workspace apps/web run build",
     "typecheck": "tsc --noEmit && npm --workspace apps/web run typecheck",
-    "test": "vitest run && npm run test:isapi-bridge && npm run test:cloudflared-kit && npm run test:local-server",
+    "test": "vitest run && npm run test:isapi-bridge && npm run test:cloudflared-kit && npm run test:local-server && npm run test:offline-adapter",
     "test:isapi-bridge": "node --check isapi-bridge/agent.mjs && node isapi-bridge/agent.integration.mjs && node isapi-bridge/agent.resolution.integration.mjs",
     "test:cloudflared-kit": "node --check scripts/cloudflared-remote-access.mjs && node scripts/cloudflared-remote-access.integration.mjs",
     "test:local-server": "node --check local-server/server.mjs && node local-server/server.test.mjs",
+    "test:offline-adapter": "node --check scripts/bundle-offline-server.mjs && node bridge-apps/android-offline/server/adapter.test.mjs",
     "offline": "node local-server/server.mjs",
     "offline:backup": "node local-server/backup.mjs",
     "tunnel:plan": "node scripts/cloudflared-remote-access.mjs",
@@ -30,6 +31,7 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260922.1",
+    "esbuild": "^0.28.2",
     "typescript": "^5.9.2",
     "vitest": "^4.1.11",
     "wrangler": "^4.136.3"

@@ -53,7 +53,7 @@ Still model/account dependent:
 See [`docs/MINMOE-NO-PC.md`](docs/MINMOE-NO-PC.md), [`docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md`](docs/VISITOR-CREDENTIALS-AND-ACCESS-DEVICES.md), and [`isapi-bridge/README.md`](isapi-bridge/README.md) before installing a device. Property workflows are in [`docs/MULTI-PROPERTY-OWNERSHIP.md`](docs/MULTI-PROPERTY-OWNERSHIP.md) and [`docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md`](docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md). Proof uploads and theming are documented in [`docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md`](docs/PROOF-UPLOADS-AND-PORTAL-CUSTOMISATION.md). Private upload setup is in [`docs/GITHUB-STORAGE.md`](docs/GITHUB-STORAGE.md), people administration is in [`docs/PEOPLE-REGISTRATION-AND-IMPORTS.md`](docs/PEOPLE-REGISTRATION-AND-IMPORTS.md), and Manager and import behavior is in [`docs/MANAGERS-IMPORTS-HIKCONNECT-SITE-SYNC.md`](docs/MANAGERS-IMPORTS-HIKCONNECT-SITE-SYNC.md). Remote support access is in [`docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md`](docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md). AI agents should begin with [`AGENTS.md`](AGENTS.md).
 
 > [!TIP]
-> **No Internet at all?** The same application also runs fully offline on the estate LAN: [`local-server/`](local-server/README.md) serves the identical portal and API from one Node 22 process (SQLite file, in-process queue, WebSocket live feed, local-disk uploads) and embeds the EstateMate agent so the server itself communicates directly with the Hikvision terminals over ISAPI. Nothing is forked — the offline edition runs the exact `src/` Worker code.
+> **No Internet at all?** The same application also runs fully offline on the estate LAN: [`local-server/`](local-server/README.md) serves the identical portal and API from one Node 22 process (SQLite file, in-process queue, WebSocket live feed, local-disk uploads) and embeds the EstateMate agent so the server itself communicates directly with the Hikvision terminals over ISAPI. Nothing is forked — the offline edition runs the exact `src/` Worker code. The same offline edition is also packaged as an **Android APK** ([`bridge-apps/android-offline/`](bridge-apps/android-offline/README.md)): one phone or tablet becomes the estate server, with the Worker running in an embedded WebView engine and the same portal served from APK assets.
 
 ## Architecture
 
@@ -80,6 +80,17 @@ Hikvision terminals ── ISAPI alertStream + card commands (LAN) ──▶ emb
                                                                                                      ├── in-process queue + WebSocket live feed
                                                                                                      └── local-disk upload storage
 Browsers on the estate LAN ── HTTP ──▶ the same offline server
+```
+
+The same offline edition as an APK ([`bridge-apps/android-offline/`](bridge-apps/android-offline/README.md)):
+
+```text
+Browsers on the estate LAN ── HTTP ──▶ Android device (foreground service)
+                                         ├── WebServer (pure Java) ─ /api/* ─▶ src/index.ts Worker
+                                         │                                  running in a WebView engine
+                                         │                                  (SQLite, file storage, live feed)
+                                         ├── the React portal from APK assets (StaticFiles)
+                                         └── embedded ISAPI agent (bridge APK classes) ─▶ Hikvision terminals
 ```
 
 ## Supported Hikvision series profiles

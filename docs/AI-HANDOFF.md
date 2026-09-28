@@ -1,5 +1,71 @@
 # AI handoff — EstateMate
 
+## Offline server as an Android APK (2026-09-28)
+
+Requested as: the same offline edition packaged as an Android APK — the phone
+or tablet becomes the estate server. User explicitly chose "server-apk" (whole
+server on Android) over a thin client APK or both. Delivered as
+`bridge-apps/android-offline/` (package `com.estatemate.offline`, app label
+"EstateMate Server"), built by `scripts/build-offline-apk.py` with the repo's
+Gradle-free pure-Java APK pattern (reuses `build-bridge-apk.py` helpers by
+path-import; aapt2 `-A` assets; d8; v2 signing; `--test` runs a JVM suite).
+
+- **No product-code fork.** `scripts/bundle-offline-server.mjs` (esbuild,
+  devDep 0.28.2) bundles `src/index.ts` + hono + `server/adapter.js` into
+  `assets/server/server-bundle.js` (IIFE, global `EstateMateOfflineModule`,
+  ~405 kB) plus `boot.html`. The adapter replaces only the platform bindings:
+  D1 → `Native.d1Exec` (same JSON protocol as `local-server/d1.mjs`), Queues →
+  in-memory buffer drained by Java (`drainQueue()`), AccessLiveFeed →
+  `Native.liveBroadcast` → Java WebSocket hub, private-GitHub storage →
+  `Native.fileStore` behind the same `api.github.com` REST slice, hourly cron
+  → Java timer at minute 15 (`tickCron()`).
+- **The engine is a hidden WebView** (`JsEngine`): Android has no Node, but
+  WebView Chromium gives ES2021/fetch/WebCrypto. The page is served from APK
+  assets at `https://localhost/` through `shouldInterceptRequest` (secure
+  context → `crypto.subtle` works). Java→JS is `evaluateJavascript`
+  (`dispatch(id, json)` with base64 bodies; U+2028/2029 sanitized), JS→Java is
+  the `@JavascriptInterface Native` object (`NativeBridge`). Renderer death
+  (`onRenderProcessGone`) recreates the WebView; in-flight dispatches time out
+  503. WebView timers are throttled when backgrounded, so Java owns the
+  queue-drain (1 s) and minute-15 cron timers.
+- **Java layer** (`bridge-apps/android-offline/app/src/main/java/com/estatemate/offline/`):
+  `WebServer` (keep-alive, 8 MB cap → 413, chunked bodies + trailers,
+  100-continue, upgrade → authorizer → handler; pure `java.*`), `LiveFeedHub`
+  (RFC6455 server hub: ready/ping-pong/broadcast, close echo), `Db`
+  (SQLiteDatabase + assets `migrations/*.sql` via `SqlSplit`, the
+  comment/quote-aware statement splitter; INSERT returns `last_insert_rowid()`),
+  `StaticFiles` (portal from assets, CRC32+version ETag, immutable `/assets/`,
+  SPA fallback, traversal refusal), `ServerPrefs` (SecureRandom secrets:
+  JWT/pepper/storage/bootstrap), `ServerLog` (ring buffer + logcat),
+  `OfflineAgent` (reuses `bridge-apps/android/…/bridge/{IsapiClient,
+  AlertStreamReader,WorkerClient,BridgeConfig,Device,Json}` against
+  `http://127.0.0.1:<port>`), `OfflineService` (foreground; /api → engine,
+  other GET/HEAD → StaticFiles, upgrade probe = dispatch without Upgrade
+  header expecting the Worker's 400), `MainActivity` (status, LAN address,
+  bootstrap token, agent config, log), `BootReceiver`.
+- **Validation split (be honest about it):** the JS engine contract
+  (`npm run test:offline-adapter`, in the `npm test` chain) builds the real
+  bundle and drives the full flow against a mock Native bridge — health,
+  migrations, bootstrap/login/cookie, agent device-config + events →
+  `access_events` + live broadcast, WS probe contract (401/400), storage
+  PUT/GET/404, dispatch, cron — ALL GREEN in this sandbox. The Java side was
+  syntax-checked (javalang) and cross-reference-audited by script, but **no JDK
+  exists in the sandbox** (apt/GitHub-CDN/Maven blocked; jdk4py gives a JRE
+  without javac), so `tools/OfflineServerTest.java` (HTTP keep-alive/413/
+  chunked/100-continue, static/304/SPA, WebSocket handshake+ping/pong+
+  broadcast to 2 clients, SqlSplit) and the full APK compile run **in CI only**
+  (job `offline-server-apk` in `.github/workflows/bridge.yml`: npm ci →
+  build:web → adapter test → JVM suite → build+sign; also triggered by
+  `offline-*` tags).
+- APK assets (fail-fast enforced in the build script): `portal/` (built SPA),
+  `server/{boot.html,server-bundle.js}`, `migrations/*.sql`. Runtime state
+  (SQLite DB, file storage, prefs secrets) is app-private; secrets never leave
+  the device. Cleartext traffic is enabled deliberately (terminal VLAN HTTP +
+  loopback agent), documented in the manifest and README.
+- Docs: `bridge-apps/android-offline/README.md` (setup, build, security,
+  troubleshooting), root README (tip + architecture diagram), AGENTS.md
+  (architecture bullets + offline no-fork rule now covers the APK).
+
 ## Offline LAN edition (2026-09-28)
 
 Requested as: "replicate this app to work offline on same LAN with the access
