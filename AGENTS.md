@@ -10,7 +10,10 @@ This file is the starting point for any AI coding agent continuing EstateMate in
 4. `docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md`
 5. `docs/PEOPLE-REGISTRATION-AND-IMPORTS.md`
 6. `docs/MANAGERS-IMPORTS-HIKCONNECT-SITE-SYNC.md`
-7. Latest migrations in `migrations/`
+7. `docs/EMPLOYEE-ID-AND-BULK-PEOPLE.md`
+8. `docs/VISITOR-DEVICE-ACCOUNTS.md`
+9. `docs/ESTATE-MODULES.md`
+10. Latest migrations in `migrations/`
 
 Run `./scripts/ai-context.sh` to print a safe repository summary.
 
@@ -48,6 +51,9 @@ Retired transports: direct HTTP Listening, the Render free relay, Hikvision clou
 - Never claim a model supports QR, alertStream, ISAPI card APIs or remote commands without model/firmware evidence.
 - DS-K1T808MFWX-B is card/fingerprint/PIN oriented; DS-K2802 is a controller and needs a reader.
 - Soft-delete access devices so historical events retain referential integrity.
+- **Employee IDs are never longer than 32 characters** (the ISAPI employeeNo limit). They live on the *person* (`users.employee_id`, `household_members.employee_id`), are unique across both tables, and every place that accepts or composes one validates with `src/employee-id.ts` — never the raw 36-char UUID.
+- **A visitor pass is never deleted by the device-account lifecycle.** The lifecycle only advances `visitor_requests.device_account_state` (none → provisioned → removal_queued → removed) and manages the terminal slot; the row, gate history, and audit persist. A `checked_in` pass is never status-flipped by the sweep — an overstaying visitor physically inside the estate must stay checkable-out.
+- **Two cron schedules exist** (`wrangler.jsonc`): the hourly housekeeping job and a per-minute one that runs *only* the bounded visitor-slot release. Keep the minute job cheap — never add property/billing/pruning work to it.
 
 ## Required validation before commit
 
