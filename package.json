@@ -12,9 +12,12 @@
     "build": "npm run typecheck && npm run test && npm run build:web",
     "build:web": "npm --workspace apps/web run build",
     "typecheck": "tsc --noEmit && npm --workspace apps/web run typecheck",
-    "test": "vitest run && npm run test:isapi-bridge && npm run test:cloudflared-kit",
+    "test": "vitest run && npm run test:isapi-bridge && npm run test:cloudflared-kit && npm run test:local-server",
     "test:isapi-bridge": "node --check isapi-bridge/agent.mjs && node isapi-bridge/agent.integration.mjs && node isapi-bridge/agent.resolution.integration.mjs",
     "test:cloudflared-kit": "node --check scripts/cloudflared-remote-access.mjs && node scripts/cloudflared-remote-access.integration.mjs",
+    "test:local-server": "node --check local-server/server.mjs && node local-server/server.test.mjs",
+    "offline": "node local-server/server.mjs",
+    "offline:backup": "node local-server/backup.mjs",
     "tunnel:plan": "node scripts/cloudflared-remote-access.mjs",
     "db:migrate:local": "wrangler d1 migrations apply estatemate-db --local",
     "db:migrate:remote": "wrangler d1 migrations apply estatemate-db --remote",
@@ -22,7 +25,8 @@
     "cf:types": "wrangler types"
   },
   "dependencies": {
-    "hono": "^4.9.8"
+    "hono": "^4.9.8",
+    "ws": "^8.18.3"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260922.1",

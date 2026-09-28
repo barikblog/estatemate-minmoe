@@ -23,6 +23,10 @@ isup-gateway/isup-adapter.json
 isup-gateway/sdk/
 isup-gateway/vendor/
 
+# Offline LAN server runtime state (database, uploads, generated agent config)
+local-server/config.json
+local-server/data/
+
 *.tsbuildinfo
 
 __pycache__/

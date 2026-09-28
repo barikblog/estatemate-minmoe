@@ -1,5 +1,50 @@
 # AI handoff — EstateMate
 
+## Offline LAN edition (2026-09-28)
+
+Requested as: "replicate this app to work offline on same LAN with the access
+controls, it will communicate directly to the access controls". Delivered as
+`local-server/` — the complete application (identical portal and API) running
+as one Node 22 process on the estate LAN with zero Internet dependency:
+
+- **No product-code fork.** `local-server/server.mjs` imports `src/index.ts`
+  directly (Node type stripping plus the `local-server/ts-resolve.mjs` loader
+  hook for extensionless TS imports). Only Cloudflare bindings are replaced:
+  D1 → `node:sqlite` file (`d1.mjs`), Queues → in-process batch delivery to the
+  same `queue()` consumer with retry/dead-letter files (`queue.mjs`),
+  `AccessLiveFeed` Durable Object → a `ws` hub with the same wire protocol
+  (`live-feed.mjs`), hourly Cron → minute-15 in-process scheduler, and the
+  private-GitHub upload store → local disk under `local-server/data/storage/`
+  (`github-vfs.mjs` intercepts exactly the `api.github.com` REST slice
+  `src/github-storage.ts` uses, and seeds the `github_storage_settings` row so
+  the portal reports storage configured). Portal statics are served from
+  `apps/web/dist` with SPA fallback (`assets.mjs`).
+- **Direct communication with the access controls:** the embedded supervisor
+  (`agent-supervisor.mjs`) runs the unmodified `isapi-bridge/agent.mjs` as a
+  child process pointed at the server's loopback address — it holds the
+  ISAPI alertStream per terminal and applies card/visitor operations over
+  ISAPI Digest, exactly as on the cloud path. It can be disabled to run the
+  agent on a separate machine instead.
+- Windows-first packaging: `local-server/windows/` has a boot scheduled task
+  installer with restart wrapper and firewall rule (same mechanism as the
+  bridge exe), plus `backup.mjs` (`VACUUM INTO` snapshots) and
+  `--import-sql` for one-time `wrangler d1 export` migration onto the estate
+  server. `local-server/README.md` is the full setup guide; root README,
+  AGENTS.md and this handoff link it.
+- **Validation:** `npm run test:local-server` (in the `npm test` chain; a
+  `vitest.config.ts` was added to keep the plain-Node test out of vitest's
+  glob) boots the real server plus a fake Hikvision terminal (Digest
+  challenge, multipart alertStream, ISAPI command endpoint) and proves the
+  whole loop: health/migrations on SQLite, bootstrap+login, the GitHub-REST
+  slice, authenticated live-feed WebSocket, terminal swipe → agent → loopback
+  API → queue → `access_events` + live broadcast + device online, and card
+  issue → operation queue → agent → ISAPI → `applied`. Full gates pass:
+  typecheck, vitest, isapi-bridge, cloudflared-kit, local-server, migration
+  chain, `git diff --check`, PowerShell lint.
+- Runtime state (`local-server/config.json`, `local-server/data/`) is
+  gitignored; secrets are generated on first boot and the one-time bootstrap
+  token is printed once.
+
 ## Access-operations operator script + fingerprint slot uniqueness fix (2026-09-27)
 
 Requested as: "Retry the failed card jobs. Suspend and restore any card that was

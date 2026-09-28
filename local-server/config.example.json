@@ -1,0 +1,40 @@
+{
+  "host": "0.0.0.0",
+  "port": 8080,
+  "dataDir": "data",
+  "appName": "EstateMate",
+  "allowedOrigins": "",
+  "hikvisionMode": "per-device",
+  "fileStorage": "local",
+  "secrets": {
+    "jwtSecret": "",
+    "bootstrapToken": "",
+    "deviceIngestPepper": "",
+    "storageEncryptionKey": ""
+  },
+  "agent": {
+    "enabled": true,
+    "agentId": "",
+    "agentSecret": "",
+    "syncIntervalSeconds": 30,
+    "heartbeatIntervalSeconds": 60,
+    "eventStream": true,
+    "devices": [
+      {
+        "estateMateDeviceId": "",
+        "name": "Main Gate Terminal",
+        "isapiHost": "192.168.1.100",
+        "isapiPort": 80,
+        "isapiUsername": "admin",
+        "isapiPassword": "",
+        "protocol": "http",
+        "eventStream": true
+      }
+    ]
+  },
+  "tls": {
+    "certFile": "",
+    "keyFile": "",
+    "loopbackPort": 8081
+  }
+}
