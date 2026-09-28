@@ -1,5 +1,12 @@
 # AI handoff — EstateMate
 
+## Card-operation terminal identity guard (2026-09-28)
+
+- Both LAN bridge implementations now require the Worker-issued `employeeNo` (1–32 terminal-safe characters) for card upsert/re-enable. Missing or unsafe IDs fail before any ISAPI request; the old resident-UUID and literal-`1` fallbacks are gone. ISAPI `ResponseStatus` reasons are retained, and the stray empty-body JSON-to-XML retry was removed. Coverage: `isapi-bridge/agent.card-operations.integration.mjs` and Android `ProtocolTest`.
+- The Worker-side canonical `employee_id` and its 32-character bound are migration `0018`, already on production from PR #37. Bridge guard merged in PR #38 as `d28d03b`; Deploy EstateMate run `36362797902` succeeded, followed by production smoke run `36362850890` (health, portal config, sign-in shell and login response checks passed).
+- Rebuilt and published [EstateMate Bridge 0.2.4](https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.2.4) from `d28d03b`; tag build `36362897668` passed Node/Windows/Android bridge validation and published the Windows executable, Windows bundle and Android bridge APK with checksums.
+- Operational caveat: the release's Windows bundle is unsigned; no persistent Android release keystore was configured, so the bridge APK is debug-signed with a throwaway key and cannot update an existing differently signed install in place. Reinstalling the Android app clears its private config; obtain a fresh portal installer/secret and re-enter the terminal config if reinstall is needed. The sandbox published artifacts but did not install them on the estate's physical LAN host or test against a real terminal.
+
 ## Employee ID (32-char rule), bulk people toolkit, visitor device-account lifecycle, and the six estate modules (2026-09-27)
 
 Requested as: cap the Employee ID at 32 characters; add bulk person
