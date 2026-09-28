@@ -10,6 +10,9 @@
  *
  *   * `--version` / `--help` work without any configuration;
  *   * `init` writes configuration templates;
+ *   * the `setup` wizard turns the portal's "Download setup" script into a working
+ *     configuration (by path and piped on stdin), never echoes the agent secret,
+ *     and is never entered when there is no console to answer on;
  *   * `check` validates the config, authenticates with the Worker, parses the
  *     terminal's deviceInfo and opens its alertStream (Digest challenge included);
  *   * `run` heartbeats, forwards alertStream events in batches, applies a queued
@@ -246,10 +249,13 @@ function startFakeDevice(state) {
   return server;
 }
 
-function runCli(exe, args, { timeoutMs = 90000 } = {}) {
+function runCli(exe, args, { timeoutMs = 90000, input = null } = {}) {
   const started = Date.now();
   return new Promise((resolve) => {
-    const child = spawn(exe, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(exe, args, { windowsHide: true, stdio: [input === null ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
+    // `--from-installer -` reads the script from stdin, which is how a technician
+    // pipes the portal's file in: Get-Content installer.ps1 | .\exe setup --from-installer -
+    if (input !== null) child.stdin.end(input);
     let stdout = '';
     let stderr = '';
     const timer = setTimeout(() => terminate(child), timeoutMs);
@@ -306,6 +312,37 @@ function readLogLines(file) {
   } catch {
     return '';
   }
+}
+
+function readJsonIfExists(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The file the portal's "Download setup" button produces for a Windows agent,
+ * reduced to what the setup wizard parses: `$agentId`, `$agentSecret`,
+ * `$installerKey` and `$workerUrl`. Kept byte-shaped like the Worker's
+ * /api/isapi/agents/:id/installer response on purpose — if the portal ever
+ * renames one of those variables, this test fails before a technician sees
+ * "no agentId/agentSecret found".
+ */
+function portalInstallerScript({ agentId, agentSecret, installerKey, workerUrl, name = 'Smoke PC' }) {
+  return `# EstateMate Windows ISAPI Agent Installer
+# Agent: ${name} (${agentId})
+# This script is one-time use and expires in 24 hours.
+
+$ErrorActionPreference = "Stop"
+Write-Host "Installing EstateMate ISAPI Bridge Agent..." -ForegroundColor Cyan
+
+$agentId = "${agentId}"
+$agentSecret = "${agentSecret}"
+$installerKey = "${installerKey}"
+$workerUrl = "${workerUrl}"
+`;
 }
 
 async function main() {
@@ -372,6 +409,102 @@ async function main() {
     const init = await runCli(exe, ['init', '--data-dir', initDir, '--no-prompt']);
     const initFiles = ['agent-config.json', 'isapi-devices.json'].filter((name) => fs.existsSync(path.join(initDir, name)));
     check('init writes configuration templates', init.status === 0 && initFiles.length === 2, `${init.stderr}${init.stdout}`.slice(-300));
+
+    // 1b. Nothing to answer with: the wizard must never be entered when there is
+    //     no console. A Scheduled Task or a service starts this executable with
+    //     no arguments on a machine whose configuration is not there yet, and it
+    //     has to fail with instructions rather than wait for a keypress forever.
+    const headless = await runCli(exe, [], { timeoutMs: 20000 });
+    const headlessText = `${headless.stdout}${headless.stderr}`;
+    check(
+      'an unconfigured exe with no console refuses instead of prompting',
+      headless.status === 2 && /cannot start until the configuration is fixed/i.test(headlessText) && !/Installer script path/i.test(headlessText),
+      `status=${headless.status} ${headlessText}`.slice(-400),
+    );
+
+    // 1c. The setup wizard: the portal's "Download setup" file becomes a working
+    //     configuration with no hand-edited JSON, which is what the executable on
+    //     the releases page is expected to do first on an estate PC.
+    const wizardDir = path.join(workDir, 'wizard');
+    const installerPath = path.join(workDir, 'estatemate-isapi-agent.ps1');
+    const installerKey = `installer-${randomUUID()}`;
+    const wizardSecret = `wizard-${randomUUID()}-secret`;
+    const installerScript = portalInstallerScript({
+      agentId: state.agentId,
+      agentSecret: wizardSecret,
+      installerKey,
+      workerUrl: `http://127.0.0.1:${workerPort}`,
+    });
+    fs.writeFileSync(installerPath, installerScript);
+
+    const wizardDevicesPath = path.join(workDir, 'wizard-devices.json');
+    const wizardDevice = {
+      estateMateDeviceId: state.deviceId,
+      name: 'Wizard terminal',
+      isapiHost: '127.0.0.1',
+      isapiPort: devicePort,
+      isapiUsername: state.user,
+      isapiPassword: state.password,
+      protocol: 'http',
+      enabled: true,
+      eventStream: false,
+    };
+    fs.writeFileSync(wizardDevicesPath, `${JSON.stringify({ devices: [wizardDevice] }, null, 2)}\n`);
+
+    const wizard = await runCli(exe, [
+      'setup',
+      '--no-prompt',
+      '--no-verify',
+      '--from-installer',
+      installerPath,
+      '--devices-json',
+      wizardDevicesPath,
+      '--data-dir',
+      wizardDir,
+      '--log-file',
+      path.join(wizardDir, 'bridge.log'),
+    ]);
+    const wizardOutput = `${wizard.stdout}${wizard.stderr}`;
+    const wizardConfig = readJsonIfExists(path.join(wizardDir, 'agent-config.json'));
+    const wizardDevices = readJsonIfExists(path.join(wizardDir, 'isapi-devices.json'));
+    check(
+      'setup wizard accepts the portal installer script',
+      wizard.status === 0 && Boolean(wizardConfig) && wizardConfig.agentId === state.agentId,
+      `status=${wizard.status} ${wizardOutput}`.slice(-400),
+    );
+    check(
+      'setup wizard writes the agent secret, Worker URL and installer key',
+      Boolean(wizardConfig) &&
+        wizardConfig.agentSecret === wizardSecret &&
+        wizardConfig.workerUrl === `http://127.0.0.1:${workerPort}` &&
+        wizardConfig.installerKey === installerKey,
+      JSON.stringify(wizardConfig && { ...wizardConfig, agentSecret: '***' }),
+    );
+    check(
+      'setup wizard writes the terminal list it was given',
+      Boolean(wizardDevices) &&
+        wizardDevices.devices?.length === 1 &&
+        wizardDevices.devices[0].isapiHost === '127.0.0.1' &&
+        Number(wizardDevices.devices[0].isapiPort) === devicePort &&
+        wizardDevices.devices[0].estateMateDeviceId === state.deviceId,
+      JSON.stringify(wizardDevices),
+    );
+    check('setup wizard never echoes the agent secret', !wizardOutput.includes(wizardSecret), 'the one-time secret appeared in the wizard output');
+    check('setup wizard reports the next commands', /Setup complete/i.test(wizardOutput) && /install-service/.test(wizardOutput), wizardOutput.slice(-300));
+
+    // The same wizard, with the installer piped in instead of named.
+    const pipedDir = path.join(workDir, 'wizard-piped');
+    const piped = await runCli(
+      exe,
+      ['setup', '--no-prompt', '--no-verify', '--from-installer', '-', '--devices-json', wizardDevicesPath, '--data-dir', pipedDir, '--log-file', path.join(pipedDir, 'bridge.log')],
+      { input: installerScript },
+    );
+    const pipedConfig = readJsonIfExists(path.join(pipedDir, 'agent-config.json'));
+    check(
+      'setup wizard reads the installer from stdin (--from-installer -)',
+      piped.status === 0 && Boolean(pipedConfig) && pipedConfig.agentId === state.agentId && pipedConfig.agentSecret === wizardSecret,
+      `status=${piped.status} ${piped.stderr}${piped.stdout}`.slice(-300),
+    );
 
     // 2. Real configuration pointing at the fake Worker and the fake terminal.
     fs.writeFileSync(
