@@ -48,16 +48,24 @@ protocol documentation.
    the one thing worth carrying to the PC: nothing above has to be retyped, and
    neither does the EstateMate device id — the bridge resolves each terminal from
    the portal by its LAN address.
-3. **Estate PC** — copy `estatemate-bridge.exe` and the `.ps1` to the PC, then in
-   PowerShell:
+3. **Estate PC** — copy `estatemate-bridge.exe` and the `.ps1` to the PC. On a PC
+   that has no configuration yet, **double-click the executable**: it notices the
+   missing configuration, says so, and starts the setup wizard itself. The wizard
+   asks for the `.ps1` (paste its path; typing the agent id and secret by hand
+   still works), adds each Hikvision terminal with a reachability test while you
+   are still on site, and writes both configuration files with administrator-only
+   permissions. From PowerShell the same three commands are:
 
    ```powershell
-   .\estatemate-bridge.exe setup            # asks for the installer script path
+   .\estatemate-bridge.exe setup            # the wizard; asks for the installer script path
    .\estatemate-bridge.exe check            # Worker + every terminal, one report
    .\estatemate-bridge.exe install-service  # Administrator shell: start at boot
    ```
 
-   `setup` writes both configuration files, restricts their ACL to
+   The wizard only starts itself for a bare double-click: with any option, a
+   command, `--no-prompt`, or no console at all (a Scheduled Task, a service, a
+   redirected `cmd /c`) the executable behaves exactly as before, so a service is
+   never left waiting for an answer. `setup` writes both configuration files, restricts their ACL to
    Administrators + SYSTEM and can test each terminal while you are still on
    site. `check` is the pre-flight: it authenticates with the Worker, lists the
    devices the portal believes are linked and probes each terminal over ISAPI
