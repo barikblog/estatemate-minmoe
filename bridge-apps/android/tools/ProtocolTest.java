@@ -257,6 +257,31 @@ public final class ProtocolTest {
         IsapiClient.OpResult unknown = client.applyOperation(device, "teleport_resident", payload);
         check("unknown operations fail cleanly", !unknown.success && unknown.error.contains("Unknown operation"));
 
+        // EstateMate issues every employee number; the bridge never guesses one. The
+        // old fallbacks (the 36-character resident id, or a literal "1") either
+        // failed on the terminal or bound the card to the wrong person.
+        int recordsBefore = fake.cardRecords.size() + fake.xmlCardRecords.size();
+        Map<String, Object> anonymous = new LinkedHashMap<String, Object>();
+        anonymous.put("cardUid", "55554444");
+        anonymous.put("residentId", "0b9d3c2e-6a4f-4c1e-9d7a-2f5e8b1c4a90");
+        IsapiClient.OpResult refused = client.applyOperation(device, "enable_card", anonymous);
+        check("a card operation without an employee number is refused",
+                !refused.success && refused.error != null && refused.error.contains("employee number"), String.valueOf(refused.error));
+        Map<String, Object> unsafe = new LinkedHashMap<String, Object>();
+        unsafe.put("cardUid", "55554444");
+        unsafe.put("employeeNo", "</employeeNo><cardNo>1");
+        IsapiClient.OpResult unsafeResult = client.applyOperation(device, "upsert_card", unsafe);
+        check("an employee number a terminal cannot take is refused", !unsafeResult.success, String.valueOf(unsafeResult.error));
+        check("nothing reaches the terminal without a valid employee number",
+                fake.cardRecords.size() + fake.xmlCardRecords.size() == recordsBefore, fake.cardRecords.toString());
+        String rejection = IsapiClient.describeFailure(400,
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ResponseStatus version=\"2.0\" xmlns=\"http://www.hikvision.com/ver20/XMLSchema\">"
+                        + "<requestURL>/ISAPI/AccessControl/CardInfo/Record</requestURL><statusCode>6</statusCode>"
+                        + "<statusString>Invalid Content</statusString><subStatusCode>badParameters</subStatusCode>"
+                        + "<errorMsg>employeeNo</errorMsg></ResponseStatus>");
+        check("an ISAPI rejection is summarised from its ResponseStatus",
+                "ISAPI 400: Invalid Content / badParameters / employeeNo".equals(rejection), rejection);
+
         // Older firmware: the JSON card endpoint answers 400 and the XML one is used.
         fake.rejectJsonCards = true;
         Map<String, Object> fallbackPayload = new LinkedHashMap<String, Object>();

@@ -1,5 +1,23 @@
 # AI handoff — EstateMate
 
+## Bridge setup wizard on first run, and the wizard release gate (2026-09-28)
+
+Requested as: "publish the wizard in a GitHub release" / "create a new exe bridge file with setup wizard".
+
+- **Released [EstateMate Bridge 0.2.5](https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.2.5)** from main `5d738cc` (tag build `36387280074`, published 2026-09-28T06:41:45Z): `estatemate-bridge-win-x64.exe` (87,348,736 B), `estatemate-bridge-0.2.5.apk`, `estatemate-android-bridge-0.2.5-debug.apk`, `estatemate-isapi-agent-win-x64-bridge-0.2.5.zip`, per-family `SHA256SUMS.txt`, `BUILD-INFO.json`, `README.txt`, `SIGNING.txt`, `estatemate-bridge-android-fix.zip`. Release notes now carry a **Setup wizard** section.
+- **The wizard itself already shipped** inside the exe (`bridge-apps/windows/host/setup.cjs`, the `setup` command) since `bridge-0.2.1`; earlier notes never mentioned it and no gate ever ran it. What changed in PR #40 is discovery and proof, not the wizard.
+- **First-run handoff** (`bridge-apps/windows/host/cli.cjs`): a bare double-click on a machine with no `agent-config.json` now says so and runs the same `setup` wizard. Deliberately narrow — no command typed, **no option at all**, `configExists=false`, and stdin+stdout both TTYs. `run` typed on purpose (the Scheduled Task), services, pipes and `--data-dir`/`--no-prompt`/`--quiet`/`--json` are unchanged (exit 2 + `Run "… setup"`).
+- **Wizard checks are now a release gate** (`scripts/bridge-exe-smoke-test.mjs`): the portal installer by path and via `--from-installer -` on stdin, both written files parsed (agent id, secret, Worker URL, installer key, terminal list), the one-time secret never echoed, the next commands printed, and an unconfigured exe **with no console** refusing instead of prompting (20 s budget, so a prompt hang fails the release). 27/27 checks pass on the Windows artifact in every bridge build.
+- **Not changed:** the zip bundle still installs non-interactively (`install-service.ps1 -AgentId -AgentSecret`); the Android bridge is untouched. Only the single-file exe carries the wizard.
+- Local trap worth knowing: `bridge-apps/windows/host/cli.cjs` is a library, not an entry point — `node bridge-apps/windows/host/cli.cjs …` exits 0 printing nothing. Exercise it through the packaged exe, or through a harness that calls `runCli(meta)` with a runtime directory holding the host files and `agent/agent.mjs`.
+
+## Card-operation terminal identity guard (2026-09-28)
+
+- Both LAN bridge implementations now require the Worker-issued `employeeNo` (1–32 terminal-safe characters) for card upsert/re-enable. Missing or unsafe IDs fail before any ISAPI request; the old resident-UUID and literal-`1` fallbacks are gone. ISAPI `ResponseStatus` reasons are retained, and the stray empty-body JSON-to-XML retry was removed. Coverage: `isapi-bridge/agent.card-operations.integration.mjs` and Android `ProtocolTest`.
+- The Worker-side canonical `employee_id` and its 32-character bound are migration `0018`, already on production from PR #37. Bridge guard merged in PR #38 as `d28d03b`; Deploy EstateMate run `36362797902` succeeded, followed by production smoke run `36362850890` (health, portal config, sign-in shell and login response checks passed).
+- Rebuilt and published [EstateMate Bridge 0.2.4](https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.2.4) from `d28d03b`; tag build `36362897668` passed Node/Windows/Android bridge validation and published the Windows executable, Windows bundle and Android bridge APK with checksums.
+- Operational caveat: the release's Windows bundle is unsigned; no persistent Android release keystore was configured, so the bridge APK is debug-signed with a throwaway key and cannot update an existing differently signed install in place. Reinstalling the Android app clears its private config; obtain a fresh portal installer/secret and re-enter the terminal config if reinstall is needed. The sandbox published artifacts but did not install them on the estate's physical LAN host or test against a real terminal.
+
 ## Employee ID (32-char rule), bulk people toolkit, visitor device-account lifecycle, and the six estate modules (2026-09-27)
 
 Requested as: cap the Employee ID at 32 characters; add bulk person

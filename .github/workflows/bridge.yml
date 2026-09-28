@@ -832,6 +832,13 @@ jobs:
             echo "- **Android APK** (\`estatemate-android-*-debug.apk\`, plus \`-release.apk\` when signing secrets are configured)."
             echo "- Checksums for each artifact family, as \`SHA256SUMS.txt\` - qualified with the family name where two would otherwise collide, since release asset names are flat."
             echo
+            echo "### Setup wizard"
+            echo "The executable carries the interactive **setup wizard** (\`estatemate-bridge.exe setup\`): it reads the portal's **Download setup** script (\`--from-installer\`, or \`--from-installer -\` on stdin), adds each Hikvision terminal with a reachability test while you are still on site, and writes \`agent-config.json\` / \`isapi-devices.json\` with administrator-only permissions."
+            echo
+            echo "On a PC with no configuration yet, **double-clicking the executable starts the wizard** - it explains the missing configuration instead of failing with a path. Only a bare double-click does this: any command or option (\`run\`, \`--data-dir\`, \`--no-prompt\`, \`--quiet\`, \`--json\`), a Scheduled Task, a service or a pipe keeps the previous behaviour, so nothing unattended is ever left waiting for an answer."
+            echo
+            echo "Every release is smoke-tested end to end on Windows before it is published, the wizard included: \`setup --no-prompt --from-installer\` by path and from stdin, the content of both files it writes, that the one-time agent secret is never echoed, and that an unconfigured executable with no console refuses instead of prompting."
+            echo
             echo "### Windows install"
             echo "Unzip to \`C:\\EstateMate\\ISAPI-Agent\`, then in an Administrator PowerShell:"
             echo
