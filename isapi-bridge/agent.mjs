@@ -575,10 +575,41 @@ async function deviceEventLoop(device) {
   log('info', `Event stream stopped for ${device.name}`);
 }
 
+// The person a terminal files a card under is the holder's employee number,
+// issued by EstateMate and sent with every card operation. The agent never
+// invents one: it used to fall back to the resident's user id (36 characters —
+// terminals refuse person IDs over 32 bytes) or to a literal "1", which attached
+// a re-enabled card to whoever terminal person 1 was and still reported success.
+// Only values a terminal accepts and that are safe inside the XML body pass.
+const TERMINAL_EMPLOYEE_NO = /^[A-Za-z0-9_-]{1,32}$/;
+
+function terminalEmployeeNo(payload) {
+  const value = String(payload.employeeNo ?? '').trim();
+  return TERMINAL_EMPLOYEE_NO.test(value) ? value : null;
+}
+
+/**
+ * A short, readable reason for an ISAPI rejection. Hikvision answers with a
+ * ResponseStatus (JSON or XML); its statusString / subStatusCode / errorMsg name
+ * the cause, e.g. "Invalid Content / badParameters / employeeNo". A raw 200-byte
+ * slice of the XML used to cut off right before that field name.
+ */
+function describeIsapiFailure(result) {
+  const body = String(result.body || '');
+  const field = (name) => {
+    const json = new RegExp(`"${name}"\\s*:\\s*"([^"]*)"`).exec(body);
+    if (json) return json[1];
+    const xml = new RegExp(`<${name}>([^<]*)</${name}>`).exec(body);
+    return xml ? xml[1] : '';
+  };
+  const reason = [field('statusString'), field('subStatusCode'), field('errorMsg')].filter(Boolean).join(' / ');
+  return `ISAPI ${result.status}: ${reason || body.slice(0, 200)}`;
+}
+
 async function applyCardOperation(device, operation) {
   const payload = operation.payload || {};
   const cardUid = payload.cardUid || payload.cardNo || payload.card_number;
-  const employeeNo = payload.employeeNo || payload.residentId || '1';
+  const employeeNo = terminalEmployeeNo(payload);
   const op = operation.operation;
 
   log('info', `Applying ${op} for device ${device.name} (${device.estateMateDeviceId}) card=${cardUid} opId=${operation.id}`);
@@ -588,6 +619,10 @@ async function applyCardOperation(device, operation) {
 
   try {
     if (op === 'upsert_card' || op === 'enable_card') {
+      if (!cardUid) return { success: false, error: 'operation has no card number' };
+      if (!employeeNo) {
+        return { success: false, error: 'operation has no valid EstateMate employee number; refusing to guess which terminal person owns the card' };
+      }
       // Check if card exists
       // PUT /ISAPI/AccessControl/CardInfo/Record?format=json or /ISAPI/AccessControl/CardInfo/SetUp?format=json
       // For simplicity, we attempt to create/update card via ISAPI JSON if supported.
@@ -607,11 +642,10 @@ async function applyCardOperation(device, operation) {
         },
       };
 
-      let result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/CardInfo/Record?format=json', JSON.stringify(jsonBody), false);
+      const jsonResult = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/CardInfo/Record?format=json', JSON.stringify(jsonBody), false);
+      let result = jsonResult;
       if (result.status >= 400) {
-        // Fallback to XML
-        result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/CardInfo/Record?format=json', null);
-        // Try XML endpoint
+        // Older firmware only accepts the XML form.
         result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/CardInfo/Record', cardXml, true);
       }
 
@@ -622,7 +656,12 @@ async function applyCardOperation(device, operation) {
         log('warn', `Card upsert failed on ${device.name}: ${result.status} ${result.body.slice(0, 500)}`);
         // Some devices return 200 with error in body, parse
         if (result.body.includes('ok') || result.body.includes('success')) return { success: true };
-        return { success: false, error: `ISAPI ${result.status}: ${result.body.slice(0, 200)}` };
+        // Report both answers when the XML retry also failed: the JSON one is
+        // usually the firmware's real objection.
+        const reason = result === jsonResult
+          ? describeIsapiFailure(result)
+          : `${describeIsapiFailure(jsonResult)}; XML retry ${describeIsapiFailure(result)}`;
+        return { success: false, error: reason };
       }
     } else if (op === 'disable_card' || op === 'delete_card') {
       // Delete or disable - for disable we could update card status, but many firmwares only support delete.
@@ -646,7 +685,7 @@ async function applyCardOperation(device, operation) {
         log('warn', `Card delete failed on ${device.name}: ${result.status} ${result.body.slice(0, 500)}`);
         // If card not found, treat as success (idempotent)
         if (result.body.includes('not exist') || result.body.includes('not found') || result.status === 404) return { success: true };
-        return { success: false, error: `ISAPI ${result.status}: ${result.body.slice(0, 200)}` };
+        return { success: false, error: describeIsapiFailure(result) };
       }
     } else if (op === 'revoke_visitor') {
       const visitorCard = payload.credentialNumber || cardUid;
@@ -817,6 +856,11 @@ export {
   // reuses the digest/basic ISAPI client instead of reimplementing it, so there
   // is exactly one place where Hikvision authentication is spelled out.
   isapiRequest,
+  // Exported for the card-operation integration checks, which drive the
+  // employee-number rules against a simulated terminal without the main loops.
+  applyCardOperation,
+  describeIsapiFailure,
+  terminalEmployeeNo,
   resolveDeviceIds,
   isUuid,
   buildDigestAuthHeader,

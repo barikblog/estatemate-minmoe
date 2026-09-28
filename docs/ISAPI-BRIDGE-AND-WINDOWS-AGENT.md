@@ -27,6 +27,10 @@ The ISAPI bridge is a small Node.js agent that runs on the same LAN as Hikvision
 
 No SDK required — uses documented ISAPI endpoints available on most K1T, K26xx, K27xx/K28xx when accessed from LAN.
 
+### Card identity guard
+
+Card upsert and re-enable operations must carry the holder's canonical EstateMate `employee_id`, which is bounded to 32 characters by migration `0018` and the terminal's ISAPI limit. Both the Node and Android bridge validate it before making a terminal request. A missing or unsafe value fails closed; the bridge never substitutes the resident's 36-character UUID or a guessed `1` (which could attach the card to another terminal person). ISAPI `ResponseStatus` fields are included in failure diagnostics so a terminal rejection such as `Invalid Content / badParameters / employeeNo` remains actionable. Regression coverage is in `isapi-bridge/agent.card-operations.integration.mjs` and the Android `ProtocolTest`.
+
 ## Presence: how online/offline is decided
 
 - **Agent** — online while it heartbeats; offline after **3 minutes** without one (3 missed default heartbeats).

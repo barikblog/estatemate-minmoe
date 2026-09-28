@@ -22,6 +22,14 @@ import java.util.Map;
 public final class IsapiClient {
     private static final int MAX_BODY = 512 * 1024;
 
+    /**
+     * What a terminal accepts as a person ID and what is safe inside the XML body.
+     * EstateMate issues every employee number (nine digits) and sends it with each
+     * card operation; the bridge never invents one.
+     */
+    private static final java.util.regex.Pattern TERMINAL_EMPLOYEE_NO =
+            java.util.regex.Pattern.compile("[A-Za-z0-9_-]{1,32}");
+
     private final int timeoutMs;
 
     public IsapiClient(int timeoutMs) {
@@ -316,15 +324,18 @@ public final class IsapiClient {
                 Json.string(payload, "cardUid", null),
                 Json.string(payload, "cardNo", null),
                 Json.string(payload, "card_number", null));
-        String employeeNo = firstNonEmpty(
-                Json.string(payload, "employeeNo", null),
-                Json.string(payload, "residentId", null),
-                "1");
+        // No fallback: the resident id is 36 characters (terminals refuse person IDs
+        // over 32 bytes) and a literal "1" attached a re-enabled card to whoever
+        // terminal person 1 was, while still reporting success.
+        String employeeNo = terminalEmployeeNo(Json.string(payload, "employeeNo", null));
         BridgeLog.append("info", "applying " + op + " on " + device.name + " card=" + cardUid);
 
         try {
             if (op.equals("upsert_card") || op.equals("enable_card")) {
                 if (cardUid == null) return new OpResult(false, "operation has no card number");
+                if (employeeNo == null) {
+                    return new OpResult(false, "operation has no valid EstateMate employee number; refusing to guess which terminal person owns the card");
+                }
                 Map<String, Object> card = new LinkedHashMap<String, Object>();
                 card.put("employeeNo", employeeNo);
                 card.put("cardNo", cardUid);
@@ -431,8 +442,45 @@ public final class IsapiClient {
         if (tolerateMissing && (lower.contains("not exist") || lower.contains("not found") || response.status == 404)) {
             return new OpResult(true, null);
         }
-        String snippet = body.length() > 200 ? body.substring(0, 200) : body;
-        return new OpResult(false, "ISAPI " + response.status + ": " + snippet);
+        return new OpResult(false, describeFailure(response.status, body));
+    }
+
+    /**
+     * A short reason for an ISAPI rejection, read from the ResponseStatus the
+     * terminal returns (JSON or XML): "Invalid Content / badParameters /
+     * employeeNo". A raw 200-byte slice of the XML cut off right before the field
+     * name that explains the failure.
+     */
+    static String describeFailure(int status, String body) {
+        String text = body == null ? "" : body;
+        StringBuilder reason = new StringBuilder();
+        String[] fields = { "statusString", "subStatusCode", "errorMsg" };
+        for (int i = 0; i < fields.length; i++) {
+            String value = responseField(text, fields[i]);
+            if (value == null) continue;
+            if (reason.length() > 0) reason.append(" / ");
+            reason.append(value);
+        }
+        if (reason.length() == 0) reason.append(text.length() > 200 ? text.substring(0, 200) : text);
+        return "ISAPI " + status + ": " + reason;
+    }
+
+    private static String responseField(String text, String name) {
+        java.util.regex.Matcher json = java.util.regex.Pattern
+                .compile("\"" + name + "\"\\s*:\\s*\"([^\"]*)\"")
+                .matcher(text);
+        if (json.find() && !json.group(1).trim().isEmpty()) return json.group(1).trim();
+        return tag(text, name);
+    }
+
+    /**
+     * The card holder's EstateMate-issued employee number from an operation
+     * payload, or null when it is missing or not a value a terminal accepts.
+     */
+    static String terminalEmployeeNo(String value) {
+        if (value == null) return null;
+        String trimmed = value.trim();
+        return TERMINAL_EMPLOYEE_NO.matcher(trimmed).matches() ? trimmed : null;
     }
 
     private static String doorCommand(String operation) {
