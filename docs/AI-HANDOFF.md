@@ -1,5 +1,50 @@
 # AI handoff — EstateMate
 
+## Bridge MSI installer (2026-10-01)
+
+Requested as: "exe file is not installing please create a msi file". Root cause
+of the report: `estatemate-bridge-win-x64.exe` is a console tool, not an
+installer — double-clicking it runs `run`, flashes a console and exits, which
+reads as "not installing". Delivered an MSI alongside the exe (same
+`bridge-exe` CI job, same release):
+
+- **`bridge-apps/windows/msi/estatemate-bridge.wxs`** (WiX v3): per-machine
+  x64 install to `C:\Program Files\EstateMate Bridge`, stable UpgradeCode
+  `BE4C3E0B-…` with `MajorUpgrade` (same-version reinstalls allowed), Start
+  Menu shortcuts that open consoles that STAY OPEN (Console/Check/Status via
+  `cmd /K estatemate-bridge.exe …`, working dir = install dir), App Paths
+  (Win+R `estatemate-bridge`), install dir appended to the system PATH,
+  Programs-and-Features entry. Deliberately does NOT register the boot task
+  (needs portal credentials first) and never touches `%ProgramData%\EstateMate`
+  (config/secrets/logs survive uninstall). `light -sice:ICE43` because the
+  per-machine non-advertised shortcuts have a file keypath, not HKCU (the
+  per-user repair nuance ICE43 polices does not apply); all other ICEs run.
+- **`scripts/package-bridge-msi.mjs`**: stages the exe (renamed
+  `estatemate-bridge.exe`) + a generated README.txt, discovers candle/light
+  (PATH, `%WIX%\bin`, `C:\Program Files (x86)\WiX Toolset v3.14\bin` etc.),
+  runs `candle -arch x64 -dVersion/-dExeSource/-dReadmeSource` + `light
+  -sice:ICE43`, validates MSI ProductVersion (numeric, each field < 65536),
+  writes SHA256SUMS.txt/BUILD-INFO.json. `--dry-run` stages and prints the
+  commands (works on any OS — used for local testing).
+- **CI (`bridge-exe` job)**: builds the MSI with the runner's preinstalled
+  WiX v3.14, then **installs it silently** (`msiexec /i … /qn`), asserts the
+  installed exe exists, runs `estatemate-bridge version` AND the full
+  `bridge-exe-smoke-test.mjs` against the installed copy, verifies the machine
+  PATH + App Paths registry values, uninstalls (`/x /qn`) and asserts removal.
+  Uploads artifact `bridge-msi`; `publish-release` now needs it and the release
+  notes list the MSI as the recommended install. Unsigned (no code-signing
+  certificate — the README documents *More info → Run anyway* / *Unblock*).
+- Docs: `bridge-apps/windows/README.md` gained an *Installing* section (MSI
+  recommended vs portable exe, SmartScreen note, what the MSI does not do),
+  MSI build instructions, and troubleshooting rows (SmartScreen, stale PATH in
+  already-open shells). AGENTS.md artifact bullet updated.
+- **Validation status (honest):** `node --check`, dry-run staging on Linux
+  (payload + commands + error paths), XML well-formedness and structure check
+  of the .wxs, YAML parse of the workflow. The actual candle/light compile,
+  ICE validation and the install/smoke/uninstall cycle run in CI only — this
+  sandbox has no Windows and no WiX (Microsoft CDNs/Maven blocked). The first
+  CI run on the pushed branch is the compile check.
+
 ## Offline server as an Android APK (2026-09-28)
 
 Requested as: the same offline edition packaged as an Android APK — the phone

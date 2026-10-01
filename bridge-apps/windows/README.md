@@ -35,6 +35,33 @@ protocol documentation.
 > port-forward ISAPI or the device web UI to the Internet. The bridge only ever
 > makes *outbound* connections.
 
+## Installing
+
+Two shapes, same agent:
+
+| | How | Best for |
+|---|---|---|
+| **MSI installer** (`estatemate-bridge-<version>-win-x64.msi`) | Double-click, or `msiexec /i <file>`. Installs to `C:\Program Files\EstateMate Bridge`, adds Start Menu shortcuts, puts `estatemate-bridge` on the PATH and in *Settings → Apps* for upgrades/uninstall. | A PC the estate keeps — the normal case. |
+| **Portable exe** (`estatemate-bridge-win-x64.exe`) | Copy anywhere and run; no install, no admin. | USB sticks, testing, machines you may not install on. |
+
+If double-clicking the **exe** seemed to do nothing: it is a console tool, not an
+installer — the window opens, prints and closes. That is exactly what the MSI
+removes: its *EstateMate Bridge Console* / *Check configuration* / *Service
+status* shortcuts open console windows that **stay open** in the install
+directory.
+
+> The build is unsigned (this project uses no code-signing certificate). If
+> Windows shows *"Windows protected your PC"*, choose **More info → Run
+> anyway**, or right-click the file → **Properties → Unblock** first.
+
+### What the MSI deliberately does *not* do
+
+* It does **not** register the start-at-boot task — that needs the agent
+  credentials from the portal first (the `setup` → `check` → `install-service`
+  steps below).
+* It never touches `%ProgramData%\EstateMate`, so configuration, secrets and
+  logs survive every upgrade and uninstall.
+
 ## Five-minute setup
 
 1. **Portal** — sign in as Administrator → *Device agent* →
@@ -48,14 +75,18 @@ protocol documentation.
    the one thing worth carrying to the PC: nothing above has to be retyped, and
    neither does the EstateMate device id — the bridge resolves each terminal from
    the portal by its LAN address.
-3. **Estate PC** — copy `estatemate-bridge.exe` and the `.ps1` to the PC, then in
-   PowerShell:
+3. **Estate PC** — install the MSI (or copy the exe and the `.ps1` to the PC),
+   then in PowerShell — the Start Menu's *EstateMate Bridge Console* is the
+   same thing, already open in the right directory:
 
    ```powershell
-   .\estatemate-bridge.exe setup            # asks for the installer script path
-   .\estatemate-bridge.exe check            # Worker + every terminal, one report
-   .\estatemate-bridge.exe install-service  # Administrator shell: start at boot
+   estatemate-bridge setup            # asks for the installer script path
+   estatemate-bridge check            # Worker + every terminal, one report
+   estatemate-bridge install-service  # Administrator shell: start at boot
    ```
+
+   (With the portable exe the commands are `.\estatemate-bridge.exe setup` and
+   so on.)
 
    `setup` writes both configuration files, restricts their ACL to
    Administrators + SYSTEM and can test each terminal while you are still on
@@ -145,6 +176,8 @@ startup rather than silently dropping the events it reads.
 | **alertStream did not open** | The terminal refuses a second stream — only one alertStream connection per device is allowed. Close the browser tab or iVMS session that is holding one. |
 | Events arrive but the portal shows nothing | The device is not linked to *this* agent in the portal: re-run **Connect terminal**. |
 | `install-service` says **Access is denied** | Run it from an Administrator PowerShell. |
+| The MSI shows *"Windows protected your PC"* | The build is unsigned: **More info → Run anyway**, or right-click the MSI → *Properties → Unblock*. |
+| After installing the MSI, `estatemate-bridge` is "not recognized" | Open a **new** console — Windows does not refresh PATH in windows that were already open. (Win+R `estatemate-bridge` works immediately.) |
 | Task exists but nothing happens after reboot | `schtasks /Query /TN EstateMateBridge /V /FO LIST`, then read `%ProgramData%\EstateMate\logs\bridge.log`. |
 
 Logs: `<data-dir>\logs\bridge.log` (rotated at 5 MB to `bridge.log.1`).
@@ -179,8 +212,26 @@ node scripts/package-bridge-exe.mjs \
 node scripts/bridge-exe-smoke-test.mjs --exe dist/bridge/estatemate-bridge-win-x64.exe
 ```
 
+Building the **MSI** on top of that (Windows + the [WiX Toolset v3](https://wixtoolset.org),
+which the GitHub Actions `windows-latest` runner ships preinstalled):
+
+```powershell
+node scripts/package-bridge-msi.mjs `
+  --exe dist/bridge/estatemate-bridge-win-x64.exe `
+  --out dist/bridge-msi --version 0.2.0
+
+# Install/uninstall silently, the way CI proves it:
+msiexec /i dist\bridge-msi\estatemate-bridge-0.2.0-win-x64.msi /qn
+msiexec /x dist\bridge-msi\estatemate-bridge-0.2.0-win-x64.msi /qn
+```
+
+The installer source is [`msi/estatemate-bridge.wxs`](msi/estatemate-bridge.wxs)
+(what goes where, and what it deliberately never touches). `--dry-run` stages
+the payload and prints the `candle`/`light` commands, which works on any OS.
+
 Targets: `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `darwin-x64`,
-`darwin-arm64` — the same host supports Linux and macOS estates.
+`darwin-arm64` — the same host supports Linux and macOS estates. (The MSI is
+x64-only, matching the exe CI builds today.)
 
 HTTPS terminals with self-signed certificates are **not** trusted: use `http` on
 the isolated device VLAN (recommended, and what the portal documentation

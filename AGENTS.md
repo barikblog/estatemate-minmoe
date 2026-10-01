@@ -29,7 +29,7 @@ Retired transports: direct HTTP Listening, the Render free relay, Hikvision clou
 - The only access-device transport: `isapi-bridge/` agent (+ `windows-agent/` Windows Service wrapper)
 - Pull-request quality gate (no deploy, no credentials): `.github/workflows/ci.yml`, backed by `scripts/ci-checks.sh` for the PR-relative checks
 - CI deployment: `.github/workflows/deploy.yml`
-- Client artifact builds (Windows agent bundle + Android APKs): `.github/workflows/bridge.yml`, on `bridge-*` tags (the offline server APK job also runs on `offline-*` tags)
+- Client artifact builds (Windows agent bundle + Android APKs): `.github/workflows/bridge.yml`, on `bridge-*` tags (the offline server APK job also runs on `offline-*` tags). The Windows bridge is shipped both as a portable single-file exe and as an MSI installer (`scripts/package-bridge-msi.mjs` + `bridge-apps/windows/msi/`, WiX v3; CI installs the MSI, smoke-tests the installed exe and uninstalls it again)
 - Remote support access (Cloudflare Tunnel / Zero Trust Free): `scripts/cloudflared-remote-access.mjs` (+ `.integration.mjs`), documented in `docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md`
 
 ## Non-negotiable project rules
