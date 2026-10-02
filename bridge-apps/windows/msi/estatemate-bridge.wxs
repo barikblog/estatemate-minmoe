@@ -7,7 +7,7 @@
 
       candle -arch x64 -dVersion=<x.y.z> -dExeSource=<staged exe> \
              -dReadmeSource=<staged readme> estatemate-bridge.wxs -out <obj>
-      light  -sice:ICE43 <obj> -out estatemate-bridge-<x.y.z>-win-x64.msi
+      light  -sice:ICE43 -sice:ICE57 <obj> -out estatemate-bridge-<x.y.z>-win-x64.msi
 
   What the installer deliberately IS:
 
@@ -33,9 +33,10 @@
 
   The non-advertised shortcuts live in the per-machine component keyed on the
   executable. ICE43 objects to non-advertised shortcuts without an HKCU
-  keypath (a per-user repair nuance that does not apply to an all-users
-  shortcut for a per-machine console tool), so light suppresses that one ICE;
-  every other validation rule still runs.
+  keypath and ICE57 reads the same shortcuts as per-user data in a
+  per-machine component — both are per-user-install heuristics that do not
+  apply to an all-users shortcut for a per-machine console tool, so light
+  suppresses those two ICEs; every other validation rule still runs.
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <!-- Id="*" gives every build a fresh ProductCode; the UpgradeCode below is

@@ -263,8 +263,13 @@ function main() {
     ];
     // ICE43 wants non-advertised shortcuts to have an HKCU keypath; ours are
     // per-machine shortcuts next to a per-machine executable, so that per-user
-    // repair nuance does not apply. Every other ICE still validates the MSI.
-    const lightArgs = ['-nologo', '-sice:ICE43', wixobjPath, '-out', msiPath];
+    // repair nuance does not apply.
+    // ICE57 flags the same shortcut components as "per-user data with a
+    // per-machine keypath"; at install time (ALLUSERS=1) the Program Menu
+    // resolves to the all-users profile and Windows Installer handles it
+    // correctly. Both ICEs are heuristic lints for mixed per-user installs,
+    // which this deliberately is not. Every other ICE still validates the MSI.
+    const lightArgs = ['-nologo', '-sice:ICE43', '-sice:ICE57', wixobjPath, '-out', msiPath];
 
     if (flags.dryRun) {
       console.log('[dry-run] staged payload:');

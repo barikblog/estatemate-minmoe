@@ -76,7 +76,7 @@ public final class OfflineServerTest {
         check(statements.get(0).contains("'not; a statement'"), "semicolon inside a literal survives");
         check(statements.get(1).trim().startsWith("INSERT"), "block comments are skipped");
         check(statements.get(2).contains("'multi''quote; done'"), "escaped quotes keep the statement open");
-        check(statements.get(0).contains("uuid"), "line comments are dropped but their line's code stays");
+        check(statements.get(0).contains("id TEXT PRIMARY KEY"), "line comments are dropped but their line's code stays");
     }
 
     // ---------------------------------------------------------- StaticFiles --
@@ -156,20 +156,20 @@ public final class OfflineServerTest {
                 OutputStream out = socket.getOutputStream();
                 InputStream in = socket.getInputStream();
                 sendRequest(out, "GET", "/api/health", "X-Probe: one", null);
-                HttpResponse first = readResponse(in);
+                HttpResponse first = readResponse(in, true);
                 check(first.status == 200, "first request answers");
                 check("GET /api/health ".equals(new String(first.body, StandardCharsets.UTF_8)), "dispatcher echo");
                 check("keep-alive".equalsIgnoreCase(first.header("Connection")), "keep-alive header");
                 check("one".equals(dispatcher.lastHeader), "custom header reached the dispatcher");
 
                 sendRequest(out, "POST", "/api/echo", "X-Probe: two", "hello estate");
-                HttpResponse second = readResponse(in);
+                HttpResponse second = readResponse(in, true);
                 check(second.status == 200 && second.body.length > 0, "second request on the same socket");
                 check(dispatcher.lastBody.equals("hello estate"), "content-length body parsed");
                 check("two".equals(dispatcher.lastHeader), "headers reset between requests");
 
                 sendRequest(out, "HEAD", "/anything", null, null);
-                HttpResponse head = readResponse(in);
+                HttpResponse head = readResponse(in, false);
                 check(head.status == 200 && head.body.length == 0, "HEAD returns headers only");
             } finally {
                 socket.close();
@@ -187,7 +187,7 @@ public final class OfflineServerTest {
                 out.write("7;ext=1\r\n estate\r\n".getBytes(StandardCharsets.US_ASCII));
                 out.write("0\r\nX-Trailer: v\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
                 out.flush();
-                HttpResponse response = readResponse(in);
+                HttpResponse response = readResponse(in, true);
                 check(response.status == 200 && dispatcher.lastBody.equals("hello estate"),
                         "chunked body decoded", "body was '" + dispatcher.lastBody + "'");
             } finally {
@@ -208,7 +208,7 @@ public final class OfflineServerTest {
                 check(readLine(in).isEmpty(), "100 continue ends with a blank line");
                 out.write("again".getBytes(StandardCharsets.US_ASCII));
                 out.flush();
-                check(readResponse(in).status == 200 && dispatcher.lastBody.equals("again"), "body after 100-continue");
+                check(readResponse(in, true).status == 200 && dispatcher.lastBody.equals("again"), "body after 100-continue");
             } finally {
                 expect.close();
             }
@@ -222,7 +222,7 @@ public final class OfflineServerTest {
                 out.write(("POST /api/echo HTTP/1.1\r\nHost: x\r\nContent-Length: "
                         + (WebServer.MAX_BODY_BYTES + 1) + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
                 out.flush();
-                HttpResponse tooLarge = readResponse(in);
+                HttpResponse tooLarge = readResponse(in, true);
                 check(tooLarge.status == 413, "bodies over the cap are refused", "status " + tooLarge.status);
             } finally {
                 big.close();
@@ -233,7 +233,7 @@ public final class OfflineServerTest {
             query.setSoTimeout(10000);
             try {
                 sendRequest(query.getOutputStream(), "GET", "/api/access/events?page=2&size=50", null, null);
-                readResponse(query.getInputStream());
+                readResponse(query.getInputStream(), true);
                 check("/api/access/events".equals(dispatcher.lastPath), "path excludes the query");
             } finally {
                 query.close();
@@ -256,7 +256,7 @@ public final class OfflineServerTest {
     private static void webSocketEndToEndTests() throws Exception {
         System.out.println("WebSocket end-to-end");
         final List<String> probed = new ArrayList<String>();
-        final LiveFeedHub hub = new LiveFeedHub(quietLogger());
+        final LiveFeedHub hub = new LiveFeedHub(hubLogger());
         WebServer server = new WebServer(0,
                 new EchoDispatcher(),
                 new WebServer.UpgradeAuthorizer() {
@@ -277,7 +277,7 @@ public final class OfflineServerTest {
             Socket refused = connect(server.port());
             try {
                 new WsClient(refused).sendUpgrade("Bearer bad");
-                HttpResponse denied = readResponse(refused.getInputStream());
+                HttpResponse denied = readResponse(refused.getInputStream(), true);
                 check(denied.status == 401, "unauthorized upgrades get 401", "status " + denied.status);
                 check(readByte(refused.getInputStream()) < 0, "refused connection is closed");
             } finally {
@@ -457,7 +457,8 @@ public final class OfflineServerTest {
         out.flush();
     }
 
-    private static HttpResponse readResponse(InputStream in) throws IOException {
+    /** @param expectBody false for HEAD responses, which frame a length but send nothing. */
+    private static HttpResponse readResponse(InputStream in, boolean expectBody) throws IOException {
         HttpResponse response = new HttpResponse();
         String statusLine = readLine(in);
         String[] parts = statusLine.split(" ", 3);
@@ -468,7 +469,7 @@ public final class OfflineServerTest {
             response.headers.put(line.substring(0, colon).trim(), line.substring(colon + 1).trim());
         }
         String declared = response.header("Content-Length");
-        int length = declared == null ? 0 : Integer.parseInt(declared.trim());
+        int length = declared == null || !expectBody ? 0 : Integer.parseInt(declared.trim());
         byte[] buffer = new byte[length];
         for (int read = 0; read < length; ) {
             int got = in.read(buffer, read, length - read);
@@ -516,6 +517,16 @@ public final class OfflineServerTest {
 
     private static WebServer.Logger quietLogger() {
         return new WebServer.Logger() {
+            public void log(String level, String message) {
+                System.out.println("       [" + level + "] " + message);
+            }
+        };
+    }
+
+    // LiveFeedHub.Logger is a different interface with the same shape; the
+    // hub cannot take the WebServer logger (caught by CI's javac).
+    private static LiveFeedHub.Logger hubLogger() {
+        return new LiveFeedHub.Logger() {
             public void log(String level, String message) {
                 System.out.println("       [" + level + "] " + message);
             }
