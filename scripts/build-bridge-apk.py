@@ -70,6 +70,15 @@ def run(command: list[str], what: str, quiet: bool = False) -> str:
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
         detail = (result.stdout or "") + (result.stderr or "")
+        # The job-log CDN is not always reachable when diagnosing a red run,
+        # so replay the tool's own error lines as check annotations too — the
+        # one channel that is always readable (javac/aapt2/d8/apksigner
+        # diagnostics all carry "error" in the actionable lines).
+        for line in detail.splitlines():
+            if "error" not in line.lower() and "warning" not in line.lower():
+                continue
+            escaped = line.strip()[:900].replace("%", "%25").replace("\r", "%0D")
+            print(f"::error title={pathlib.Path(command[0]).name}::{escaped}")
         raise BuildError(f"{what} failed (exit {result.returncode}):\n{detail.strip()}")
     if not quiet and result.stdout.strip():
         print(result.stdout.strip())

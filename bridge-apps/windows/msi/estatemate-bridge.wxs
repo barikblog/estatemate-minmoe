@@ -52,7 +52,9 @@
     <!-- Shows up as the "Visit support site" link in Programs and Features. -->
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/barikblog/estatemate-minmoe" />
 
-    <Feature Id="Main" Title="EstateMate Bridge" Level="1" AllowAbsent="no">
+    <!-- Absent="disallow": the one feature is the product; there is no
+         optional-components UI anyway. (v3 spells it Absent, not AllowAbsent.) -->
+    <Feature Id="Main" Title="EstateMate Bridge" Level="1" Absent="disallow">
       <ComponentRef Id="BridgeExecutable" />
       <ComponentRef Id="BridgeReadme" />
     </Feature>

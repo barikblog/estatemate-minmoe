@@ -276,7 +276,7 @@ public final class OfflineServerTest {
             // Refused upgrade → 401, and the socket closes.
             Socket refused = connect(server.port());
             try {
-                sendUpgrade(refused.getOutputStream(), "Bearer bad");
+                new WsClient(refused).sendUpgrade("Bearer bad");
                 HttpResponse denied = readResponse(refused.getInputStream());
                 check(denied.status == 401, "unauthorized upgrades get 401", "status " + denied.status);
                 check(readByte(refused.getInputStream()) < 0, "refused connection is closed");
@@ -422,7 +422,7 @@ public final class OfflineServerTest {
                 if (got < 0) throw new IOException("eof in frame");
                 read += got;
             }
-            if (opcode == 0x8) throw new IOException("close frame: " + new String(payload, StandardCharsets.US_8));
+            if (opcode == 0x8) throw new IOException("close frame: " + new String(payload, StandardCharsets.US_ASCII));
             return new String(payload, StandardCharsets.UTF_8);
         }
 
