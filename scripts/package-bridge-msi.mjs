@@ -151,6 +151,18 @@ function run(command, args, what) {
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
   if (result.status !== 0) {
+    // The job log lives on a CDN this project's tooling cannot always fetch,
+    // so replay the tool's own diagnostics as check annotations too — that is
+    // the one channel that is always readable. WiX error lines look like
+    // "estatemate-bridge.wxs(42) : error CNDL0000 : ...".
+    const diagnostics = `${result.stdout || ''}\n${result.stderr || ''}`
+      .split(/\r?\n/)
+      .filter((line) => /error|warning|exception/i.test(line) || /:\s+(CNDL|LGHT|ICE)\d+/.test(line))
+      .slice(0, 25);
+    for (const line of diagnostics) {
+      const escaped = line.slice(0, 900).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+      console.log(`::error title=${path.basename(String(command))}::${escaped}`);
+    }
     fail(`${what} failed with exit code ${result.status}`);
   }
 }

@@ -46,6 +46,10 @@ public final class OfflineServerTest {
         System.out.println("offline server JVM tests: ALL GREEN");
     }
 
+    private static void check(boolean condition, String name) {
+        check(condition, name, null);
+    }
+
     private static void check(boolean condition, String name, String detail) {
         if (condition) {
             passed += 1;
@@ -492,6 +496,13 @@ public final class OfflineServerTest {
 
     private static int readByte(InputStream in) throws IOException {
         return in.read();
+    }
+
+    private static String header(WebServer.Response response, String name) {
+        for (String[] header : response.headers) {
+            if (header[0].equalsIgnoreCase(name)) return header[1];
+        }
+        return null;
     }
 
     private interface Condition {

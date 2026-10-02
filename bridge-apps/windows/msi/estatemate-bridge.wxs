@@ -92,7 +92,7 @@
                       WorkingDirectory="INSTALLDIR" />
             <Shortcut Id="StartMenuReadme" Directory="ApplicationProgramsFolder"
                       Name="Read me first" Description="The five-minute setup guide"
-                      Target="[#BridgeReadme]" WorkingDirectory="INSTALLDIR" />
+                      Target="[INSTALLDIR]README.txt" WorkingDirectory="INSTALLDIR" />
 
             <!-- Take the Start Menu folder away again when the last file goes. -->
             <RemoveFolder Id="RemoveApplicationProgramsFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
