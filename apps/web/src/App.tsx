@@ -14,7 +14,7 @@ type Section =
   // Property & estate
   | 'properties' | 'bills' | 'maintenance' | 'bookings' | 'notices' | 'emergency'
   // Information & compliance
-  | 'information' | 'legal' | 'visitors'
+  | 'documents' | 'information' | 'legal' | 'visitors'
   // Administration
   | 'imports' | 'settings';
 
@@ -76,11 +76,10 @@ const navGroups: NavGroup[] = [
     { id: 'isapi', label: 'Device agent', roles: ['admin','manager'] },
     { id: 'operations', label: 'Hardware actions', roles: ['admin','manager'] },
   ]},
-  { id: 'people', label: 'Residents & staff', items: [
-    { id: 'residents', label: 'Resident manager', roles: ['admin','manager','cashier','security'] },
-    { id: 'residency', label: 'Tenancy & household', roles: ['admin','manager','resident'] },
-    { id: 'dependants', label: 'Dependants manager', roles: ['admin','manager','cashier','resident'] },
-    { id: 'staff', label: 'Staff management', roles: ['admin','manager'] },
+  { id: 'people', label: 'People & workforce', items: [
+    { id: 'residents', label: 'People', roles: ['admin','manager','cashier','security','resident'] },
+    { id: 'residency', label: 'Property & tenancy', roles: ['admin','manager','resident'] },
+    { id: 'staff', label: 'Staff & attendance', roles: ['admin','manager','facility_staff'] },
   ]},
   { id: 'estate', label: 'Estate management', items: [
     { id: 'properties', label: 'Property administration', roles: ['admin','manager','cashier','security','resident'] },
@@ -88,14 +87,13 @@ const navGroups: NavGroup[] = [
     { id: 'maintenance', label: 'Service operations', roles: ['admin','manager','resident'] },
     { id: 'bookings', label: 'Facility bookings', roles: ['admin','manager','cashier','resident'] },
     { id: 'notices', label: 'Estate notices' },
-    { id: 'emergency', label: 'Emergency contacts' },
+    { id: 'emergency', label: 'Emergency contacts', roles: ['admin','manager','resident','security','cashier'] },
   ]},
   { id: 'visitors', label: 'Visitors', items: [
-    { id: 'visitors', label: 'Visitor management' },
+    { id: 'visitors', label: 'Visitor management', roles: ['admin','manager','resident','security','cashier'] },
   ]},
-  { id: 'info', label: 'Information resources', items: [
-    { id: 'information', label: 'Information hub' },
-    { id: 'legal', label: 'Legal & governance' },
+  { id: 'info', label: 'Knowledge base', items: [
+    { id: 'documents', label: 'Documents & governance', roles: ['admin','manager','resident','security','cashier'] },
   ]},
   { id: 'admin', label: 'Administration', items: [
     { id: 'imports', label: 'Import centre', roles: ['admin','manager'] },
@@ -380,10 +378,10 @@ function App() {
   if (!user) return <Login config={portalConfig} onLogin={(nextUser, nextGate) => { setUser(nextUser); setGate(nextGate ?? null); }} />;
 
   const visibleGroups: NavGroup[] = navGroups
-    .map((g) => ({ ...g, items: g.items.filter((item) => !item.roles || item.roles.includes(user.role)) }))
+    .map((g) => ({ ...g, items: g.items.filter((item) => !item.roles || item.roles.includes(user.role)).map((item) => user.role==='facility_staff'&&item.id==='staff'?{...item,label:'Time & attendance'}:user.role==='resident'&&item.id==='residents'?{...item,label:'My household'}:item) }))
     .filter((g) => g.items.length > 0);
   const flatAvailable = visibleGroups.flatMap((g) => g.items);
-  const current = flatAvailable.find((item) => item.id === section) ?? flatAvailable[0]!;
+  const current = flatAvailable.find((item) => item.id === (section === 'dependants' ? 'residents' : section)) ?? flatAvailable[0]!;
 
   return <div className="app-shell">
     <aside className={menuOpen ? 'sidebar open' : 'sidebar'}>
@@ -409,11 +407,11 @@ function App() {
           </section>
         ))}
       </nav>
-      <footer className="user-card"><span className="avatar">{initials(user.name)}</span><span><strong>{user.name}</strong><small>{user.role}</small></span><button className="icon-button" title="Sign out" onClick={logout}>↗</button></footer>
+      <footer className="user-card"><span className="avatar">{initials(user.name)}</span><span><strong>{user.name}</strong><small>{roleLabel(user.role)}</small></span><button className="icon-button" title="Sign out" onClick={logout}>↗</button></footer>
     </aside>
     {menuOpen && <button className="scrim" aria-label="Close menu" onClick={() => setMenuOpen(false)} />}
     <main className="workspace">
-      <header className="topbar"><button className="icon-button mobile-menu" onClick={() => setMenuOpen(true)}>☰</button><div><p className="eyebrow">{user.role} workspace</p><h1>{current.label}</h1></div>
+      <header className="topbar"><button className="icon-button mobile-menu" onClick={() => setMenuOpen(true)}>☰</button><div><p className="eyebrow">{roleLabel(user.role)} workspace</p><h1>{current.label}</h1></div>
         {user.role === 'security' && gate && <button type="button" className="gate-chip" title="Change the gate you are posted at" onClick={() => setSwitchingGate(true)}>🚪 {String(gate.gate_name || gate.name)}<span>switch</span></button>}
         <div className="top-status"><span className="pulse-dot" /> System online</div></header>
       <div className="content"><SectionView section={current.id} user={user} config={portalConfig} gate={gate} onNavigate={setSection} /><PortalFooter portalName={portalConfig.portal_name} /></div>
@@ -442,13 +440,14 @@ function SectionView({ section, user, config, gate, onNavigate }: { section: Sec
     case 'isapi': return <IsapiBridge user={user} />;
     case 'operations': return <Operations />;
     case 'settings': return <Settings />;
-    // New module pages (placeholder/information surfaces; backend wiring to follow):
-    case 'dependants': return <DependantsManager user={user} onNavigate={onNavigate} />;
+    // Household roster and account directory share one People menu with internal tabs.
+    case 'dependants': return <People user={user} initialTab="household" />;
     case 'staff': return <StaffManagement user={user} />;
     case 'bookings': return <FacilityBookings user={user} />;
     case 'emergency': return <EmergencyContacts user={user} />;
-    case 'information': return <InformationHub user={user} onNavigate={onNavigate} />;
-    case 'legal': return <LegalGovernance user={user} />;
+    case 'documents': return <EstateDocuments user={user} onNavigate={onNavigate} />;
+    case 'information': return <EstateDocuments user={user} onNavigate={onNavigate} initialSet="info" />;
+    case 'legal': return <EstateDocuments user={user} onNavigate={onNavigate} initialSet="legal" />;
   }
 }
 
@@ -459,7 +458,7 @@ function SectionView({ section, user, config, gate, onNavigate }: { section: Sec
  */
 const TERMINATION_STEPS: Array<{ title: string; body: string; actionLabel: string; section: Section }> = [
   { title: 'Revoke or suspend the access card and every fingerprint', body: 'Open Access cards & fingerprints, find the person, then Suspend for a temporary stop. EstateMate queues the matching disable-card action for every linked device, records the change in the status history, and queues a fingerprint removal task to confirm on the terminal.', actionLabel: 'Open Access cards & fingerprints', section: 'cards' },
-  { title: 'Deactivate dependants and household members', body: 'A spouse, child, relative or domestic staff member keeps gate access through their household membership. Under Tenancy & household, deactivate the member so any card or fingerprint issued to them stops working.', actionLabel: 'Open Tenancy & household', section: 'residency' },
+  { title: 'Deactivate household members', body: 'A spouse, child, relative or domestic staff member keeps gate access through their household membership. Under People → Household members, deactivate the record so any card or fingerprint issued to them stops working.', actionLabel: 'Open People → Household members', section: 'dependants' },
   { title: 'End the tenancy or the resident account', body: 'Ending a tenancy removes the right to occupy; deactivating the account under People removes the login. Do both when someone moves out. Ownership, billing, card, visitor and gate-event history is preserved either way.', actionLabel: 'Open People', section: 'residents' },
   { title: 'Cancel that household’s live visitor passes', body: 'Reject any pending or checked-in pass issued by the departing household, so a visitor cannot still use an invitation that no longer holds.', actionLabel: 'Open Visitors', section: 'visitors' },
   { title: 'Retire the gate terminal itself', body: 'Under Access-control devices, disable or delete the device. It is soft-deleted so historical gate events keep their reference, and Security officers assigned to that post must select a different gate at their next login.', actionLabel: 'Open devices', section: 'devices' },
@@ -490,6 +489,16 @@ function Dashboard({ user, config, gate, onNavigate }: { user: User; config: Por
   if (loading) return <Loading />;
   if (error) return <Notice tone="error">{error}</Notice>;
   const isOperator = user.role === 'admin' || user.role === 'manager';
+  if (user.role === 'facility_staff') return <>
+    <section className="hero-card">
+      <div><p className="eyebrow">Facility team workspace</p><h2>Welcome, {user.name.split(' ')[0]}.</h2><p>Your attendance and staff notices are here. Use the estate clock to record your shift.</p></div>
+      <div className="hero-orb"><span>HR</span></div>
+    </section>
+    <section className="panel staff-welcome">
+      <div><p className="eyebrow">TIME & ATTENDANCE</p><h3>Record your shift accurately</h3><p>Clock-in and clock-out times are stamped by EstateMate. Your own monthly history is available to you; HR can export the team report.</p></div>
+      {onNavigate && <button type="button" className="primary" onClick={()=>onNavigate('staff')}>Open time &amp; attendance →</button>}
+    </section>
+  </>;
   const image = gateImageUrl(config);
   const openMaint = Number(nested(data, 'openMaintenance', 'count') ?? 0);
   const cards: Array<[string, unknown, string]> = user.role === 'resident'
@@ -551,17 +560,19 @@ function Dashboard({ user, config, gate, onNavigate }: { user: User; config: Por
 }
 
 function buildQuickActions(role: User['role'], isOperator: boolean): Array<{ title: string; items: Array<{ id: Section; label: string }> }> {
+  if (role === 'facility_staff') return [{ title: 'My work', items: [{ id: 'staff', label: 'Time & attendance' }] }];
   const groups: Array<{ title: string; items: Array<{ id: Section; label: string }> }> = [
     { title: 'Access control', items: [{ id: 'cards', label: 'Cards & fingers' }, { id: 'events', label: 'Gate activity' }, { id: 'operations', label: 'Hardware' }] },
-    { title: 'Residents & staff', items: [{ id: 'residents', label: 'Residents' }, { id: 'residency', label: 'Tenancy' }, { id: 'dependants', label: 'Dependants' }] },
+    { title: 'People & workforce', items: [{ id: 'residents', label: role === 'resident' ? 'My household' : 'People' }, { id: 'residency', label: 'Property & tenancy' }, { id: 'staff', label: 'Staff & attendance' }] },
     { title: 'Estate', items: [{ id: 'properties', label: 'Properties' }, { id: 'bills', label: 'Bills' }, { id: 'maintenance', label: 'Service' }] },
-    { title: 'Resources', items: [{ id: 'visitors', label: 'Visitors' }, { id: 'notices', label: 'Notices' }, { id: 'emergency', label: 'Emergency' }, { id: 'information', label: 'Info hub' }] },
+    { title: 'Resources', items: [{ id: 'visitors', label: 'Visitors' }, { id: 'notices', label: 'Notices' }, { id: 'emergency', label: 'Emergency' }, { id: 'documents', label: 'Documents' }] },
   ];
-  // Filter items by role visibility (best-effort; mirroring the sidebar rules).
+  // Mirror the sidebar permissions so shortcuts cannot expose a hidden route.
   const can = (id: Section) => {
-    if (id === 'residents') return ['admin','manager','cashier','security'].includes(role);
+    if (id === 'residents') return ['admin','manager','cashier','security','resident'].includes(role);
     if (id === 'residency') return ['admin','manager','resident'].includes(role);
-    if (id === 'dependants') return ['admin','manager','cashier','resident'].includes(role);
+    if (id === 'staff') return isOperator;
+    if (id === 'documents') return true;
     if (id === 'properties') return ['admin','manager','cashier','security','resident'].includes(role);
     if (id === 'bills') return ['admin','cashier','resident'].includes(role);
     if (id === 'maintenance') return ['admin','manager','resident'].includes(role);
@@ -575,7 +586,23 @@ function buildQuickActions(role: User['role'], isOperator: boolean): Array<{ tit
     .filter((g) => g.items.length > 0);
 }
 
-function People({ user }: { user: User }) {
+function People({ user, initialTab = 'accounts' }: { user: User; initialTab?: 'accounts'|'household' }) {
+  const canSeeAccounts = ['admin','manager','cashier','security'].includes(user.role);
+  const canSeeHousehold = ['admin','manager','cashier','resident'].includes(user.role);
+  const requestedTab = initialTab === 'household' || user.role === 'resident' ? 'household' : 'accounts';
+  const safeTab = requestedTab === 'accounts' && !canSeeAccounts ? 'household' : requestedTab === 'household' && !canSeeHousehold ? 'accounts' : requestedTab;
+  const [tab,setTab] = useState<'accounts'|'household'>(safeTab);
+  useEffect(() => setTab(safeTab),[safeTab]);
+  return <div className="directory-view">
+    {(canSeeAccounts && canSeeHousehold) && <div className="section-tabs" role="tablist" aria-label="People directory views">
+      <button type="button" role="tab" aria-selected={tab==='accounts'} className={tab==='accounts'?'tab-active':''} onClick={()=>setTab('accounts')}>Accounts</button>
+      <button type="button" role="tab" aria-selected={tab==='household'} className={tab==='household'?'tab-active':''} onClick={()=>setTab('household')}>Household members</button>
+    </div>}
+    {tab==='household' && canSeeHousehold ? <DependantsManager user={user} /> : canSeeAccounts ? <PeopleAccounts user={user} /> : <DependantsManager user={user} />}
+  </div>;
+}
+
+function PeopleAccounts({ user }: { user: User }) {
   const canManage=user.role==='admin'||user.role==='manager';
   const [search,setSearch]=useState('');const [role,setRole]=useState('');
   const list=useList(`/api/users?limit=100&search=${encodeURIComponent(search)}${role?`&role=${role}`:''}`);
@@ -610,7 +637,7 @@ function People({ user }: { user: User }) {
   return <PagePanel title="People" subtitle="Register, assign, import and safely manage resident and staff accounts" action={canManage?<div className="row-actions">{user.role==='admin'&&<button className="secondary" onClick={generateSamples}>Create 24-hour sample logins</button>}<button className="secondary" onClick={()=>setShowImport(!showImport)}>Import users</button><button className="secondary" onClick={()=>setShowBulk(!showBulk)}>Bulk tools</button><button className="primary" onClick={()=>{setShowForm(!showForm);setEditing(null);}}>Add person</button></div>:null}>
     {message&&<Notice tone={/failed|Could not|before|must|cannot|already/i.test(message)?'error':'success'}>{message}</Notice>}
     {temporaryPassword&&<section className="credential-box"><p className="eyebrow">COPY NOW — SHOWN ONCE</p><h3>Temporary password</h3><code>{temporaryPassword}</code><p>Share it securely. The user should change it immediately after signing in.</p><button className="secondary" onClick={()=>navigator.clipboard.writeText(temporaryPassword)}>Copy password</button><button className="text" onClick={()=>setTemporaryPassword('')}>Hide</button></section>}
-    {sampleCredentials.length>0&&<section className="credential-box"><p className="eyebrow">24-HOUR SAMPLE LOGINS — SHOWN ONCE</p><h3>All five user categories created</h3><p>Administrator, Manager, Resident, Security and Cashier sample accounts are active for 24 hours.</p><div className="row-actions"><button className="secondary" onClick={downloadSamples}>Download login details</button><button className="text" onClick={()=>setSampleCredentials([])}>Hide</button></div></section>}
+    {sampleCredentials.length>0&&<section className="credential-box"><p className="eyebrow">24-HOUR SAMPLE LOGINS — SHOWN ONCE</p><h3>All six user categories created</h3><p>Administrator, Manager, Resident, Security, Cashier and Facility staff sample accounts are active for 24 hours.</p><div className="row-actions"><button className="secondary" onClick={downloadSamples}>Download login details</button><button className="text" onClick={()=>setSampleCredentials([])}>Hide</button></div></section>}
     {showForm&&<UserAccountForm actorRole={user.role} properties={available.data?.items ?? []} onDone={(notice)=>{setShowForm(false);setMessage(notice);refresh();}} />}
     {editing&&<UserAccountForm actorRole={user.role} user={editing} properties={available.data?.items ?? []} onDone={(notice)=>{setEditing(null);setMessage(notice);refresh();}} onCancel={()=>setEditing(null)} />}
     {accessPerson&&<section className="person-access"><div className="row-actions"><button className="secondary sm" onClick={()=>setAccessPerson(null)}>Close access panel</button></div>
@@ -618,7 +645,7 @@ function People({ user }: { user: User }) {
     </section>}
     {showImport&&<UsersCsvImporter onDone={()=>{refresh();}} />}
     {showBulk&&<PeopleBulkTools onDone={()=>{refresh();}} />}
-    <div className="people-filters"><label>Search<input value={search} onChange={(event)=>setSearch(event.target.value)} placeholder="Name, email or phone" /></label><label>Role<select value={role} onChange={(event)=>setRole(event.target.value)}><option value="">All roles</option><option value="resident">Residents</option><option value="security">Security</option><option value="cashier">Cashiers</option><option value="manager">Managers</option><option value="admin">Administrators</option></select></label></div>
+    <div className="people-filters"><label>Search<input value={search} onChange={(event)=>setSearch(event.target.value)} placeholder="Name, email or phone" /></label><label>Role<select value={role} onChange={(event)=>setRole(event.target.value)}><option value="">All roles</option><option value="resident">Residents</option><option value="security">Security</option><option value="cashier">Cashiers</option><option value="facility_staff">Facility staff</option><option value="manager">Managers</option><option value="admin">Administrators</option></select></label></div>
     <ListState list={list}><DataTable exportTitle="Residents & Staff" rows={list.data?.items ?? []} columns={[['name','Name'],['role','Role'],['employee_id','Employee ID'],['email','Email'],['phone','Phone'],['unit_numbers','Owned'],['rented_units','Rented'],['dependant_units','Dependant at'],['property_count','Owned count'],['status','Status']]} action={actions} /></ListState>
     {canManage&&imports.data&&imports.data.items.length>0&&<section className="import-history"><h3>User import history</h3><DataTable rows={imports.data.items} columns={[['filename','File'],['status','Status'],['total_rows','Rows'],['successful_rows','Created'],['error_rows','Errors'],['created_at','Uploaded','date']]} action={(row)=>row.storage_key?<a className="text" href={`/api/files/${encodeURIComponent(String(row.storage_key))}`}>Download source</a>:null} /></section>}
   </PagePanel>;
@@ -635,7 +662,7 @@ function UserAccountForm({ actorRole,user,properties,onDone,onCancel }: { actorR
   return <FormCard title={user?`Edit ${String(user.name)}`:'New account'} onSubmit={submit} message={message}>
     <label>Name<input name="name" defaultValue={String(user?.name ?? '')} required /></label><label>Email<input name="email" type="email" defaultValue={String(user?.email ?? '')} required /></label><label>Phone<input name="phone" defaultValue={String(user?.phone ?? '')} /></label>
     <label>Employee ID<input name="employeeId" defaultValue={String(user?.employee_id ?? '')} maxLength={32} pattern="[A-Za-z0-9._/\-]{1,32}" placeholder="Auto-generated" /><small>The person's identity on access-control devices. Max 32 characters; left blank, EstateMate generates one.</small></label>
-    <label>Role<select name="role" value={role} onChange={(event)=>setRole(event.target.value)}><option value="resident">Resident</option><option value="security">Security</option><option value="cashier">Cashier</option>{actorRole==='admin'&&<><option value="manager">Manager</option><option value="admin">Administrator</option></>}</select></label>
+    <label>Role<select name="role" value={role} onChange={(event)=>setRole(event.target.value)}><option value="resident">Resident</option><option value="security">Security</option><option value="cashier">Cashier</option><option value="facility_staff">Facility staff</option>{actorRole==='admin'&&<><option value="manager">Manager</option><option value="admin">Administrator</option></>}</select></label>
     {user&&<label>Status<select name="status" defaultValue={String(user.status ?? 'active')}><option value="active">Active</option><option value="inactive">Inactive</option></select></label>}
     {role==='resident'&&<label>{user?'Assign another available property (optional)':'Available property (optional)'}<select name="propertyId"><option value="">No property assignment</option>{properties.map((property)=><option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)} — {String(property.address)}</option>)}</select><small>Only properties without an approved owner are listed. Existing ownership is not replaced.</small></label>}
     {!user&&<label>Temporary password<input name="password" type="password" minLength={12} autoComplete="new-password" required /><small>At least 12 characters. The user should change it after first sign-in.</small></label>}
@@ -654,7 +681,7 @@ function PeopleBulkTools({ onDone }: { onDone:()=>void }) {
   const [otherResult,setOtherResult]=useState('');const [busy,setBusy]=useState(false);
   const [deleteIds,setDeleteIds]=useState('');const [resyncIds,setResyncIds]=useState('');
   const [credentials,setCredentials]=useState<Array<{ name:string;email:string;employeeId:string;temporaryPassword:string }>>([]);
-  const uploadTemplate='person_type,name,email,phone,role,employee_id,unit_number,relationship,primary_resident_email\naccount,Ada Resident,ada@example.com,+2348000000000,resident,EMP-0001,A-01,,\naccount,Gate Officer,security@example.com,+2348000000001,security,EMP-0002,,,\ndependant,Nanny One,,+2348000000002,,EMP-0003,,domestic_staff,ada@example.com\n';
+  const uploadTemplate='person_type,name,email,phone,role,employee_id,unit_number,relationship,primary_resident_email\naccount,Ada Resident,ada@example.com,+2348000000000,resident,EMP-0001,A-01,,\naccount,Gate Officer,security@example.com,+2348000000001,security,EMP-0002,,,\naccount,Facilities Officer,facilities@example.com,+2348000000004,facility_staff,EMP-0004,,,\ndependant,Nanny One,,+2348000000002,,EMP-0003,,domestic_staff,ada@example.com\n';
   const editTemplate='employee_id,name,phone,new_employee_id,status\nEMP-0001,Ada Resident,+2348000000099,,active\nEMP-0003,,+2348000000100,DEP-2024,,inactive\n';
   function download(name:string,text:string){const url=URL.createObjectURL(new Blob([text],{type:'text/csv'}));const link=document.createElement('a');link.href=url;link.download=name;link.click();URL.revokeObjectURL(url);}
   function downloadCredentials(){const quote=(value:string)=>`"${value.replaceAll('"','""')}"`;download('estatemate-bulk-people-credentials.csv',`name,email,employee_id,temporary_password\n${credentials.map((item)=>[item.name,item.email,item.employeeId,item.temporaryPassword].map(quote).join(',')).join('\n')}\n`);}
@@ -706,7 +733,7 @@ function PeopleBulkTools({ onDone }: { onDone:()=>void }) {
 
 function UsersCsvImporter({ onDone }: { onDone:()=>void }) {
   const [result,setResult]=useState('');const [busy,setBusy]=useState(false);const [credentials,setCredentials]=useState<Array<{ name:string;email:string;temporaryPassword:string }>>([]);
-  const template='name,email,phone,role,unit_number,status,employee_id\nAda Resident,ada@example.com,+2348000000000,resident,A-01,active,EMP-0001\nGate Officer,security@example.com,+2348000000001,security,,active,\n';
+  const template='name,email,phone,role,unit_number,status,employee_id\nAda Resident,ada@example.com,+2348000000000,resident,A-01,active,EMP-0001\nGate Officer,security@example.com,+2348000000001,security,,active,EMP-0002\nFacilities Officer,facilities@example.com,+2348000000002,facility_staff,,active,EMP-0003\n';
   function download(name:string,text:string) { const url=URL.createObjectURL(new Blob([text],{ type:'text/csv' }));const link=document.createElement('a');link.href=url;link.download=name;link.click();URL.revokeObjectURL(url); }
   function downloadCredentials() { const quote=(value:string)=>`"${value.replaceAll('"','""')}"`;download('estatemate-new-user-credentials.csv',`name,email,temporary_password\n${credentials.map((item)=>[item.name,item.email,item.temporaryPassword].map(quote).join(',')).join('\n')}\n`); }
   async function upload(event:FormEvent<HTMLFormElement>) {
@@ -856,23 +883,13 @@ function Residency({ user }: { user: User }) {
   const operator=user.role==='admin'||user.role==='manager';
   const properties = useList('/api/properties?limit=100');
   const tenancies = useList('/api/property-tenancies?limit=100');
-  const household = useList('/api/household-members?limit=100');
   const [showTenancy, setShowTenancy] = useState(false);
-  const [showMember, setShowMember] = useState(false);
-  const [accessMember,setAccessMember]=useState<Row|null>(null);
-  const accessDevices=useAsync<{ items:Row[] }>(()=>operator?api('/api/access/device-options'):Promise.resolve({ items:[] }),[user.role]);
   const [message, setMessage] = useState('');
-  function refresh() { properties.reload(); tenancies.reload(); household.reload(); }
+  function refresh() { properties.reload(); tenancies.reload(); }
   async function addTenancy(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setMessage(''); const values = Object.fromEntries(new FormData(event.currentTarget));
     try { const proofKeys=await uploadProofFiles(event.currentTarget,'tenancy-proofs'); const result = await api<{ status:string }>('/api/property-tenancies',{ method:'POST',body:JSON.stringify({ ...values,proofKeys }) }); setShowTenancy(false); setMessage(result.status === 'active' ? 'Tenant assigned.' : 'Tenant nomination submitted for administrator approval.'); refresh(); }
     catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not create tenancy'); }
-  }
-  async function addMember(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setMessage(''); const form = new FormData(event.currentTarget);
-    const body = { propertyId:form.get('propertyId'),primaryResidentId:form.get('primaryResidentId') || undefined,name:form.get('name'),relationship:form.get('relationship'),dateOfBirth:form.get('dateOfBirth') || undefined,phone:form.get('phone'),email:form.get('email'),canCreateVisitors:form.get('canCreateVisitors') === 'on',canViewBills:form.get('canViewBills') === 'on',requestNote:form.get('requestNote') };
-    try { const proofKeys=await uploadProofFiles(event.currentTarget,'household-proofs'); const result = await api<{ status:string }>('/api/household-members',{ method:'POST',body:JSON.stringify({ ...body,proofKeys }) }); setShowMember(false); setMessage(result.status === 'active' ? 'Household member added.' : 'Household member submitted for administrator approval.'); refresh(); }
-    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not add household member'); }
   }
   async function tenancyAction(row: Row, action: 'approve'|'reject'|'end'|'update') {
     const reviewNote = prompt(action === 'reject' ? 'Reason for rejection' : 'Optional note') ?? '';
@@ -880,38 +897,16 @@ function Residency({ user }: { user: User }) {
     try { await api(`/api/property-tenancies/${row.id}`,{ method:'PATCH',body:JSON.stringify({ action,reviewNote,billingResponsibility }) }); setMessage(`Tenancy ${action} completed.`); refresh(); }
     catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Tenancy action failed'); }
   }
-  async function memberAction(row: Row, action: 'approve'|'reject'|'deactivate'|'update') {
-    const reviewNote = prompt(action === 'reject' ? 'Reason for rejection' : 'Optional note') ?? '';
-    const canCreateVisitors = action === 'approve' || action === 'update' ? confirm('Allow this dependant to create visitor passes when they have a login?') : undefined;
-    const canViewBills = action === 'approve' || action === 'update' ? confirm('Allow this dependant to view the main resident’s property bills?') : undefined;
-    try { await api(`/api/household-members/${row.id}`,{ method:'PATCH',body:JSON.stringify({ action,reviewNote,canCreateVisitors,canViewBills }) }); setMessage(`Household member ${action} completed.`); refresh(); }
-    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Household action failed'); }
-  }
-  async function createMemberLogin(row: Row) {
-    const email = prompt('Login email',String(row.email ?? '')); if (!email) return;
-    const temporaryPassword = prompt('Temporary password (at least 12 characters). Leave blank to link an existing resident account.','') ?? '';
-    try { await api(`/api/household-members/${row.id}/login`,{ method:'POST',body:JSON.stringify({ email,temporaryPassword:temporaryPassword || undefined }) }); setMessage('Dependant login linked.'); refresh(); }
-    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not create dependant login'); }
-  }
   const pendingTenancies = tenancies.data?.items.filter((row) => row.status === 'pending') ?? [];
-  const pendingMembers = household.data?.items.filter((row) => row.status === 'pending') ?? [];
   const tenancyActions = (row:Row) => <div className="row-actions"><EvidenceButton entityType="property_tenancy" entityId={row.id} count={row.proof_count} />{operator&&<>{row.status === 'pending' && <><button className="text" onClick={() => tenancyAction(row,'approve')}>Approve</button><button className="text danger" onClick={() => tenancyAction(row,'reject')}>Reject</button></>}{row.status === 'active' && <><button className="text" onClick={() => tenancyAction(row,'update')}>Billing</button><button className="text danger" onClick={() => tenancyAction(row,'end')}>End</button></>}</>}</div>;
-  const accessMemberRow = accessMember ? household.data?.items.find((row) => String(row.id) === String(accessMember.id)) : undefined;
-  const memberActions = (row:Row) => <div className="row-actions"><EvidenceButton entityType="household_member" entityId={row.id} count={row.proof_count} />{operator&&<>{row.status === 'pending' && <><button className="text" onClick={() => memberAction(row,'approve')}>Approve</button><button className="text danger" onClick={() => memberAction(row,'reject')}>Reject</button></>}{row.status === 'active' && <><button className="text" onClick={() => memberAction(row,'update')}>Permissions</button><button className="text" onClick={() => setAccessMember(row)}>Cards &amp; fingerprints</button>{!row.linked_user_id && <button className="text" onClick={() => createMemberLogin(row)}>Add login</button>}<button className="text danger" onClick={() => memberAction(row,'deactivate')}>Deactivate</button></>}</>}</div>;
-  return <PagePanel title="Tenancy & household" subtitle="Main tenants, rented apartments, dependants, domestic staff and delegated permissions" action={<div className="row-actions"><button className="secondary" onClick={() => setShowMember(!showMember)}>Add dependant</button><button className="primary" onClick={() => setShowTenancy(!showTenancy)}>{operator ? 'Assign tenant' : 'Nominate tenant'}</button></div>}>
-    <Notice tone="info"><strong>Rented apartment:</strong> legal ownership remains with the owner. The approved tenant becomes the main resident for the tenancy dates. The administrator chooses whether future property bills go to the owner or tenant.</Notice>
-    {message && <Notice tone={message.includes('Could not') || message.includes('failed') ? 'error' : 'success'}>{message}</Notice>}
+  return <PagePanel title="Property & tenancy" subtitle="Legal ownership, rented apartments, main tenants and billing responsibility" action={<button className="primary" onClick={() => setShowTenancy(!showTenancy)}>{operator ? 'Assign tenant' : 'Nominate tenant'}</button>}>
+    <Notice tone="info"><strong>Rented apartment:</strong> legal ownership remains with the owner. The approved tenant becomes the main resident for the tenancy dates. The administrator chooses whether future property bills go to the owner or tenant. Manage household members from People → Household members.</Notice>
+    {message && <Notice tone={/Could not|failed/i.test(message) ? 'error' : 'success'}>{message}</Notice>}
     {showTenancy && <FormCard title={operator ? 'Assign a tenant' : 'Nominate a tenant for approval'} onSubmit={addTenancy}><label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.owner_name ?? property.relationship_type)}</option>)}</select></label><label>Tenant email<input name="tenantEmail" type="email" required /></label><label>Start date<input name="startDate" type="date" required /></label><label>End date<input name="endDate" type="date" /></label><label>Bill responsibility<select name="billingResponsibility"><option value="owner">Legal owner</option><option value="tenant">Main tenant</option></select></label><label className="span-2">Note<textarea name="requestNote" rows={3} /></label><ProofFilesField label="Tenancy agreement or authority proof (recommended)" /><button className="primary">{operator ? 'Assign tenant' : 'Submit nomination'}</button></FormCard>}
-    {showMember && <FormCard title="Add a dependant or household member" onSubmit={addMember}><label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.main_resident_name ?? property.owner_name)}</option>)}</select></label>{operator && <label>Main resident ID<input name="primaryResidentId" placeholder="Optional; resolved automatically" /></label>}<label>Full name<input name="name" required /></label><label>Relationship<select name="relationship"><option value="spouse">Spouse</option><option value="child">Child</option><option value="parent">Parent</option><option value="relative">Relative</option><option value="domestic_staff">Domestic staff</option><option value="caregiver">Caregiver</option><option value="other">Other</option></select></label><label>Date of birth<input name="dateOfBirth" type="date" /></label><label>Phone<input name="phone" /></label><label>Email<input name="email" type="email" /></label><label className="check"><input name="canCreateVisitors" type="checkbox" /> May create visitors after login</label><label className="check"><input name="canViewBills" type="checkbox" /> May view bills after login</label><label className="span-2">Note<textarea name="requestNote" rows={3} /></label><ProofFilesField label="Identity, relationship or consent proof (recommended)" /><button className="primary">{operator ? 'Add member' : 'Submit for approval'}</button></FormCard>}
-    {operator && (pendingTenancies.length > 0 || pendingMembers.length > 0) && <section className="approval-queue"><h3>Pending residency approvals</h3><p>{pendingTenancies.length} tenancy nomination(s) and {pendingMembers.length} household member(s) are waiting.</p></section>}
-    <section className="residency-section"><h3>Tenancies</h3><ListState list={tenancies}><DataTable exportTitle="Tenancies" rows={tenancies.data?.items ?? []} columns={[['unit_number','Unit'],['owner_name','Legal owner'],['tenant_name','Main tenant'],['start_date','Starts'],['end_date','Ends'],['billing_responsibility','Bill payer'],['status','Status']]} action={tenancyActions} /></ListState></section>
-    <section className="residency-section"><h3>Dependants and household members</h3><ListState list={household}><DataTable exportTitle="Household Members" rows={household.data?.items ?? []} columns={[['name','Name'],['relationship','Relationship'],['unit_number','Unit'],['primary_resident_name','Main resident'],['login_email','Login'],['can_create_visitors','Visitors'],['can_view_bills','Bills'],['status','Status']]} action={memberActions} /></ListState></section>
-    {operator && accessMemberRow && <section className="person-access"><div className="row-actions"><button className="secondary sm" onClick={() => setAccessMember(null)}>Close access panel</button></div>
-      <PersonCredentials householdMemberId={String(accessMemberRow.id)} personName={String(accessMemberRow.name)} devices={accessDevices.data?.items ?? []} onChanged={refresh} />
-    </section>}
+    {operator && pendingTenancies.length > 0 && <section className="approval-queue"><h3>Pending tenancy approvals</h3><p>{pendingTenancies.length} tenant nomination(s) are waiting.</p></section>}
+    <section className="residency-section"><h3>Tenancies</h3><ListState list={tenancies}><DataTable exportTitle="Tenancies" rows={tenancies.data?.items ?? []} columns={[["unit_number","Unit"],["owner_name","Legal owner"],["tenant_name","Main tenant"],["start_date","Starts"],["end_date","Ends"],["billing_responsibility","Bill payer"],["status","Status"]]} action={tenancyActions} /></ListState></section>
   </PagePanel>;
 }
-
 
 const operationImportDefinitions={
   properties:{ label:'Properties',description:'Create streets, units, blocks and zones before assigning residents.',template:'unit_number,address,street,block,zone\nA-01,1 Palm Avenue,Palm Avenue,Block A,North\n' },
@@ -1542,7 +1537,7 @@ function PersonPicker({ picked, onPick }: { picked: PickedPerson | null; onPick:
       {results.loading && <Loading />}
       {results.error && <Notice tone="error">{results.error}</Notice>}
       {!results.loading && !results.error && !(results.data?.items ?? []).length && (
-        <p className="person-empty">No active resident or household member matches{debounced ? ` “${debounced}”` : ' yet'}. Register them under People or Tenancy &amp; household first.</p>
+        <p className="person-empty">No active resident or household member matches{debounced ? ` “${debounced}”` : ' yet'}. Register them under People → Accounts or People → Household members first.</p>
       )}
       {(results.data?.items ?? []).map((item) => <button type="button" key={`${item.kind}:${item.id}`} className="person-result" onClick={() => { onPick({ kind: item.kind, id: item.id, name: item.name, detail: item.detail }); setOpen(false); }}>
         <span className="avatar">{initials(item.name)}</span>
@@ -1557,7 +1552,7 @@ function PersonPicker({ picked, onPick }: { picked: PickedPerson | null; onPick:
  * One person's access credentials: cards and fingerprints, in one place.
  *
  * Admin/Manager only — a credential is access, not profile data. Used from the
- * People table (main residents) and from Tenancy & household (dependants), so a
+ * People → Accounts (main residents) and People → Household members (dependants), so a
  * person's profile gives the same controls as the Access cards & fingerprints page
  * without hunting for them in a separate screen.
  */
@@ -2601,6 +2596,7 @@ function nested(source: Row | null, objectKey: string, key: string): unknown {
 
 function localDateTime(date:Date):string { const offset=date.getTimezoneOffset()*60000;return new Date(date.valueOf()-offset).toISOString().slice(0,16); }
 function initials(name: string): string { return name.split(/\s+/).slice(0,2).map((part) => part[0]).join('').toUpperCase(); }
+function roleLabel(role: User['role']): string { return role==='facility_staff'?'Facility staff':role.charAt(0).toUpperCase()+role.slice(1); }
 function navIcon(section: Section): string {
   return ({
     dashboard: '◫',
@@ -2608,67 +2604,127 @@ function navIcon(section: Section): string {
     residents: '●', residency: '♙', dependants: '♟', staff: '✦',
     properties: '⌂', bills: '₦', maintenance: '◇', bookings: '▦', notices: '!', emergency: '✚',
     visitors: '↔',
-    information: 'ⓘ', legal: '§',
+    documents: '▣', information: 'ⓘ', legal: '§',
     imports: '⇩', settings: '⚙',
   })[section] ?? '•';
 }
 
-function DependantsManager({ user, onNavigate: _onNavigate }: { user: User; onNavigate?: (s: Section) => void }) {
+function DependantsManager({ user }: { user: User }) {
   const canManage = user.role === 'admin' || user.role === 'manager';
+  const canAdd = canManage || user.role === 'resident';
   const [search, setSearch] = useState('');
   const [status, setStatus] = useState('');
   const [relationship, setRelationship] = useState('');
   const roster = useList(`/api/dependants?limit=100&search=${encodeURIComponent(search)}${status ? `&status=${status}` : ''}${relationship ? `&relationship=${relationship}` : ''}`);
+  const properties = useList('/api/properties?limit=100');
+  const accessDevices = useAsync<{ items:Row[] }>(()=>canManage?api('/api/access/device-options'):Promise.resolve({ items:[] }),[user.role]);
+  const [showForm, setShowForm] = useState(false);
+  const [accessMember, setAccessMember] = useState<Row|null>(null);
   const [message, setMessage] = useState('');
-  function refresh() { roster.reload(); }
-  async function decide(row: Row, action: string, promptText?: string) {
-    const note = promptText ? prompt(promptText) : null;
-    if (promptText && note === null) return;
-    if (action === 'deactivate' && !confirm(`Deactivate ${String(row.name)}? Their cards and fingerprints are suspended on every terminal; the record stays.`)) return;
+  function refresh() { roster.reload(); properties.reload(); }
+  async function addMember(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setMessage(''); const form = new FormData(event.currentTarget);
+    const body = { propertyId:form.get('propertyId'),primaryResidentId:form.get('primaryResidentId') || undefined,name:form.get('name'),relationship:form.get('relationship'),dateOfBirth:form.get('dateOfBirth') || undefined,phone:form.get('phone'),email:form.get('email'),canCreateVisitors:form.get('canCreateVisitors') === 'on',canViewBills:form.get('canViewBills') === 'on',requestNote:form.get('requestNote') };
     try {
-      await api(`/api/household-members/${row.id}`, { method: 'PATCH', body: JSON.stringify({ action, reviewNote: note || undefined }) });
-      setMessage(action === 'approve' ? 'Dependant approved.' : action === 'deactivate' ? 'Dependant deactivated; all their credentials were suspended.' : 'Dependant updated.');
+      const proofKeys=await uploadProofFiles(event.currentTarget,'household-proofs');
+      const result=await api<{ status:string }>('/api/household-members',{ method:'POST',body:JSON.stringify({ ...body,proofKeys }) });
+      setShowForm(false);
+      setMessage(result.status === 'active' ? 'Household member added.' : 'Household member submitted for approval.');
       refresh();
-    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Dependant update failed'); }
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not add household member'); }
+  }
+  async function decide(row: Row, action: 'approve'|'reject'|'deactivate'|'reactivate'|'update') {
+    let reviewNote: string | undefined;
+    if (action === 'reject') {
+      const note = prompt('Reason for rejecting this household member');
+      if (note === null) return;
+      reviewNote = note;
+    } else if (action === 'approve' || action === 'update') {
+      reviewNote = prompt('Optional review note') ?? undefined;
+    }
+    if (action === 'deactivate' && !confirm(`Deactivate ${String(row.name)}? Their cards and fingerprints will be suspended; the household record and history stay.`)) return;
+    const canCreateVisitors = action === 'approve' || action === 'update' ? confirm('Allow this household member to create visitor passes when they have a login?') : undefined;
+    const canViewBills = action === 'approve' || action === 'update' ? confirm('Allow this household member to view the main resident’s property bills?') : undefined;
+    try {
+      await api(`/api/household-members/${row.id}`, { method: 'PATCH', body: JSON.stringify({ action, reviewNote, canCreateVisitors, canViewBills }) });
+      setMessage(action === 'approve' ? 'Household member approved.' : action === 'deactivate' ? 'Household member deactivated; their credentials were suspended.' : action === 'reactivate' ? 'Household member reactivated.' : 'Household member updated.');
+      refresh();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Household member update failed'); }
+  }
+  async function createMemberLogin(row: Row) {
+    const email = prompt('Login email',String(row.email ?? '')); if (!email) return;
+    const temporaryPassword = prompt('Temporary password (at least 12 characters). Leave blank to link an existing resident account.','') ?? '';
+    try {
+      await api(`/api/household-members/${row.id}/login`,{ method:'POST',body:JSON.stringify({ email,temporaryPassword:temporaryPassword || undefined }) });
+      setMessage('Household member login linked.'); refresh();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not create household member login'); }
   }
   const summary = roster.data?.summary as Record<string, unknown> | undefined;
+  const accessMemberRow = accessMember ? roster.data?.items.find((row) => String(row.id) === String(accessMember.id)) : undefined;
   const actions = (row: Row) => (
     <div className="row-actions">
-      {canManage && String(row.status) === 'pending' && <button className="text" onClick={() => decide(row, 'approve')}>Approve</button>}
-      {canManage && String(row.status) === 'pending' && <button className="text" onClick={() => decide(row, 'reject', 'Reason for rejecting this dependant')}>Reject</button>}
-      {canManage && String(row.status) !== 'inactive'
-        ? <button className="text" onClick={() => decide(row, 'deactivate')}>Deactivate</button>
-        : canManage && <button className="text" onClick={() => decide(row, 'update')}>Reactivate</button>}
+      <EvidenceButton entityType="household_member" entityId={row.id} count={row.proof_count} />
+      {canManage && String(row.status) === 'pending' && <><button className="text" onClick={() => decide(row, 'approve')}>Approve</button><button className="text danger" onClick={() => decide(row, 'reject')}>Reject</button></>}
+      {canManage && String(row.status) === 'active' && <><button className="text" onClick={() => decide(row, 'update')}>Permissions</button><button className="text" onClick={() => setAccessMember(row)}>Cards &amp; fingerprints</button>{!row.linked_user_id && <button className="text" onClick={() => createMemberLogin(row)}>Add login</button>}<button className="text danger" onClick={() => decide(row, 'deactivate')}>Deactivate</button></>}
+      {canManage && String(row.status) === 'inactive' && <button className="text" onClick={() => decide(row, 'reactivate')}>Reactivate</button>}
     </div>
   );
-  return <PagePanel title="Dependants manager" subtitle="Every spouse, child, relative and domestic worker across every household — with their live access picture" action={canManage ? <span className="eyebrow">Bulk uploads: Residents & staff → People → Bulk tools</span> : undefined}>
-    {message && <Notice tone={/failed|Could not/i.test(message) ? 'error' : 'success'}>{message}</Notice>}
+  const rows = (roster.data?.items ?? []).map((row) => ({
+    ...row,
+    visitor_permission: Boolean(Number(row.can_create_visitors)),
+    bill_permission: Boolean(Number(row.can_view_bills)),
+  }));
+  return <PagePanel title="Household members" subtitle="Manage household records, approvals, delegated access and credentials alongside People accounts" action={<div className="row-actions">{canManage&&<span className="eyebrow">Bulk tools are under the Accounts tab</span>}{canAdd&&<button className="primary" onClick={()=>setShowForm(!showForm)}>{showForm?'Close form':'Add household member'}</button>}</div>}>
+    {message && <Notice tone={/failed|Could not|reason|must|cannot|already/i.test(message) ? 'error' : 'success'}>{message}</Notice>}
     {summary && <div className="stat-grid">
-      <article className="stat-card"><p>All dependants</p><strong>{Number(summary.total ?? 0)}</strong></article>
+      <article className="stat-card"><p>All household members</p><strong>{Number(summary.total ?? 0)}</strong></article>
       <article className="stat-card"><p>Active</p><strong>{Number(summary.active ?? 0)}</strong></article>
       <article className="stat-card"><p>Pending approval</p><strong>{Number(summary.pending ?? 0)}</strong></article>
       <article className="stat-card"><p>Domestic staff &amp; caregivers</p><strong>{Number(summary.domestic_staff ?? 0)}</strong></article>
       <article className="stat-card"><p>With their own login</p><strong>{Number(summary.with_logins ?? 0)}</strong></article>
     </div>}
+    {showForm && <FormCard title="Add a household member" onSubmit={addMember}>
+      <label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.main_resident_name ?? property.owner_name ?? property.relationship_type)}</option>)}</select></label>
+      {canManage && <label>Main resident ID<input name="primaryResidentId" placeholder="Optional; resolved automatically" /></label>}
+      <label>Full name<input name="name" required /></label>
+      <label>Relationship<select name="relationship"><option value="spouse">Spouse</option><option value="child">Child</option><option value="parent">Parent</option><option value="relative">Relative</option><option value="domestic_staff">Domestic staff</option><option value="caregiver">Caregiver</option><option value="other">Other</option></select></label>
+      <label>Date of birth<input name="dateOfBirth" type="date" /></label><label>Phone<input name="phone" /></label><label>Email<input name="email" type="email" /></label>
+      <label className="check"><input name="canCreateVisitors" type="checkbox" /> May create visitors after login</label><label className="check"><input name="canViewBills" type="checkbox" /> May view bills after login</label>
+      <label className="span-2">Note<textarea name="requestNote" rows={3} /></label><ProofFilesField label="Identity, relationship or consent proof (recommended)" /><button className="primary">{canManage ? 'Add member' : 'Submit for approval'}</button>
+    </FormCard>}
+    {accessMemberRow && <section className="person-access"><div className="row-actions"><button className="secondary sm" onClick={() => setAccessMember(null)}>Close access panel</button></div>
+      <PersonCredentials householdMemberId={String(accessMemberRow.id)} personName={String(accessMemberRow.name)} devices={accessDevices.data?.items ?? []} onChanged={refresh} />
+    </section>}
     <div className="people-filters">
       <label>Search<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Name, email, phone, Employee ID or main resident" /></label>
       <label>Status<select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All statuses</option><option value="active">Active</option><option value="pending">Pending</option><option value="inactive">Inactive</option><option value="rejected">Rejected</option></select></label>
       <label>Relationship<select value={relationship} onChange={(event) => setRelationship(event.target.value)}><option value="">All relationships</option><option value="spouse">Spouse</option><option value="child">Child</option><option value="parent">Parent</option><option value="relative">Relative</option><option value="domestic_staff">Domestic staff</option><option value="caregiver">Caregiver</option><option value="other">Other</option></select></label>
     </div>
     <ListState list={roster}>
-      <DataTable exportTitle="Dependants" rows={roster.data?.items ?? []} columns={[
-        ['name', 'Name'], ['relationship', 'Relationship'], ['employee_id', 'Employee ID'],
-        ['primary_resident_name', 'Main resident'], ['unit_number', 'Unit'],
-        ['active_cards', 'Cards live'], ['active_fingerprints', 'Fingers live'],
-        ['gate_events', 'Gate events'], ['last_gate_event_at', 'Last gate use', 'date'],
-        ['status', 'Status'],
+      <DataTable exportTitle="Household Members" rows={rows} columns={[
+        ['name','Name'], ['relationship','Relationship'], ['employee_id','Employee ID'], ['primary_resident_name','Main resident'], ['unit_number','Unit'],
+        ['email','Email'], ['linked_login_name','Linked login'], ['visitor_permission','Visitors'], ['bill_permission','Bills'],
+        ['active_cards','Cards live'], ['active_fingerprints','Fingers live'], ['gate_events','Gate events'], ['last_gate_event_at','Last gate use','date'], ['status','Status'],
       ]} action={actions} />
     </ListState>
-    <Notice tone="info">A deactivated dependant keeps their record, bills and gate history; only their credentials stop working. Register new dependants from Tenancy &amp; household, or in bulk from People → Bulk tools.</Notice>
+    <Notice tone="info">Residents can submit new members for approval. Administrators and Managers can review them, adjust permissions, manage credentials and deactivate access without deleting the household or gate history.</Notice>
   </PagePanel>;
 }
 
 function StaffManagement({ user }: { user: User }) {
+  const [view,setView] = useState<'directory'|'attendance'>(user.role==='facility_staff'?'attendance':'directory');
+  useEffect(() => { if (user.role==='facility_staff') setView('attendance'); },[user.role]);
+  if (user.role==='facility_staff') return <StaffAttendance user={user} />;
+  return <div className="staff-workspace">
+    <div className="section-tabs" role="tablist" aria-label="Staff workspace views">
+      <button type="button" role="tab" aria-selected={view==='directory'} className={view==='directory'?'tab-active':''} onClick={()=>setView('directory')}>Staff directory &amp; shifts</button>
+      <button type="button" role="tab" aria-selected={view==='attendance'} className={view==='attendance'?'tab-active':''} onClick={()=>setView('attendance')}>Monthly attendance</button>
+    </div>
+    {view==='attendance' ? <StaffAttendance user={user} /> : <StaffDirectory user={user} />}
+  </div>;
+}
+
+function StaffDirectory({ user }: { user: User }) {
   const [search, setSearch] = useState('');
   const [role, setRole] = useState('');
   const staff = useList(`/api/staff?limit=100&search=${encodeURIComponent(search)}${role ? `&role=${role}` : ''}`);
@@ -2700,13 +2756,14 @@ function StaffManagement({ user }: { user: User }) {
   }
   const summary = staff.data?.summary as Record<string, unknown> | undefined;
   const staffOnly = (people.data?.items ?? []).filter((row) => String(row.role) !== 'resident');
-  return <PagePanel title="Staff management" subtitle="Administrators, managers, cashiers and security officers — postings, shifts and accountability" action={<button className="primary" onClick={() => setShowShiftForm(!showShiftForm)}>Schedule shift</button>}>
+  return <PagePanel title="Staff directory & shifts" subtitle="Facility staff and estate operators — postings, scheduled duties and accountability" action={<button className="primary" onClick={() => setShowShiftForm(!showShiftForm)}>Schedule shift</button>}>
     {message && <Notice tone={/failed|Could not/i.test(message) ? 'error' : 'success'}>{message}</Notice>}
     {summary && <div className="stat-grid">
       <article className="stat-card"><p>Staff accounts</p><strong>{Number(summary.total ?? 0)}</strong></article>
       <article className="stat-card"><p>Active</p><strong>{Number(summary.active ?? 0)}</strong></article>
       <article className="stat-card"><p>Security officers</p><strong>{Number(summary.security_officers ?? 0)}</strong></article>
       <article className="stat-card"><p>Cashiers</p><strong>{Number(summary.cashiers ?? 0)}</strong></article>
+      <article className="stat-card"><p>Facility staff</p><strong>{Number(summary.facility_staff ?? 0)}</strong></article>
       <article className="stat-card"><p>Managers &amp; admins</p><strong>{Number(summary.managers ?? 0) + Number(summary.administrators ?? 0)}</strong></article>
     </div>}
     {showShiftForm && <FormCard title="Schedule a shift" onSubmit={submitShift} message="">
@@ -2721,7 +2778,7 @@ function StaffManagement({ user }: { user: User }) {
     </FormCard>}
     <div className="people-filters">
       <label>Search<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Name, email, phone or Employee ID" /></label>
-      <label>Role<select value={role} onChange={(event) => setRole(event.target.value)}><option value="">All staff roles</option><option value="admin">Administrators</option><option value="manager">Managers</option><option value="cashier">Cashiers</option><option value="security">Security</option></select></label>
+      <label>Role<select value={role} onChange={(event) => setRole(event.target.value)}><option value="">All staff roles</option><option value="admin">Administrators</option><option value="manager">Managers</option><option value="cashier">Cashiers</option><option value="security">Security</option><option value="facility_staff">Facility staff</option></select></label>
     </div>
     <ListState list={staff}>
       <DataTable exportTitle="Staff" rows={staff.data?.items ?? []} columns={[
@@ -2744,6 +2801,173 @@ function StaffManagement({ user }: { user: User }) {
       )} />
     </ListState>
     <Notice tone="info">Gate postings (which terminal an officer may operate) are managed under Access control → Remote door control. Roles and passwords are edited from the People page. Every staff action remains in the audit log.</Notice>
+  </PagePanel>;
+}
+
+function currentMonthInput(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+}
+
+function attendanceInputPart(value: unknown, timeZone: string, part: 'date'|'time'): string {
+  if (!value) return '';
+  const date = new Date(String(value));
+  if (Number.isNaN(date.valueOf())) return '';
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA',{
+    timeZone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23',
+  }).formatToParts(date).filter((item)=>item.type!=='literal').map((item)=>[item.type,item.value]));
+  return part==='date' ? `${parts.year}-${parts.month}-${parts.day}` : `${parts.hour}:${parts.minute}`;
+}
+
+function estateDateForMonth(month:string,timeZone:string):string {
+  const today=attendanceInputPart(new Date().toISOString(),timeZone,'date');
+  return today.slice(0,7)===month?today:`${month}-01`;
+}
+
+function StaffAttendance({ user }: { user: User }) {
+  const canReview = user.role==='admin' || user.role==='manager';
+  const [month,setMonth] = useState('');
+  const [staffId,setStaffId] = useState('');
+  const [extraItems,setExtraItems] = useState<Row[]>([]);
+  const [nextPage,setNextPage] = useState(2);
+  const [loadingMore,setLoadingMore] = useState(false);
+  const [hasMoreRows,setHasMoreRows] = useState(false);
+  const query = `/api/staff/attendance?limit=1000${month?`&month=${encodeURIComponent(month)}`:''}${canReview&&staffId?`&staffId=${encodeURIComponent(staffId)}`:''}`;
+  const attendance = useList(query);
+  const reportKeyRef = useRef(query);
+  const staff = useAsync<{ items:Row[] }>(()=>canReview?api('/api/staff?role=facility_staff&limit=100'):Promise.resolve({items:[]}),[user.role]);
+  const [message,setMessage] = useState('');
+  const [showForm,setShowForm] = useState(false);
+  const [editing,setEditing] = useState<Row|null>(null);
+  const [busy,setBusy] = useState(false);
+  const timeZone = String(attendance.data?.timeZone || 'Africa/Lagos');
+  const baseItems = (attendance.data?.items ?? []) as Row[];
+  const items = [...baseItems,...extraItems];
+  const summaries = (attendance.data?.staff ?? []) as Row[];
+  const totals = (attendance.data?.totals ?? {}) as Row;
+  const pagination = (attendance.data?.pagination ?? {}) as Row;
+  const openSession = (attendance.data?.openSession ?? null) as Row|null;
+  const selectedMonth = month || String(attendance.data?.month || currentMonthInput());
+  useEffect(()=>{
+    reportKeyRef.current=query;
+    setExtraItems([]);
+    setNextPage(2);
+    setHasMoreRows(Boolean(pagination.hasMore));
+  },[query,attendance.data]);
+  function refresh() { attendance.reload(); if(canReview) staff.reload(); }
+
+  async function loadMore() {
+    const requestKey=query;
+    setLoadingMore(true);
+    try {
+      const params=new URLSearchParams({month:selectedMonth,limit:'1000',page:String(nextPage)});
+      if(canReview&&staffId)params.set('staffId',staffId);
+      const result=await api<{items:Row[];pagination?:{hasMore?:boolean}}>(`/api/staff/attendance?${params.toString()}`);
+      if(reportKeyRef.current!==requestKey)return;
+      setExtraItems((current)=>[...current,...result.items]);
+      setHasMoreRows(Boolean(result.pagination?.hasMore));
+      setNextPage((current)=>current+1);
+    } catch(reason) {
+      setMessage(reason instanceof Error?reason.message:'Could not load the next attendance page');
+    } finally { setLoadingMore(false); }
+  }
+
+  async function clock(action:'clock_in'|'clock_out') {
+    setBusy(true);setMessage('');
+    try {
+      await api('/api/staff/attendance/clock',{method:'POST',body:JSON.stringify({action})});
+      setMessage(action==='clock_in'?'Clock-in recorded by the server.':'Clock-out recorded by the server.');
+      attendance.reload();
+    } catch(reason) { setMessage(reason instanceof Error?reason.message:'Could not record attendance'); }
+    finally { setBusy(false); }
+  }
+
+  async function submitManual(event:FormEvent<HTMLFormElement>) {
+    event.preventDefault();setBusy(true);setMessage('');
+    const values=Object.fromEntries(new FormData(event.currentTarget));
+    const body={staffUserId:String(values.staffUserId||''),workDate:String(values.workDate||''),clockIn:String(values.clockIn||''),clockOut:String(values.clockOut||''),reason:String(values.reason||'').trim()};
+    try {
+      if(editing) await api(`/api/staff/attendance/${editing.id}`,{method:'PATCH',body:JSON.stringify(body)});
+      else await api('/api/staff/attendance',{method:'POST',body:JSON.stringify(body)});
+      setShowForm(false);setEditing(null);setMessage(editing?'Attendance correction saved and audited.':'Manual attendance record added and audited.');refresh();
+    } catch(reason) { setMessage(reason instanceof Error?reason.message:'Could not save attendance'); }
+    finally { setBusy(false); }
+  }
+
+  function editRecord(row:Row) { setEditing(row);setShowForm(true);setMessage(''); }
+  const displayRows=items.map((row)=>({
+    ...row,
+    clock_in_display:String(row.clock_in_local||'—'),
+    clock_out_display:String(row.clock_out_local||'Still open'),
+    hours_display:row.duration_minutes===null?'Open':`${(Number(row.duration_minutes||0)/60).toFixed(2)} h`,
+  }));
+  const summaryRows=summaries.map((row)=>({
+    ...row,
+    hours_display:`${(Number(row.total_minutes||0)/60).toFixed(2)} h`,
+    days_display:String(row.days_present??0),
+    sessions_display:String(row.sessions??0),
+  }));
+  const selfOpen = Boolean(openSession);
+
+  if (!canReview) return <PagePanel title="My time & attendance" subtitle="Your personal clock-ins and monthly attendance history" action={<button className="secondary" onClick={attendance.reload}>Refresh</button>}>
+    {message&&<Notice tone={/Could not|already|not clocked|cannot/i.test(message)?'warning':'success'}>{message}</Notice>}
+    <section className="attendance-clock panel">
+      <div><p className="eyebrow">TODAY’S ATTENDANCE</p><h3>{selfOpen?'You are clocked in':'You are not clocked in'}</h3>
+        {selfOpen?<p>Started {String(openSession?.clock_in_local||'')} · work date {String(openSession?.work_date||'')}</p>:<p>Clock-in is stamped by EstateMate using the estate’s local time. Do not share your sign-in.</p>}
+      </div>
+      <button className={selfOpen?'secondary':'primary'} disabled={busy||attendance.loading} onClick={()=>clock(selfOpen?'clock_out':'clock_in')}>{busy?'Recording…':selfOpen?'Clock out':'Clock in'}</button>
+    </section>
+    <Notice tone="info">These punches are an attendance record, not a GPS or device-verification system. HR can review and export your monthly record; a gate swipe is not automatically treated as paid work time.</Notice>
+    <label className="month-filter">Month<input type="month" value={selectedMonth} onChange={(event)=>setMonth(event.target.value)} /></label>
+    {attendance.error&&<Notice tone="error">{attendance.error} <button className="text" onClick={attendance.reload}>Retry</button></Notice>}
+    {attendance.loading?<Loading/>:<>
+      <div className="stat-grid attendance-stats">
+        <article className="stat-card"><p>Days recorded</p><strong>{Number(totals.staff_days||0)}</strong></article>
+        <article className="stat-card"><p>Sessions</p><strong>{Number(totals.sessions||0)}</strong></article>
+        <article className="stat-card"><p>Hours recorded</p><strong>{(Number(totals.total_minutes||0)/60).toFixed(2)}</strong></article>
+        <article className="stat-card"><p>Open sessions</p><strong>{Number(totals.open_sessions||0)}</strong></article>
+      </div>
+      <DataTable exportTitle={`My attendance ${selectedMonth}`} rows={displayRows} columns={[
+        ['work_date','Work date'],['clock_in_display','Clock in'],['clock_out_display','Clock out'],['hours_display','Duration'],['source','Record type'],['note','Note'],
+      ]}/>
+    </>}
+  </PagePanel>;
+
+  return <PagePanel title="Monthly facility-staff attendance" subtitle="Review, correct and export clock-in/out records for HR" action={<div className="row-actions"><button className="secondary" onClick={attendance.reload}>Refresh</button><button className="primary" disabled={attendance.loading||staff.loading} onClick={()=>{setEditing(null);setShowForm(!showForm);}}>Add manual record</button></div>}>
+    {message&&<Notice tone={/Could not|failed|overlap|future|reason/i.test(message)?'error':'success'}>{message}</Notice>}
+    <Notice tone="info">Self punches are server-stamped. Manual entries and corrections require a reason and are written to the audit log. Export the summary and session detail for the selected month; compare with the shift roster before approving payroll.</Notice>
+    <div className="attendance-filters">
+      <label>Report month<input type="month" value={selectedMonth} onChange={(event)=>setMonth(event.target.value)} /></label>
+      <label>Facility staff<select value={staffId} onChange={(event)=>setStaffId(event.target.value)}><option value="">All facility staff</option>{(staff.data?.items??[]).map((row)=><option key={String(row.id)} value={String(row.id)}>{String(row.name)}{row.status==='inactive'?' (inactive)':''}</option>)}</select></label>
+    </div>
+    {attendance.error&&<Notice tone="error">{attendance.error} <button className="text" onClick={attendance.reload}>Retry</button></Notice>}
+    {attendance.loading?<Loading/>:<>
+      {hasMoreRows&&<Notice tone="warning">This report has additional session pages. Load every page before exporting the complete monthly detail.</Notice>}
+      <div className="stat-grid attendance-stats">
+        <article className="stat-card"><p>Staff in report</p><strong>{Number(totals.staff||0)}</strong></article>
+        <article className="stat-card"><p>Staff-days recorded</p><strong>{Number(totals.staff_days||0)}</strong></article>
+        <article className="stat-card"><p>Sessions</p><strong>{Number(totals.sessions||0)}</strong></article>
+        <article className="stat-card"><p>Total hours</p><strong>{(Number(totals.total_minutes||0)/60).toFixed(2)}</strong></article>
+        <article className="stat-card"><p>Open punches</p><strong>{Number(totals.open_sessions||0)}</strong></article>
+      </div>
+      <h3>Monthly summary by staff</h3>
+      <DataTable exportTitle={`Facility staff attendance summary ${selectedMonth}`} rows={summaryRows} columns={[
+        ['staff_name','Staff member'],['employee_id','Employee ID'],['account_status','Account'],['days_display','Days recorded'],['sessions_display','Sessions'],['hours_display','Hours'],['open_sessions','Open punches'],
+      ]}/>
+      <h3>Attendance sessions</h3>
+      <DataTable exportTitle={`Facility staff attendance detail ${selectedMonth}`} rows={displayRows} columns={[
+        ['staff_name','Staff member'],['employee_id','Employee ID'],['work_date','Work date'],['clock_in_display','Clock in'],['clock_out_display','Clock out'],['hours_display','Duration'],['source','Record type'],['note','HR note'],
+      ]} action={(row)=><button className="text" onClick={()=>editRecord(row)}>Correct</button>}/>
+      {canReview&&hasMoreRows&&<div className="attendance-load-more"><button type="button" className="secondary" disabled={loadingMore} onClick={loadMore}>{loadingMore?'Loading…':'Load next 1,000 sessions'}</button><small>{displayRows.length} of {Number(totals.sessions||0)} session(s) loaded</small></div>}
+    </>}
+    {showForm&&<FormCard title={editing?`Correct attendance for ${String(editing.staff_name)}`:'Add a manual attendance record'} onSubmit={submitManual} message="">
+      <label>Facility staff<select name="staffUserId" defaultValue={String(editing?.staff_user_id||'')} required disabled={Boolean(editing)}><option value="">Select staff…</option>{(staff.data?.items??[]).map((row)=><option key={String(row.id)} value={String(row.id)}>{String(row.name)} · {String(row.employee_id||'No Employee ID')}{row.status==='inactive'?' · inactive':''}</option>)}</select></label>
+      <label>Work date<input name="workDate" type="date" defaultValue={String(editing?.work_date||estateDateForMonth(selectedMonth,timeZone))} required /></label>
+      <label>Clock in<input name="clockIn" type="time" defaultValue={editing?attendanceInputPart(editing.clock_in_at,timeZone,'time'):'09:00'} required /></label>
+      <label>Clock out<input name="clockOut" type="time" defaultValue={editing?attendanceInputPart(editing.clock_out_at,timeZone,'time'):'17:00'} required /></label>
+      <label className="span-2">HR reason / note<textarea name="reason" rows={3} defaultValue={editing?String(editing.note||''):''} minLength={4} maxLength={500} placeholder="Required: e.g. supervisor verified the missed punch against the signed duty register" required /></label>
+      <div className="row-actions"><button className="primary" disabled={busy}>{busy?'Saving…':editing?'Save correction':'Add attendance'}</button><button type="button" className="secondary" onClick={()=>{setShowForm(false);setEditing(null);}}>Cancel</button></div>
+    </FormCard>}
   </PagePanel>;
 }
 
@@ -3039,13 +3263,24 @@ function DocumentLibrary({ user, set, title, subtitle, categories }: { user: Use
   </PagePanel>;
 }
 
-function InformationHub({ user, onNavigate }: { user: User; onNavigate?: (s: Section) => void }) {
+function EstateDocuments({ user, onNavigate, initialSet = 'info' }: { user: User; onNavigate?: (s: Section) => void; initialSet?: 'info'|'legal' }) {
+  const [collection,setCollection] = useState<'info'|'legal'>(initialSet);
+  useEffect(()=>setCollection(initialSet),[initialSet]);
+  const categories: Array<[string,string]> = collection==='info'
+    ? [['guide','Resident guide'],['form','Form'],['other','Other']]
+    : [['bylaw','By-law'],['house_rule','House rule'],['privacy','Privacy & data'],['agreement','Residents’ agreement'],['minutes','Meeting minutes'],['policy','Policy']];
   return <>
-    <DocumentLibrary user={user} set="info" title="Information hub" subtitle="Resident guides, forms, service documents and estate communications" categories={[
-      ['guide', 'Resident guide'], ['form', 'Form'], ['other', 'Other'],
-    ]} />
+    <div className="section-tabs" role="tablist" aria-label="Document library collections">
+      <button type="button" role="tab" aria-selected={collection==='info'} className={collection==='info'?'tab-active':''} onClick={()=>setCollection('info')}>Guides &amp; forms</button>
+      <button type="button" role="tab" aria-selected={collection==='legal'} className={collection==='legal'?'tab-active':''} onClick={()=>setCollection('legal')}>Legal &amp; governance</button>
+    </div>
+    <DocumentLibrary user={user} set={collection} title="Documents & governance" subtitle={collection==='info'?'Resident guides, forms, service documents and estate communications':'By-laws, privacy notices, agreements, policies and governance records'} categories={categories} />
     <InformationShortcuts onNavigate={onNavigate} />
   </>;
+}
+
+function InformationHub({ user, onNavigate }: { user: User; onNavigate?: (s: Section) => void }) {
+  return <EstateDocuments user={user} onNavigate={onNavigate} initialSet="info" />;
 }
 
 /** The hub's quick-route cards remain alongside the real library. */
@@ -3056,7 +3291,6 @@ function InformationShortcuts({ onNavigate }: { onNavigate?: (s: Section) => voi
     ['bookings', 'Facility bookings', 'Reserve estate amenities and view the upcoming events calendar.'],
     ['emergency', 'Emergency contacts', 'Quick access to security, medical, fire and utility response lines.'],
     ['visitors', 'Visitor management', 'Invite guests, issue passes and review arrival history.'],
-    ['legal', 'Legal & governance', 'Estate by-laws, house rules, data handling and governance documents.'],
   ];
   return <section className="feature-grid">
     {cards.map(([id, title, body]) => (
@@ -3072,9 +3306,7 @@ function InformationShortcuts({ onNavigate }: { onNavigate?: (s: Section) => voi
 }
 
 function LegalGovernance({ user }: { user: User }) {
-  return <DocumentLibrary user={user} set="legal" title="Legal & governance" subtitle="By-laws, house rules, residents’ agreement, privacy and data-handling notices, AGM minutes and Exco resolutions" categories={[
-    ['bylaw', 'By-law'], ['house_rule', 'House rule'], ['privacy', 'Privacy & data'], ['agreement', 'Residents’ agreement'], ['minutes', 'Meeting minutes'], ['policy', 'Policy'],
-  ]} />;
+  return <EstateDocuments user={user} initialSet="legal" />;
 }
 
 export default App;

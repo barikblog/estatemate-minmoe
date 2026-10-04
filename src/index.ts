@@ -51,6 +51,13 @@ export { AccessLiveFeed };
 type AppContext = Context<{ Bindings: Env; Variables: AppVariables }>;
 const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 const MAX_PAGE_SIZE = 100;
+
+/** Return the portal-facing role from the compatible legacy storage columns. */
+function effectiveRoleSql(alias = ''): string {
+  const prefix = alias ? `${alias}.` : '';
+  return `CASE WHEN ${prefix}is_manager=1 THEN 'manager' WHEN ${prefix}is_facility_staff=1 THEN 'facility_staff' ELSE ${prefix}role END`;
+}
+
 const DEVICE_BODY_LIMIT = 2 * 1024 * 1024;
 const CSV_BODY_LIMIT = 2 * 1024 * 1024;
 
@@ -144,7 +151,7 @@ const requireAuth: MiddlewareHandler<{ Bindings: Env; Variables: AppVariables }>
   // one through POST /api/auth/select-gate, so it must never satisfy auth here.
   if (claims.pendingGate) return jsonError(c, 401, 'Select the gate you are working before continuing');
   const user = await c.env.DB.prepare(
-    `SELECT id,name,email,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,property_id FROM users WHERE id=? AND status='active' AND (account_expires_at IS NULL OR datetime(account_expires_at)>datetime('now')) LIMIT 1`,
+    `SELECT id,name,email,${effectiveRoleSql()} AS role,property_id FROM users WHERE id=? AND status='active' AND (account_expires_at IS NULL OR datetime(account_expires_at)>datetime('now')) LIMIT 1`,
   ).bind(claims.sub).first<AuthUser>();
   if (!user) return jsonError(c, 401, 'User is inactive or no longer exists');
   c.set('user', user);
@@ -219,7 +226,12 @@ function requireRoles(...roles: Role[]): MiddlewareHandler<{ Bindings: Env; Vari
 
 function isEstateOperator(role:Role):boolean { return role==='admin' || role==='manager'; }
 function canManageAccount(actor:Role,target:Role):boolean { return actor==='admin' || (actor==='manager' && !['admin','manager'].includes(target)); }
-function storedRole(role:Role):{ role:Exclude<Role,'manager'>;isManager:number } { return role==='manager'?{ role:'security',isManager:1 }:{ role,isManager:0 }; }
+type StoredRole = { role: Exclude<Role,'manager'|'facility_staff'>; isManager:number; isFacilityStaff:number };
+function storedRole(role:Role):StoredRole {
+  if (role==='manager') return { role:'security',isManager:1,isFacilityStaff:0 };
+  if (role==='facility_staff') return { role:'security',isManager:0,isFacilityStaff:1 };
+  return { role,isManager:0,isFacilityStaff:0 };
+}
 function encryptionKey(env:Env):string { return env.STORAGE_ENCRYPTION_KEY || env.JWT_SECRET; }
 
 async function audit(c: AppContext, action: string, entityType: string, entityId: string | null, details?: unknown) {
@@ -239,6 +251,70 @@ async function estateTimeZone(db: D1Database): Promise<string> {
   } catch {
     return DEFAULT_ESTATE_TIMEZONE;
   }
+}
+
+function partsInTimeZone(date: Date, timeZone: string): Record<string, string> {
+  return Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone, year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', hourCycle:'h23',
+  }).formatToParts(date).filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]));
+}
+
+function estateLocalDate(date: Date, timeZone: string): string {
+  const parts = partsInTimeZone(date, timeZone);
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function estateLocalMonth(date: Date, timeZone: string): string {
+  const parts = partsInTimeZone(date, timeZone);
+  return `${parts.year}-${parts.month}`;
+}
+
+function isCalendarDate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(date.valueOf()) && date.toISOString().slice(0,10) === value;
+}
+
+function isAttendanceMonth(value: string): boolean {
+  return /^\d{4}-(0[1-9]|1[0-2])$/.test(value);
+}
+
+function nextMonthStart(month: string): string {
+  const [year, monthNumber] = month.split('-').map(Number);
+  const next = new Date(Date.UTC(year!, monthNumber!, 1));
+  return next.toISOString().slice(0,10);
+}
+
+function nextCalendarDate(date: string): string {
+  const next = new Date(`${date}T00:00:00.000Z`);
+  next.setUTCDate(next.getUTCDate() + 1);
+  return next.toISOString().slice(0,10);
+}
+
+function clockMinutes(value: string): number | null {
+  const match = /^(\d{2}):(\d{2})$/.exec(value);
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  return hours <= 23 && minutes <= 59 ? hours * 60 + minutes : null;
+}
+
+function attendanceWindow(workDate: string, clockIn: string, clockOut: string, timeZone: string): { clockInAt: string; clockOutAt: string } | null {
+  const inMinutes = clockMinutes(clockIn);
+  const outMinutes = clockMinutes(clockOut);
+  if (!isCalendarDate(workDate) || inMinutes === null || outMinutes === null) return null;
+  const endDate = outMinutes <= inMinutes ? nextCalendarDate(workDate) : workDate;
+  const startMs = parseEstateInstantMs(`${workDate}T${clockIn}`, timeZone);
+  const endMs = parseEstateInstantMs(`${endDate}T${clockOut}`, timeZone);
+  if (startMs === null || endMs === null || endMs <= startMs || endMs - startMs > 24 * 60 * 60 * 1000) return null;
+  return { clockInAt: new Date(startMs).toISOString(), clockOutAt: new Date(endMs).toISOString() };
+}
+
+function attendanceLocalTime(value: unknown, timeZone: string): string | null {
+  if (!value) return null;
+  const ms = parseEstateInstantMs(value, timeZone);
+  if (ms === null) return null;
+  return new Intl.DateTimeFormat('en-GB', { timeZone, hour:'2-digit', minute:'2-digit', hourCycle:'h23' }).format(new Date(ms));
 }
 
 type PropertyRelationship = {
@@ -585,7 +661,7 @@ app.post('/api/auth/login', async (c) => {
   const body = await c.req.json<{ email?: string; password?: string }>();
   if (!body.email || !body.password) return jsonError(c, 400, 'email and password are required');
   const user = await c.env.DB.prepare(
-    `SELECT id,name,email,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,property_id,password_hash FROM users WHERE email=? AND status='active' AND (account_expires_at IS NULL OR datetime(account_expires_at)>datetime('now')) LIMIT 1`,
+    `SELECT id,name,email,${effectiveRoleSql()} AS role,property_id,password_hash FROM users WHERE email=? AND status='active' AND (account_expires_at IS NULL OR datetime(account_expires_at)>datetime('now')) LIMIT 1`,
   ).bind(body.email.trim().toLowerCase()).first<AuthUser & { password_hash: string }>();
   if (!user || !(await verifyPassword(body.password, user.password_hash))) return jsonError(c, 401, 'Invalid email or password');
   const { password_hash: _passwordHash, ...safeUser } = user;
@@ -630,7 +706,7 @@ app.post('/api/auth/select-gate', async (c) => {
   }
 
   const user = await c.env.DB.prepare(
-    `SELECT id,name,email,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,property_id FROM users WHERE id=? AND status='active' AND (account_expires_at IS NULL OR datetime(account_expires_at)>datetime('now')) LIMIT 1`,
+    `SELECT id,name,email,${effectiveRoleSql()} AS role,property_id FROM users WHERE id=? AND status='active' AND (account_expires_at IS NULL OR datetime(account_expires_at)>datetime('now')) LIMIT 1`,
   ).bind(claims.sub).first<AuthUser>();
   if (!user) return jsonError(c, 401, 'User is inactive or no longer exists');
   if (user.role !== 'security') return jsonError(c, 403, 'Only a Security officer selects a gate for a session');
@@ -654,6 +730,23 @@ app.post('/api/auth/logout', (c) => {
 });
 
 app.use('/api/*', requireAuth);
+
+// Facility staff use a deliberately narrow self-service workspace. Enforce its
+// allow-list at the API boundary as well as in the sidebar so a hidden menu item
+// can never become a permission check.
+app.use('/api/*', async (c, next) => {
+  if (c.get('user').role !== 'facility_staff') return next();
+  const path = new URL(c.req.url).pathname;
+  const method = c.req.method.toUpperCase();
+  const isNoticeAcknowledgement = method === 'POST' && path.startsWith('/api/notices/') && path.endsWith('/acknowledge') && path.split('/').length === 5;
+  const allowed = (method === 'GET' && [
+    '/api/auth/me', '/api/dashboard', '/api/notices', '/api/notices/popup', '/api/staff/attendance',
+  ].includes(path))
+    || (method === 'POST' && ['/api/auth/change-password', '/api/auth/logout', '/api/staff/attendance/clock'].includes(path))
+    || isNoticeAcknowledgement;
+  if (!allowed) return jsonError(c, 403, 'Facility staff accounts can only access their own attendance and staff notices');
+  await next();
+});
 
 app.get('/api/auth/me', async (c) => {
   const deviceId = gateScope(c);
@@ -683,6 +776,7 @@ app.post('/api/auth/change-password', async (c) => {
 
 app.get('/api/dashboard', async (c) => {
   const user = c.get('user');
+  if (user.role === 'facility_staff') return c.json({ workspace: 'facility_staff' });
   if (user.role === 'resident') {
     const results = await c.env.DB.batch([
       c.env.DB.prepare(`SELECT COUNT(*) AS count, COALESCE(SUM(amount_minor),0) AS amount FROM bills WHERE resident_id = ? AND status IN ('unpaid','partial')`).bind(user.id),
@@ -1083,14 +1177,15 @@ app.post('/api/household-members', requireRoles('resident','admin','manager'), a
 });
 
 app.patch('/api/household-members/:id', requireRoles('admin','manager'), async (c) => {
-  const body = await c.req.json<{ action?: 'approve'|'reject'|'deactivate'|'update'; canCreateVisitors?: boolean; canViewBills?: boolean; reviewNote?: string; name?: string; phone?: string; email?: string; relationship?: string; employeeId?: string }>();
-  if (!body.action || !['approve','reject','deactivate','update'].includes(body.action)) return jsonError(c, 400, 'Invalid household action');
+  const body = await c.req.json<{ action?: 'approve'|'reject'|'deactivate'|'reactivate'|'update'; canCreateVisitors?: boolean; canViewBills?: boolean; reviewNote?: string; name?: string; phone?: string; email?: string; relationship?: string; employeeId?: string }>();
+  if (!body.action || !['approve','reject','deactivate','reactivate','update'].includes(body.action)) return jsonError(c, 400, 'Invalid household action');
   const member = await c.env.DB.prepare(`SELECT * FROM household_members WHERE id=?`).bind(c.req.param('id')).first<Record<string,string|number|null>>();
   if (!member) return jsonError(c, 404, 'Household member not found');
   const visitorPermission = body.canCreateVisitors == null ? Number(member.can_create_visitors) : body.canCreateVisitors ? 1 : 0;
   const billPermission = body.canViewBills == null ? Number(member.can_view_bills) : body.canViewBills ? 1 : 0;
-  const status = body.action === 'approve' ? 'active' : body.action === 'reject' ? 'rejected' : body.action === 'deactivate' ? 'inactive' : String(member.status);
+  const status = body.action === 'approve' || body.action === 'reactivate' ? 'active' : body.action === 'reject' ? 'rejected' : body.action === 'deactivate' ? 'inactive' : String(member.status);
   if (body.action === 'approve' && member.status !== 'pending') return jsonError(c, 409, 'Only pending household members can be approved');
+  if (body.action === 'reactivate' && member.status !== 'inactive') return jsonError(c, 409, 'Only inactive household members can be reactivated');
   const relationships = ['spouse','child','parent','relative','domestic_staff','caregiver','other'];
   if (body.relationship !== undefined && !relationships.includes(body.relationship)) return jsonError(c,400,'Invalid relationship');
   const employeeIdUpdate=await resolveUpdatedEmployeeId(c.env.DB,'dependant',c.req.param('id'),body.employeeId);
@@ -1432,7 +1527,7 @@ app.get('/api/users', requireRoles('admin','manager','cashier','security'), asyn
   const role = c.req.query('role');
   const search = `%${c.req.query('search')?.trim() ?? ''}%`;
   const result = await c.env.DB.prepare(
-    `SELECT u.id,u.name,u.email,u.phone,u.employee_id,CASE WHEN u.is_manager=1 THEN 'manager' ELSE u.role END AS role,u.status,u.property_id,u.account_expires_at,u.created_at,
+    `SELECT u.id,u.name,u.email,u.phone,u.employee_id,${effectiveRoleSql('u')} AS role,u.status,u.property_id,u.account_expires_at,u.created_at,
        GROUP_CONCAT(CASE WHEN po.status='active' THEN p.unit_number END, ', ') AS unit_numbers,
        COUNT(CASE WHEN po.status='active' THEN 1 END) AS property_count,
        (SELECT GROUP_CONCAT(tp.unit_number,', ') FROM property_tenancies t JOIN properties tp ON tp.id=t.property_id WHERE t.tenant_id=u.id AND t.status='active') AS rented_units,
@@ -1440,7 +1535,7 @@ app.get('/api/users', requireRoles('admin','manager','cashier','security'), asyn
      FROM users u
      LEFT JOIN property_ownerships po ON po.resident_id=u.id AND po.status='active'
      LEFT JOIN properties p ON p.id=po.property_id
-     WHERE (? IS NULL OR CASE WHEN u.is_manager=1 THEN 'manager' ELSE u.role END=?) AND (u.name LIKE ? OR u.email LIKE ? OR u.phone LIKE ?)
+     WHERE (? IS NULL OR ${effectiveRoleSql('u')}=?) AND (u.name LIKE ? OR u.email LIKE ? OR u.phone LIKE ?)
      GROUP BY u.id ORDER BY u.created_at DESC LIMIT ? OFFSET ?`,
   ).bind(role ?? null, role ?? null, search, search, search, limit, offset).all();
   return c.json({ items: result.results, page: pageNumber, limit });
@@ -1452,7 +1547,7 @@ app.post('/api/users', requireRoles('admin','manager'), async (c) => {
   if (!name || !email || !body.password || !body.role) return jsonError(c, 400, 'name, email, password and role are required');
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return jsonError(c,400,'Enter a valid email address');
   if (body.password.length<12) return jsonError(c,400,'Temporary password must contain at least 12 characters');
-  if (!['admin','manager','resident','security','cashier'].includes(body.role)) return jsonError(c, 400, 'Invalid role');
+  if (!['admin','manager','resident','security','cashier','facility_staff'].includes(body.role)) return jsonError(c, 400, 'Invalid role');
   if (!canManageAccount(c.get('user').role,body.role)) return jsonError(c,403,'Managers cannot create administrator or manager accounts');
   const existingEmail=await c.env.DB.prepare(`SELECT id FROM users WHERE lower(email)=?`).bind(email).first();
   if (existingEmail) return jsonError(c,409,'An account with this email already exists');
@@ -1470,8 +1565,8 @@ app.post('/api/users', requireRoles('admin','manager'), async (c) => {
   const employeeId=await resolveNewEmployeeId(c.env.DB,id,body.employeeId);
   if (employeeId.error) return jsonError(c,employeeId.conflict?409:400,employeeId.error);
   const statements = [c.env.DB.prepare(
-    `INSERT INTO users(id,name,email,phone,password_hash,role,is_manager,property_id,employee_id) VALUES (?,?,?,?,?,?,?,?,?)`,
-  ).bind(id,name,email,phone,await hashPassword(body.password),persistedRole.role,persistedRole.isManager,body.propertyId || null,employeeId.value)];
+    `INSERT INTO users(id,name,email,phone,password_hash,role,is_manager,is_facility_staff,property_id,employee_id) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+  ).bind(id,name,email,phone,await hashPassword(body.password),persistedRole.role,persistedRole.isManager,persistedRole.isFacilityStaff,body.propertyId || null,employeeId.value)];
   let ownershipId: string | null = null;
   if (body.propertyId) {
     ownershipId = crypto.randomUUID();
@@ -1485,7 +1580,7 @@ app.post('/api/users', requireRoles('admin','manager'), async (c) => {
 });
 
 app.patch('/api/users/:id', requireRoles('admin','manager'), async (c) => {
-  const existing=await c.env.DB.prepare(`SELECT id,name,email,phone,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,status FROM users WHERE id=?`).bind(c.req.param('id')).first<{ id:string;name:string;email:string;phone:string|null;role:Role;status:'active'|'inactive' }>();
+  const existing=await c.env.DB.prepare(`SELECT id,name,email,phone,${effectiveRoleSql()} AS role,status FROM users WHERE id=?`).bind(c.req.param('id')).first<{ id:string;name:string;email:string;phone:string|null;role:Role;status:'active'|'inactive' }>();
   if (!existing) return jsonError(c,404,'User account not found');
   if (!canManageAccount(c.get('user').role,existing.role)) return jsonError(c,403,'Managers cannot edit administrator or manager accounts');
   const body=await c.req.json<{ name?:string;email?:string;phone?:string|null;role?:Role;status?:'active'|'inactive';propertyId?:string;employeeId?:string }>();
@@ -1495,8 +1590,16 @@ app.patch('/api/users/:id', requireRoles('admin','manager'), async (c) => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return jsonError(c,400,'Enter a valid email address');
   const emailOwner=await c.env.DB.prepare(`SELECT id FROM users WHERE lower(email)=? AND id<>?`).bind(email,existing.id).first();
   if (emailOwner) return jsonError(c,409,'An account with this email already exists');
-  if (!['admin','manager','resident','security','cashier'].includes(role)) return jsonError(c,400,'Invalid role');
+  if (!['admin','manager','resident','security','cashier','facility_staff'].includes(role)) return jsonError(c,400,'Invalid role');
   if (!canManageAccount(c.get('user').role,role)) return jsonError(c,403,'Managers cannot grant administrator or manager access');
+  if (role==='facility_staff' && existing.role!=='facility_staff') {
+    const gatePosting=await c.env.DB.prepare(`SELECT 1 AS found FROM security_gate_assignments WHERE security_user_id=? AND active=1 LIMIT 1`).bind(existing.id).first();
+    if (gatePosting) return jsonError(c,409,'Remove active gate postings before changing this account to Facility Staff.');
+  }
+  if (existing.role==='facility_staff' && role!=='facility_staff') {
+    const attendanceHistory=await c.env.DB.prepare(`SELECT 1 AS found FROM staff_attendance WHERE staff_user_id=? LIMIT 1`).bind(existing.id).first();
+    if (attendanceHistory) return jsonError(c,409,'This account has attendance history. Deactivate it instead of changing its role so HR records remain accessible.');
+  }
   if (!['active','inactive'].includes(status)) return jsonError(c,400,'Invalid status');
   if (existing.id===c.get('user').id && (role!=='admin' || status!=='active')) return jsonError(c,409,'You cannot remove your own active administrator access');
   if (existing.role==='admin' && (role!=='admin' || status!=='active')) {
@@ -1536,8 +1639,8 @@ app.patch('/api/users/:id', requireRoles('admin','manager'), async (c) => {
   const employeeIdColumn=!touchesEmployeeId?'employee_id=employee_id':clearsEmployeeId?'employee_id=NULL':'employee_id=?';
   const updateBindings:Array<string|number|null>=[name,email,phone];
   if (touchesEmployeeId && !clearsEmployeeId) updateBindings.push(employeeIdUpdate.value);
-  updateBindings.push(persistedRole.role,persistedRole.isManager,status,body.propertyId || null,existing.id);
-  const statements:D1PreparedStatement[]=[c.env.DB.prepare(`UPDATE users SET name=?,email=?,phone=?,${employeeIdColumn},role=?,is_manager=?,status=?,property_id=COALESCE(property_id,?),updated_at=datetime('now') WHERE id=?`).bind(...updateBindings)];
+  updateBindings.push(persistedRole.role,persistedRole.isManager,persistedRole.isFacilityStaff,status,body.propertyId || null,existing.id);
+  const statements:D1PreparedStatement[]=[c.env.DB.prepare(`UPDATE users SET name=?,email=?,phone=?,${employeeIdColumn},role=?,is_manager=?,is_facility_staff=?,status=?,property_id=COALESCE(property_id,?),updated_at=datetime('now') WHERE id=?`).bind(...updateBindings)];
   if (ownershipId && body.propertyId) statements.push(c.env.DB.prepare(`INSERT INTO property_ownerships(id,property_id,resident_id,status,approved_by) VALUES (?,?,?,'active',?)`).bind(ownershipId,body.propertyId,existing.id,c.get('user').id));
   await c.env.DB.batch(statements);
   if (status==='inactive' && existing.status==='active') await suspendUserCards(c.env,existing.id,c.get('user').id,'account deactivated');
@@ -1553,7 +1656,7 @@ app.patch('/api/users/:id', requireRoles('admin','manager'), async (c) => {
 });
 
 app.post('/api/users/:id/reset-password', requireRoles('admin','manager'), async (c) => {
-  const target=await c.env.DB.prepare(`SELECT id,email,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,status FROM users WHERE id=?`).bind(c.req.param('id')).first<{ id:string;email:string;role:Role;status:string }>();
+  const target=await c.env.DB.prepare(`SELECT id,email,${effectiveRoleSql()} AS role,status FROM users WHERE id=?`).bind(c.req.param('id')).first<{ id:string;email:string;role:Role;status:string }>();
   if (!target) return jsonError(c,404,'User account not found');
   if (!canManageAccount(c.get('user').role,target.role)) return jsonError(c,403,'Managers cannot reset administrator or manager passwords');
   let body:{ temporaryPassword?:string }={};
@@ -1568,7 +1671,7 @@ app.post('/api/users/:id/reset-password', requireRoles('admin','manager'), async
 });
 
 app.delete('/api/users/:id', requireRoles('admin','manager'), async (c) => {
-  const target=await c.env.DB.prepare(`SELECT id,name,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,status FROM users WHERE id=?`).bind(c.req.param('id')).first<{ id:string;name:string;role:Role;status:string }>();
+  const target=await c.env.DB.prepare(`SELECT id,name,${effectiveRoleSql()} AS role,status FROM users WHERE id=?`).bind(c.req.param('id')).first<{ id:string;name:string;role:Role;status:string }>();
   if (!target) return jsonError(c,404,'User account not found');
   if (!canManageAccount(c.get('user').role,target.role)) return jsonError(c,403,'Managers cannot delete administrator or manager accounts');
   if (target.id===c.get('user').id) return jsonError(c,409,'You cannot delete your own account');
@@ -1596,12 +1699,12 @@ app.post('/api/users/sample-logins', requireRoles('admin'), async (c) => {
   if (body.confirmation!=='CREATE_24_HOUR_SAMPLE_LOGINS') return jsonError(c,400,'Explicit sample-login confirmation is required');
   const stamp=`${new Date().toISOString().replace(/[-:TZ.]/g,'').slice(0,14).toLowerCase()}-${crypto.randomUUID().slice(0,6)}`;
   const expiresAt=new Date(Date.now()+24*60*60*1000).toISOString();
-  const roles:Role[]=['admin','manager','resident','security','cashier'];
+  const roles:Role[]=['admin','manager','resident','security','cashier','facility_staff'];
   const credentials=roles.map((role)=>({ id:crypto.randomUUID(),role,name:`Sample ${role[0]!.toUpperCase()}${role.slice(1)}`,email:`sample.${role}.${stamp}@example.invalid`,temporaryPassword:`EM-${randomToken(12)}-aA1!` }));
   const hashes=await Promise.all(credentials.map((item)=>hashPassword(item.temporaryPassword)));
   await c.env.DB.batch(credentials.map((item,index)=>{const persisted=storedRole(item.role);return c.env.DB.prepare(
-    `INSERT INTO users(id,name,email,password_hash,role,is_manager,status,account_expires_at,employee_id) VALUES (?,?,?,?,?,?,'active',?,?)`,
-  ).bind(item.id,item.name,item.email,hashes[index],persisted.role,persisted.isManager,expiresAt,employeeIdFromUuid(item.id));}));
+    `INSERT INTO users(id,name,email,password_hash,role,is_manager,is_facility_staff,status,account_expires_at,employee_id) VALUES (?,?,?,?,?,?,?,'active',?,?)`,
+  ).bind(item.id,item.name,item.email,hashes[index],persisted.role,persisted.isManager,persisted.isFacilityStaff,expiresAt,employeeIdFromUuid(item.id));}));
   await audit(c,'create_sample_logins','user_set',null,{ roles,expiresAt });
   c.header('Cache-Control','no-store');
   return c.json({ expiresAt,credentials:credentials.map(({ role,name,email,temporaryPassword })=>({ role,name,email,temporaryPassword })),notice:'These accounts expire in 24 hours. Download the credentials now and deactivate them sooner when testing is complete.' },201);
@@ -1630,7 +1733,7 @@ const PEOPLE_BULK_MAX_ROWS = 500;
 const PEOPLE_BULK_MAX_NEW_ACCOUNTS = 25;
 
 const PERSON_RELATIONSHIPS = ['spouse','child','parent','relative','domestic_staff','caregiver','other'];
-const PERSON_ROLES: Role[] = ['admin','manager','resident','security','cashier'];
+const PERSON_ROLES: Role[] = ['admin','manager','resident','security','cashier','facility_staff'];
 
 interface PersonRef {
   kind: PersonKind;
@@ -1766,7 +1869,7 @@ app.post('/api/people/bulk-upload', requireRoles('admin','manager'), async (c) =
       const status = (row.status?.trim().toLowerCase() || 'active') as 'active'|'inactive';
       const unitNumber = row.unit_number?.trim() || null;
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { errors.push({ row:rowNumber,error:'a valid email is required for an account row' });continue; }
-      if (!PERSON_ROLES.includes(role)) { errors.push({ row:rowNumber,error:'role must be admin, manager, resident, security or cashier' });continue; }
+      if (!PERSON_ROLES.includes(role)) { errors.push({ row:rowNumber,error:'role must be admin, manager, resident, security, cashier or facility_staff' });continue; }
       if (!canManageAccount(actor.role,role)) { errors.push({ row:rowNumber,error:'managers cannot import administrator or manager accounts' });continue; }
       if (!['active','inactive'].includes(status)) { errors.push({ row:rowNumber,error:'status must be active or inactive' });continue; }
       if (unitNumber && role !== 'resident') { errors.push({ row:rowNumber,error:'only resident rows can select a property' });continue; }
@@ -1855,8 +1958,8 @@ app.post('/api/people/bulk-upload', requireRoles('admin','manager'), async (c) =
     validAccounts.forEach((entry,index) => {
       const persisted = storedRole(entry.role);
       statements.push(c.env.DB.prepare(
-        `INSERT INTO users(id,name,email,phone,password_hash,role,is_manager,property_id,status,employee_id) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-      ).bind(entry.id,entry.name,entry.email,entry.phone,hashes[index],persisted.role,persisted.isManager,entry.propertyId,entry.status,entry.employeeId || null));
+        `INSERT INTO users(id,name,email,phone,password_hash,role,is_manager,is_facility_staff,property_id,status,employee_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      ).bind(entry.id,entry.name,entry.email,entry.phone,hashes[index],persisted.role,persisted.isManager,persisted.isFacilityStaff,entry.propertyId,entry.status,entry.employeeId || null));
       if (entry.propertyId) {
         statements.push(c.env.DB.prepare(
           `INSERT INTO property_ownerships(id,property_id,resident_id,status,approved_by) VALUES (?,?,?,'active',?)`,
@@ -1944,7 +2047,7 @@ app.post('/api/people/bulk-edit', requireRoles('admin','manager'), async (c) => 
 
     if (person.kind === 'account') {
       const role = row.role?.trim().toLowerCase() as Role | undefined;
-      if (role && !PERSON_ROLES.includes(role)) { errors.push({ row:rowNumber,error:'role must be admin, manager, resident, security or cashier' });continue; }
+      if (role && !PERSON_ROLES.includes(role)) { errors.push({ row:rowNumber,error:'role must be admin, manager, resident, security, cashier or facility_staff' });continue; }
       if (role && !canManageAccount(actor.role,role)) { errors.push({ row:rowNumber,error:'managers cannot grant administrator or manager access' });continue; }
       if (person.id === actor.id && (status === 'inactive' || (role && role !== 'admin'))) { errors.push({ row:rowNumber,error:'you cannot remove your own active administrator access in bulk' });continue; }
       if (role && role !== 'resident' && (await c.env.DB.prepare(`SELECT 1 AS ok FROM property_ownerships WHERE resident_id=? AND status='active' LIMIT 1`).bind(person.id).first())) {
@@ -1957,13 +2060,24 @@ app.post('/api/people/bulk-edit', requireRoles('admin','manager'), async (c) => 
         if (owner) { errors.push({ row:rowNumber,error:'an account with this email already exists' });continue; }
       }
       const persistedRole = role ? storedRole(role) : null;
+      if (role && persistedRole) {
+        const currentRole = await c.env.DB.prepare(`SELECT ${effectiveRoleSql()} AS role FROM users WHERE id=?`).bind(person.id).first<{ role:Role }>();
+        if (role==='facility_staff' && currentRole?.role!=='facility_staff') {
+          const gatePosting=await c.env.DB.prepare(`SELECT 1 AS found FROM security_gate_assignments WHERE security_user_id=? AND active=1 LIMIT 1`).bind(person.id).first();
+          if (gatePosting) { errors.push({ row:rowNumber,error:'remove active gate postings before changing this account to Facility Staff' });continue; }
+        }
+        if (currentRole?.role==='facility_staff' && role!=='facility_staff') {
+          const attendanceHistory=await c.env.DB.prepare(`SELECT 1 AS found FROM staff_attendance WHERE staff_user_id=? LIMIT 1`).bind(person.id).first();
+          if (attendanceHistory) { errors.push({ row:rowNumber,error:'this account has attendance history; deactivate it instead of changing its role' });continue; }
+        }
+      }
       await c.env.DB.prepare(
         `UPDATE users SET name=COALESCE(?,name),phone=CASE WHEN ? THEN phone ELSE ? END,email=COALESCE(?,email),
-           role=COALESCE(?,role),is_manager=COALESCE(?,is_manager),status=COALESCE(?,status),
+           role=COALESCE(?,role),is_manager=COALESCE(?,is_manager),is_facility_staff=COALESCE(?,is_facility_staff),status=COALESCE(?,status),
            employee_id=COALESCE(?,employee_id),updated_at=datetime('now') WHERE id=?`,
       ).bind(name,
         touchesPhone ? 0 : 1, touchesPhone ? phone : '',
-        email,persistedRole?.role ?? null,persistedRole?.isManager ?? null,status,newEmployeeId,person.id).run();
+        email,persistedRole?.role ?? null,persistedRole?.isManager ?? null,persistedRole?.isFacilityStaff ?? null,status,newEmployeeId,person.id).run();
       if (status === 'inactive' && person.status === 'active') await suspendUserCards(c.env,person.id,actor.id,'bulk edit deactivated the account');
       updated += 1;
       continue;
@@ -2065,9 +2179,9 @@ app.post('/api/people/bulk-delete', requireRoles('admin','manager'), async (c) =
 
 /** The effective role of an account, treating the manager flag as the truth. */
 async function accountRoleOf(db: D1Database, userId: string): Promise<Role> {
-  const row = await db.prepare(`SELECT role,is_manager FROM users WHERE id=?`).bind(userId).first<{ role: Role; is_manager: number }>();
+  const row = await db.prepare(`SELECT role,is_manager,is_facility_staff FROM users WHERE id=?`).bind(userId).first<{ role: Role; is_manager: number; is_facility_staff:number }>();
   if (!row) return 'resident';
-  return row.is_manager ? 'manager' : row.role;
+  return row.is_manager ? 'manager' : row.is_facility_staff ? 'facility_staff' : row.role;
 }
 
 /**
@@ -2424,7 +2538,7 @@ app.post('/api/imports/users', requireRoles('admin','manager'), async (c) => {
     let error='';
     if (!name) error='name is required';
     else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) error='a valid email is required';
-    else if (!['admin','manager','resident','security','cashier'].includes(role)) error='role must be admin, manager, resident, security or cashier';
+    else if (!['admin','manager','resident','security','cashier','facility_staff'].includes(role)) error='role must be admin, manager, resident, security, cashier or facility_staff';
     else if (!canManageAccount(c.get('user').role,role)) error='managers cannot import administrator or manager accounts';
     else if (!['active','inactive'].includes(status)) error='status must be active or inactive';
     else if (unitNumber && role!=='resident') error='only resident rows can select a property';
@@ -2476,7 +2590,7 @@ app.post('/api/imports/users', requireRoles('admin','manager'), async (c) => {
     const statements:D1PreparedStatement[]=[];
     valid.forEach((candidate,index)=>{
       const persisted=storedRole(candidate.role);
-      statements.push(c.env.DB.prepare(`INSERT INTO users(id,name,email,phone,password_hash,role,is_manager,property_id,status,employee_id) VALUES (?,?,?,?,?,?,?,?,?,?)`).bind(candidate.id,candidate.name,candidate.email,candidate.phone,hashes[index],persisted.role,persisted.isManager,candidate.propertyId,candidate.status,candidate.employeeId));
+      statements.push(c.env.DB.prepare(`INSERT INTO users(id,name,email,phone,password_hash,role,is_manager,is_facility_staff,property_id,status,employee_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)`).bind(candidate.id,candidate.name,candidate.email,candidate.phone,hashes[index],persisted.role,persisted.isManager,persisted.isFacilityStaff,candidate.propertyId,candidate.status,candidate.employeeId));
       if (candidate.propertyId) statements.push(c.env.DB.prepare(`INSERT INTO property_ownerships(id,property_id,resident_id,status,approved_by) VALUES (?,?,?,'active',?)`).bind(crypto.randomUUID(),candidate.propertyId,candidate.id,c.get('user').id));
     });
     try {
@@ -3308,7 +3422,7 @@ app.get('/api/staff', requireRoles('admin','manager'), async (c) => {
   const search = `%${c.req.query('search')?.trim() ?? ''}%`;
   const role = c.req.query('role')?.trim() || null;
   const result = await c.env.DB.prepare(
-    `SELECT u.id,u.name,u.email,u.phone,u.employee_id,CASE WHEN u.is_manager=1 THEN 'manager' ELSE u.role END AS role,
+    `SELECT u.id,u.name,u.email,u.phone,u.employee_id,${effectiveRoleSql('u')} AS role,
        u.status,u.account_expires_at,u.created_at,
        (SELECT COUNT(*) FROM security_gate_assignments g WHERE g.security_user_id=u.id AND g.active=1) AS active_gate_assignments,
        (SELECT GROUP_CONCAT(d.gate_name,', ') FROM security_gate_assignments g JOIN hikvision_devices d ON d.id=g.device_id WHERE g.security_user_id=u.id AND g.active=1) AS gates,
@@ -3317,20 +3431,178 @@ app.get('/api/staff', requireRoles('admin','manager'), async (c) => {
        (SELECT COUNT(*) FROM audit_log a WHERE a.actor_id=u.id) AS audit_entries,
        (SELECT MAX(a.created_at) FROM audit_log a WHERE a.actor_id=u.id) AS last_action_at
      FROM users u
-     WHERE u.role<>'resident' AND (? IS NULL OR CASE WHEN u.is_manager=1 THEN 'manager' ELSE u.role END=?)
+     WHERE u.role<>'resident' AND (? IS NULL OR ${effectiveRoleSql('u')}=?)
        AND (u.name LIKE ? OR u.email LIKE ? OR COALESCE(u.phone,'') LIKE ? OR COALESCE(u.employee_id,'') LIKE ?)
      GROUP BY u.id ORDER BY u.status='active' DESC, u.role, u.name LIMIT ? OFFSET ?`,
   ).bind(role,role,search,search,search,search,limit,offset).all();
   const summary = await c.env.DB.prepare(
     `SELECT COUNT(*) AS total,
        SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) AS active,
-       SUM(CASE WHEN role='security' AND is_manager=0 THEN 1 ELSE 0 END) AS security_officers,
-       SUM(CASE WHEN role IN ('admin') THEN 1 ELSE 0 END) AS administrators,
+       SUM(CASE WHEN role='security' AND is_manager=0 AND is_facility_staff=0 THEN 1 ELSE 0 END) AS security_officers,
+       SUM(CASE WHEN role='admin' THEN 1 ELSE 0 END) AS administrators,
        SUM(CASE WHEN is_manager=1 THEN 1 ELSE 0 END) AS managers,
-       SUM(CASE WHEN role='cashier' AND is_manager=0 THEN 1 ELSE 0 END) AS cashiers
+       SUM(CASE WHEN role='cashier' AND is_manager=0 THEN 1 ELSE 0 END) AS cashiers,
+       SUM(CASE WHEN is_facility_staff=1 THEN 1 ELSE 0 END) AS facility_staff
      FROM users WHERE role<>'resident'`,
   ).first<Record<string,number>>();
   return c.json({ items: result.results, summary: summary ?? {}, page: pageNumber, limit, employeeIdMaxLength: EMPLOYEE_ID_MAX });
+});
+
+/* Facility-staff attendance: server-stamped self punches plus a month report
+   and reasoned, audited HR corrections. Access events remain supporting context,
+   not payroll attendance — a gate swipe is not proof of a complete work shift. */
+app.get('/api/staff/attendance', requireRoles('admin','manager','facility_staff'), async (c) => {
+  const user = c.get('user');
+  const canReview = isEstateOperator(user.role);
+  const timeZone = await estateTimeZone(c.env.DB);
+  const month = c.req.query('month')?.trim() || estateLocalMonth(new Date(), timeZone);
+  if (!isAttendanceMonth(month)) return jsonError(c,400,'month must be YYYY-MM');
+  const nextMonth = nextMonthStart(month);
+  const requestedStaffId = c.req.query('staffId')?.trim() || null;
+  const staffId = canReview ? requestedStaffId : user.id;
+  if (staffId) {
+    const target = await c.env.DB.prepare(`SELECT id FROM users WHERE id=? AND is_facility_staff=1`).bind(staffId).first();
+    if (!target) return jsonError(c,404,'Facility staff account not found');
+  }
+  const pageNumber = Math.max(1,Math.floor(Number(c.req.query('page') ?? 1) || 1));
+  const limit = Math.min(1000,Math.max(1,Math.floor(Number(c.req.query('limit') ?? 1000) || 1000)));
+  const offset = (pageNumber - 1) * limit;
+  const records = await c.env.DB.prepare(
+    `SELECT a.id,a.staff_user_id,u.name AS staff_name,u.employee_id,u.status AS account_status,
+       a.work_date,a.clock_in_at,a.clock_out_at,
+       CASE WHEN a.clock_out_at IS NULL THEN NULL ELSE MAX(0,CAST(ROUND((julianday(a.clock_out_at)-julianday(a.clock_in_at))*1440) AS INTEGER)) END AS duration_minutes,
+       a.source,a.note,a.created_by,a.updated_by,creator.name AS created_by_name,editor.name AS updated_by_name,a.created_at,a.updated_at
+     FROM staff_attendance a JOIN users u ON u.id=a.staff_user_id
+     LEFT JOIN users creator ON creator.id=a.created_by LEFT JOIN users editor ON editor.id=a.updated_by
+     WHERE u.is_facility_staff=1 AND a.work_date>=? AND a.work_date<? AND (? IS NULL OR a.staff_user_id=?)
+     ORDER BY a.work_date DESC,a.clock_in_at DESC LIMIT ? OFFSET ?`,
+  ).bind(`${month}-01`,nextMonth,staffId,staffId,limit+1,offset).all<Record<string,unknown>>();
+  const hasMore = records.results.length > limit;
+  const items = records.results.slice(0,limit).map((row) => ({
+    ...row,
+    clock_in_local: attendanceLocalTime(row.clock_in_at,timeZone),
+    clock_out_local: attendanceLocalTime(row.clock_out_at,timeZone),
+    duration_hours: row.duration_minutes === null ? null : (Number(row.duration_minutes) / 60).toFixed(2),
+  }));
+  const summaries = await c.env.DB.prepare(
+    `SELECT u.id AS staff_user_id,u.name AS staff_name,u.employee_id,u.status AS account_status,
+       COUNT(DISTINCT a.work_date) AS days_present,COUNT(a.id) AS sessions,
+       COALESCE(SUM(CASE WHEN a.clock_out_at IS NULL OR a.id IS NULL THEN 0 ELSE MAX(0,CAST(ROUND((julianday(a.clock_out_at)-julianday(a.clock_in_at))*1440) AS INTEGER)) END),0) AS total_minutes,
+       COALESCE(SUM(CASE WHEN a.id IS NOT NULL AND a.clock_out_at IS NULL THEN 1 ELSE 0 END),0) AS open_sessions
+     FROM users u LEFT JOIN staff_attendance a ON a.staff_user_id=u.id AND a.work_date>=? AND a.work_date<?
+     WHERE u.is_facility_staff=1 AND (? IS NULL OR u.id=?) AND (u.status='active' OR a.id IS NOT NULL)
+     GROUP BY u.id ORDER BY u.status='active' DESC,u.name`,
+  ).bind(`${month}-01`,nextMonth,staffId,staffId).all<{
+    staff_user_id:string;staff_name:string;employee_id:string|null;account_status:string;
+    days_present:number;sessions:number;total_minutes:number;open_sessions:number;
+  }>();
+  const totals = summaries.results.reduce((value,row) => ({
+    staff: value.staff + 1,
+    staff_days: value.staff_days + Number(row.days_present || 0),
+    sessions: value.sessions + Number(row.sessions || 0),
+    total_minutes: value.total_minutes + Number(row.total_minutes || 0),
+    open_sessions: value.open_sessions + Number(row.open_sessions || 0),
+  }),{ staff:0,staff_days:0,sessions:0,total_minutes:0,open_sessions:0 });
+  const openRow = !canReview ? await c.env.DB.prepare(
+    `SELECT id,work_date,clock_in_at FROM staff_attendance WHERE staff_user_id=? AND clock_out_at IS NULL LIMIT 1`,
+  ).bind(user.id).first<{ id:string;work_date:string;clock_in_at:string }>() : null;
+  const openSession = openRow ? { ...openRow,clock_in_local:attendanceLocalTime(openRow.clock_in_at,timeZone) } : null;
+  return c.json({
+    month,timeZone,items,staff: summaries.results,totals,openSession,
+    pagination:{ page:pageNumber,limit,hasMore },
+  });
+});
+
+app.post('/api/staff/attendance/clock', requireRoles('facility_staff'), async (c) => {
+  const body: { action?:string } = await c.req.json<{ action?:string }>().catch((): { action?:string } => ({}));
+  const action = body.action?.trim().toLowerCase();
+  if (!['clock_in','clock_out'].includes(action ?? '')) return jsonError(c,400,'action must be clock_in or clock_out');
+  const user = c.get('user');
+  const open = await c.env.DB.prepare(`SELECT id,work_date FROM staff_attendance WHERE staff_user_id=? AND clock_out_at IS NULL LIMIT 1`).bind(user.id).first<{ id:string;work_date:string }>();
+  const now = new Date();
+  const nowIso = now.toISOString();
+  if (action === 'clock_in') {
+    if (open) return jsonError(c,409,'You are already clocked in. Clock out before starting another session.');
+    const timeZone = await estateTimeZone(c.env.DB);
+    const workDate = estateLocalDate(now,timeZone);
+    const id = crypto.randomUUID();
+    try {
+      await c.env.DB.prepare(
+        `INSERT INTO staff_attendance(id,staff_user_id,work_date,clock_in_at,source,created_by,updated_by) VALUES (?,?,?,?,'self',?,?)`,
+      ).bind(id,user.id,workDate,nowIso,user.id,user.id).run();
+    } catch (error) {
+      if (String(error).includes('UNIQUE constraint failed')) return jsonError(c,409,'An open attendance session already exists. Refresh and clock out first.');
+      throw error;
+    }
+    await audit(c,'clock_in','staff_attendance',id,{ workDate,source:'self' });
+    return c.json({ id,workDate,clockInAt:nowIso },201);
+  }
+  if (!open) return jsonError(c,409,'You are not clocked in. Clock in before clocking out.');
+  const update = await c.env.DB.prepare(
+    `UPDATE staff_attendance SET clock_out_at=?,updated_by=?,updated_at=datetime('now') WHERE id=? AND clock_out_at IS NULL`,
+  ).bind(nowIso,user.id,open.id).run();
+  if (!Number(update.meta.changes)) return jsonError(c,409,'This attendance session was already closed. Refresh your attendance.');
+  await audit(c,'clock_out','staff_attendance',open.id,{ workDate:open.work_date,source:'self' });
+  return c.json({ id:open.id,workDate:open.work_date,clockOutAt:nowIso });
+});
+
+app.post('/api/staff/attendance', requireRoles('admin','manager'), async (c) => {
+  const body = await c.req.json<{ staffUserId?:string;workDate?:string;clockIn?:string;clockOut?:string;reason?:string }>();
+  if (!body.staffUserId || !body.workDate || !body.clockIn || !body.clockOut) return jsonError(c,400,'staffUserId, workDate, clockIn and clockOut are required');
+  const reason = body.reason?.trim() || '';
+  if (reason.length < 4 || reason.length > 500) return jsonError(c,400,'Add an HR reason between 4 and 500 characters');
+  const staff = await c.env.DB.prepare(`SELECT id,name FROM users WHERE id=? AND is_facility_staff=1`).bind(body.staffUserId).first<{ id:string;name:string }>();
+  if (!staff) return jsonError(c,404,'Facility staff account not found');
+  const timeZone = await estateTimeZone(c.env.DB);
+  if (!isCalendarDate(body.workDate)) return jsonError(c,400,'workDate must be a real YYYY-MM-DD date');
+  const window = attendanceWindow(body.workDate,body.clockIn,body.clockOut,timeZone);
+  if (!window) return jsonError(c,400,'Enter valid estate-local clock-in and clock-out times no more than 24 hours apart');
+  if (Date.parse(window.clockInAt)>Date.now() || Date.parse(window.clockOutAt)>Date.now()) return jsonError(c,400,'Manual attendance cannot be recorded in the future');
+  const overlap = await c.env.DB.prepare(
+    `SELECT id FROM staff_attendance WHERE staff_user_id=? AND julianday(clock_in_at)<julianday(?)
+       AND julianday(COALESCE(clock_out_at,'9999-12-31T23:59:59Z'))>julianday(?) LIMIT 1`,
+  ).bind(staff.id,window.clockOutAt,window.clockInAt).first();
+  if (overlap) return jsonError(c,409,'This record overlaps another attendance session for the same staff member');
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare(
+    `INSERT INTO staff_attendance(id,staff_user_id,work_date,clock_in_at,clock_out_at,source,note,created_by,updated_by)
+     VALUES (?,?,?,?,?,'manual',?,?,?)`,
+  ).bind(id,staff.id,body.workDate,window.clockInAt,window.clockOutAt,reason,c.get('user').id,c.get('user').id).run();
+  await audit(c,'manual_attendance','staff_attendance',id,{ staffUserId:staff.id,staffName:staff.name,workDate:body.workDate,clockInAt:window.clockInAt,clockOutAt:window.clockOutAt,reason });
+  return c.json({ id,source:'manual' },201);
+});
+
+app.patch('/api/staff/attendance/:id', requireRoles('admin','manager'), async (c) => {
+  const existing = await c.env.DB.prepare(
+    `SELECT a.id,a.staff_user_id,a.work_date,a.clock_in_at,a.clock_out_at,a.source,a.note,u.name AS staff_name
+     FROM staff_attendance a JOIN users u ON u.id=a.staff_user_id WHERE a.id=? AND u.is_facility_staff=1`,
+  ).bind(c.req.param('id')).first<{
+    id:string;staff_user_id:string;work_date:string;clock_in_at:string;clock_out_at:string|null;source:string;note:string|null;staff_name:string;
+  }>();
+  if (!existing) return jsonError(c,404,'Attendance record not found');
+  const body = await c.req.json<{ workDate?:string;clockIn?:string;clockOut?:string;reason?:string }>();
+  if (!body.workDate || !body.clockIn || !body.clockOut) return jsonError(c,400,'workDate, clockIn and clockOut are required');
+  const reason = body.reason?.trim() || '';
+  if (reason.length < 4 || reason.length > 500) return jsonError(c,400,'Add an HR reason between 4 and 500 characters');
+  const timeZone = await estateTimeZone(c.env.DB);
+  if (!isCalendarDate(body.workDate)) return jsonError(c,400,'workDate must be a real YYYY-MM-DD date');
+  const window = attendanceWindow(body.workDate,body.clockIn,body.clockOut,timeZone);
+  if (!window) return jsonError(c,400,'Enter valid estate-local clock-in and clock-out times no more than 24 hours apart');
+  if (Date.parse(window.clockInAt)>Date.now() || Date.parse(window.clockOutAt)>Date.now()) return jsonError(c,400,'Attendance cannot be adjusted to a future time');
+  const overlap = await c.env.DB.prepare(
+    `SELECT id FROM staff_attendance WHERE staff_user_id=? AND id<>? AND julianday(clock_in_at)<julianday(?)
+       AND julianday(COALESCE(clock_out_at,'9999-12-31T23:59:59Z'))>julianday(?) LIMIT 1`,
+  ).bind(existing.staff_user_id,existing.id,window.clockOutAt,window.clockInAt).first();
+  if (overlap) return jsonError(c,409,'This correction overlaps another attendance session for the same staff member');
+  await c.env.DB.prepare(
+    `UPDATE staff_attendance SET work_date=?,clock_in_at=?,clock_out_at=?,source='adjusted',note=?,updated_by=?,updated_at=datetime('now') WHERE id=?`,
+  ).bind(body.workDate,window.clockInAt,window.clockOutAt,reason,c.get('user').id,existing.id).run();
+  await audit(c,'adjust_attendance','staff_attendance',existing.id,{
+    staffUserId:existing.staff_user_id,staffName:existing.staff_name,reason,
+    before:{ workDate:existing.work_date,clockInAt:existing.clock_in_at,clockOutAt:existing.clock_out_at,source:existing.source },
+    after:{ workDate:body.workDate,clockInAt:window.clockInAt,clockOutAt:window.clockOutAt,source:'adjusted' },
+  });
+  return c.json({ ok:true });
 });
 
 /* Shift roster. Gate postings say which terminal an officer may operate; a
@@ -3344,7 +3616,7 @@ app.get('/api/staff/shifts', requireRoles('admin','manager','security','cashier'
   // A non-operator reads their own shifts only.
   const scopedSelf = ['security','cashier'].includes(c.get('user').role) ? c.get('user').id : null;
   const result = await c.env.DB.prepare(
-    `SELECT s.*,u.name AS staff_name,CASE WHEN u.is_manager=1 THEN 'manager' ELSE u.role END AS staff_role,d.name AS device_name,d.gate_name
+    `SELECT s.*,u.name AS staff_name,${effectiveRoleSql('u')} AS staff_role,d.name AS device_name,d.gate_name
      FROM staff_shifts s JOIN users u ON u.id=s.staff_user_id LEFT JOIN hikvision_devices d ON d.id=s.device_id
      WHERE (? IS NULL OR s.staff_user_id=?) AND (? IS NULL OR s.device_id=?)
        AND (? IS NULL OR s.shift_date>=?) AND (? IS NULL OR s.shift_date<=?) AND (? IS NULL OR s.staff_user_id=?)
@@ -3676,7 +3948,7 @@ async function attachFacilityBookingBill(db: D1Database, bookingId: string, bill
    everyone by default with a staff-only option for internal numbers. */
 app.get('/api/emergency-contacts', async (c) => {
   const user = c.get('user');
-  const staffOnly = ['admin','manager','security','cashier'].includes(user.role);
+  const staffOnly = ['admin','manager','security','cashier','facility_staff'].includes(user.role);
   const category = c.req.query('category')?.trim() || null;
   const includeInactive = ['admin','manager'].includes(user.role);
   const result = await c.env.DB.prepare(
@@ -3750,7 +4022,7 @@ app.delete('/api/emergency-contacts/:id', requireRoles('admin','manager'), async
 const DOCUMENT_CATEGORIES = ['guide','form','bylaw','house_rule','privacy','agreement','minutes','policy','other'];
 function documentAudienceFor(role: Role): string[] {
   if (['admin','manager'].includes(role)) return ['everyone','residents','staff','managers'];
-  if (['security','cashier'].includes(role)) return ['everyone','staff'];
+  if (['security','cashier','facility_staff'].includes(role)) return ['everyone','staff'];
   return ['everyone','residents'];
 }
 
@@ -3868,7 +4140,7 @@ app.post('/api/documents/:id/acknowledge', async (c) => {
 
 app.get('/api/documents/:id/acknowledgements', requireRoles('admin','manager'), async (c) => {
   const result = await c.env.DB.prepare(
-    `SELECT a.user_id,a.acknowledged_at,u.name,CASE WHEN u.is_manager=1 THEN 'manager' ELSE u.role END AS role
+    `SELECT a.user_id,a.acknowledged_at,u.name,${effectiveRoleSql('u')} AS role
      FROM document_acknowledgements a JOIN users u ON u.id=a.user_id WHERE a.document_id=? ORDER BY a.acknowledged_at DESC`,
   ).bind(c.req.param('id')).all();
   return c.json({ items: result.results });
@@ -4842,7 +5114,7 @@ app.post('/api/security/gate-assignments', requireRoles('admin','manager'), asyn
   const deviceId = body.deviceId?.trim();
   if (!securityUserId || !deviceId) return jsonError(c,400,'securityUserId and deviceId are required');
   const officer = await c.env.DB.prepare(
-    `SELECT id,name FROM users WHERE id=? AND status='active' AND role='security' AND is_manager=0`,
+    `SELECT id,name FROM users WHERE id=? AND status='active' AND role='security' AND is_manager=0 AND is_facility_staff=0`,
   ).bind(securityUserId).first<{ id:string;name:string }>();
   if (!officer) return jsonError(c,404,'Active Security account not found');
   const device = await c.env.DB.prepare(

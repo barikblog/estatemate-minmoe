@@ -1,4 +1,4 @@
-export type Role = 'admin' | 'manager' | 'resident' | 'security' | 'cashier';
+export type Role = 'admin' | 'manager' | 'resident' | 'security' | 'cashier' | 'facility_staff';
 
 export interface Env {
   DB: D1Database;

@@ -47,20 +47,22 @@ describe('bulk people operations', () => {
       ['person_type','name','email','phone','role','employee_id','unit_number','relationship','primary_resident_email'],
       ['account','Bulk One','bulk1@example.com','','resident','BULK-001','C-02','',''],
       ['account','Bulk Two','bulk2@example.com','','security','BULK-002','','',''],
+      ['account','Bulk Facility Staff','facility-bulk@example.com','','facility_staff','BULK-003','','',''],
       ['dependant','Bulk Dependant','','','','','','spouse','RESIDENT@EXAMPLE.COM'],
     ]);
     const upload = await postCsv(env, '/api/people/bulk-upload', text, adminToken);
     expect(upload.status).toBe(201);
-    expect(upload.json.accountsCreated).toBe(2);
+    expect(upload.json.accountsCreated).toBe(3);
     expect(upload.json.dependantsCreated).toBe(1);
     const credentials = upload.json.credentials as Array<{ name:string;email:string;employeeId:string;temporaryPassword:string }>;
-    expect(credentials).toHaveLength(2);
+    expect(credentials).toHaveLength(3);
     expect(credentials[0]!.temporaryPassword).toMatch(/^EM-/);
     expect(credentials[0]!.employeeId).toBe('BULK-001');
 
     const bulk = database.one(`SELECT id FROM users WHERE email='bulk1@example.com'`);
     expect(bulk).toBeTruthy();
     expect(database.one(`SELECT po.status FROM property_ownerships po JOIN users u ON u.id=po.resident_id WHERE u.email='bulk1@example.com'`)?.status).toBe('active');
+    expect(database.one(`SELECT role,is_facility_staff FROM users WHERE email='facility-bulk@example.com'`)).toMatchObject({ role: 'security', is_facility_staff: 1 });
     const dependant = database.one(`SELECT * FROM household_members WHERE name='Bulk Dependant'`);
     expect(dependant?.primary_resident_id).toBe(estate.residentId);
     expect(dependant?.status).toBe('active');
@@ -117,6 +119,18 @@ describe('bulk people operations', () => {
     expect(row?.name).toBe('Renamed Resident');
     expect(row?.employee_id).toBe('EDIT-99');
     expect(String(edit.json.notice)).toMatch(/Resynchronise/);
+  });
+
+  it('refuses bulk role changes that would hide attendance history', async () => {
+    database.run(`INSERT INTO users(id,name,email,password_hash,role,is_manager,is_facility_staff,status,employee_id)
+      VALUES ('bulk-facility','Bulk Facility','bulk-facility@example.com','hash','security',0,1,'active','BULK-FAC-1')`);
+    database.run(`INSERT INTO staff_attendance(id,staff_user_id,work_date,clock_in_at,clock_out_at,source)
+      VALUES ('bulk-facility-attendance','bulk-facility','2026-09-01','2026-09-01T08:00:00Z','2026-09-01T16:00:00Z','self')`);
+    const text=csv([['employee_id','role'],['BULK-FAC-1','security']]);
+    const edit=await postCsv(env,'/api/people/bulk-edit',text,adminToken);
+    expect(edit.status).toBe(207);
+    expect(String((edit.json.errors as Array<{error:string}>)[0]?.error)).toMatch(/attendance history/i);
+    expect(database.one(`SELECT is_facility_staff FROM users WHERE id='bulk-facility'`)?.is_facility_staff).toBe(1);
   });
 
   it('refuses a bulk edit that would duplicate an Employee ID', async () => {
