@@ -1,5 +1,13 @@
 # Cloudflare deployment runbook
 
+> This is the **manual, from-your-terminal** runbook: create the resources, set
+> the secrets, deploy by hand. For how a push to `main` reaches production —
+> Cloudflare Workers Builds versus GitHub Actions, the
+> `CLOUDFLARE_BUILDS_AUTHORITATIVE` switch, the dashboard settings and the D1
+> token scope — read `docs/CLOUDFLARE-WORKERS-BUILDS.md`. The token permissions
+> listed below are the ones a Workers Builds API token also needs, because
+> `wrangler d1 migrations apply --remote` runs inside the build.
+
 ## Prerequisites
 
 - Cloudflare Account ID.

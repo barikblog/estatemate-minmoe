@@ -1,5 +1,94 @@
 # AI handoff — EstateMate
 
+## Production's two ship paths are now one switch away from being one (2026-10-04)
+
+Requested as: **"deploy to cloudflare from github"**, clarified to *set up
+Cloudflare's native Git integration so Cloudflare itself builds and deploys on
+push*, plus a status-only check of the Hikvision tunnel bridge.
+
+The finding that reframed the work: the integration was **already connected**.
+`AGENTS.md` had recorded it as an unresolved decision, and the commit check runs
+confirm it is live — app `cloudflare-workers-and-pages`, check
+`Workers Builds: estatemate`, green on `main` tip `90916e5` with its own Version
+ID, i.e. Cloudflare has really been publishing versions of this Worker alongside
+`deploy.yml` on every merge. So this was not a setup task; it was a consolidation
+task, and consolidating wrongly would have taken production's only working ship
+path away.
+
+### What is new
+
+- **`scripts/cloudflare-builds-deploy.mjs`** (`npm run deploy:cloudflare`) — the
+  ordered ship sequence the Cloudflare **Deploy command** points at: assert
+  `apps/web/dist` exists → `wrangler d1 migrations apply estatemate-db --remote`
+  → `wrangler deploy`. `wrangler deploy` never applies migrations, so a bare
+  default deploy command would publish code that queries columns production does
+  not have. The sequence now lives in the repository instead of a dashboard text
+  field, which was the other half of the `AGENTS.md` complaint. It refuses
+  without credentials, refuses to deploy when a migration fails, prints no
+  secret, and turns a D1 permission refusal into the exact token scope to add.
+- **`.node-version` = `22`** — the Workers Builds image defaults to Node
+  **24.18.0**; CI and `engines` are 22. A committed file beats a dashboard
+  variable: reviewable, and it travels with the branch.
+- **`deploy.yml`** keeps its name (`smoke.yml` triggers on it) but gates its
+  deploy job on `vars.CLOUDFLARE_BUILDS_AUTHORITATIVE != 'true'`, with a
+  `delegated-to-cloudflare-builds` job that states plainly it shipped nothing.
+- **`provision.yml`** (manual only) — ensures `STORAGE_ENCRYPTION_KEY` exists
+  (creates, never rotates) and lists pending remote migrations. Both were pulled
+  out of the per-push path: `wrangler secret put` publishes a new Worker version
+  and would race whichever system is shipping.
+- **`smoke.yml`** verifies whichever path shipped. In Builds mode it triggers on
+  the push and waits for that commit's Cloudflare check, because otherwise it
+  tests the previous deployment and reports a green that means nothing. No check
+  appearing at all warns and skips rather than failing a commit that shipped
+  nothing.
+- **`docs/CLOUDFLARE-WORKERS-BUILDS.md`** — the runbook: verified evidence
+  table, exact dashboard settings, token scopes, cutover order, rollback.
+
+### Why the preview builds were red — hypothesis, not confirmed
+
+Success on `main` merges, failure on every non-`main` commit **including
+`d87e6c6`, which changed only Markdown**. A docs-only commit cannot break a
+bundle, so the failure is the preview path, not the code. The default Preview
+command `npx wrangler preview` creates branch-isolated resources, and this
+Worker binds D1, two queues and a Durable Object — while the token Cloudflare
+auto-generates for Builds grants Workers Scripts/KV/R2/Routes and **no D1 and no
+Queues scope**. Production deploy only *references* existing IDs, so it passes;
+a preview that must *create* them is refused. That fits every row. Two details
+narrow it further: a red check's summary has no `Version ID` (a green one does),
+so the failed builds never publish anything; and **Node version is ruled out** —
+this PR added `.node-version` = 22 and its own preview build `07170015` still
+failed. **Not confirmed**: the build log sits in the dashboard, unreachable from
+the environment that wrote this. Open the Details link on any red check to settle
+it in one read. Recommendation is to turn preview builds off regardless — CI's
+credential-free `wrangler deploy --dry-run` already proves a PR bundles, and
+builds are running on PR branches at all only because Enable Preview Builds is
+currently on.
+
+### What only a human can finish
+
+The cutover needs dashboard access this environment does not have. In order:
+create a token with **Account → D1: Edit** + Workers Scripts: Edit and select it
+under Settings → Build; set Build command `npm run build` and Deploy command
+`npm run deploy:cloudflare`; turn **Enable Preview Builds** off; merge; confirm
+one green `Workers Builds: estatemate`; *then* set
+`CLOUDFLARE_BUILDS_AUTHORITATIVE=true`. Until that variable exists, Actions is
+still the ship path and nothing about production changed. Rollback is deleting
+the variable. Both paths apply migrations idempotently, so flip-flopping is
+safe.
+
+### Hikvision tunnel bridge — status only, as requested, not deployed
+
+Deployed 7 days ago (run `36300703128`, success) but **inert**: its own
+annotations report `HIK_USER`, `HIK_PASS`, `API_TOKEN`, `CF_ACCESS_CLIENT_ID`
+and `CF_ACCESS_CLIENT_SECRET` are all unset as repository secrets, and it warns
+"bridge deployed with incomplete credentials". `/health` answers `ok:true` and
+`tunnelConfigured:true`, so the Worker is reachable and cannot talk to a
+terminal. The run before it failed with curl exit 22 on `/health` — the
+brand-new-subdomain 404 the workflow now polls for. Not connected to Workers
+Builds, and deliberately left alone: its `wrangler.toml` carries a placeholder
+`database_id` the workflow patches at run time, so pointing Builds at that
+directory would deploy against `00000000-0000-0000-0000-000000000000`.
+
 ## ZKTeco terminals can now be provisioned and can talk back (2026-10-04, bridge `0.4.0`)
 
 Requested as: **ship the new agent capability** — ZKTeco PUSH (ADMS) as a second

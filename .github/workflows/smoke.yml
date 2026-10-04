@@ -7,6 +7,14 @@ name: Production smoke test
 # matters to an operator with a sign-in problem — that POST /api/auth/login
 # responds with JSON instead of a network failure. Dummy credentials only:
 # this never authenticates and must never receive a real secret.
+#
+# Which ship path it verifies depends on CLOUDFLARE_BUILDS_AUTHORITATIVE, the
+# same variable deploy.yml reads, so exactly one trigger path is live:
+#   not "true" -> workflow_run fires after "Deploy EstateMate" succeeded
+#   "true"     -> push fires and first waits for Cloudflare's own
+#                 "Workers Builds: estatemate" check on this commit, because
+#                 otherwise this would test the *previous* deployment and
+#                 report a green that says nothing about the new one.
 
 on:
   workflow_dispatch:
@@ -18,9 +26,13 @@ on:
   workflow_run:
     workflows: [Deploy EstateMate]
     types: [completed]
+  push:
+    branches: [main]
 
 permissions:
   contents: read
+  # To read the Cloudflare build's check run on this commit.
+  checks: read
 
 concurrency:
   group: estatemate-production-smoke
@@ -28,12 +40,76 @@ concurrency:
 
 jobs:
   smoke:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        vars.CLOUDFLARE_BUILDS_AUTHORITATIVE != 'true') ||
+      (github.event_name == 'push' &&
+        vars.CLOUDFLARE_BUILDS_AUTHORITATIVE == 'true')
     runs-on: ubuntu-latest
     env:
       BASE_URL: ${{ inputs.base_url || 'https://estatemate.estatemate.workers.dev' }}
     steps:
+      # Only in the Cloudflare-Builds-authoritative path. Waits for the build
+      # that this very push triggered, so the assertions below describe the new
+      # deployment rather than the one it replaced.
+      - name: Wait for the Cloudflare build of this commit
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="$GITHUB_SHA"
+          echo "Commit under test: $sha"
+
+          # Phase 1 — the check has to appear. Cloudflare registers it seconds
+          # after the push, but a docs-only commit can be excluded by Build
+          # watch paths and never build at all.
+          appeared=0
+          for attempt in $(seq 1 12); do
+            line="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs" \
+              --jq '[.check_runs[] | select(.app.slug=="cloudflare-workers-and-pages")] | .[0] // empty | "\(.status) \(.conclusion // "-") \(.details_url // "-")"' || true)"
+            if [ -n "$line" ]; then appeared=1; echo "Workers Builds check: $line"; break; fi
+            echo "attempt $attempt: no Workers Builds check yet"
+            sleep 15
+          done
+
+          if [ "$appeared" -eq 0 ]; then
+            echo "::warning::No 'Workers Builds: estatemate' check appeared for $sha within 3 minutes, so Cloudflare built nothing and production is unchanged — there is no new deployment to smoke-test. If this commit was supposed to ship, the Git integration is disconnected or the path is excluded: Workers & Pages > estatemate > Settings > Build."
+            echo "SKIP_REST=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # Phase 2 — wait for it to finish, and treat red as a real failure.
+          for attempt in $(seq 1 40); do
+            line="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs" \
+              --jq '[.check_runs[] | select(.app.slug=="cloudflare-workers-and-pages")] | .[0] // empty | "\(.status) \(.conclusion // "-") \(.details_url // "-")"' || true)"
+            status="${line%% *}"
+            rest="${line#* }"
+            conclusion="${rest%% *}"
+            url="${rest#* }"
+            case "$status:$conclusion" in
+              completed:success)
+                echo "Cloudflare build succeeded: $url"
+                exit 0
+                ;;
+              completed:*)
+                echo "::error::Cloudflare Workers Builds reported '$conclusion' for $sha, so the new version was not deployed. Build log: $url"
+                exit 1
+                ;;
+              *)
+                echo "attempt $attempt: $status/$conclusion — still building"
+                sleep 15
+                ;;
+            esac
+          done
+          echo "::error::Cloudflare Workers Builds did not finish $sha within 10 minutes."
+          exit 1
+
       - name: API health answers ok:true
+        if: env.SKIP_REST != '1'
         shell: bash
         run: |
           set -euo pipefail
@@ -42,6 +118,7 @@ jobs:
           grep -q '"ok":true' <<<"$body"
 
       - name: Portal config is served from D1
+        if: env.SKIP_REST != '1'
         shell: bash
         run: |
           set -euo pipefail
@@ -50,6 +127,7 @@ jobs:
           grep -q '"estate_name"' <<<"$body"
 
       - name: Sign-in page shell is served
+        if: env.SKIP_REST != '1'
         shell: bash
         run: |
           set -euo pipefail
@@ -58,6 +136,7 @@ jobs:
           grep -q '<title>EstateMate</title>' <<<"$body"
 
       - name: Login endpoint answers JSON for dummy credentials (never "Failed to fetch")
+        if: env.SKIP_REST != '1'
         shell: bash
         run: |
           set -euo pipefail
@@ -70,6 +149,7 @@ jobs:
           grep -q 'Invalid email or password' /tmp/login-body.json
 
       - name: Login endpoint rejects a malformed payload with JSON too
+        if: env.SKIP_REST != '1'
         shell: bash
         run: |
           set -euo pipefail

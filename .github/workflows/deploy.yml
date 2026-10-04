@@ -1,5 +1,23 @@
 name: Deploy EstateMate
 
+# ONE ship path at a time, chosen by the repository variable
+# CLOUDFLARE_BUILDS_AUTHORITATIVE (Settings > Secrets and variables > Actions >
+# Variables):
+#
+#   unset / anything but "true"  -> this workflow deploys (the historical path)
+#   "true"                       -> Cloudflare Workers Builds deploys, and this
+#                                   workflow applies no migrations and ships
+#                                   nothing, so two runners can never race on
+#                                   D1 or publish different bundles.
+#
+# The variable exists so the cutover is a single reversible flip rather than a
+# commit that deletes the working deploy path before the dashboard side is
+# verified. See docs/CLOUDFLARE-WORKERS-BUILDS.md for the dashboard settings and
+# the cutover order.
+#
+# The workflow keeps its name: .github/workflows/smoke.yml triggers on
+# `workflow_run: [Deploy EstateMate]`, and renaming it would silently stop the
+# post-deploy smoke test.
 on:
   push:
     branches: [main]
@@ -14,6 +32,7 @@ concurrency:
 
 jobs:
   deploy:
+    if: vars.CLOUDFLARE_BUILDS_AUTHORITATIVE != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,3 +62,14 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  # Runs only in the delegated mode, so the Actions run still says plainly what
+  # happened instead of looking like a deploy that quietly did nothing.
+  delegated-to-cloudflare-builds:
+    if: vars.CLOUDFLARE_BUILDS_AUTHORITATIVE == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report the delegation
+        run: |
+          echo "::notice::CLOUDFLARE_BUILDS_AUTHORITATIVE=true — Cloudflare Workers Builds is the ship path for commit $GITHUB_SHA. This workflow deliberately built nothing, applied no D1 migrations and deployed nothing. Read the 'Workers Builds: estatemate' check on this commit for the build log."
+          echo "::notice::Rollback: delete the CLOUDFLARE_BUILDS_AUTHORITATIVE repository variable and re-run this workflow to ship from GitHub Actions again."
