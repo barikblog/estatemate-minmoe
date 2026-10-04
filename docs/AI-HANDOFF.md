@@ -1,5 +1,40 @@
 # AI handoff — EstateMate
 
+## bridge-0.2.6 release IS LIVE (2026-10-04)
+
+`https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.2.6` —
+published 2026-10-04T05:08:53Z by run 37178916612. The MSI
+(`estatemate-bridge-0.2.6-win-x64.msi`, ~33 MB) was built, installed and
+smoke-tested on the runner (install → `version` → full agent flow → PATH/App
+Paths registry checks → clean uninstall). Debugging record for the four CI
+rounds it took (all via check annotations — the job-log CDN is unreachable
+from the dev sandbox):
+
+- WiX v3 spells it `Absent="disallow"` on Feature, not `AllowAbsent` (CNDL0004).
+- `light` suppresses ICE43 AND ICE57 — both are per-user-install heuristics
+  that misread all-users Start Menu shortcuts in a per-machine component.
+- One runner was lost mid-run ("lost communication with the server") —
+  infrastructure, not code; re-running the tag fixed it.
+- `package-bridge-msi.mjs` and `build-bridge-apk.py` `run()` now replay tool
+  error output as `::error` annotations (including javac/aapt2 symbol lines,
+  exception frames and the output tail) — this is the reliable CI feedback
+  channel from this sandbox.
+
+Known gap at 0.2.6: the `offline-server-apk` job failed, so the offline server
+APK is NOT among the release assets (it does not gate `publish-release` by
+design). Fixes landed AFTER the tag (on the branch, `cdc2e97`):
+
+- **Real bug**: `WebServer`'s pool cleanup closed WebSocket sockets that an
+  approved upgrade had already handed to `LiveFeedHub` ("the hub owns the
+  socket from here") — the live feed died the moment the handshake finished.
+  `serve()` now reports the handoff; cleanup only closes sockets it owns.
+- First real android.jar compile of the offline app: `BridgeLog.java` joined
+  `AGENT_BRIDGE_SOURCES` (IsapiClient logs through it); `MainActivity.onCreate`
+  parameter rename; `onRenderProcessGone` is a **WebViewClient** callback, not
+  WebChromeClient; `Db.errorJson` catches the checked `JSONException`.
+  Symbol/override/checked-exception/-source-8 audits of the whole compile set
+  are clean. The next tag (0.2.7+) should carry the offline APK.
+
 ## Bridge MSI installer (2026-10-01)
 
 Requested as: "exe file is not installing please create a msi file". Root cause
