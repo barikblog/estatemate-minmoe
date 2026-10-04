@@ -216,6 +216,35 @@ function run(command, args, what) {
   }
 }
 
+/** A workflow command needs `%`, CR and LF escaped or the message truncates. */
+function escapeAnnotation(text) {
+  return String(text).slice(0, 900).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+}
+
+/**
+ * Runs a build helper and, when it fails or leaves no artifact behind, replays
+ * its own output as check annotations — the job log archive is not fetchable
+ * from this project's dev sandbox, annotations always are. `env` is the
+ * quotation-proof way to hand a path to a .cmd: no argument means no quoting.
+ */
+function runCaptured(command, args, what, artifacts = [], env = undefined) {
+  const result = spawnSync(command, args, { encoding: 'utf8', env });
+  const output = `${result.stdout || ''}\n${result.stderr || ''}`.trim();
+  if (output) process.stdout.write(`${output}\n`);
+  const missing = artifacts.filter((file) => !isFile(file));
+  if (result.error || result.status !== 0 || missing.length) {
+    const lines = output.split(/\r?\n/).filter(Boolean).slice(-12);
+    for (const line of lines) console.log(`::error title=${what}::${escapeAnnotation(line)}`);
+    if (missing.length) {
+      console.log(`::error title=${what}::${escapeAnnotation(`${what} left no ${missing.join(', ')}`)}`);
+    }
+    const reason = result.error
+      ? result.error.message
+      : `exit code ${result.status}${missing.length ? `, no ${missing.join(', ')}` : ''}`;
+    fail(`${what} did not produce its output (${reason})${lines.length ? `; last line: ${lines[lines.length - 1]}` : ''}`);
+  }
+}
+
 /** MSI ProductVersion: numeric major.minor[.build], each field < 65536. */
 function validateVersion(version) {
   const match = /^(\d{1,5})\.(\d{1,5})(?:\.(\d{1,5}))?$/.exec(String(version || ''));
@@ -342,6 +371,8 @@ function kitReadmeText(version) {
     '  Install-EstateMate-Bridge.cmd   double-click this',
     '  install-bridge.ps1              what it runs (readable - it is a script)',
     `  ${kitNameFor(version)}   the MSI it installs`,
+    '  dashboard/                      the dashboard window (used by the no-installer',
+    '                                  per-user install; the MSI installs its own copy)',
     '  SHA256SUMS.txt                  checksums the script verifies',
     '',
     'Prefer no installer at all? The release also carries',
@@ -367,12 +398,23 @@ function kitNameFor(version) {
  * WiX: --dry-run produces a real kit from a fake MSI and every reference in
  * here is exercised.
  */
-function writeOutputs({ outDir, msiPath, msiName, version, commit, exePath, wix, dashboard = null }) {
+function writeOutputs({ outDir, msiPath, msiName, version, commit, exePath, wix, dashboard = null, dashboardFiles = [] }) {
   const kitFiles = [{ name: msiName, path: msiPath }];
   for (const script of KIT_SCRIPTS) {
     const destination = path.join(outDir, script.name);
     fs.copyFileSync(script.source, destination);
     kitFiles.push({ name: script.name, path: destination });
+  }
+
+  // The kit carries the dashboard too (in dashboard/), so the per-user install
+  // that uses no Windows Installer is not the one shape that still opens a
+  // console window. Under --dry-run the launcher here is the placeholder.
+  const dashboardDirectory = path.join(outDir, 'dashboard');
+  for (const file of dashboardFiles) {
+    fs.mkdirSync(dashboardDirectory, { recursive: true });
+    const destination = path.join(dashboardDirectory, path.basename(file));
+    fs.copyFileSync(file, destination);
+    kitFiles.push({ name: `dashboard/${path.basename(file)}`, path: destination });
   }
 
   // install-bridge.ps1 reads this to verify the MSI before trusting it.
@@ -486,10 +528,18 @@ function main() {
       fs.writeFileSync(stagedDashboard.exe, 'placeholder: build-dashboard.cmd was not run\n', 'utf8');
     } else {
       console.log('Compiling the dashboard launcher (no console window)');
-      run('cmd', ['/c', DASHBOARD_BUILD_SCRIPT, buildDir], 'build-dashboard.cmd');
-      if (!isFile(stagedDashboard.exe)) fail(`build-dashboard.cmd did not produce ${stagedDashboard.exe}`);
+      runCaptured(
+        'cmd',
+        ['/c', DASHBOARD_BUILD_SCRIPT],
+        'build-dashboard.cmd',
+        [stagedDashboard.exe],
+        { ...process.env, ESTATEMATE_DASHBOARD_OUT: stagedDashboard.exe },
+      );
       if (fs.statSync(stagedDashboard.exe).size < 4096) {
         fail(`the compiled dashboard launcher is implausibly small (${fs.statSync(stagedDashboard.exe).size} bytes)`);
+      }
+      if (fs.readFileSync(stagedDashboard.exe).subarray(0, 2).toString('latin1') !== 'MZ') {
+        fail('the compiled dashboard launcher is not a Windows executable (no MZ header)');
       }
     }
 
@@ -556,6 +606,7 @@ function main() {
         exePath,
         wix: { candle: 'candle.exe (not run)', light: 'light.exe (not run)' },
         dashboard: dashboardInfo,
+        dashboardFiles: [stagedDashboard.exe, stagedDashboard.script, stagedDashboard.launcher],
       });
       printSummary({
         ...output,
@@ -599,6 +650,7 @@ function main() {
       exePath,
       wix: { candle: path.basename(candle), light: path.basename(light) },
       dashboard: dashboardInfo,
+      dashboardFiles: [stagedDashboard.exe, stagedDashboard.script, stagedDashboard.launcher],
     });
     printSummary({ ...output, msiPath, msiName, quiet: flags.quiet });
   } finally {

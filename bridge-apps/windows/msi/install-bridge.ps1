@@ -250,6 +250,16 @@ function New-ConsoleShortcut($path, $arguments, $workingDirectory, $description)
   $shortcut.Save()
 }
 
+function New-Shortcut($path, $target, $arguments, $workingDirectory, $description) {
+  $shell = New-Object -ComObject WScript.Shell
+  $shortcut = $shell.CreateShortcut($path)
+  $shortcut.TargetPath = $target
+  $shortcut.Arguments = $arguments
+  $shortcut.WorkingDirectory = $workingDirectory
+  $shortcut.Description = $description
+  $shortcut.Save()
+}
+
 function Get-PayloadExecutable($msi) {
   # The per-user install needs the bridge executable without msiexec performing
   # an install. Preferred order: the portable exe shipped in the same kit, then
@@ -312,8 +322,30 @@ function Install-PerUserCopy($msi) {
     }
   }
 
-  # Start Menu shortcuts that stay open, exactly like the MSI's.
+  # The dashboard, when this kit (or the MSI payload) carried one: the per-user
+  # install must not be the one shape that still opens a console window.
+  $dashboardExe = $null
+  $searchDirs = @((Split-Path -Parent $payload), (Join-Path $PSScriptRoot 'dashboard'))
+  if ($script:StagingDir) { $searchDirs += $script:StagingDir }
+  foreach ($name in @('EstateMateBridge.exe', 'EstateMateBridge.ps1', 'EstateMateBridge.cmd')) {
+    $source = $null
+    foreach ($dir in $searchDirs) {
+      if (-not (Test-Path -LiteralPath $dir)) { continue }
+      $candidate = Get-ChildItem -LiteralPath $dir -Recurse -Filter $name -File -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($candidate) { $source = $candidate.FullName; break }
+    }
+    if ($source) { Copy-Item -LiteralPath $source -Destination (Join-Path $script:InstallDir $name) -Force }
+  }
+  $dashboardExe = Join-Path $script:InstallDir 'EstateMateBridge.exe'
+  $hasDashboard = Test-Path -LiteralPath $dashboardExe
+
+  # Start Menu: the dashboard when there is one, the console shortcuts only when
+  # this install has no dashboard to offer (a bare portable executable).
   New-Item -ItemType Directory -Force -Path $script:ShortcutDir | Out-Null
+  if ($hasDashboard) {
+    New-Shortcut (Join-Path $script:ShortcutDir 'EstateMate Bridge.lnk') $dashboardExe '' $script:InstallDir 'Configure the terminals and start the bridge'
+    Write-Ok 'Start Menu -> EstateMate Bridge opens the dashboard'
+  }
   New-ConsoleShortcut (Join-Path $script:ShortcutDir 'EstateMate Bridge Console.lnk') '/K estatemate-bridge.exe help' $script:InstallDir 'Open a console for the EstateMate bridge commands'
   New-ConsoleShortcut (Join-Path $script:ShortcutDir 'Check configuration.lnk') '/K estatemate-bridge.exe check' $script:InstallDir 'Validate the config, the Worker and every terminal'
   New-ConsoleShortcut (Join-Path $script:ShortcutDir 'Service status.lnk') '/K estatemate-bridge.exe status' $script:InstallDir 'Paths, scheduled-task state and recent log lines'
@@ -338,10 +370,17 @@ function Install-PerUserCopy($msi) {
   }
 
   Write-Head 'Next steps'
-  Write-Step '1. Start Menu -> EstateMate Bridge -> "EstateMate Bridge Console"'
-  Write-Step '2. estatemate-bridge.exe setup     (reads the portal''s Download setup script)'
-  Write-Step '3. estatemate-bridge.exe check'
-  Write-Step '4. From an Administrator console: estatemate-bridge.exe install-service'
+  if ($hasDashboard) {
+    Write-Step '1. Start Menu -> EstateMate Bridge      (the dashboard window)'
+    Write-Step '2. Configuration -> pick the portal''s "Download setup" .ps1, add the terminals'
+    Write-Step '3. Status -> "Run check"'
+    Write-Step '4. Service -> "Start at boot"           (Windows asks for the elevation)'
+  } else {
+    Write-Step '1. Start Menu -> EstateMate Bridge -> "EstateMate Bridge Console"'
+    Write-Step '2. estatemate-bridge.exe setup     (reads the portal''s Download setup script)'
+    Write-Step '3. estatemate-bridge.exe check'
+    Write-Step '4. From an Administrator console: estatemate-bridge.exe install-service'
+  }
   return 0
 }
 

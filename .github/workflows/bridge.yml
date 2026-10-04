@@ -152,6 +152,9 @@ jobs:
               'estatemate-bridge-0.0.1-win-x64.msi',
               'Install-EstateMate-Bridge.cmd',
               'install-bridge.ps1',
+              'dashboard/EstateMateBridge.exe',
+              'dashboard/EstateMateBridge.ps1',
+              'dashboard/EstateMateBridge.cmd',
               'SHA256SUMS.txt',
               'READ-ME-FIRST.txt',
           }
@@ -890,7 +893,17 @@ jobs:
             if (-not (Test-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\EstateMate Bridge'))) {
               Stop-KitCheck 'the per-user install wrote no Start Menu shortcuts'
             }
-            Write-Host 'The per-user install works without Windows Installer.'
+            # The fallback keeps the dashboard when the kit carried one: this
+            # install must not be the shape that still opens a console window.
+            $perUserDashboard = Join-Path $env:LOCALAPPDATA 'Programs\EstateMate Bridge\EstateMateBridge.exe'
+            $perUserShortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\EstateMate Bridge\EstateMate Bridge.lnk'
+            if (-not (Test-Path $perUserDashboard)) { Stop-KitCheck "the per-user install left no dashboard at $perUserDashboard" }
+            if (-not (Test-Path $perUserShortcut)) { Stop-KitCheck "the per-user install wrote no dashboard shortcut at $perUserShortcut" }
+            & $perUserDashboard -SelfTest | Out-Null
+            $selftest = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            if ($selftest -ne 0) { Stop-KitCheck "the per-user dashboard failed its self-test (exit code $selftest)" }
+            Write-Host 'The per-user install works without Windows Installer, with the dashboard.'
 
             $perUserRemove = Invoke-BridgeScript @('-File', $bridgeScript, '-Uninstall', '-Silent', '-NoPause')
             if ($perUserRemove.Code -ne 0) { Stop-KitCheck "the per-user uninstall failed with exit code $($perUserRemove.Code); it said: $(Esc $perUserRemove.Output)" }
