@@ -738,6 +738,12 @@ jobs:
             $global:LASTEXITCODE = 0
             return [pscustomobject]@{ Code = $code; Output = ($output -join "`n") }
           }
+          # Workflow commands need their own escaping: a raw newline in an
+          # ::error:: message truncates it, and this project reads failures
+          # through annotations because the job log archive is unreachable.
+          function Esc([string] $text) {
+            return (($text -replace '%', '%25') -replace "`r", '%0D') -replace "`n", '%0A'
+          }
           function Stop-KitCheck([string] $message) { throw $message }
 
           try {
@@ -758,7 +764,7 @@ jobs:
             $launcherCode = $LASTEXITCODE
             $global:LASTEXITCODE = 0
             Write-Host ($launcherOutput -join "`n")
-            if ($launcherCode -ne 0) { Stop-KitCheck "the kit launcher failed with exit code $launcherCode" }
+            if ($launcherCode -ne 0) { Stop-KitCheck "the kit launcher failed with exit code $launcherCode; it said: $(Esc ($launcherOutput -join "`n"))" }
             if (-not (Test-Path $installed)) { Stop-KitCheck 'the kit launcher did not install the executable' }
             & $installed version
             Write-Host 'The kit launcher installed the MSI.'
@@ -785,7 +791,7 @@ jobs:
             }
             $broken = Invoke-BridgeScript @('-File', $bridgeScript, '-MsiPath', $brokenMsi, '-NoFallback', '-Silent', '-NoPause')
             Write-Host "truncated-MSI run said: $($broken.Output)"
-            if ($broken.Code -ne 3) { Stop-KitCheck "a truncated MSI must be refused with exit code 3, got $($broken.Code)" }
+            if ($broken.Code -ne 3) { Stop-KitCheck "a truncated MSI must be refused with exit code 3, got $($broken.Code); it said: $(Esc $broken.Output)" }
             if (Test-Path $installed) { Stop-KitCheck 'the truncated MSI was installed anyway' }
             Write-Host 'A truncated MSI is refused with the checksum message.'
 
@@ -793,7 +799,7 @@ jobs:
             $perUserExe = Join-Path $env:LOCALAPPDATA 'Programs\EstateMate Bridge\estatemate-bridge.exe'
             $perUser = Invoke-BridgeScript @('-File', $bridgeScript, '-PerUser', '-Silent', '-NoPause')
             Write-Host ($perUser.Output -join "`n")
-            if ($perUser.Code -ne 0) { Stop-KitCheck "the per-user install failed with exit code $($perUser.Code)" }
+            if ($perUser.Code -ne 0) { Stop-KitCheck "the per-user install failed with exit code $($perUser.Code); it said: $(Esc $perUser.Output)" }
             if (-not (Test-Path $perUserExe)) { Stop-KitCheck "the per-user install left no executable at $perUserExe" }
             & $perUserExe version
             $appPaths = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\estatemate-bridge.exe' -ErrorAction SilentlyContinue).'(default)'
@@ -804,7 +810,7 @@ jobs:
             Write-Host 'The per-user install works without Windows Installer.'
 
             $perUserRemove = Invoke-BridgeScript @('-File', $bridgeScript, '-Uninstall', '-Silent', '-NoPause')
-            if ($perUserRemove.Code -ne 0) { Stop-KitCheck "the per-user uninstall failed with exit code $($perUserRemove.Code)" }
+            if ($perUserRemove.Code -ne 0) { Stop-KitCheck "the per-user uninstall failed with exit code $($perUserRemove.Code); it said: $(Esc $perUserRemove.Output)" }
             if (Test-Path $perUserExe) { Stop-KitCheck 'the per-user uninstall left the executable behind' }
             if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\EstateMateBridge') {
               Stop-KitCheck 'the per-user uninstall left the Installed apps entry behind'

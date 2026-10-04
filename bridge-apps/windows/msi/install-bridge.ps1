@@ -439,9 +439,15 @@ function Invoke-Main {
 try {
   $script:ExitCode = Invoke-Main
 } catch {
-  Write-Bad $_.Exception.Message
+  Write-Bad "the installer stopped: $($_.Exception.Message)"
+  if ($_.InvocationInfo -and $_.InvocationInfo.ScriptLineNumber) {
+    Write-Step "at line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())"
+  }
+  if ($_.ScriptStackTrace) { Write-Step "stack: $($_.ScriptStackTrace)" }
   $script:ExitCode = 1
 }
+if ($null -eq $script:ExitCode) { $script:ExitCode = 0 }
+if ($script:ExitCode -isnot [int]) { $script:ExitCode = [int]($script:ExitCode | Select-Object -Last 1) }
 
 if ($script:ExitCode -ne 0) {
   Save-Evidence $script:MsiResolved $LogPath
