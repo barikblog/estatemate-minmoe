@@ -80,10 +80,12 @@ fixed, and each one is a self-test check now:
   `Write-Utf8NoBom`, reads the first three bytes back and reports them, so it
   tests the file `setup` actually parses.
 
-**`bridge-0.2.8`** is the release that carries the dashboard and every other
-feature of this branch in the MSI, the kit and the per-user install; the tag
-run's Windows job installs the MSI, runs the installed dashboard's self-test,
-installs through the kit, uninstalls and only then publishes.
+**`bridge-0.2.8`** (published 2026-10-04,
+<https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.2.8>)
+carries the dashboard and every other feature of this branch in the MSI, the kit
+and the per-user install; the tag run's Windows job installs the MSI, runs the
+installed dashboard's self-test, installs through the kit, uninstalls and only
+then publishes.
 
 ## The Windows installer now explains itself and cannot dead-end (2026-10-04)
 
