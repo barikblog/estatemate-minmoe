@@ -11,12 +11,15 @@
 const { existsSync } = require('node:fs');
 const { pathToFileURL } = require('node:url');
 
-async function loadAgent({ agentEntry, configPath, devicesPath, standby = false, logger = null }) {
+async function loadAgent({ agentEntry, configPath, devicesPath, standby = false, version = null, logger = null }) {
   if (!existsSync(agentEntry)) {
     throw new Error(`Bridge agent sources are missing at ${agentEntry}; reinstall the bridge executable`);
   }
   process.env.AGENT_CONFIG = configPath;
   process.env.DEVICES_FILE = devicesPath;
+  // The agent reports this in its heartbeat, so the portal knows which bridge
+  // build is behind a terminal without anybody reading a log file.
+  if (version) process.env.ESTATEMATE_BRIDGE_VERSION = String(version);
   if (standby) process.env.ESTATEMATE_AGENT_STANDBY = '1';
   else delete process.env.ESTATEMATE_AGENT_STANDBY;
 

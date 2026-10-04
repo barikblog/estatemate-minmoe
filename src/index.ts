@@ -3,6 +3,21 @@ import type { Context, MiddlewareHandler } from 'hono';
 import { moneyToMinor, parseCsv, requireHeaders, validDate } from './csv';
 import type { CsvTable } from './csv';
 import { DEFAULT_ESTATE_TIMEZONE, normalizeTimeZone, parseEstateInstantMs } from './datetime';
+import {
+  AGENT_CAPABILITIES,
+  credentialsForPerson,
+  deviceSyncOverview,
+  fingerprintUploadOperation,
+  heldTemplateFor,
+  personKeyFor,
+  readPerson,
+  removePersonFromDevices,
+  setDevicePersonState,
+  syncDevices,
+  syncPersonToDevices,
+  type AgentCapability,
+  type SyncResult,
+} from './device-sync';
 import { EMPLOYEE_ID_MAX, deviceEmployeeNo, employeeIdFromUuid, readEmployeeId } from './employee-id';
 import { AccessLiveFeed } from './live-feed';
 import { evaluateVisitorPass } from './visitor-pass';
@@ -1100,8 +1115,15 @@ app.patch('/api/household-members/:id', requireRoles('admin','manager'), async (
   if (status === 'inactive' || status === 'rejected') {
     await suspendDependantCredentials(c.env, c.req.param('id'), c.get('user').id, 'household membership inactive');
   }
-  await audit(c, body.action, 'household_member', c.req.param('id'), { canCreateVisitors: Boolean(visitorPermission), canViewBills: Boolean(billPermission) });
-  return c.json({ ok: true, status });
+  // An approved dependant is a person on the terminals too: approval alone does
+  // not put them there, so the membership becoming active (or the name changing)
+  // is what triggers the write. Nothing is sent for a membership that was never
+  // given a credential.
+  const personSync = status === 'active'
+    ? await autoSyncPerson(c.env, 'dependant', c.req.param('id'), 'household membership active')
+    : null;
+  await audit(c, body.action, 'household_member', c.req.param('id'), { canCreateVisitors: Boolean(visitorPermission), canViewBills: Boolean(billPermission), personSync: personSync ? describeSync(personSync) : undefined });
+  return c.json({ ok: true, status, personSync: personSync ? describeSync(personSync) : undefined });
 });
 
 app.post('/api/household-members/:id/login', requireRoles('admin','manager'), async (c) => {
@@ -1519,8 +1541,15 @@ app.patch('/api/users/:id', requireRoles('admin','manager'), async (c) => {
   if (ownershipId && body.propertyId) statements.push(c.env.DB.prepare(`INSERT INTO property_ownerships(id,property_id,resident_id,status,approved_by) VALUES (?,?,?,'active',?)`).bind(ownershipId,body.propertyId,existing.id,c.get('user').id));
   await c.env.DB.batch(statements);
   if (status==='inactive' && existing.status==='active') await suspendUserCards(c.env,existing.id,c.get('user').id,'account deactivated');
-  await audit(c,'update','user',existing.id,{ name,email,role,status,propertyAssigned:body.propertyId || null,ownershipId,employeeId:touchesEmployeeId?employeeIdUpdate.value:undefined });
-  return c.json({ ok:true,id:existing.id,ownershipId,employeeId:touchesEmployeeId?employeeIdUpdate.value:undefined });
+  // A terminal shows the name it was given, so a rename (or a new employee
+  // number) has to be written back to the terminals this person is on. Only
+  // people already tracked there are touched; editing an unrelated account
+  // changes nothing on any gate.
+  const personSync = name!==existing.name || touchesEmployeeId
+    ? await autoSyncPerson(c.env,'account',existing.id,'person updated in the portal')
+    : null;
+  await audit(c,'update','user',existing.id,{ name,email,role,status,propertyAssigned:body.propertyId || null,ownershipId,employeeId:touchesEmployeeId?employeeIdUpdate.value:undefined,personSync:personSync?describeSync(personSync):undefined });
+  return c.json({ ok:true,id:existing.id,ownershipId,employeeId:touchesEmployeeId?employeeIdUpdate.value:undefined,personSync:personSync?describeSync(personSync):undefined });
 });
 
 app.post('/api/users/:id/reset-password', requireRoles('admin','manager'), async (c) => {
@@ -1551,8 +1580,15 @@ app.delete('/api/users/:id', requireRoles('admin','manager'), async (c) => {
   if (blocker) return jsonError(c,409,blocker);
   await c.env.DB.prepare(`UPDATE users SET status='inactive',updated_at=datetime('now') WHERE id=?`).bind(target.id).run();
   await suspendUserCards(c.env,target.id,c.get('user').id,'account deleted by administrator');
-  await audit(c,'delete','user',target.id,{ name:target.name,mode:'soft-delete-history-preserved' });
-  return c.json({ ok:true,historyPreserved:true });
+  // Deactivating a person leaves them on the terminal with suspended credentials,
+  // so they can come back. Deleting the account removes them properly: the
+  // person, their credentials and their door permissions leave the terminal.
+  const person = await syncPersonRef(c.env,'account',target.id);
+  const removal = person?.employeeNo
+    ? await removePersonFromDevices(c.env,person,{ reason:'account deleted by administrator' })
+    : null;
+  await audit(c,'delete','user',target.id,{ name:target.name,mode:'soft-delete-history-preserved',removal:removal?describeSync(removal):'nothing on a terminal' });
+  return c.json({ ok:true,historyPreserved:true,terminals:removal?describeSync(removal):'nothing on a terminal' });
 });
 
 app.post('/api/users/sample-logins', requireRoles('admin'), async (c) => {
@@ -2089,12 +2125,14 @@ app.post('/api/people/bulk-resync', requireRoles('admin','manager'), async (c) =
   }
 
   const result = await resyncPeopleCredentials(c.env,people);
-  await audit(c,'bulk_resync','people',null,{ scope,people:people.length,...result });
+  await audit(c,'bulk_resync','people',null,{ scope,requested:people.length,...result });
   return c.json({
-    ok:true,scope,people:people.length,...result,
+    ok:true,scope,requested:people.length,people:result.people,
+    cards:result.cards,fingerprints:result.fingerprints,devices:result.devices,
+    queued:result.queued,manual:result.manual,skipped:result.skipped,
     notice: result.manual
-      ? `${result.queued} command(s) queued for the agent and ${result.manual} fingerprint task(s) raised for an operator under Hardware actions.`
-      : `${result.queued} command(s) queued for the estate agent.`,
+      ? `${result.people} person record(s) and ${result.queued} credential command(s) queued for the agent, and ${result.manual} task(s) for an operator under Hardware actions.`
+      : `${result.people} person record(s) and ${result.queued} credential command(s) queued for the estate agent.`,
   });
 });
 
@@ -2163,9 +2201,9 @@ async function resyncPersonCredentials(env: Env, person: PersonRef): Promise<{ c
 }
 
 /** Resynchronise a list of people, totalling what was queued. */
-async function resyncPeopleCredentials(env: Env, people: PersonRef[]): Promise<{ cards: number; fingerprints: number; queued: number; manual: number; skipped: number; devices: number }> {
+async function resyncPeopleCredentials(env: Env, people: PersonRef[]): Promise<{ cards: number; fingerprints: number; people: number; queued: number; manual: number; skipped: number; devices: number }> {
   const devices = await env.DB.prepare(`SELECT COUNT(*) AS count FROM hikvision_devices WHERE status!='disabled' AND deleted_at IS NULL`).first<{ count:number }>();
-  const totals = { cards:0,fingerprints:0,queued:0,manual:0,skipped:0 };
+  const totals = { cards:0,fingerprints:0,people:0,queued:0,manual:0,skipped:0 };
   for (const person of people) {
     try {
       const result = await resyncPersonCredentials(env,person);
@@ -2174,6 +2212,18 @@ async function resyncPeopleCredentials(env: Env, people: PersonRef[]): Promise<{
       totals.queued += result.queued;
       totals.manual += result.manual;
       totals.skipped += result.skipped;
+      // The person record itself, not only the credentials: a terminal that has
+      // never been told the person exists cannot honour their card, so a
+      // resynchronisation that skipped this left the estate with exactly the
+      // symptom people report — cards recorded, gate does not open.
+      const ref = await syncPersonRef(env,person.kind,person.id);
+      if (ref && ref.status === 'active' && (await ensureSyncEmployeeNo(env,ref))) {
+        const persons = await syncPersonToDevices(env,ref,{ reason:'bulk resynchronisation' });
+        totals.people += 1;
+        totals.queued += persons.queued;
+        totals.manual += persons.manual;
+        totals.skipped += persons.skipped;
+      }
     } catch (error) {
       // One person whose credentials cannot be queued must not abort the batch.
       console.error('Credential resynchronisation failed',person.id,error);
@@ -4143,15 +4193,34 @@ app.post('/api/access/fingerprints', requireRoles('admin','manager'), async (c) 
   const instruction = deviceName
     ? `Enroll ${body.fingerLabel?.trim() || `finger ${fingerNo}`} for ${personName} on ${deviceName}, using finger slot ${fingerNo}${employeeNo ? ` and employee number ${employeeNo}` : ''}. Then mark this action applied.`
     : `Enroll ${body.fingerLabel?.trim() || `finger ${fingerNo}`} for ${personName} on the terminal, using finger slot ${fingerNo}${employeeNo ? ` and employee number ${employeeNo}` : ''}. Then mark this action applied.`;
+  // The person record goes to the terminals, so the new finger has somebody to
+  // belong to — but not the credentials, because the fingerprint command below is
+  // the one this action is about and two callers would queue it twice.
+  const person = { kind: (householdMemberId ? 'dependant' : 'account') as PersonKind, id: householdMemberId ?? String(residentId), name: personName, employeeNo, status: 'active' };
+  const personSync = await autoSyncPerson(c.env, person.kind, person.id, 'fingerprint recorded');
   const queued = await createFingerprintOperations(c.env, id, 'enroll_fingerprint', { fingerprintId:id, fingerNo, employeeNo, personName, deviceId, enabled:true }, instruction, { deviceId });
-  await audit(c, 'enroll', 'fingerprint_credential', id, { residentId, householdMemberId, fingerNo, employeeNo, deviceId });
+
+  // A template held for this slot is what actually reaches a terminal: when one
+  // exists (the finger was read on a terminal after this change) it is sent to
+  // every terminal whose bridge can write fingerprints. When none exists the
+  // manual instruction above is the only honest answer, and it says so.
+  let templateQueued = 0;
+  if (await heldTemplateFor(c.env, person, fingerNo)) {
+    for (const device of await syncDevices(c.env, null)) {
+      const outcome = await fingerprintUploadOperation(c.env, person, device, { id, finger_no: fingerNo, finger_label: body.fingerLabel?.trim() || null, employee_no: employeeNo, status: 'active' }, 'fingerprint recorded');
+      if (outcome === 'queued') templateQueued += 1;
+    }
+  }
+  await audit(c, 'enroll', 'fingerprint_credential', id, { residentId, householdMemberId, fingerNo, employeeNo, deviceId, templateQueued });
   return c.json({
     id,
     fingerNo,
     employeeNo,
     credentialType: 'fingerprint',
     queuedActions: queued,
-    hardwareSync: 'manual_action_required',
+    templateQueued,
+    personSync: describeSync(personSync),
+    hardwareSync: templateQueued ? 'queued' : 'manual_action_required',
     instruction,
   }, 201);
 });
@@ -4222,6 +4291,329 @@ app.delete('/api/access/fingerprints/:id', requireRoles('admin','manager'), asyn
   return c.json({ ok: true, historyPreserved: true, queuedActions: queued });
 });
 
+// ─────────────────────────────────────────────────────────────
+// Automatic person synchronisation and fingerprint capture
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * The person × terminal grid: what each terminal holds, and what it is waiting
+ * for. This is the honest answer the portal could not give before — it used to
+ * only say how many commands were queued, never whether a terminal had the
+ * person at all.
+ */
+app.get('/api/device-sync', requireRoles('admin','manager','security'), async (c) => {
+  const limit = Number(c.req.query('limit') ?? 500);
+  const overview = await deviceSyncOverview(c.env, { limit: Number.isFinite(limit) ? limit : 500 });
+  const captures = await c.env.DB.prepare(
+    `SELECT id,device_id,person_name,finger_no,finger_label,status,error_message,created_at,expires_at
+       FROM fingerprint_captures WHERE status='pending' OR (status='captured' AND updated_at > datetime('now','-1 day'))
+       ORDER BY created_at DESC LIMIT 20`,
+  ).all();
+  return c.json({
+    ...overview,
+    captures: captures.results,
+    supported: true,
+    note: 'A terminal only lets somebody through when the person record exists on it with door rights. EstateMate now writes the person, then the card, then any fingerprint template — and says here which terminal is still missing what.',
+  });
+});
+
+/**
+ * "Sync now" for the people and terminals the operator picked, defaulting to
+ * everyone holding a credential and every terminal. Idempotent: repeat presses
+ * reuse the operations already open.
+ */
+app.post('/api/device-sync/people', requireRoles('admin','manager'), async (c) => {
+  const body = await c.req.json<{
+    scope?: 'all'|'people';
+    people?: Array<{ personKind?: string; id?: string; employeeId?: string | null }>;
+    deviceIds?: string[] | null;
+    includeCredentials?: boolean;
+  }>();
+  const deviceIds = Array.isArray(body.deviceIds) && body.deviceIds.length ? body.deviceIds.map(String) : null;
+  const includeCredentials = body.includeCredentials !== false;
+
+  type Target = { kind: PersonKind; id: string };
+  const targets: Target[] = [];
+  if (body.scope === 'people') {
+    for (const entry of body.people ?? []) {
+      const kind: PersonKind = entry.personKind === 'dependant' ? 'dependant' : 'account';
+      if (entry.id) targets.push({ kind, id: String(entry.id) });
+    }
+    if (!targets.length) return jsonError(c, 400, 'List the people to synchronise with people[{personKind,id}]');
+    if (targets.length > PEOPLE_BULK_MAX_ROWS) return jsonError(c, 400, `At most ${PEOPLE_BULK_MAX_ROWS} people can be synchronised in one request`);
+  } else {
+    // Everyone a terminal could plausibly need: an active account with a
+    // credential or an employee number, plus every active dependant holding one.
+    const accounts = await c.env.DB.prepare(
+      `SELECT id FROM users
+        WHERE status='active' AND (
+          employee_id IS NOT NULL
+          OR EXISTS(SELECT 1 FROM access_cards c WHERE c.resident_id=users.id AND c.household_member_id IS NULL)
+          OR EXISTS(SELECT 1 FROM fingerprint_credentials f WHERE f.resident_id=users.id AND f.household_member_id IS NULL))
+        ORDER BY name LIMIT ?`,
+    ).bind(PEOPLE_BULK_MAX_ROWS).all<{ id: string }>();
+    const dependants = await c.env.DB.prepare(
+      `SELECT id FROM household_members
+        WHERE status='active' AND (
+          employee_id IS NOT NULL
+          OR EXISTS(SELECT 1 FROM access_cards c WHERE c.household_member_id=household_members.id)
+          OR EXISTS(SELECT 1 FROM fingerprint_credentials f WHERE f.household_member_id=household_members.id))
+        ORDER BY name LIMIT ?`,
+    ).bind(PEOPLE_BULK_MAX_ROWS).all<{ id: string }>();
+    targets.push(...accounts.results.map((row) => ({ kind: 'account' as PersonKind, id: row.id })));
+    targets.push(...dependants.results.map((row) => ({ kind: 'dependant' as PersonKind, id: row.id })));
+  }
+
+  const totals = { devices: 0, queued: 0, manual: 0, skipped: 0, removed: 0, unresolved: 0 };
+  let processed = 0;
+  for (const target of targets) {
+    try {
+      const result = await syncPersonEverywhere(c.env, target.kind, target.id, 'portal synchronisation', { deviceIds, includeCredentials });
+      totals.devices += result.devices;
+      totals.queued += result.queued;
+      totals.manual += result.manual;
+      totals.skipped += result.skipped;
+      totals.unresolved += result.unresolved.length;
+      processed += 1;
+    } catch (error) {
+      // One person who cannot be queued must not abort the batch.
+      console.error('Device synchronisation failed', target.kind, target.id, error);
+    }
+  }
+  await audit(c, 'sync', 'device_person_state', null, { scope: body.scope ?? 'all', people: processed, requestedDevices: deviceIds, ...totals });
+  return c.json({
+    ok: true,
+    scope: body.scope === 'people' ? 'people' : 'all',
+    people: processed,
+    devices: deviceIds ?? totals.devices,
+    queued: totals.queued,
+    manual: totals.manual,
+    skipped: totals.skipped,
+    removed: totals.removed,
+    unresolved: totals.unresolved,
+    notice: `${processed} person(s) synchronised across ${deviceIds ? deviceIds.length : totals.devices} terminal(s): ${totals.queued} command(s) for the agent, ${totals.manual} operator task(s), ${totals.skipped} already queued${totals.unresolved ? `, ${totals.unresolved} without an employee number` : ''}.`,
+  });
+});
+
+/**
+ * "Remove from device": take a person off one terminal, or off every terminal,
+ * together with their cards, fingerprints and door permissions.
+ *
+ * This is deliberately not what deactivating an account does. Deactivating
+ * suspends credentials so the person can come back; removing deletes them from
+ * the terminal, which is what an estate does when a tenancy ends.
+ */
+app.post('/api/device-sync/remove', requireRoles('admin','manager'), async (c) => {
+  const body = await c.req.json<{
+    personKind?: string; id?: string; employeeId?: string | null;
+    deviceIds?: string[] | null; reason?: string; fullRemoval?: boolean;
+  }>();
+  const kind: PersonKind = body.personKind === 'dependant' ? 'dependant' : 'account';
+  let personId = body.id ? String(body.id) : null;
+  if (!personId && body.employeeId) {
+    const table = kind === 'account' ? 'users' : 'household_members';
+    const row = await c.env.DB.prepare(`SELECT id FROM ${table} WHERE employee_id=? LIMIT 1`).bind(String(body.employeeId)).first<{ id: string }>();
+    personId = row?.id ?? null;
+  }
+  if (!personId) return jsonError(c, 400, 'id (or employeeId) is required');
+  const person = await syncPersonRef(c.env, kind, personId);
+  if (!person) return jsonError(c, 404, 'Person not found');
+  if (!person.employeeNo) return jsonError(c, 409, 'That person has no terminal employee number, so no terminal can be holding them');
+
+  const deviceIds = Array.isArray(body.deviceIds) && body.deviceIds.length ? body.deviceIds.map(String) : null;
+  const result = await removePersonFromDevices(c.env, person, {
+    reason: body.reason?.trim() || 'removed from the terminal by an administrator',
+    deviceIds,
+    fullRemoval: body.fullRemoval !== false,
+  });
+  await audit(c, 'remove_from_devices', 'device_person_state', personId, { kind, employeeNo: person.employeeNo, requestedDevices: deviceIds, ...result });
+  return c.json({
+    ok: true,
+    person: person.name,
+    employeeNo: person.employeeNo,
+    devices: result.devices,
+    queued: result.queued,
+    manual: result.manual,
+    skipped: result.skipped,
+    removed: result.removed,
+    notice: `${person.name} is being removed from ${result.removed} terminal(s): ${describeSync(result)}.`,
+  });
+});
+
+/**
+ * Starts a fingerprint capture on a chosen terminal.
+ *
+ * The operator picks the person, the finger and the terminal in front of them;
+ * the bridge arms the terminal's own reader, the finger goes on the glass, and
+ * the template is sent to every other terminal that can take one. Nothing is
+ * typed on the terminal.
+ */
+app.post('/api/access/fingerprints/capture', requireRoles('admin','manager'), async (c) => {
+  const body = await c.req.json<{
+    residentId?: string; householdMemberId?: string; personKind?: string; personId?: string;
+    fingerNo?: number | string; fingerLabel?: string; deviceId?: string;
+  }>();
+  const kind: PersonKind = body.personKind === 'dependant' || body.householdMemberId ? 'dependant' : 'account';
+  const personId = String(body.personId ?? body.householdMemberId ?? body.residentId ?? '').trim();
+  if (!personId) return jsonError(c, 400, 'personId (or residentId / householdMemberId) is required');
+  const fingerNo = Number(body.fingerNo);
+  if (!Number.isInteger(fingerNo) || fingerNo < 1 || fingerNo > 10) return jsonError(c, 400, 'fingerNo must be a whole number between 1 and 10');
+  if (!body.deviceId) return jsonError(c, 400, 'deviceId is required: a finger is captured at one terminal');
+  const person = await syncPersonRef(c.env, kind, personId);
+  if (!person) return jsonError(c, 404, 'Person not found');
+  if (person.status !== 'active') return jsonError(c, 409, 'Only an active person can be enrolled');
+
+  const started = await startFingerprintCapture(c.env, {
+    person,
+    fingerNo,
+    fingerLabel: body.fingerLabel?.trim() || null,
+    deviceId: String(body.deviceId),
+    createdBy: c.get('user').id,
+  });
+  if (!started.ok) return jsonError(c, started.status, started.error);
+  await audit(c, 'capture_start', 'fingerprint_capture', started.capture.id, { personId, kind, fingerNo, deviceId: body.deviceId, employeeNo: started.capture.employee_no });
+  return c.json({
+    ok: true,
+    captureId: started.capture.id,
+    status: started.capture.status,
+    employeeNo: started.capture.employee_no,
+    expiresAt: started.capture.expires_at,
+    instruction: started.instruction,
+  }, 201);
+});
+
+/** Polls one capture: pending until a finger is read, then where it was sent. */
+app.get('/api/access/fingerprints/captures/:id', requireRoles('admin','manager','security'), async (c) => {
+  const capture = await c.env.DB.prepare(`SELECT * FROM fingerprint_captures WHERE id=?`).bind(c.req.param('id')).first<FingerprintCaptureRow>();
+  if (!capture) return jsonError(c, 404, 'Capture not found');
+  const uploads = await c.env.DB.prepare(
+    `SELECT o.status,o.error_message,d.name AS device_name
+       FROM device_operations o JOIN hikvision_devices d ON d.id=o.device_id
+      WHERE o.capture_id=? AND o.operation='upload_fingerprint' ORDER BY d.name`,
+  ).bind(capture.id).all<{ status: string; error_message: string | null; device_name: string }>();
+  return c.json({
+    id: capture.id,
+    status: capture.status,
+    personName: capture.person_name,
+    fingerNo: capture.finger_no,
+    fingerLabel: capture.finger_label,
+    employeeNo: capture.employee_no,
+    error: capture.error_message,
+    expiresAt: capture.expires_at,
+    // Never the template itself: it exists to reach a terminal, not a browser.
+    hasTemplate: Boolean(capture.template_data),
+    uploads: uploads.results,
+  });
+});
+
+/** Stops waiting for a finger — the person walked away, or it was the wrong slot. */
+app.post('/api/access/fingerprints/captures/:id/cancel', requireRoles('admin','manager'), async (c) => {
+  const capture = await c.env.DB.prepare(`SELECT id,status FROM fingerprint_captures WHERE id=?`).bind(c.req.param('id')).first<{ id: string; status: string }>();
+  if (!capture) return jsonError(c, 404, 'Capture not found');
+  if (capture.status === 'pending') {
+    await c.env.DB.batch([
+      c.env.DB.prepare(`UPDATE fingerprint_captures SET status='cancelled',template_data=NULL,error_message='cancelled by the operator',updated_at=datetime('now') WHERE id=?`).bind(capture.id),
+      c.env.DB.prepare(`UPDATE device_operations SET status='failed',error_message='cancelled by the operator',updated_at=datetime('now') WHERE capture_id=? AND status IN ('pending','sent')`).bind(capture.id),
+    ]);
+  }
+  await audit(c, 'capture_cancel', 'fingerprint_capture', capture.id, {});
+  return c.json({ ok: true, status: capture.status === 'pending' ? 'cancelled' : capture.status });
+});
+
+/** Re-sends a stored fingerprint to the terminals, or says it must be re-read. */
+app.post('/api/access/fingerprints/:id/sync', requireRoles('admin','manager'), async (c) => {
+  const body = await c.req.json<{ deviceIds?: string[] | null }>().catch(() => ({} as { deviceIds?: string[] | null }));
+  const record = await c.env.DB.prepare(
+    `SELECT f.id,f.finger_no,f.finger_label,f.employee_no,f.status,f.resident_id,f.household_member_id,COALESCE(f.finger_label,'Finger ' || f.finger_no) AS label,u.name AS resident_name
+       FROM fingerprint_credentials f JOIN users u ON u.id=f.resident_id WHERE f.id=?`,
+  ).bind(c.req.param('id')).first<{
+    id: string; finger_no: number; finger_label: string | null; employee_no: string | null; status: string;
+    resident_id: string; household_member_id: string | null; label: string; resident_name: string;
+  }>();
+  if (!record) return jsonError(c, 404, 'Fingerprint credential not found');
+  const kind: PersonKind = record.household_member_id ? 'dependant' : 'account';
+  const person = await syncPersonRef(c.env, kind, record.household_member_id ?? record.resident_id);
+  if (!person) return jsonError(c, 404, 'Person not found');
+
+  const deviceIds = Array.isArray(body.deviceIds) && body.deviceIds.length ? body.deviceIds.map(String) : null;
+  const devices = await syncDevices(c.env, deviceIds);
+  const held = await heldTemplateFor(c.env, person, record.finger_no);
+  let queued = 0;
+  let manual = 0;
+  let skipped = 0;
+  for (const device of devices) {
+    const outcome = await fingerprintUploadOperation(c.env, person, device, {
+      id: record.id, finger_no: record.finger_no, finger_label: record.finger_label,
+      employee_no: record.employee_no, status: record.status,
+    }, 're-sent from the portal');
+    if (outcome === 'queued') queued += 1;
+    else if (outcome === 'manual') manual += 1;
+    else skipped += 1;
+  }
+  await audit(c, 'sync', 'fingerprint_credential', record.id, { queued, manual, skipped, templateHeld: Boolean(held) });
+  return c.json({
+    ok: true,
+    templateHeld: Boolean(held),
+    queued,
+    manual,
+    skipped,
+    notice: held
+      ? `The stored template for ${record.label} is being sent to ${queued} terminal(s); ${manual ? `${manual} terminal(s) need an operator because no agent there can write fingerprints.` : 'every terminal with an agent takes it directly.'}`
+      : `No template is held for ${record.label} any more — templates only live on the terminals. Enrol the finger again at a terminal (Capture at a terminal), and EstateMate will send the new template to the others.`,
+  });
+});
+
+/**
+ * "Remove from device" for one finger: deletes that slot on the chosen terminal
+ * (or every terminal) without touching the credential's history.
+ */
+app.post('/api/access/fingerprints/:id/remove-from-device', requireRoles('admin','manager'), async (c) => {
+  const body = await c.req.json<{ deviceId?: string; allDevices?: boolean; reason?: string }>().catch(() => ({} as { deviceId?: string; allDevices?: boolean; reason?: string }));
+  const record = await c.env.DB.prepare(
+    `SELECT f.id,f.finger_no,f.finger_label,f.employee_no,f.status,f.resident_id,f.household_member_id,u.name AS resident_name
+       FROM fingerprint_credentials f JOIN users u ON u.id=f.resident_id WHERE f.id=?`,
+  ).bind(c.req.param('id')).first<{ id: string; finger_no: number; finger_label: string | null; employee_no: string | null; status: string; resident_id: string; household_member_id: string | null; resident_name: string }>();
+  if (!record) return jsonError(c, 404, 'Fingerprint credential not found');
+  if (!body.deviceId && !body.allDevices) return jsonError(c, 400, 'Give deviceId, or allDevices: true to remove it from every terminal');
+  const deviceIds = body.allDevices ? null : [String(body.deviceId)];
+  const devices = await syncDevices(c.env, deviceIds);
+  if (!devices.length) return jsonError(c, 404, 'No matching terminal');
+
+  const open = await c.env.DB.prepare(
+    `SELECT device_id FROM device_operations WHERE fingerprint_id=? AND operation='delete_fingerprint_device' AND status IN ('pending','sent','manual_action_required')`,
+  ).bind(record.id).all<{ device_id: string }>();
+  const alreadyOpen = new Set(open.results.map((row) => row.device_id));
+
+  let queued = 0;
+  let manual = 0;
+  let skipped = 0;
+  const statements: D1PreparedStatement[] = [];
+  for (const device of devices) {
+    if (alreadyOpen.has(device.id)) { skipped += 1; continue; }
+    const agentReady = device.hasAgent && device.agentCapabilities.includes('fingerprint');
+    const payload = JSON.stringify({
+      fingerprintId: record.id,
+      fingerNo: record.finger_no,
+      employeeNo: record.employee_no,
+      personName: record.resident_name,
+      module: 1,
+      reason: body.reason?.trim() || 'removed from the terminal by an administrator',
+    });
+    statements.push(c.env.DB.prepare(
+      `INSERT INTO device_operations(id,device_id,fingerprint_id,operation,payload_json,status,manual_instruction)
+       VALUES (?,?,?,?,?,?,?)`,
+    ).bind(
+      crypto.randomUUID(), device.id, record.id, 'delete_fingerprint_device', payload,
+      agentReady ? 'pending' : 'manual_action_required',
+      agentReady ? null : `Delete finger ${record.finger_no}${record.employee_no ? ` (employee number ${record.employee_no})` : ''} for ${record.resident_name} from ${device.name}, then mark this action applied.`,
+    ));
+    if (agentReady) queued += 1; else manual += 1;
+  }
+  if (statements.length) await c.env.DB.batch(statements);
+  await audit(c, 'remove_from_devices', 'fingerprint_credential', record.id, { deviceIds, queued, manual, skipped });
+  return c.json({ ok: true, queued, manual, skipped, notice: `Finger ${record.finger_no} is being removed from ${queued + manual} terminal(s): ${queued} by the agent, ${manual} waiting for an operator${skipped ? `, ${skipped} already queued` : ''}.` });
+});
+
 app.post('/api/access/cards', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{ residentId?: string; householdMemberId?: string; cardUid?: string; cardLabel?: string }>();
   if ((!body.residentId && !body.householdMemberId) || !body.cardUid?.trim()) return jsonError(c, 400, 'residentId or householdMemberId, and cardUid are required');
@@ -4245,9 +4637,14 @@ app.post('/api/access/cards', requireRoles('admin','manager'), async (c) => {
   // fingerprint resolve to it. Without this the terminal invents its own number
   // and a cardless swipe cannot be attributed back to the person.
   const cardEmployeeNo=await ensurePersonEmployeeId(c.env.DB,householdMemberId?'dependant':'account',householdMemberId ?? String(residentId));
+  // The person record goes first: a terminal stores a card against an employee
+  // number, and a card whose person has no door rights on that terminal is
+  // written but cannot open anything. The agent feed orders upsert_person before
+  // the credential operations queued in the same second.
+  const personSync = await autoSyncPerson(c.env, householdMemberId ? 'dependant' : 'account', householdMemberId ?? String(residentId), 'card issued', { includeCredentials: true });
   await createDeviceOperations(c.env,id,'upsert_card',{ cardUid:body.cardUid.trim(),residentId,householdMemberId,employeeNo:cardEmployeeNo,enabled:true });
-  await audit(c, 'issue', 'access_card', id, { ...body, residentId, householdMemberId, employeeNo: cardEmployeeNo });
-  return c.json({ id, employeeNo: cardEmployeeNo, hardwareSync: 'manual_action_required' }, 201);
+  await audit(c, 'issue', 'access_card', id, { ...body, residentId, householdMemberId, employeeNo: cardEmployeeNo, personSync: personSync.queued + personSync.manual });
+  return c.json({ id, employeeNo: cardEmployeeNo, personSync: describeSync(personSync), hardwareSync: personSync.manual ? 'manual_action_required' : 'queued' }, 201);
 });
 
 app.patch('/api/access/cards/:id', requireRoles('admin','manager'), async (c) => {
@@ -4769,7 +5166,7 @@ app.get('/api/access/operations', requireRoles('admin','manager'), async (c) => 
        WHERE o.status IN ('pending','manual_action_required','failed')
      ) ORDER BY created_at LIMIT ? OFFSET ?`,
   ).bind(limit, offset).all();
-  return c.json({ items: result.results, page: pageNumber, limit, note: 'Card, visitor and door commands are applied by a linked agent. Fingerprint enrollment always happens on the terminal and is confirmed here. Door commands are never sent through a public tunnel.' });
+  return c.json({ items: result.results, page: pageNumber, limit, note: 'Card, visitor, person and door commands are applied by a linked agent. Fingerprint work is applied by the agent when the bridge on that terminal is new enough to advertise the capability, and is confirmed here either way; a finger that has never been read by a terminal still has to be read by one. Door commands are never sent through a public tunnel.' });
 });
 
 app.patch('/api/access/operations/:id', requireRoles('admin','manager'), async (c) => {
@@ -5376,6 +5773,313 @@ async function createFingerprintOperations(
   return statements.length;
 }
 
+// ─────────────────────────────────────────────────────────────
+// Keeping every terminal's copy of a person in step with the portal
+//
+// src/device-sync.ts holds the queueing rules; this section is the connection
+// between them and the portal's own records — the employee number the terminal
+// keys a person by, the auto-sync hooks, and the fingerprint capture flow.
+// ─────────────────────────────────────────────────────────────
+
+/** What src/device-sync.ts expects a person to look like. */
+type SyncPersonRef = Parameters<typeof syncPersonToDevices>[1];
+
+/** How long a terminal is given to produce a fingerprint template. */
+const FINGERPRINT_CAPTURE_TTL_SECONDS = 3 * 60;
+/** How long a captured template is held before it is dropped untouched. */
+const FINGERPRINT_TEMPLATE_TTL_SECONDS = 24 * 60 * 60;
+
+/**
+ * A person's terminal identity, issuing one when they have none.
+ *
+ * Returns null for a dependant who is not active, because "active" is what a
+ * household membership means and a pending member must not be given gate access
+ * on any terminal.
+ */
+async function syncPersonRef(env: Env, kind: PersonKind, id: string): Promise<SyncPersonRef | null> {
+  if (kind === 'account') {
+    const row = await env.DB.prepare(`SELECT id,name,employee_id,status FROM users WHERE id=?`)
+      .bind(id).first<{ id: string; name: string; employee_id: string | null; status: string }>();
+    if (!row) return null;
+    return { kind, id: row.id, name: row.name, employeeNo: row.employee_id, status: row.status };
+  }
+  const row = await env.DB.prepare(`SELECT id,name,employee_id,status FROM household_members WHERE id=?`)
+    .bind(id).first<{ id: string; name: string; employee_id: string | null; status: string }>();
+  if (!row) return null;
+  return { kind, id: row.id, name: row.name, employeeNo: row.employee_id, status: row.status };
+}
+
+/** The employee number a terminal will store for this person, issued on demand. */
+async function ensureSyncEmployeeNo(env: Env, person: SyncPersonRef): Promise<string | null> {
+  if (person.employeeNo) return person.employeeNo;
+  const issued = await ensurePersonEmployeeId(env.DB, person.kind, person.id);
+  if (!issued) return null;
+  person.employeeNo = issued;
+  return issued;
+}
+
+/**
+ * Pushes a person to every terminal.
+ *
+ * `includeCredentials` also re-sends their cards and re-sends any held
+ * fingerprint template, which is what "sync" means to an operator. It is used
+ * when a credential is issued or changed; a plain profile edit only re-states the
+ * person record.
+ */
+async function syncPersonEverywhere(
+  env: Env,
+  kind: PersonKind,
+  id: string,
+  reason: string,
+  options: { deviceIds?: string[] | null; includeCredentials?: boolean; requireActive?: boolean } = {},
+): Promise<SyncResult & { person: string | null }> {
+  const person = await syncPersonRef(env, kind, id);
+  if (!person) return { devices: 0, queued: 0, manual: 0, skipped: 0, removed: 0, unresolved: [], person: null };
+  if (options.requireActive !== false && person.status !== 'active') {
+    return { devices: 0, queued: 0, manual: 0, skipped: 0, removed: 0, unresolved: [person.id], person: person.name };
+  }
+  if (!(await ensureSyncEmployeeNo(env, person))) {
+    return { devices: 0, queued: 0, manual: 0, skipped: 0, removed: 0, unresolved: [person.id], person: person.name };
+  }
+  const result = await syncPersonToDevices(env, person, {
+    reason,
+    deviceIds: options.deviceIds ?? null,
+    includeCredentials: options.includeCredentials === true,
+  });
+  return { ...result, person: person.name };
+}
+
+/**
+ * The automatic half: called after a person or one of their credentials changes.
+ *
+ * Only a person who already exists on a terminal, or who holds a credential, is
+ * pushed. That is the difference between "keep the access controls in step" and
+ * "queue an operation for every account the estate ever created" — editing an
+ * unrelated admin account must not touch a terminal.
+ */
+async function autoSyncPerson(
+  env: Env,
+  kind: PersonKind,
+  id: string,
+  reason: string,
+  options: { deviceIds?: string[] | null; includeCredentials?: boolean } = {},
+): Promise<SyncResult & { person: string | null }> {
+  const person = await syncPersonRef(env, kind, id);
+  if (!person || person.status !== 'active') {
+    return { devices: 0, queued: 0, manual: 0, skipped: 0, removed: 0, unresolved: [], person: person?.name ?? null };
+  }
+  const tracked = await env.DB.prepare(
+    `SELECT COUNT(*) AS count FROM device_person_state WHERE person_kind=? AND person_id=?`,
+  ).bind(kind, id).first<{ count: number }>();
+  if (!Number(tracked?.count ?? 0)) {
+    const credentials = await credentialsForPerson(env, person);
+    if (!credentials.cards.length && !credentials.fingerprints.length) {
+      return { devices: 0, queued: 0, manual: 0, skipped: 0, removed: 0, unresolved: [], person: person.name };
+    }
+  }
+  return syncPersonEverywhere(env, kind, id, reason, { ...options, requireActive: true });
+}
+
+/** A one-line human summary of a sync, for the portal's activity messages. */
+function describeSync(result: SyncResult): string {
+  const parts: string[] = [];
+  if (result.queued) parts.push(`${result.queued} command(s) sent to the agent`);
+  if (result.manual) parts.push(`${result.manual} task(s) for an operator on the terminal`);
+  if (result.removed) parts.push(`removed from ${result.removed} terminal(s)`);
+  if (result.skipped) parts.push(`${result.skipped} already queued`);
+  return parts.length ? parts.join(', ') : 'nothing to do';
+}
+
+interface FingerprintCaptureRow {
+  id: string;
+  device_id: string;
+  resident_id: string;
+  household_member_id: string | null;
+  employee_no: string | null;
+  person_name: string;
+  finger_no: number;
+  finger_label: string | null;
+  status: 'pending' | 'captured' | 'failed' | 'cancelled' | 'expired';
+  error_message: string | null;
+  template_data: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+  expires_at: string;
+}
+
+/**
+ * Starts a capture: the operator picks the person, the finger and the terminal
+ * they are standing at, and the terminal's own reader does the rest.
+ *
+ * A capture is only queued for an agent that advertises the fingerprint
+ * capability. Anything else would leave a window saying "touch the reader" on a
+ * terminal nobody is listening to.
+ */
+async function startFingerprintCapture(
+  env: Env,
+  input: { person: SyncPersonRef; fingerNo: number; fingerLabel: string | null; deviceId: string; createdBy: string },
+): Promise<{ ok: true; capture: FingerprintCaptureRow; instruction: string } | { ok: false; error: string; status: 400 | 404 | 409 }> {
+  const device = await env.DB.prepare(
+    `SELECT d.id,d.name,d.gate_name,
+       (SELECT a.capabilities FROM isapi_device_configs cfg JOIN isapi_agents a ON a.id=cfg.agent_id
+         WHERE cfg.device_id=d.id AND cfg.sync_enabled=1 AND a.deleted_at IS NULL LIMIT 1) AS capabilities,
+       (SELECT COUNT(*) FROM isapi_device_configs cfg WHERE cfg.device_id=d.id AND cfg.sync_enabled=1 AND cfg.agent_id IS NOT NULL) AS agents
+     FROM hikvision_devices d WHERE d.id=? AND d.deleted_at IS NULL AND d.status!='disabled'`,
+  ).bind(input.deviceId).first<{ id: string; name: string; gate_name: string; capabilities: string | null; agents: number }>();
+  if (!device) return { ok: false, error: 'Active access-control device not found', status: 404 };
+  const capabilities: string[] = device.capabilities ? (JSON.parse(device.capabilities) as string[]) : [];
+  if (!Number(device.agents) || !capabilities.includes('fingerprint')) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'That terminal has no agent that can capture fingerprints. Enrol the finger on the terminal itself and record the slot here, or update the bridge on the PC linked to it.',
+    };
+  }
+  const employeeNo = await ensureSyncEmployeeNo(env, input.person);
+  if (!employeeNo) return { ok: false, error: 'This person has no terminal employee number yet', status: 409 };
+
+  const duplicate = await env.DB.prepare(
+    `SELECT id FROM fingerprint_credentials WHERE resident_id=? AND COALESCE(household_member_id,'')=? AND finger_no=? AND status IN ('active','suspended')`,
+  ).bind(input.person.kind === 'account' ? input.person.id : await primaryResidentFor(env, input.person), input.person.kind === 'dependant' ? input.person.id : '', input.fingerNo).first();
+  if (duplicate) return { ok: false, status: 409, error: `Finger ${input.fingerNo} is already registered for ${input.person.name}` };
+
+  const id = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + FINGERPRINT_CAPTURE_TTL_SECONDS * 1000).toISOString().replace('T', ' ').slice(0, 19);
+  const residentId = input.person.kind === 'account' ? input.person.id : await primaryResidentFor(env, input.person);
+  await env.DB.prepare(
+    `INSERT INTO fingerprint_captures(id,device_id,resident_id,household_member_id,employee_no,person_name,finger_no,finger_label,status,created_by,expires_at)
+     VALUES (?,?,?,?,?,?,?,?,'pending',?,?)`,
+  ).bind(
+    id, device.id, residentId,
+    input.person.kind === 'dependant' ? input.person.id : null,
+    employeeNo, input.person.name, input.fingerNo, input.fingerLabel, input.createdBy, expiresAt,
+  ).run();
+  await env.DB.prepare(
+    `INSERT INTO device_operations(id,device_id,user_id,household_member_id,capture_id,operation,payload_json,status,manual_instruction)
+     VALUES (?,?,?,?,?,'capture_fingerprint',?,'pending',?)`,
+  ).bind(
+    crypto.randomUUID(), device.id,
+    input.person.kind === 'account' ? input.person.id : null,
+    input.person.kind === 'dependant' ? input.person.id : null,
+    id,
+    JSON.stringify({ captureId: id, fingerNo: input.fingerNo, fingerLabel: input.fingerLabel, employeeNo, personName: input.person.name, deviceName: device.name, expiresAt }),
+    `Ask ${input.person.name} to place finger ${input.fingerNo} on the reader of ${device.name}. The bridge collects the template and sends it to the other terminals; nothing has to be typed.`,
+  ).run();
+  const capture = await env.DB.prepare(`SELECT * FROM fingerprint_captures WHERE id=?`).bind(id).first<FingerprintCaptureRow>();
+  const instruction = `Ask ${input.person.name} to touch the reader on ${device.name} now — finger slot ${input.fingerNo}${input.fingerLabel ? ` (${input.fingerLabel})` : ''}, employee number ${employeeNo}.`;
+  await syncPersonToDevices(env, input.person, { reason: 'fingerprint capture', deviceIds: [device.id] });
+  return { ok: true, capture: capture!, instruction };
+}
+
+/** The resident a dependant's credentials hang off (household_members.primary_resident_id). */
+/**
+ * Recomputes what a terminal holds for one person.
+ *
+ * The state is not a note about the last command; it is the answer to "is there
+ * anything still waiting to be written, and did the last attempt succeed?". That
+ * is what makes the portal's grid truthful for every kind of work — a person
+ * record, a card, a fingerprint upload or a removal — without a separate rule per
+ * operation type.
+ */
+async function refreshDevicePersonState(env: Env, person: SyncPersonRef, deviceId: string): Promise<void> {
+  const personColumn = person.kind === 'account' ? 'user_id' : 'household_member_id';
+  const counts = await env.DB.prepare(
+    `SELECT
+       SUM(CASE WHEN status IN ('pending','sent','manual_action_required') THEN 1 ELSE 0 END) AS outstanding,
+       SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+       MAX(isapi_synced_at) AS last_synced
+     FROM device_operations WHERE device_id=? AND ${personColumn}=?`,
+  ).bind(deviceId, person.id).first<{ outstanding: number | null; failed: number | null; last_synced: string | null }>();
+  const outstanding = Number(counts?.outstanding ?? 0);
+  const failed = Number(counts?.failed ?? 0);
+  // Anything still waiting means the terminal does not have the person yet. A
+  // failure with nothing left to try is what "missing" means to an operator: act
+  // on it on the terminal itself.
+  const state: 'synced' | 'pending' | 'missing' = outstanding > 0 ? 'pending' : failed > 0 ? 'missing' : 'synced';
+  const credentials = await credentialsForPerson(env, person);
+  await setDevicePersonState(env, person, deviceId, state, {
+    fingerprintCount: credentials.fingerprints.length,
+    cardCount: credentials.cards.filter((card) => card.status === 'active').length,
+  });
+}
+
+async function primaryResidentFor(env: Env, person: SyncPersonRef): Promise<string> {
+  const row = await env.DB.prepare(`SELECT primary_resident_id FROM household_members WHERE id=?`)
+    .bind(person.id).first<{ primary_resident_id: string }>();
+  return row?.primary_resident_id ?? person.id;
+}
+
+/**
+ * Records a template the agent captured and sends it to every other terminal.
+ *
+ * This is the whole point of the feature: one finger on one reader, and every
+ * terminal this person should be on receives the same template — no second trip
+ * to each gate, and no template kept anywhere but the terminals (and briefly,
+ * encrypted at rest, in `fingerprint_captures`).
+ */
+async function applyCapturedTemplate(
+  env: Env,
+  capture: FingerprintCaptureRow,
+  templateData: string,
+): Promise<{ fingerprintId: string; queued: number; manual: number; devices: number }> {
+  const person: SyncPersonRef = {
+    kind: capture.household_member_id ? 'dependant' : 'account',
+    id: capture.household_member_id ?? capture.resident_id,
+    name: capture.person_name,
+    employeeNo: capture.employee_no,
+    status: 'active',
+  };
+  const existing = await env.DB.prepare(
+    `SELECT id FROM fingerprint_credentials WHERE resident_id=? AND COALESCE(household_member_id,'')=? AND finger_no=? AND status IN ('active','suspended')`,
+  ).bind(capture.resident_id, capture.household_member_id ?? '', capture.finger_no).first<{ id: string }>();
+
+  let fingerprintId = existing?.id ?? null;
+  if (fingerprintId) {
+    await env.DB.prepare(
+      `UPDATE fingerprint_credentials SET employee_no=?,finger_label=COALESCE(?,finger_label),enrolled_device_id=?,status='active',deactivated_at=NULL,deactivated_reason=NULL,updated_at=datetime('now') WHERE id=?`,
+    ).bind(capture.employee_no, capture.finger_label, capture.device_id, fingerprintId).run();
+  } else {
+    fingerprintId = crypto.randomUUID();
+    await env.DB.prepare(
+      `INSERT INTO fingerprint_credentials(id,resident_id,household_member_id,employee_no,finger_no,finger_label,enrolled_device_id,status,created_by)
+       VALUES (?,?,?,?,?,?,?,'active',?)`,
+    ).bind(fingerprintId, capture.resident_id, capture.household_member_id, capture.employee_no, capture.finger_no, capture.finger_label, capture.device_id, capture.created_by).run();
+    await env.DB.prepare(
+      `INSERT INTO fingerprint_status_changes(id,fingerprint_id,old_status,new_status,reason,changed_by) VALUES (?,?,'active','active',?,?)`,
+    ).bind(crypto.randomUUID(), fingerprintId, `template captured at ${capture.device_id}`, capture.created_by).run();
+  }
+
+  // Only the template each terminal needs is handed out, and only to terminals
+  // with an agent that can write fingerprints.
+  const devices = await syncDevices(env, null);
+  const finger = { id: fingerprintId, finger_no: capture.finger_no, finger_label: capture.finger_label, employee_no: capture.employee_no, status: 'active' };
+  let queued = 0;
+  let manual = 0;
+  for (const device of devices) {
+    if (!device.hasAgent || !device.agentCapabilities.includes('fingerprint')) continue;
+    const outcome = await fingerprintUploadOperation(env, { ...person, employeeNo: capture.employee_no }, device, finger, 'captured at another terminal');
+    if (outcome === 'queued') queued += 1;
+    else if (outcome === 'manual') manual += 1;
+  }
+  return { fingerprintId, queued, manual, devices: devices.length };
+}
+
+/** Drops templates nobody is waiting for any more. Runs hourly. */
+async function expireFingerprintTemplates(env: Env): Promise<{ captures: number; purged: number }> {
+  const captures = await env.DB.prepare(
+    `UPDATE fingerprint_captures SET status='failed',error_message='nobody touched the reader in time',updated_at=datetime('now')
+      WHERE status='pending' AND expires_at <= datetime('now')`,
+  ).run();
+  const purged = await env.DB.prepare(
+    `UPDATE fingerprint_captures
+        SET status='expired',template_data=NULL,updated_at=datetime('now')
+      WHERE status='captured' AND template_data IS NOT NULL
+        AND (expires_at <= datetime('now') OR updated_at <= datetime('now','-${FINGERPRINT_TEMPLATE_TTL_SECONDS} seconds'))`,
+  ).run();
+  return { captures: Number(captures.meta.changes ?? 0), purged: Number(purged.meta.changes ?? 0) };
+}
+
 function isRemoteDoorOperation(value: string): value is RemoteDoorOperation {
   return Object.prototype.hasOwnProperty.call(REMOTE_DOOR_COMMANDS, value);
 }
@@ -5759,12 +6463,22 @@ async function handleIsapiAgentHeartbeat(request: Request, env: Env, agentId: st
   if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'POST' } });
   const agent = await authenticateIsapiAgent(request, env, agentId);
   if (!agent) return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Bearer realm="EstateMate ISAPI agent"' } });
-  let body: { version?: string; hostname?: string; ip?: string; stats?: unknown; devices?: unknown } = {};
+  let body: { version?: string; hostname?: string; ip?: string; stats?: unknown; devices?: unknown; capabilities?: unknown } = {};
   try { body = await request.json(); } catch { body = {}; }
   const ip = request.headers.get('CF-Connecting-IP') || body.ip || null;
+  // What this bridge can do, as it says so itself. Only capabilities we know are
+  // stored, and an agent that sends none keeps its previous record (every agent
+  // built before this change sends none, and must keep receiving card commands
+  // while its person and fingerprint work stays manual).
+  const advertised = Array.isArray(body.capabilities)
+    ? body.capabilities
+      .map((value) => String(value).trim().toLowerCase())
+      .filter((value, index, all) => (AGENT_CAPABILITIES as readonly string[]).includes(value) && all.indexOf(value) === index)
+    : [];
   await env.DB.prepare(
-    `UPDATE isapi_agents SET status='online',last_seen_at=datetime('now'),last_ip=?,hostname=COALESCE(?,hostname),version=COALESCE(?,version),updated_at=datetime('now') WHERE id=?`,
-  ).bind(ip, body.hostname?.trim() || null, body.version?.trim() || null, agentId).run();
+    `UPDATE isapi_agents SET status='online',last_seen_at=datetime('now'),last_ip=?,hostname=COALESCE(?,hostname),version=COALESCE(?,version),
+       capabilities=CASE WHEN ?=1 THEN ? ELSE capabilities END,updated_at=datetime('now') WHERE id=?`,
+  ).bind(ip, body.hostname?.trim() || null, body.version?.trim() || null, advertised.length ? 1 : 0, JSON.stringify(advertised), agentId).run();
 
   // Per-terminal presence. The agent reports one entry per EstateMate device id
   // whose alertStream it is (or is not) holding open: `stream: 'up'` promotes the
@@ -5906,7 +6620,15 @@ async function handleIsapiAgentEvents(request: Request, env: Env, agentId: strin
   }, { headers: { 'Cache-Control': 'no-store' } });
 }
 
-type GatewayOperationKind = 'card'|'visitor';
+/**
+ * Operation families an agent can be handed. 'person' and 'fingerprint' are only
+ * ever queued for an agent whose heartbeat advertises the matching capability;
+ * everything else keeps the pre-existing routing so an older bridge is not
+ * silently starved of the commands it can still apply.
+ */
+type GatewayOperationKind = 'card'|'visitor'|'person'|'fingerprint'|'door';
+const GATEWAY_OPERATION_KINDS: readonly GatewayOperationKind[] = ['card','visitor','person','fingerprint','door'];
+
 type GatewayOperationRow = {
   id: string;
   kind: GatewayOperationKind;
@@ -5925,19 +6647,28 @@ async function handleIsapiAgentOperations(request: Request, env: Env, agentId: s
   const limit = Math.min(100, Math.max(1, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : 20));
   const result = await env.DB.prepare(
     `SELECT * FROM (
-       SELECT o.id,CASE WHEN o.operation IN ('remote_open','remote_close','remote_always_open','remote_always_close','remote_resume') THEN 'door' ELSE 'card' END AS kind,o.device_id,o.operation,o.payload_json,o.attempts,o.created_at,o.updated_at,d.name AS device_name,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol
+       SELECT o.id,
+         CASE
+           WHEN o.operation IN ('remote_open','remote_close','remote_always_open','remote_always_close','remote_resume') THEN 'door'
+           WHEN o.operation IN ('upsert_person','delete_person') THEN 'person'
+           WHEN o.operation IN ('capture_fingerprint','upload_fingerprint','delete_fingerprint_device','enroll_fingerprint','enable_fingerprint','disable_fingerprint','delete_fingerprint') THEN 'fingerprint'
+           ELSE 'card'
+         END AS kind,
+         o.device_id,o.operation,o.payload_json,o.attempts,o.created_at,o.updated_at,o.capture_id,
+         d.name AS device_name,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol
        FROM device_operations o
        JOIN isapi_device_configs cfg ON cfg.device_id=o.device_id
        JOIN hikvision_devices d ON d.id=o.device_id
-       WHERE cfg.agent_id=? AND cfg.sync_enabled=1 AND (o.status='pending' OR (o.status='sent' AND o.updated_at<datetime('now','-2 minutes')))
+       WHERE cfg.agent_id=? AND cfg.sync_enabled=1
+         AND (o.status='pending' OR (o.status='sent' AND o.updated_at < datetime('now', CASE WHEN o.operation='capture_fingerprint' THEN '-10 minutes' ELSE '-2 minutes' END)))
        UNION ALL
-       SELECT vo.id,'visitor' AS kind,vo.device_id,vo.operation,vo.payload_json,vo.attempts,vo.created_at,vo.updated_at,d.name AS device_name,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol
+       SELECT vo.id,'visitor' AS kind,vo.device_id,vo.operation,vo.payload_json,vo.attempts,vo.created_at,vo.updated_at,NULL AS capture_id,d.name AS device_name,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol
        FROM visitor_device_operations vo
        JOIN isapi_device_configs cfg ON cfg.device_id=vo.device_id
        JOIN hikvision_devices d ON d.id=vo.device_id
        JOIN visitor_requests v ON v.id=vo.visitor_request_id
        WHERE cfg.agent_id=? AND cfg.sync_enabled=1 AND (vo.status='pending' OR (vo.status='sent' AND vo.updated_at<datetime('now','-2 minutes')))
-     ) ORDER BY created_at LIMIT ?`,
+     ) ORDER BY created_at, CASE operation WHEN 'upsert_person' THEN 0 ELSE 1 END LIMIT ?`,
   ).bind(agentId, agentId, limit).all<GatewayOperationRow & { device_id:string; device_name:string; isapi_host:string; isapi_port:number; isapi_username:string|null; protocol:string }>();
 
   let claimed = result.results;
@@ -5952,6 +6683,18 @@ async function handleIsapiAgentOperations(request: Request, env: Env, agentId: s
     claimed = result.results.filter((_, i) => Number(claims[i]?.meta.changes ?? 0) > 0);
   }
 
+  // A fingerprint upload needs the transient template, and only the agent the
+  // operation was claimed by gets it. Everything else is already in payload.
+  const captureIds = claimed.map((op) => (op as Record<string, unknown>).capture_id).filter((value): value is string => typeof value === 'string' && value.length > 0);
+  const templates = new Map<string, string>();
+  if (captureIds.length) {
+    const rows = await env.DB.prepare(
+      `SELECT id,template_data FROM fingerprint_captures
+        WHERE id IN (${captureIds.map(() => '?').join(',')}) AND status='captured' AND template_data IS NOT NULL AND expires_at > datetime('now')`,
+    ).bind(...captureIds).all<{ id: string; template_data: string }>();
+    for (const row of rows.results) templates.set(row.id, row.template_data);
+  }
+
   return Response.json({
     agentId,
     serverTime: new Date().toISOString(),
@@ -5959,6 +6702,8 @@ async function handleIsapiAgentOperations(request: Request, env: Env, agentId: s
     items: claimed.map((op) => {
       let payload: unknown;
       try { payload = JSON.parse(op.payload_json); } catch { payload = {}; }
+      const captureId = (op as Record<string, unknown>).capture_id;
+      const template = typeof captureId === 'string' ? templates.get(captureId) : undefined;
       return {
         id: op.id,
         kind: op.kind,
@@ -5966,6 +6711,10 @@ async function handleIsapiAgentOperations(request: Request, env: Env, agentId: s
         deviceName: op.device_name,
         operation: op.operation,
         payload,
+        // The template a terminal must apply. Absent when the capture expired
+        // between claim and delivery, in which case the agent reports a failure
+        // and the portal asks for the finger again rather than writing nothing.
+        fingerData: template ?? null,
         attempt: op.attempts + 1,
         createdAt: op.created_at,
         isapi: { host: (op as Record<string,unknown>).isapi_host, port: (op as Record<string,unknown>).isapi_port, username: (op as Record<string,unknown>).isapi_username, protocol: (op as Record<string,unknown>).protocol },
@@ -5978,13 +6727,24 @@ async function handleIsapiAgentOperationResult(request: Request, env: Env, agent
   if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'POST' } });
   const agent = await authenticateIsapiAgent(request, env, agentId);
   if (!agent) return new Response('Unauthorized', { status: 401 });
-  let body: { kind?: GatewayOperationKind; status?: 'applied'|'failed'; errorMessage?: string; durationMs?: number };
+  let body: { kind?: GatewayOperationKind; status?: 'applied'|'failed'; errorMessage?: string; durationMs?: number; result?: Record<string, unknown> };
   try { body = await request.json(); } catch { return Response.json({ error: 'JSON body required' }, { status: 400 }); }
-  if (!body.kind || !['card','visitor','door'].includes(body.kind) || !body.status || !['applied','failed'].includes(body.status)) {
-    return Response.json({ error: 'kind must be card, visitor or door and status must be applied or failed' }, { status: 400 });
+  if (!body.kind || !GATEWAY_OPERATION_KINDS.includes(body.kind) || !body.status || !['applied','failed'].includes(body.status)) {
+    return Response.json({ error: `kind must be one of ${GATEWAY_OPERATION_KINDS.join(', ')} and status must be applied or failed` }, { status: 400 });
   }
   const errorMessage = body.status === 'failed' ? (body.errorMessage?.trim().slice(0, 1000) || 'ISAPI agent reported failure') : null;
   const duration = body.durationMs && Number.isFinite(body.durationMs) ? Math.max(0, Math.floor(body.durationMs)) : null;
+
+  // The row is read before the update so the side effects below know what kind of
+  // work this was (and which person it was about) without a second guess.
+  const detail = await env.DB.prepare(
+    `SELECT id,device_id,operation,user_id,household_member_id,card_id,fingerprint_id,capture_id,result_json FROM device_operations WHERE id=?
+     UNION ALL SELECT id,device_id,operation,NULL,NULL,NULL,NULL,NULL,NULL FROM visitor_device_operations WHERE id=? LIMIT 1`,
+  ).bind(operationId, operationId).first<{
+    id: string; device_id: string; operation: string;
+    user_id: string | null; household_member_id: string | null; card_id: string | null;
+    fingerprint_id: string | null; capture_id: string | null; result_json: string | null;
+  }>();
 
   // Try card first, then visitor
   let updated = await env.DB.prepare(
@@ -5998,6 +6758,84 @@ async function handleIsapiAgentOperationResult(request: Request, env: Env, agent
     visitorOperation = Number(updated.meta.changes ?? 0) > 0;
   }
   if (!updated.meta.changes) return Response.json({ error: 'Operation not found or not assigned to this agent' }, { status: 404 });
+
+  // What a terminal now holds, from the terminal's own answer. Best effort: a
+  // result report must never fail because a bookkeeping row could not be written.
+  if (detail?.user_id || detail?.household_member_id) {
+    try {
+      const person = await syncPersonRef(env, detail.household_member_id ? 'dependant' : 'account', (detail.household_member_id ?? detail.user_id)!);
+      if (person) {
+        const applied = body.status === 'applied';
+        if (detail.operation === 'delete_person') {
+          await setDevicePersonState(env, person, detail.device_id, applied ? 'removed' : 'missing', { operationId, error: errorMessage });
+        } else {
+          await refreshDevicePersonState(env, person, detail.device_id);
+        }
+      }
+    } catch (error) { console.error('Device-person state update failed', operationId, error); }
+  }
+  if (detail?.operation === 'upload_fingerprint' || detail?.operation === 'delete_fingerprint_device') {
+    try {
+      const stillQueued = await env.DB.prepare(
+        `SELECT COUNT(*) AS count FROM device_operations
+          WHERE device_id=? AND fingerprint_id IS NOT NULL AND fingerprint_id=? AND status IN ('pending','sent')`,
+      ).bind(detail.device_id, detail.fingerprint_id).first<{ count: number }>();
+      if (body.status === 'applied' && detail.capture_id && Number(stillQueued?.count ?? 0) === 0) {
+        // Every terminal that could take the template has taken it: drop it, so
+        // the estate's fingerprints live on the terminals and nowhere else.
+        await env.DB.prepare(
+          `UPDATE fingerprint_captures SET template_data=NULL,status='expired',updated_at=datetime('now') WHERE id=? AND status='captured'`,
+        ).bind(detail.capture_id).run();
+      }
+      if (body.status === 'failed' && Number(stillQueued?.count ?? 0) === 0) {
+        // Nothing is left to deliver this finger automatically. Leave an
+        // instruction rather than a silently failed row.
+        const finger = await env.DB.prepare(
+          `SELECT f.finger_no,f.employee_no,u.name AS person_name FROM fingerprint_credentials f JOIN users u ON u.id=f.resident_id WHERE f.id=?`,
+        ).bind(detail.fingerprint_id).first<{ finger_no: number; employee_no: string | null; person_name: string }>();
+        if (finger) {
+          await env.DB.prepare(
+            `INSERT INTO device_operations(id,device_id,fingerprint_id,operation,payload_json,status,manual_instruction)
+             VALUES (?,?,?,'enroll_fingerprint',?,'manual_action_required',?)`,
+          ).bind(
+            crypto.randomUUID(), detail.device_id, detail.fingerprint_id,
+            JSON.stringify({ fingerprintId: detail.fingerprint_id, fingerNo: finger.finger_no, employeeNo: finger.employee_no, reason: 'the agent could not write the template' }),
+            `The agent could not write finger ${finger.finger_no} for ${finger.person_name} to this terminal (${errorMessage ?? 'ISAPI refused it'}). Enrol the finger on the terminal's own reader using slot ${finger.finger_no}, then mark this action applied.`,
+          ).run();
+        }
+      }
+    } catch (error) { console.error('Fingerprint template bookkeeping failed', operationId, error); }
+  }
+
+  // A capture is the one operation that returns data. The bridge writes the
+  // template back here and it is never sent to a browser; EstateMate then hands
+  // it to every terminal that can take it.
+  if (detail?.operation === 'capture_fingerprint') {
+    try {
+      const template = typeof body.result?.templateData === 'string' ? body.result.templateData : '';
+      const capture = detail.capture_id
+        ? await env.DB.prepare(`SELECT * FROM fingerprint_captures WHERE id=?`).bind(detail.capture_id).first<FingerprintCaptureRow>()
+        : null;
+      if (capture && body.status === 'applied' && template) {
+        await env.DB.prepare(
+          `UPDATE fingerprint_captures SET status='captured',template_data=?,error_message=NULL,updated_at=datetime('now'),
+             expires_at=datetime('now','+${FINGERPRINT_TEMPLATE_TTL_SECONDS} seconds') WHERE id=?`,
+        ).bind(template, capture.id).run();
+        const recorded = await env.DB.prepare(`SELECT * FROM fingerprint_captures WHERE id=?`).bind(capture.id).first<FingerprintCaptureRow>();
+        const applied = await applyCapturedTemplate(env, recorded ?? capture, template);
+        await env.DB.prepare(`UPDATE device_operations SET result_json=? WHERE id=?`)
+          .bind(JSON.stringify({ fingerprintId: applied.fingerprintId, queued: applied.queued, manual: applied.manual }), operationId).run();
+        const person = { kind: capture.household_member_id ? 'dependant' as PersonKind : 'account' as PersonKind, id: capture.household_member_id ?? capture.resident_id, name: capture.person_name, employeeNo: capture.employee_no, status: 'active' };
+        for (const device of await syncDevices(env, null)) {
+          await refreshDevicePersonState(env, person, device.id);
+        }
+      } else if (capture && body.status === 'failed') {
+        await env.DB.prepare(
+          `UPDATE fingerprint_captures SET status='failed',error_message=?,template_data=NULL,updated_at=datetime('now') WHERE id=?`,
+        ).bind(errorMessage, capture.id).run();
+      }
+    } catch (error) { console.error('Fingerprint capture result failed', operationId, error); }
+  }
 
   // The agent deleted the visitor credential from this terminal. Once it has done
   // so on every terminal the pass was sent to, the pass is recorded as removed and
@@ -6278,6 +7116,7 @@ export default {
       enforceFacilityFees(env),
       expireStalePresence(env),
       pruneAccessEvents(env),
+      expireFingerprintTemplates(env),
       syncActiveVisitorPasses(env.DB),
       // Also swept hourly, so a missed or delayed minute trigger still catches up.
       releaseExpiredVisitorDeviceAccounts(env),

@@ -193,12 +193,65 @@ async function apiFetch(path, init = {}) {
   } finally { clearTimeout(timeout); }
 }
 
+/**
+ * Probes the terminals this bridge serves and remembers what they support.
+ * 'card' and 'door' are unconditional: those endpoints have been on every
+ * terminal EstateMate has been tested against. 'person' and 'fingerprint' are
+ * decided by the terminal's own answers, so the portal never queues an API the
+ * firmware does not have — that would leave an operation failed that an operator
+ * never sees, which is worse than an explicit instruction.
+ *
+ * The probe is deliberately never awaited by the heartbeat: an access terminal
+ * holding a long-lived connection open (an alertStream, an event stream, a slow
+ * firmware) must not be able to delay the heartbeat that tells the portal this
+ * estate is alive. The remembered answer is sent, and a refresh is started in the
+ * background when it goes stale.
+ */
+const CAPABILITY_TTL_MS = 10 * 60 * 1000;
+const BASELINE_CAPABILITIES = ['card', 'door'];
+const capabilityCache = { at: 0, value: null };
+let capabilityRefresh = null;
+
+/** What to put in a heartbeat right now, refreshing the answer in the background. */
+function capabilitiesForHeartbeat() {
+  if (!capabilityCache.value || Date.now() - capabilityCache.at >= CAPABILITY_TTL_MS) {
+    if (!capabilityRefresh) {
+      capabilityRefresh = probeCapabilities()
+        .catch((err) => log('debug', `Capability probe failed: ${err.message}`))
+        .finally(() => { capabilityRefresh = null; });
+    }
+  }
+  return capabilityCache.value ?? BASELINE_CAPABILITIES;
+}
+
+async function probeCapabilities() {
+  if (capabilityCache.value && Date.now() - capabilityCache.at < CAPABILITY_TTL_MS) return capabilityCache.value;
+  const found = new Set(['card', 'door']);
+  for (const device of devices.values()) {
+    try {
+      const person = await isapiRequest(device, 'GET', '/ISAPI/AccessControl/UserInfo/capabilities?format=json', null, false);
+      if (isapiOk(person) || (!isapiUnsupported(person) && person.status >= 200 && person.status < 300)) found.add('person');
+      const fingerprint = await isapiRequest(device, 'GET', '/ISAPI/AccessControl/FingerPrintCfg/capabilities?format=json', null, false);
+      if (isapiOk(fingerprint) || (!isapiUnsupported(fingerprint) && fingerprint.status >= 200 && fingerprint.status < 300)) found.add('fingerprint');
+      if (!found.has('fingerprint')) {
+        const capture = await isapiRequest(device, 'GET', '/ISAPI/AccessControl/CaptureFingerPrint/capabilities', null, true);
+        if (isapiOk(capture) || (!isapiUnsupported(capture) && capture.status >= 200 && capture.status < 300)) found.add('fingerprint');
+      }
+    } catch (err) {
+      log('debug', `Capability probe failed for ${device.name}: ${err.message}`);
+    }
+  }
+  capabilityCache.at = Date.now();
+  capabilityCache.value = [...found];
+  return capabilityCache.value;
+}
+
 async function heartbeat() {
   try {
     const { res, json } = await apiFetch(`/api/isapi/v1/agents/${agentId}/heartbeat`, {
       method: 'POST',
       body: JSON.stringify({
-        version: '1.1.0',
+        version: process.env.ESTATEMATE_BRIDGE_VERSION || '2.0.0',
         hostname: process.env.COMPUTERNAME || process.env.HOSTNAME || 'isapi-bridge',
         platform: process.platform,
         stats: {
@@ -207,6 +260,11 @@ async function heartbeat() {
           eventsPending: pendingEvents.length,
           eventStream: eventStreamEnabled,
         },
+        // What this bridge can actually do, probed against the terminals it
+        // serves rather than claimed. EstateMate only hands a bridge person and
+        // fingerprint work when the matching capability is here, so an old
+        // bridge keeps working exactly as before instead of failing operations.
+        capabilities: capabilitiesForHeartbeat(),
         // Per-terminal liveness: 'down' retires the terminal in the portal at
         // once rather than waiting for the hourly offline sweep.
         devices: heartbeatDeviceStates(),
@@ -305,6 +363,26 @@ async function isapiRequest(device, method, path, body = null, isXml = true) {
       body: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : undefined,
       signal: controller.signal,
     });
+    if (res.status === 401) {
+      // A nonce can go stale and be reissued, which RFC 2617 answers with a
+      // fresh challenge. Answer it once. This is the only retry: a 401 without
+      // a new Digest challenge is an authentication failure, and repeating it
+      // risks locking the account (the guide: remaining attempts 0 ⇒ the next
+      // attempt locks the user).
+      const reChallenge = res.headers.get('www-authenticate') || '';
+      if (reChallenge.toLowerCase().includes('digest')) {
+        await res.text().catch(() => '');
+        res = await fetch(url, {
+          method,
+          headers: {
+            Authorization: buildDigestAuthHeader(device, method, path, reChallenge),
+            'Content-Type': isXml ? 'application/xml; charset=utf-8' : 'application/json',
+          },
+          body: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : undefined,
+          signal: controller.signal,
+        });
+      }
+    }
     const text = await res.text();
     clearTimeout(timeout);
     return { status: res.status, body: text, headers: res.headers };
@@ -329,6 +407,11 @@ const eventStats = { forwarded: 0, dropped: 0 };
 const pendingEvents = [];
 let flushTimer = null;
 let flushing = false;
+
+// The guide's alertStream heartbeat is ~10 s with a 30 s timeout; three windows
+// of silence is worth a warning, checked on a coarse timer.
+const STREAM_IDLE_WARN_MS = 90 * 1000;
+const STREAM_IDLE_CHECK_MS = 15 * 1000;
 
 /**
  * Per-terminal alertStream state, keyed by EstateMate device id.
@@ -553,12 +636,38 @@ async function deviceEventLoop(device) {
           log('info', `Event stream connected for ${device.name}${boundary ? ' (multipart)' : ' (bare JSON)'}`);
           setStreamState(device.estateMateDeviceId, 'up');
           const decoder = new TextDecoder();
+          // The stream carries the terminal's keep-alive heartbeat as well as
+          // events. Keeping the link alive is the heartbeat's only job, so it is
+          // counted as activity but never forwarded as a gate event.
+          let lastActivityAt = Date.now();
+          const onDocument = (document) => {
+            lastActivityAt = Date.now();
+            if (isStreamHeartbeat(document)) {
+              log('debug', `Heartbeat on ${device.name}`);
+              return;
+            }
+            queueEvent(device.estateMateDeviceId, document);
+          };
           const feed = boundary
-            ? createMultipartEventParser(boundary, (document) => queueEvent(device.estateMateDeviceId, document))
-            : createJsonEventScanner((document) => queueEvent(device.estateMateDeviceId, document));
-          for await (const chunk of res.body) {
-            if (shutdownRequested) break;
-            feed(decoder.decode(chunk, { stream: true }));
+            ? createMultipartEventParser(boundary, onDocument)
+            : createJsonEventScanner(onDocument);
+          // The guide's heartbeat cadence is ~10 s with a 30 s timeout; a TCP
+          // connection can stay open while the terminal stops streaming, so warn
+          // (log only — the stream state must not flip on a guess) once a stream
+          // goes quiet for three of those windows.
+          const idleTimer = setInterval(() => {
+            const quietMs = Date.now() - lastActivityAt;
+            if (quietMs < STREAM_IDLE_WARN_MS) return;
+            lastActivityAt = Date.now();
+            log('warn', `No heartbeat or event from ${device.name} for ${Math.round(quietMs / 1000)}s; the terminal may have stopped streaming even though the connection is open`);
+          }, STREAM_IDLE_CHECK_MS);
+          try {
+            for await (const chunk of res.body) {
+              if (shutdownRequested) break;
+              feed(decoder.decode(chunk, { stream: true }));
+            }
+          } finally {
+            clearInterval(idleTimer);
           }
           log('warn', `Event stream closed for ${device.name}`);
           setStreamState(device.estateMateDeviceId, 'down', 'terminal closed the event stream');
@@ -593,6 +702,13 @@ function terminalEmployeeNo(payload) {
  * ResponseStatus (JSON or XML); its statusString / subStatusCode / errorMsg name
  * the cause, e.g. "Invalid Content / badParameters / employeeNo". A raw 200-byte
  * slice of the XML used to cut off right before that field name.
+ *
+ * A 401 is the terminal refusing the credentials, and the guide defines the
+ * authentication-failed document that carries the remaining attempts
+ * (retryTimes), the lock state and the lock time — a lockout the operator needs
+ * to see before the account is barred. A 401 is only repeated when the terminal
+ * reissues the challenge (a stale nonce); a bare 401 never is, because "if the
+ * remaining attempts is 0, the user will be locked at the next attempt".
  */
 function describeIsapiFailure(result) {
   const body = String(result.body || '');
@@ -602,8 +718,413 @@ function describeIsapiFailure(result) {
     const xml = new RegExp(`<${name}>([^<]*)</${name}>`).exec(body);
     return xml ? xml[1] : '';
   };
+  if (result.status === 401) {
+    const notes = [];
+    if (field('lockStatus')) notes.push(`lockStatus ${field('lockStatus')}`);
+    if (field('retryTimes')) notes.push(`${field('retryTimes')} attempt(s) left`);
+    if (field('resLockTime')) notes.push(`locked for ${field('resLockTime')}s`);
+    if (field('subStatusCode')) notes.push(field('subStatusCode'));
+    const suffix = notes.length ? ` (${notes.join(', ')})` : '';
+    return `ISAPI 401: authentication failed${suffix} — check the ISAPI username and password`;
+  }
   const reason = [field('statusString'), field('subStatusCode'), field('errorMsg')].filter(Boolean).join(' / ');
   return `ISAPI ${result.status}: ${reason || body.slice(0, 200)}`;
+}
+
+/**
+ * Whether an alertStream document is the terminal's keep-alive heartbeat rather
+ * than a gate event. The guide defines the heartbeat as eventType "videoloss"
+ * with eventState "inactive" (a subscription heartbeat is "heartBeat"/"active").
+ * Forwarding one files a bogus "videoloss" entry against the terminal in
+ * EstateMate. A real video-loss alarm is "videoloss"/"active" and is kept.
+ */
+function isStreamHeartbeat(document) {
+  const text = String(document || '');
+  const pick = (name) => {
+    const json = new RegExp(`"${name}"\\s*:\\s*"([^"]*)"`).exec(text);
+    if (json) return json[1];
+    const xml = new RegExp(`<${name}>([^<]*)</${name}>`).exec(text);
+    return xml ? xml[1] : '';
+  };
+  const eventType = pick('eventType').trim().toLowerCase();
+  if (eventType === 'heartbeat') return true;
+  if (eventType !== 'videoloss') return false;
+  return pick('eventState').trim().toLowerCase() === 'inactive';
+}
+
+/**
+ * Whether a terminal accepted a request. A 2xx is normally enough, but some
+ * firmware answers 200 with a ResponseStatus whose statusCode is not 1 (OK).
+ */
+function isapiOk(result) {
+  if (result.status < 200 || result.status >= 300) return false;
+  const body = String(result.body || '');
+  const code = /"statusCode"\s*:\s*(\d+)/.exec(body) || /<statusCode>(\d+)<\/statusCode>/.exec(body);
+  return !code || Number(code[1]) === 1;
+}
+
+/**
+ * The terminal does not implement this URL or format at all (as opposed to
+ * rejecting the content we sent). Only then is it worth retrying in another
+ * format: retrying a content error in XML just buries the real reason.
+ */
+function isapiUnsupported(result) {
+  if (result.status === 404 || result.status === 405 || result.status === 501) return true;
+  return /notSupport|invalidURL|invalidOperation/i.test(String(result.body || ''));
+}
+
+/** The failure reasons worth showing: real rejections, else the unsupported ones. */
+function describeAttempts(attempts) {
+  const rejections = attempts.filter((attempt) => !isapiUnsupported(attempt));
+  return (rejections.length ? rejections : attempts).map(describeIsapiFailure).join('; then ');
+}
+
+const ISAPI_XML_NS = 'xmlns="http://www.isapi.org/ver20/XMLSchema" version="2.0"';
+
+/**
+ * Adds a card to the terminal, or updates it when the terminal already has that
+ * card number. Terminals answer a duplicate Record with an error, so a re-enable
+ * or re-issue of an existing card must fall through to Modify.
+ * JSON is the format these terminals speak; XML is only tried when the JSON URL
+ * is not supported.
+ */
+async function writeTerminalCard(device, employeeNo, cardNo) {
+  const body = JSON.stringify({ CardInfo: { employeeNo: String(employeeNo), cardNo: String(cardNo), cardType: 'normalCard' } });
+  const attempts = [];
+  let result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/CardInfo/Record?format=json', body, false);
+  attempts.push(result);
+  if (isapiOk(result)) return { ok: true, result, attempts };
+  if (!isapiUnsupported(result)) {
+    const modify = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/CardInfo/Modify?format=json', body, false);
+    if (isapiOk(modify)) return { ok: true, result: modify, attempts: [...attempts, modify] };
+    // "No such card" from Modify means the card was never the problem: Record's
+    // own rejection is the reason worth reporting.
+    if (alreadyGone(modify)) return { ok: false, result, attempts };
+    attempts.push(modify);
+    return { ok: false, result: modify, attempts };
+  }
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<CardInfo ${ISAPI_XML_NS}>
+  <employeeNo>${employeeNo}</employeeNo>
+  <cardNo>${cardNo}</cardNo>
+  <cardType>normalCard</cardType>
+</CardInfo>`;
+  result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/CardInfo/Record', xml, true);
+  attempts.push(result);
+  return { ok: isapiOk(result), result, attempts };
+}
+
+/**
+ * Removes a card. The delete condition must be wrapped in CardInfoDelCond with a
+ * lower-case cardNo; a bare {CardNoList:[{CardNo}]} is what produced
+ * "Invalid Format / badJsonFormat". A card that is already gone counts as removed,
+ * but a terminal that simply does not support the call does not.
+ */
+async function deleteTerminalCard(device, cardNo) {
+  const body = JSON.stringify({ CardInfoDelCond: { CardNoList: [{ cardNo: String(cardNo) }] } });
+  const attempts = [];
+  let result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/CardInfo/Delete?format=json', body, false);
+  attempts.push(result);
+  if (!isapiOk(result) && isapiUnsupported(result) && !alreadyGone(result)) {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<CardInfoDelCond ${ISAPI_XML_NS}>
+  <CardNoList>
+    <cardNo>${cardNo}</cardNo>
+  </CardNoList>
+</CardInfoDelCond>`;
+    result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/CardInfo/Delete', xml, true);
+    attempts.push(result);
+  }
+  if (isapiOk(result) || alreadyGone(result)) return { ok: true, result, attempts };
+  return { ok: false, result, attempts };
+}
+
+function alreadyGone(result) {
+  return /not ?exist|not ?found|cardNoNotExist/i.test(String(result.body || '')) && !/notSupport/i.test(String(result.body || ''));
+}
+
+// ---------------------------------------------------------------------------
+// People and fingerprints
+//
+// A terminal stores a card *against a person*: the ISAPI employee number. Field
+// reports (and Hikvision's own field integrators) are consistent that a person
+// added without doorRight and RightPlan exists but is authorised for nothing —
+// the card is recorded, the door does not open. So the person is written first,
+// with door rights, and the card follows.
+//
+// Fingerprints are the other half. The ISAPI surface on an access terminal can
+// both *read* a template (CaptureFingerPrint: the reader beams, the finger goes
+// on the glass, the template comes back Base64) and *write* one
+// (FingerPrint/SetUp with `fingerData`). That is what makes "scan once, work at
+// every gate" possible without putting a template anywhere but the terminals.
+// Both are probed against the device: nothing here assumes a firmware supports
+// them, and a terminal that does not gets the operator instruction instead of a
+// silent failure.
+// ---------------------------------------------------------------------------
+
+/** The number of the terminal's own fingerprint module. 1 is the built-in reader. */
+const FINGERPRINT_MODULE = 1;
+/** How often to re-arm the reader while a capture is pending. */
+const CAPTURE_RETRY_MS = Number(process.env.ESTATEMATE_CAPTURE_RETRY_MS || 5000);
+/** A capture operation is given at most this long before it reports failure. */
+const CAPTURE_MAX_MS = Number(process.env.ESTATEMATE_CAPTURE_MAX_MS || 100000);
+
+/** The JSON person body. Every load-bearing node the guide requires is here. */
+function personBody(payload) {
+  const doors = Array.isArray(payload.doorNumbers) && payload.doorNumbers.length
+    ? payload.doorNumbers.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 1 && value <= 8)
+    : [1];
+  return {
+    employeeNo: String(payload.employeeNo),
+    name: String(payload.name || payload.employeeNo).slice(0, 63),
+    userType: payload.userType === 'visitor' || payload.userType === 'blackList' ? payload.userType : 'normal',
+    // enable:false means a permanent validity window, which is what the estate
+    // wants: EstateMate's own card/account lifecycle decides when access stops,
+    // and a terminal-side end date would silently override it.
+    Valid: { enable: false, beginTime: '2020-01-01T00:00:00', endTime: '2037-12-31T23:59:59', timeType: 'local' },
+    doorRight: doors.join(','),
+    RightPlan: doors.map((doorNo) => ({ doorNo, planTemplateNo: '1' })),
+    localUIRight: false,
+    gender: 'unknown',
+  };
+}
+
+/**
+ * Adds or updates a person. Record first (the terminal's add), Modify second with
+ * `addUser: true` (its edit — and its add when Record refused because the person
+ * was already there), SetUp third for a firmware that only implements the
+ * combined call. A terminal that took the write is verified by the caller's next
+ * operation (the card, or the fingerprint template), so a false "success" here
+ * would surface on the very next command rather than silently.
+ */
+async function writeTerminalPerson(device, payload) {
+  const body = JSON.stringify({ UserInfo: personBody(payload) });
+  const attempts = [];
+  let result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/UserInfo/Record?format=json', body, false);
+  attempts.push(result);
+  if (isapiOk(result)) return { ok: true, result, attempts };
+  if (!isapiUnsupported(result)) {
+    const modify = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/UserInfo/Modify?format=json', body, false);
+    attempts.push(modify);
+    if (isapiOk(modify)) return { ok: true, result: modify, attempts };
+    // "Person exists" from Record, or "no such person" from Modify, both mean the
+    // other verb is the right one; try the combined call before giving up.
+    const setUp = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/UserInfo/SetUp?format=json', body, false);
+    attempts.push(setUp);
+    if (isapiOk(setUp)) return { ok: true, result: setUp, attempts };
+    return { ok: false, result: setUp, attempts };
+  }
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<UserInfo ${ISAPI_XML_NS}>
+  <employeeNo>${payload.employeeNo}</employeeNo>
+  <name>${String(payload.name || payload.employeeNo)}</name>
+  <userType>normal</userType>
+  <Valid>
+    <enable>false</enable>
+    <beginTime>2020-01-01T00:00:00</beginTime>
+    <endTime>2037-12-31T23:59:59</endTime>
+    <timeType>local</timeType>
+  </Valid>
+  <doorRight>${personBody(payload).doorRight}</doorRight>
+  <RightPlan>
+    ${personBody(payload).RightPlan.map((plan) => `<RightPlanEntry><doorNo>${plan.doorNo}</doorNo><planTemplateNo>1</planTemplateNo></RightPlanEntry>`).join('\n    ')}
+  </RightPlan>
+</UserInfo>`;
+  result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/UserInfo/Record', xml, true);
+  attempts.push(result);
+  return { ok: isapiOk(result), result, attempts };
+}
+
+/**
+ * Removes a person from the terminal.
+ *
+ * The full removal is `UserInfoDetail/Delete`: it takes the person, their cards,
+ * their fingerprints and their permissions together. The narrower
+ * `UserInfo/Delete` removes only the person record, which leaves a card on the
+ * terminal that nobody can use and that a later re-add would inherit, so it is
+ * only used when the full removal is not supported.
+ */
+async function deleteTerminalPerson(device, payload) {
+  const employeeNo = String(payload.employeeNo);
+  const attempts = [];
+  if (payload.fullRemoval !== false) {
+    const detailBodies = [
+      JSON.stringify({ UserInfoDetail: { mode: 'byEmployeeNo', EmployeeNoList: [{ employeeNo }] } }),
+      JSON.stringify({ UserInfoDetail: { EmployeeNoList: [{ employeeNo }] } }),
+    ];
+    for (const body of detailBodies) {
+      const result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/UserInfoDetail/Delete?format=json', body, false);
+      attempts.push(result);
+      if (isapiOk(result)) return { ok: true, result, attempts, mode: 'UserInfoDetail/Delete' };
+      if (isapiUnsupported(result)) break;
+      if (alreadyGone(result)) return { ok: true, result, attempts, mode: 'UserInfoDetail/Delete' };
+    }
+  }
+  const condBodies = [
+    JSON.stringify({ UserInfoDelCond: { EmployeeNoList: [{ employeeNo }] } }),
+    JSON.stringify({ UserInfoDelCond: { employeeNo } }),
+  ];
+  for (const body of condBodies) {
+    const result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/UserInfo/Delete?format=json', body, false);
+    attempts.push(result);
+    if (isapiOk(result) || alreadyGone(result)) return { ok: true, result, attempts, mode: 'UserInfo/Delete' };
+    if (!isapiUnsupported(result)) break;
+  }
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<UserInfoDelCond ${ISAPI_XML_NS}>
+  <EmployeeNoList>
+    <employeeNo>${employeeNo}</employeeNo>
+  </EmployeeNoList>
+</UserInfoDelCond>`;
+  const result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/UserInfo/Delete', xml, true);
+  attempts.push(result);
+  return { ok: isapiOk(result) || alreadyGone(result), result, attempts, mode: 'UserInfo/Delete (XML)' };
+}
+
+/**
+ * Writes a fingerprint template to the terminal. `fingerData` is Base64 exactly
+ * as another terminal produced it; it is never logged.
+ */
+async function writeTerminalFingerprint(device, payload, fingerData) {
+  if (!fingerData) return { ok: false, error: 'no template was supplied for this fingerprint' };
+  const body = JSON.stringify({
+    FingerPrintCfg: {
+      employeeNo: String(payload.employeeNo),
+      enableCardReader: [FINGERPRINT_MODULE],
+      fingerPrintID: Number(payload.fingerNo),
+      fingerType: 'normalFP',
+      fingerData,
+      checkEmployeeNo: true,
+    },
+  });
+  const attempts = [];
+  let result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/FingerPrint/SetUp?format=json', body, false);
+  attempts.push(result);
+  if (isapiOk(result)) return { ok: true, result, attempts };
+  if (!isapiUnsupported(result)) {
+    const put = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/FingerPrint/SetUp?format=json', body, false);
+    attempts.push(put);
+    return { ok: isapiOk(put), result: put, attempts };
+  }
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<FingerPrintCfg ${ISAPI_XML_NS}>
+  <employeeNo>${payload.employeeNo}</employeeNo>
+  <enableCardReader>
+    <cardReaderNo>${FINGERPRINT_MODULE}</cardReaderNo>
+  </enableCardReader>
+  <fingerPrintID>${payload.fingerNo}</fingerPrintID>
+  <fingerType>normalFP</fingerType>
+  <fingerData>${fingerData}</fingerData>
+</FingerPrintCfg>`;
+  result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/FingerPrint/SetUp', xml, true);
+  attempts.push(result);
+  return { ok: isapiOk(result), result, attempts };
+}
+
+/** Deletes one finger slot for a person. The terminal answers success either way. */
+async function deleteTerminalFingerprint(device, payload) {
+  const body = JSON.stringify({
+    FingerPrintCfg: {
+      employeeNo: String(payload.employeeNo),
+      enableCardReader: [Number(payload.module || FINGERPRINT_MODULE)],
+      fingerPrintID: Number(payload.fingerNo),
+      fingerType: 'normalFP',
+      deleteFingerPrint: true,
+    },
+  });
+  const attempts = [];
+  let result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/FingerPrint/SetUp?format=json', body, false);
+  attempts.push(result);
+  if (isapiOk(result)) return { ok: true, result, attempts };
+  if (isapiUnsupported(result)) {
+    const put = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/FingerPrint/SetUp?format=json', body, false);
+    attempts.push(put);
+    if (isapiOk(put)) return { ok: true, result: put, attempts };
+  }
+  return { ok: false, result: attempts[attempts.length - 1], attempts };
+}
+
+/** Whether this terminal documents the fingerprint collection URL at all. */
+async function supportsFingerprintCapture(device) {
+  const result = await isapiRequest(device, 'GET', '/ISAPI/AccessControl/CaptureFingerPrint/capabilities', null, true);
+  return !isapiUnsupported(result) && result.status !== 401;
+}
+
+/**
+ * Reads a fingerprint template from the terminal's own reader.
+ *
+ * The JSON flavour returns the template in one call
+ * (`CaptureFingerPrintCond` in, `CaptureFingerPrint` out with Base64
+ * `fingerData`); the XML flavour is the documented form on the terminal wiki.
+ * Both are tried, JSON first, and a "nobody touched the reader" answer is
+ * retried until the operation's deadline — the person is standing there, and an
+ * access terminal arms its reader per request.
+ */
+async function captureTerminalFingerprint(device, payload, deadlineMs) {
+  const fingerNo = Number(payload.fingerNo);
+  if (!Number.isInteger(fingerNo) || fingerNo < 1 || fingerNo > 10) {
+    return { ok: false, error: 'fingerNo must be 1-10' };
+  }
+  if (!(await supportsFingerprintCapture(device))) {
+    return { ok: false, error: 'this terminal does not document fingerprint collection (CaptureFingerPrint); enrol the finger on its own menu and record the slot in EstateMate' };
+  }
+
+  const jsonBody = JSON.stringify({ CaptureFingerPrintCond: { fingerNo } });
+  const xmlBody = `<?xml version="1.0" encoding="UTF-8"?>
+<CaptureFingerPrintCond ${ISAPI_XML_NS}>
+  <fingerNo>${fingerNo}</fingerNo>
+</CaptureFingerPrintCond>`;
+
+  const attempts = [];
+  let lastError = 'the reader did not answer';
+  let heartbeatAt = Date.now();
+  while (Date.now() < deadlineMs) {
+    // JSON first: on the access terminals that document fingerprint collection
+    // this returns the template directly.
+    let result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/CaptureFingerPrint?format=json', jsonBody, false);
+    attempts.push(result);
+    let template = extractFingerprintData(result.body);
+    if (template) return { ok: true, template, quality: extractFingerprintQuality(result.body), attempts };
+    let unsupported = isapiUnsupported(result);
+    if (!isapiOk(result) && !unsupported) lastError = describeIsapiFailure(result);
+
+    if (unsupported) {
+      const xmlResult = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/CaptureFingerPrint', xmlBody, true);
+      attempts.push(xmlResult);
+      template = extractFingerprintData(xmlResult.body);
+      if (template) return { ok: true, template, quality: extractFingerprintQuality(xmlResult.body), attempts };
+      if (!isapiOk(xmlResult) && !isapiUnsupported(xmlResult)) lastError = describeIsapiFailure(xmlResult);
+      if (isapiUnsupported(xmlResult)) {
+        return { ok: false, error: `this terminal does not accept fingerprint collection (${describeIsapiFailure(xmlResult)}); enrol the finger on its menu and record the slot in EstateMate`, attempts };
+      }
+    }
+
+    // Keep the portal's view of this bridge fresh while a person is pressing a
+    // finger on the glass, then arm the reader again.
+    if (Date.now() - heartbeatAt > 30000) {
+      heartbeatAt = Date.now();
+      await heartbeat();
+    }
+    await sleep(CAPTURE_RETRY_MS);
+  }
+  return { ok: false, error: `${lastError} (nobody placed a finger on the reader within the time allowed)`, attempts };
+}
+
+/** Base64 template from either flavour of the capture response. */
+function extractFingerprintData(body) {
+  const text = String(body || '');
+  const json = /"fingerData"\s*:\s*"([^"]+)"/.exec(text);
+  if (json?.[1]) return json[1];
+  const xml = /<fingerData>([^<]+)<\/fingerData>/.exec(text);
+  return xml?.[1] ?? null;
+}
+
+function extractFingerprintQuality(body) {
+  const text = String(body || '');
+  const json = /"fingerPrintQuality"\s*:\s*(\d+)/.exec(text);
+  if (json?.[1]) return Number(json[1]);
+  const xml = /<fingerPrintQuality>(\d+)<\/fingerPrintQuality>/.exec(text);
+  return xml?.[1] ? Number(xml[1]) : null;
 }
 
 async function applyCardOperation(device, operation) {
@@ -614,106 +1135,92 @@ async function applyCardOperation(device, operation) {
 
   log('info', `Applying ${op} for device ${device.name} (${device.estateMateDeviceId}) card=${cardUid} opId=${operation.id}`);
 
-  // Example ISAPI payloads - these vary by model/firmware. Adjust per your device manual.
-  // This is a best-effort generic implementation; test against your specific model.
-
   try {
     if (op === 'upsert_card' || op === 'enable_card') {
       if (!cardUid) return { success: false, error: 'operation has no card number' };
       if (!employeeNo) {
         return { success: false, error: 'operation has no valid EstateMate employee number; refusing to guess which terminal person owns the card' };
       }
-      // Check if card exists
-      // PUT /ISAPI/AccessControl/CardInfo/Record?format=json or /ISAPI/AccessControl/CardInfo/SetUp?format=json
-      // For simplicity, we attempt to create/update card via ISAPI JSON if supported.
-      const cardXml = `<?xml version="1.0" encoding="UTF-8"?>
-<CardInfo>
-  <employeeNo>${employeeNo}</employeeNo>
-  <cardNo>${cardUid}</cardNo>
-  <cardType>normalCard</cardType>
-</CardInfo>`;
-
-      // Try JSON first (newer firmware)
-      const jsonBody = {
-        CardInfo: {
-          employeeNo: String(employeeNo),
-          cardNo: String(cardUid),
-          cardType: 'normalCard',
-        },
-      };
-
-      const jsonResult = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/CardInfo/Record?format=json', JSON.stringify(jsonBody), false);
-      let result = jsonResult;
-      if (result.status >= 400) {
-        // Older firmware only accepts the XML form.
-        result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/CardInfo/Record', cardXml, true);
-      }
-
-      if (result.status >= 200 && result.status < 300) {
-        log('info', `Card ${cardUid} upsert OK on ${device.name}: ${result.status}`);
+      const written = await writeTerminalCard(device, employeeNo, cardUid);
+      if (written.ok) {
+        log('info', `Card ${cardUid} upsert OK on ${device.name}: ${written.result.status}`);
         return { success: true };
-      } else {
-        log('warn', `Card upsert failed on ${device.name}: ${result.status} ${result.body.slice(0, 500)}`);
-        // Some devices return 200 with error in body, parse
-        if (result.body.includes('ok') || result.body.includes('success')) return { success: true };
-        // Report both answers when the XML retry also failed: the JSON one is
-        // usually the firmware's real objection.
-        const reason = result === jsonResult
-          ? describeIsapiFailure(result)
-          : `${describeIsapiFailure(jsonResult)}; XML retry ${describeIsapiFailure(result)}`;
-        return { success: false, error: reason };
       }
+      log('warn', `Card upsert failed on ${device.name}: ${written.result.status} ${String(written.result.body).slice(0, 500)}`);
+      return { success: false, error: describeAttempts(written.attempts) };
     } else if (op === 'disable_card' || op === 'delete_card') {
-      // Delete or disable - for disable we could update card status, but many firmwares only support delete.
-      // We attempt delete.
-      const deleteXml = `<?xml version="1.0" encoding="UTF-8"?>
-<CardInfoDelCond>
-  <CardNoList>
-    <CardNo>${cardUid}</CardNo>
-  </CardNoList>
-</CardInfoDelCond>`;
-
-      let result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/CardInfo/Delete?format=json', JSON.stringify({ CardNoList: [{ CardNo: cardUid }] }), false);
-      if (result.status >= 400) {
-        result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/CardInfo/Delete', deleteXml, true);
-      }
-
-      if (result.status >= 200 && result.status < 300) {
+      if (!cardUid) return { success: false, error: 'operation has no card number' };
+      const removed = await deleteTerminalCard(device, cardUid);
+      if (removed.ok) {
         log('info', `Card ${cardUid} delete/disable OK on ${device.name}`);
         return { success: true };
-      } else {
-        log('warn', `Card delete failed on ${device.name}: ${result.status} ${result.body.slice(0, 500)}`);
-        // If card not found, treat as success (idempotent)
-        if (result.body.includes('not exist') || result.body.includes('not found') || result.status === 404) return { success: true };
-        return { success: false, error: describeIsapiFailure(result) };
       }
+      log('warn', `Card delete failed on ${device.name}: ${removed.result.status} ${String(removed.result.body).slice(0, 500)}`);
+      return { success: false, error: describeAttempts(removed.attempts) };
     } else if (op === 'revoke_visitor') {
       const visitorCard = payload.credentialNumber || cardUid;
       if (!visitorCard) return { success: false, error: 'Missing credential number' };
-      let result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/CardInfo/Delete?format=json', JSON.stringify({ CardNoList: [{ CardNo: visitorCard }] }), false);
-      if (result.status >= 400) {
-        const deleteXml = `<?xml version="1.0" encoding="UTF-8"?>\n<CardInfoDelCond>\n  <CardNoList>\n    <CardNo>${visitorCard}</CardNo>\n  </CardNoList>\n</CardInfoDelCond>`;
-        result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/CardInfo/Delete', deleteXml, true);
-      }
-      if (result.status >= 200 && result.status < 300) return { success: true };
-      if (result.body.includes('not exist') || result.body.includes('not found') || result.status === 404) return { success: true };
-      return { success: false, error: `Visitor revoke ISAPI ${result.status}: ${result.body.slice(0, 200)}` };
+      const removed = await deleteTerminalCard(device, visitorCard);
+      if (removed.ok) return { success: true };
+      return { success: false, error: `Visitor revoke ${describeAttempts(removed.attempts)}` };
     } else if (op === 'upsert_visitor') {
-      // Visitor credential - map to temporary card or visitor via ISAPI
-      // This is highly model-dependent. We log and mark as applied with note.
-      log('info', `Visitor operation ${op} for ${device.name} credential=${payload.credentialNumber} - manual mapping may be required`);
-      // For now, treat visitor as card with limited validity
+      // A visitor credential is filed as a normal card under the visitor's issued
+      // employee number. "tempCard" is not a valid cardType value on these terminals.
       const visitorCard = payload.credentialNumber || cardUid;
       if (!visitorCard) return { success: false, error: 'Missing credential number' };
-      const visitorXml = `<?xml version="1.0" encoding="UTF-8"?>
-<CardInfo>
-  <employeeNo>visitor-${payload.credentialNumber}</employeeNo>
-  <cardNo>${visitorCard}</cardNo>
-  <cardType>tempCard</cardType>
-</CardInfo>`;
-      let result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/CardInfo/Record', visitorXml, true);
-      if (result.status >= 200 && result.status < 300) return { success: true };
-      return { success: false, error: `Visitor ISAPI ${result.status}` };
+      const visitorEmployeeNo = employeeNo || (TERMINAL_EMPLOYEE_NO.test(`visitor-${payload.credentialNumber}`) ? `visitor-${payload.credentialNumber}` : null);
+      if (!visitorEmployeeNo) return { success: false, error: 'operation has no valid visitor employee number' };
+      const written = await writeTerminalCard(device, visitorEmployeeNo, visitorCard);
+      if (written.ok) return { success: true };
+      return { success: false, error: `Visitor ${describeAttempts(written.attempts)}` };
+    }
+
+    else if (op === 'upsert_person') {
+      if (!employeeNo) return { success: false, error: 'operation has no valid EstateMate employee number' };
+      const written = await writeTerminalPerson(device, { ...payload, employeeNo, userType: payload.userType || (String(employeeNo).startsWith('visitor-') ? 'visitor' : 'normal') });
+      if (written.ok) {
+        log('info', `Person ${employeeNo} upsert OK on ${device.name}: ${written.result.status}`);
+        return { success: true };
+      }
+      log('warn', `Person upsert failed on ${device.name}: ${written.result.status} ${String(written.result.body).slice(0, 500)}`);
+      return { success: false, error: describeAttempts(written.attempts) };
+    } else if (op === 'delete_person') {
+      if (!employeeNo) return { success: false, error: 'operation has no valid EstateMate employee number' };
+      const removed = await deleteTerminalPerson(device, { ...payload, employeeNo });
+      if (removed.ok) {
+        log('info', `Person ${employeeNo} removed from ${device.name} via ${removed.mode}`);
+        return { success: true };
+      }
+      log('warn', `Person delete failed on ${device.name}: ${removed.result.status} ${String(removed.result.body).slice(0, 500)}`);
+      return { success: false, error: describeAttempts(removed.attempts) };
+    } else if (op === 'upload_fingerprint') {
+      if (!employeeNo) return { success: false, error: 'operation has no valid EstateMate employee number' };
+      if (!operation.fingerData) return { success: false, error: 'the template for this fingerprint has expired; capture it again from a terminal' };
+      const written = await writeTerminalFingerprint(device, { ...payload, employeeNo }, operation.fingerData);
+      if (written.ok) {
+        log('info', `Fingerprint ${payload.fingerNo} for ${employeeNo} written to ${device.name}`);
+        return { success: true };
+      }
+      log('warn', `Fingerprint write failed on ${device.name}: ${written.result.status}`);
+      return { success: false, error: describeAttempts(written.attempts) };
+    } else if (op === 'delete_fingerprint_device') {
+      if (!employeeNo) return { success: false, error: 'operation has no valid EstateMate employee number' };
+      const removed = await deleteTerminalFingerprint(device, { ...payload, employeeNo });
+      if (removed.ok) {
+        log('info', `Fingerprint ${payload.fingerNo} for ${employeeNo} deleted from ${device.name}`);
+        return { success: true };
+      }
+      return { success: false, error: describeAttempts(removed.attempts) };
+    } else if (op === 'capture_fingerprint') {
+      const captured = await captureTerminalFingerprint(device, payload, Date.now() + CAPTURE_MAX_MS);
+      if (captured.ok) {
+        log('info', `Fingerprint captured for ${payload.employeeNo ?? '?'} slot ${payload.fingerNo} on ${device.name} (${captured.template.length} chars${captured.quality != null ? `, quality ${captured.quality}` : ''})`);
+        // The template goes back to EstateMate, which hands it to the other
+        // terminals. It is never written to the bridge log or to disk.
+        return { success: true, result: { templateData: captured.template, quality: captured.quality ?? null, fingerNo: Number(payload.fingerNo) } };
+      }
+      log('warn', `Fingerprint capture failed on ${device.name}: ${captured.error}`);
+      return { success: false, error: captured.error };
     }
 
     const doorCmd = {
@@ -728,15 +1235,16 @@ async function applyCardOperation(device, operation) {
       if (!Number.isInteger(doorNo) || doorNo < 1 || doorNo > 8) return { success: false, error: 'doorNo must be 1-8' };
       // Best-effort Hikvision RemoteControl. Not verified per firmware in
       // docs/device-profiles/; a rejection is reported so an operator can apply it.
-      const jsonBody = JSON.stringify({ RemoteControlDoor: { cmd: doorCmd } });
-      let result = await isapiRequest(device, 'PUT', `/ISAPI/AccessControl/RemoteControl/door/${doorNo}?format=json`, jsonBody, false);
-      if (result.status >= 400) {
-        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<RemoteControlDoor><cmd>${doorCmd}</cmd></RemoteControlDoor>`;
+      const attempts = [];
+      let result = await isapiRequest(device, 'PUT', `/ISAPI/AccessControl/RemoteControl/door/${doorNo}?format=json`, JSON.stringify({ RemoteControlDoor: { cmd: doorCmd } }), false);
+      attempts.push(result);
+      if (!isapiOk(result)) {
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<RemoteControlDoor ${ISAPI_XML_NS}><cmd>${doorCmd}</cmd></RemoteControlDoor>`;
         result = await isapiRequest(device, 'PUT', `/ISAPI/AccessControl/RemoteControl/door/${doorNo}`, xml, true);
+        attempts.push(result);
       }
-      if (result.status >= 200 && result.status < 300) return { success: true };
-      if (result.body.includes('ok') || result.body.includes('success')) return { success: true };
-      return { success: false, error: `Door ISAPI ${result.status}: ${result.body.slice(0, 200)}` };
+      if (isapiOk(result)) return { success: true };
+      return { success: false, error: `Door ${describeAttempts(attempts)}` };
     }
 
     return { success: false, error: `Unknown operation ${op}` };
@@ -781,6 +1289,7 @@ async function pollAndApply() {
             status: result.success ? 'applied' : 'failed',
             errorMessage: result.error || null,
             durationMs: duration,
+            result: result.result || null,
           }),
         });
         if (!rRes.ok) log('warn', `Result report failed for ${op.id}:`, rRes.status, rJson);
@@ -860,6 +1369,19 @@ export {
   // employee-number rules against a simulated terminal without the main loops.
   applyCardOperation,
   describeIsapiFailure,
+  // Exported for the person/fingerprint integration checks: the capability probe
+  // decides what the Worker will ever hand this bridge, so it is worth asserting
+  // against a simulated terminal rather than trusting a comment.
+  probeCapabilities,
+  capabilitiesForHeartbeat,
+  writeTerminalPerson,
+  deleteTerminalPerson,
+  writeTerminalFingerprint,
+  deleteTerminalFingerprint,
+  captureTerminalFingerprint,
+  extractFingerprintData,
+  personBody,
+  isStreamHeartbeat,
   terminalEmployeeNo,
   resolveDeviceIds,
   isUuid,

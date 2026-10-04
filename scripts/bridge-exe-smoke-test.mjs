@@ -506,6 +506,53 @@ async function main() {
       `status=${piped.status} ${piped.stderr}${piped.stdout}`.slice(-300),
     );
 
+    // 1d. The same configuration, typed instead of imported: this is the path the
+    //     Windows dashboard uses when there is no portal script to point at, so it
+    //     must produce the identical files (and keep the secret out of the output).
+    const manualDir = path.join(workDir, 'manual');
+    const manualSecret = `manual-${randomUUID()}-secret`;
+    const manual = await runCli(exe, [
+      'setup',
+      '--no-prompt',
+      '--no-verify',
+      '--agent-id',
+      state.agentId,
+      '--agent-secret',
+      manualSecret,
+      '--worker-url',
+      `http://127.0.0.1:${workerPort}`,
+      '--devices-json',
+      wizardDevicesPath,
+      '--data-dir',
+      manualDir,
+      '--log-file',
+      path.join(manualDir, 'bridge.log'),
+    ]);
+    const manualOutput = `${manual.stdout}${manual.stderr}`;
+    const manualConfig = readJsonIfExists(path.join(manualDir, 'agent-config.json'));
+    const manualDevices = readJsonIfExists(path.join(manualDir, 'isapi-devices.json'));
+    check(
+      'setup accepts a hand-typed agent id, secret and Worker URL',
+      manual.status === 0 &&
+        Boolean(manualConfig) &&
+        manualConfig.agentId === state.agentId &&
+        manualConfig.agentSecret === manualSecret &&
+        manualConfig.workerUrl === `http://127.0.0.1:${workerPort}`,
+      `status=${manual.status} ${manualOutput}`.slice(-400),
+    );
+    check(
+      'the hand-typed path writes the terminal list too',
+      Boolean(manualDevices) && manualDevices.devices?.length === 1 && manualDevices.devices[0].estateMateDeviceId === state.deviceId,
+      JSON.stringify(manualDevices),
+    );
+    check('the hand-typed path never echoes the agent secret', !manualOutput.includes(manualSecret), 'the secret appeared in the setup output');
+    const badId = await runCli(exe, ['setup', '--no-prompt', '--no-verify', '--agent-id', 'not-a-uuid', '--agent-secret', manualSecret, '--data-dir', path.join(workDir, 'manual-bad')]);
+    check(
+      'setup refuses an agent id that is not a UUID',
+      badId.status !== 0 && /not an agent id/i.test(`${badId.stdout}${badId.stderr}`),
+      `status=${badId.status} ${badId.stderr}${badId.stdout}`.slice(-300),
+    );
+
     // 2. Real configuration pointing at the fake Worker and the fake terminal.
     fs.writeFileSync(
       configPath,

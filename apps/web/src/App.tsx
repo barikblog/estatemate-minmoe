@@ -8,7 +8,7 @@ type Section =
   // Overview
   | 'dashboard'
   // Access control
-  | 'cards' | 'events' | 'devices' | 'remote' | 'isapi' | 'operations'
+  | 'cards' | 'events' | 'devices' | 'remote' | 'sync' | 'isapi' | 'operations'
   // People & households
   | 'residents' | 'residency' | 'dependants' | 'staff'
   // Property & estate
@@ -72,6 +72,7 @@ const navGroups: NavGroup[] = [
     { id: 'events', label: 'Gate activity', roles: ['admin','manager','security','resident'] },
     { id: 'devices', label: 'Terminals & devices', roles: ['admin','manager','security'] },
     { id: 'remote', label: 'Remote door control', roles: ['admin'] },
+    { id: 'sync', label: 'Person sync', roles: ['admin','manager'] },
     { id: 'isapi', label: 'Device agent', roles: ['admin','manager'] },
     { id: 'operations', label: 'Hardware actions', roles: ['admin','manager'] },
   ]},
@@ -437,6 +438,7 @@ function SectionView({ section, user, config, gate, onNavigate }: { section: Sec
     case 'events': return <AccessEvents user={user} />;
     case 'devices': return <Devices user={user} />;
     case 'remote': return <RemoteAccess onNavigate={onNavigate} />;
+    case 'sync': return <PersonSync />;
     case 'isapi': return <IsapiBridge user={user} />;
     case 'operations': return <Operations />;
     case 'settings': return <Settings />;
@@ -1570,6 +1572,7 @@ function PersonCredentials({ residentId, householdMemberId, personName, devices,
   const list = useList(`/api/access/credentials?limit=50&${query}`);
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
+  const [captureId, setCaptureId] = useState('');
 
   async function addCard(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setMessage('');
@@ -1589,13 +1592,28 @@ function PersonCredentials({ residentId, householdMemberId, personName, devices,
   async function addFingerprint(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setMessage('');
     const form = new FormData(event.currentTarget);
+    const deviceId = String(form.get('deviceId') ?? '').trim();
+    const shared = {
+      fingerNo: Number(form.get('fingerNo')),
+      fingerLabel: String(form.get('fingerLabel') ?? '').trim() || undefined,
+      employeeNo: String(form.get('employeeNo') ?? '').trim() || undefined,
+      deviceId: deviceId || undefined,
+    };
     try {
+      if (deviceId) {
+        // A terminal is chosen: arm its reader and read the finger for real.
+        const started = await api<{ captureId:string; instruction:string }>('/api/access/fingerprints/capture', { method: 'POST', body: JSON.stringify({
+          ...(residentId ? { residentId, personId: residentId, personKind: 'account' } : { householdMemberId, personId: householdMemberId, personKind: 'dependant' }),
+          ...shared,
+        }) });
+        setCaptureId(String(started.captureId));
+        setMessage(started.instruction);
+        event.currentTarget.reset();
+        return;
+      }
       const result = await api<{ queuedActions:number }>('/api/access/fingerprints', { method: 'POST', body: JSON.stringify({
         ...(residentId ? { residentId } : { householdMemberId }),
-        fingerNo: Number(form.get('fingerNo')),
-        fingerLabel: String(form.get('fingerLabel') ?? '').trim() || undefined,
-        employeeNo: String(form.get('employeeNo') ?? '').trim() || undefined,
-        deviceId: String(form.get('deviceId') ?? '').trim() || undefined,
+        ...shared,
       }) });
       setMessage(`Fingerprint recorded for ${personName}. ${result.queuedActions} terminal task(s) queued — enroll the finger on the terminal, then mark each action applied under Hardware actions.`);
       event.currentTarget.reset(); list.reload(); onChanged?.();
@@ -1618,7 +1636,13 @@ function PersonCredentials({ residentId, householdMemberId, personName, devices,
   return <section className="panel person-credentials">
     <div className="panel-title"><div><p className="eyebrow">ACCESS</p><h3>{personName} — cards &amp; fingerprints</h3></div><button className="secondary sm" onClick={() => list.reload()}>Refresh</button></div>
     {message && <Notice tone={/Could not|failed/i.test(message) ? 'error' : 'success'}>{message}</Notice>}
-    <p className="presence-hint">A card is written to a terminal by a linked agent. A fingerprint is captured on the terminal itself — EstateMate records the slot and queues the task, and an operator confirms it under <strong>Hardware actions</strong>.</p>
+    <p className="presence-hint">A card is written to a terminal by a linked agent. For a fingerprint, EstateMate arms the reader on the terminal you choose: the person presses a finger, and the template is written to every other terminal automatically. Choose <em>Not recorded yet</em> to record the slot only and enrol it on the terminal by hand.</p>
+    {captureId && <FingerprintCapture captureId={captureId} onFinished={(status, value) => {
+      setMessage(status === 'captured'
+        ? `Fingerprint read from ${personName} and sent to the other terminals.`
+        : String(value.error ?? 'The fingerprint could not be read — the manual enrolment task is in Hardware actions.'));
+      if (status === 'captured') { list.reload(); onChanged?.(); }
+    }} onCancel={() => setCaptureId('')} />}
     <ListState list={list}><DataTable rows={rows} columns={[['credential_type','Type'],['credential_reference','Card / finger'],['credential_label','Label'],['finger_no','Slot'],['employee_no','Employee no'],['enrolled_device_name','Enrolled at'],['status','Status'],['pending_operations','Open tasks'],['updated_at','Updated','date']]} action={(row) => <div className="row-actions">{String(row.status) === 'active'
       ? <button className="text danger" onClick={() => change(row.credential_type, row.id, 'suspended')}>Suspend</button>
       : <button className="text" onClick={() => change(row.credential_type, row.id, 'active')}>Activate</button>}</div>} /></ListState>
@@ -1632,8 +1656,8 @@ function PersonCredentials({ residentId, householdMemberId, personName, devices,
         <label>Finger slot<select name="fingerNo" defaultValue="1">{[1,2,3,4,5,6,7,8,9,10].map((value) => <option key={value} value={value}>Finger {value}</option>)}</select><small>The slot the terminal stores this finger under (1–10).</small></label>
         <label>Which finger<input name="fingerLabel" placeholder="Right index" /></label>
         <label>Employee number<input name="employeeNo" placeholder={residentId ? 'Defaults to the EstateMate person ID' : 'Required for this dependant'} /><small>The terminal identifies the person by this number, so a fingerprint event can be matched to them. A dependant has no default.</small></label>
-        <label>Capture at<select name="deviceId"><option value="">Not recorded yet</option>{devices.map((device) => <option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.gate_name)}</option>)}</select></label>
-        <button className="primary" disabled={busy}>Record fingerprint</button>
+        <label>Capture at<select name="deviceId"><option value="">Not recorded yet — enrol on the terminal myself</option>{devices.map((device) => <option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.gate_name)}</option>)}</select><small>Choose a terminal to arm its reader now and read the finger; the template then goes to the other terminals.</small></label>
+        <button className="primary" disabled={busy}>{busy ? 'Working…' : 'Read the fingerprint'}</button>
       </FormCard>
     </div>
   </section>;
@@ -1648,6 +1672,8 @@ function Cards({ user }: { user: User }) {
   const [credentialKind,setCredentialKind]=useState<'card'|'fingerprint'>('card');
   const [mode,setMode]=useState<'device'|'manual'>('device');
   const [scanSession,setScanSession]=useState<Row|null>(null);
+  const [captureId,setCaptureId]=useState('');
+  const [fingerMode,setFingerMode]=useState<'capture'|'manual'>('capture');
   const [picked,setPicked]=useState<PickedPerson|null>(null);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setMessage('');
@@ -1686,13 +1712,29 @@ function Cards({ user }: { user: User }) {
     if (!picked) { setMessage('Choose the person this fingerprint belongs to.'); return; }
     const form = new FormData(event.currentTarget);
     const person = picked.kind === 'resident' ? { residentId: picked.id } : { householdMemberId: picked.id };
+    const deviceId = String(form.get('deviceId') ?? '').trim();
     try {
+      if (fingerMode === 'capture') {
+        if (!deviceId) { setMessage('Choose the terminal whose reader will take the fingerprint.'); return; }
+        const started = await api<Row>('/api/access/fingerprints/capture', { method: 'POST', body: JSON.stringify({
+          ...person,
+          personKind: picked.kind === 'resident' ? 'account' : 'dependant',
+          personId: picked.id,
+          fingerNo: Number(form.get('fingerNo')),
+          fingerLabel: String(form.get('fingerLabel') ?? '').trim() || undefined,
+          deviceId,
+        }) });
+        setShow(false); setPicked(null);
+        setCaptureId(String(started.captureId));
+        setMessage(String(started.instruction ?? 'The terminal reader is armed.'));
+        return;
+      }
       const result = await api<Row>('/api/access/fingerprints', { method: 'POST', body: JSON.stringify({
         ...person,
         fingerNo: Number(form.get('fingerNo')),
         fingerLabel: String(form.get('fingerLabel') ?? '').trim() || undefined,
         employeeNo: String(form.get('employeeNo') ?? '').trim() || undefined,
-        deviceId: String(form.get('deviceId') ?? '').trim() || undefined,
+        deviceId: deviceId || undefined,
       }) });
       setShow(false); setPicked(null);
       setMessage(String(result.instruction ?? `Fingerprint recorded for ${picked.name}.`) + ' Mark it applied under Hardware actions once the finger is enrolled.');
@@ -1708,8 +1750,14 @@ function Cards({ user }: { user: User }) {
   const actions = operator ? (row: Row) => <div className="row-actions">{row.status === 'active' ? <button className="text danger" onClick={() => change(row, 'suspended')}>Suspend</button> : <button className="text" onClick={() => change(row, 'active')}>Activate</button>}{String(row.credential_type) === 'fingerprint' && <button className="text danger" onClick={() => removeFingerprint(row)}>Delete</button>}</div> : undefined;
   return <PagePanel title="Access cards & fingerprints" subtitle="Cards are written to a terminal by an agent; fingerprints are captured on the terminal and confirmed here" action={operator ? <button className="primary" onClick={() => { setShow(!show); setPicked(null); setMessage(''); }}>Issue card or fingerprint</button> : null}>
     {message && <Notice tone={message.includes('issued')?'success':message.includes('Waiting')?'info':'error'}>{message}</Notice>}
-    {show && <FormCard title="Issue a card or record a fingerprint" onSubmit={credentialKind==='card'?submit:submitFingerprint}><label>Credential type<select value={credentialKind} onChange={(event)=>setCredentialKind(event.target.value as 'card'|'fingerprint')}><option value="card">Access card</option><option value="fingerprint">Fingerprint</option></select></label>{credentialKind==='card'?<><label>Enrollment method<select value={mode} onChange={(event)=>setMode(event.target.value as 'device'|'manual')}><option value="device">Tap/scan at selected device (recommended)</option><option value="manual">Enter card UID manually</option></select></label>{mode==='device'&&<label>Access-control device<select name="deviceId" required><option value="">Select device</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.model||device.vendor)} — {String(device.gate_name)}</option>)}</select></label>}<PersonPicker picked={picked} onPick={setPicked} />{mode==='manual'&&<label>Card UID / number<input name="cardUid" required /></label>}<label>Label<input name="cardLabel" placeholder="Optional card label" /></label><button className="primary">{mode==='device'?'Start scan':'Issue card'}</button></>:<><p className="form-note">A fingerprint is captured on the terminal, not through the browser: pick the person and the slot, then enroll the finger on the terminal and confirm the queued task under <strong>Hardware actions</strong>.</p><PersonPicker picked={picked} onPick={setPicked} /><label>Finger slot<select name="fingerNo" defaultValue="1">{[1,2,3,4,5,6,7,8,9,10].map((value)=><option key={value} value={value}>Finger {value}</option>)}</select></label><label>Which finger<input name="fingerLabel" placeholder="Right index" /></label><label>Employee number<input name="employeeNo" placeholder="Defaults to the EstateMate person ID" /><small>Required when the person chosen is a dependant.</small></label><label>Capture at<select name="deviceId"><option value="">Not recorded yet</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.gate_name)}</option>)}</select></label><button className="primary">Record fingerprint</button></>}</FormCard>}
+    {show && <FormCard title="Issue a card or record a fingerprint" onSubmit={credentialKind==='card'?submit:submitFingerprint}><label>Credential type<select value={credentialKind} onChange={(event)=>setCredentialKind(event.target.value as 'card'|'fingerprint')}><option value="card">Access card</option><option value="fingerprint">Fingerprint</option></select></label>{credentialKind==='card'?<><label>Enrollment method<select value={mode} onChange={(event)=>setMode(event.target.value as 'device'|'manual')}><option value="device">Tap/scan at selected device (recommended)</option><option value="manual">Enter card UID manually</option></select></label>{mode==='device'&&<label>Access-control device<select name="deviceId" required><option value="">Select device</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.model||device.vendor)} — {String(device.gate_name)}</option>)}</select></label>}<PersonPicker picked={picked} onPick={setPicked} />{mode==='manual'&&<label>Card UID / number<input name="cardUid" required /></label>}<label>Label<input name="cardLabel" placeholder="Optional card label" /></label><button className="primary">{mode==='device'?'Start scan':'Issue card'}</button></>:<><p className="form-note">EstateMate arms the reader on the terminal you choose: the person presses a finger on the glass, the terminal hands back the template, and it is written to every other terminal automatically. Nothing is typed on the terminal, and the template is kept only until every gate has it. If the terminal’s firmware cannot do it, EstateMate says so and queues the manual enrolment instead.</p><PersonPicker picked={picked} onPick={setPicked} /><label>Enrollment<select value={fingerMode} onChange={(event)=>setFingerMode(event.target.value as 'capture'|'manual')}><option value="capture">Scan the finger at a selected terminal (recommended)</option><option value="manual">Record the slot only — enrol on the terminal myself</option></select></label><label>Finger slot<select name="fingerNo" defaultValue="1">{[1,2,3,4,5,6,7,8,9,10].map((value)=><option key={value} value={value}>Finger {value}</option>)}</select></label><label>Which finger<input name="fingerLabel" placeholder="Right index" /></label>{fingerMode==='manual'&&<label>Employee number<input name="employeeNo" placeholder="Defaults to the EstateMate person ID" /><small>Required when the person chosen is a dependant.</small></label>}<label>Capture at<select name="deviceId" required={fingerMode==='capture'}><option value="">{fingerMode==='capture'?'Select the terminal the person is standing at':'Not recorded yet'}</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.gate_name)}</option>)}</select><small>{fingerMode==='capture'?'The reader of this terminal is armed for the next three minutes.':''}</small></label><button className="primary">{fingerMode==='capture'?'Scan fingerprint':'Record fingerprint'}</button></>}</FormCard>}
     {scanSession&&<section className={`enrollment-session ${String(scanSession.status)}`}><p className="eyebrow">DEVICE CARD ENROLLMENT</p><h3>{scanSession.status==='captured'?'Card detected':'Waiting for a card…'}</h3>{Boolean(scanSession.captured_credential)&&<strong className="credential-number">{String(scanSession.captured_credential)}</strong>}<p>Present the card at the selected device. EstateMate captures the next card credential event, including a denied unknown-card event.</p><div className="row-actions">{scanSession.status==='captured'&&<button className="primary" onClick={completeScan}>Confirm and issue card</button>}<button className="secondary" onClick={cancelScan}>Cancel</button></div></section>}
+    {captureId && <FingerprintCapture captureId={captureId} onFinished={(status, value) => {
+      setMessage(status === 'captured'
+        ? `Fingerprint read from ${String(value.personName ?? 'the person')} and sent to the other terminals.`
+        : String(value.error ?? 'The fingerprint could not be read — record the slot and enrol it on the terminal instead.'));
+      if (status === 'captured') list.reload();
+    }} onCancel={() => setCaptureId('')} />}
     <ListState list={list}><DataTable exportTitle="Access Credentials" rows={list.data?.items ?? []} columns={[['credential_type','Type'],['resident_name','Main resident'],['household_member_name','Holder'],['unit_number','Unit'],['credential_reference','Card / finger'],['finger_no','Slot'],['credential_label','Label'],['enrolled_device_name','Enrolled at'],['employee_no','Employee no'],['status','Status'],['deactivated_reason','Reason'],['pending_operations','Open tasks'],['updated_at','Updated','date']]} action={actions} /></ListState>
   </PagePanel>;
 }
@@ -2095,6 +2143,79 @@ function RemoteAccess({ onNavigate }: { onNavigate?: (section: Section) => void 
   </PagePanel>;
 }
 
+/**
+ * The person × terminal grid, and the two actions an estate actually needs.
+ *
+ * A terminal only lets somebody through when the *person* exists on it with door
+ * rights — a card recorded for an employee number no terminal has seen as a
+ * person is stored and does not open anything. That is why "synchronise" writes
+ * the person first and the credentials after, why it is automatic whenever a
+ * credential is issued or a name changes, and why this page exists at all: it is
+ * the only place that can honestly say which terminal is still missing whom.
+ */
+function PersonSync() {
+  const [copyNotice, copy] = useCopy();
+  const overview = useAsync<{
+    devices: Array<Row>; people: Array<Row>; totals: { people:number; terminals:number; synced:number; pending:number; manual:number; missing:number };
+  }>(() => api('/api/device-sync'), []);
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState('');
+
+  async function syncAll() {
+    if (!confirm('Push every person holding a credential (and their cards and fingerprints) to every terminal now? Repeated presses reuse work that is already queued.')) return;
+    setBusy('all'); setMessage('');
+    try {
+      const result = await api<{ people:number;devices:number;queued:number;manual:number;skipped:number;notice:string }>('/api/device-sync/people', { method: 'POST', body: JSON.stringify({ scope: 'all' }) });
+      setMessage(result.notice ?? `${result.people} person(s) synchronised.`);
+      overview.reload();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Synchronisation failed'); }
+    finally { setBusy(''); }
+  }
+
+  async function syncPerson(person: Row) {
+    setBusy(String(person.id)); setMessage('');
+    try {
+      const result = await api<{ notice:string }>('/api/device-sync/people', { method: 'POST', body: JSON.stringify({ scope: 'people', people: [{ personKind: person.kind, id: person.id }] }) });
+      setMessage(result.notice ?? 'Synchronised.'); overview.reload();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Synchronisation failed'); }
+    finally { setBusy(''); }
+  }
+
+  async function removeFromDevices(person: Row) {
+    if (!confirm(`Remove ${String(person.name)} from every terminal, with their cards, fingerprints and door permissions? The portal history stays.`)) return;
+    setBusy(String(person.id)); setMessage('');
+    try {
+      const result = await api<{ notice:string }>('/api/device-sync/remove', { method: 'POST', body: JSON.stringify({ personKind: person.kind, id: person.id }) });
+      setMessage(result.notice ?? 'Removal queued.'); overview.reload();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Removal failed'); }
+    finally { setBusy(''); }
+  }
+
+  const totals = overview.data?.totals;
+  const devices = overview.data?.devices ?? [];
+  return <PagePanel title="Person sync" subtitle="Keep every person, card and fingerprint in step with every access-control terminal" action={<div className="row-actions"><button className="secondary" onClick={overview.reload}>Refresh</button><button className="primary" onClick={syncAll} disabled={busy === 'all'}>{busy === 'all' ? 'Synchronising…' : 'Synchronise everyone'}</button></div>}>
+    {copyNotice && <Notice tone="info">{copyNotice}</Notice>}
+    {message && <Notice tone={/failed|error|without an employee/i.test(message) ? 'warning' : 'success'}>{message}</Notice>}
+    <Notice tone="info">EstateMate writes the <strong>person record</strong> to a terminal before the card, because a card filed against a person the terminal has never seen is stored but cannot open the door. Edits to a name or Employee ID, and every new card or fingerprint, are pushed automatically. A terminal with no bridge is listed here as a task for an operator instead of a silent failure.</Notice>
+    {totals && <div className="stat-row"><div className="stat-card"><span className="eyebrow">PEOPLE</span><strong>{totals.people}</strong></div><div className="stat-card"><span className="eyebrow">TERMINALS</span><strong>{totals.terminals}</strong></div><div className="stat-card"><span className="eyebrow">IN STEP</span><strong>{totals.synced}</strong></div><div className="stat-card"><span className="eyebrow">PENDING</span><strong>{totals.pending}</strong></div><div className="stat-card"><span className="eyebrow">NEEDS AN OPERATOR</span><strong>{totals.manual}</strong></div><div className="stat-card"><span className="eyebrow">NOT YET SENT</span><strong>{totals.missing}</strong></div></div>}
+    <h3>Terminals</h3>
+    {devices.length === 0 ? <p className="presence-hint">No access-control device is configured yet. Add one under <strong>Terminals &amp; devices</strong> and connect it to a bridge.</p> : <div className="device-sync-grid">{devices.map((device) => <article key={String(device.id)} className="form-card sync-card">
+      <strong>{String(device.name)}</strong>
+      <small>{String(device.gate_name || '')} · doors {Array.isArray(device.doorNumbers) ? (device.doorNumbers as number[]).join(', ') : '1'}</small>
+      {device.hasAgent
+        ? <small className="capabilities">Bridge can write: {(Array.isArray(device.agentCapabilities) && (device.agentCapabilities as string[]).length ? (device.agentCapabilities as string[]) : ['card','door']).join(', ')}</small>
+        : <small className="capabilities warning">No bridge linked — every change here is a task for an operator.</small>}
+      <span className="sync-counts">{String(device.synced)} in step · {String(device.pending)} pending · {String(device.manual)} manual · {String(device.missing)} not sent</span>
+    </article>)}</div>}
+    <h3>People</h3>
+    <ListState list={overview as unknown as ReturnType<typeof useList>}><DataTable rows={overview.data?.people ?? []} columns={[['name','Person'],['employeeNo','Employee no'],['status','Status'],['cards','Cards'],['fingerprints','Fingers']]} action={(row) => <div className="row-actions">
+      <button className="text" onClick={() => syncPerson(row)} disabled={busy === String(row.id)}>{busy === String(row.id) ? 'Working…' : 'Sync now'}</button>
+      <button className="text danger" onClick={() => removeFromDevices(row)} disabled={busy === String(row.id)}>Remove from devices</button>
+    </div>} /></ListState>
+    {overview.data?.people?.length === 0 && <p className="presence-hint">Nobody holds a card or fingerprint yet. Issue one under <strong>Cards &amp; fingerprints</strong> and it will be written to every terminal automatically.</p>}
+  </PagePanel>;
+}
+
 function Operations() {
   const [copyNotice, copy] = useCopy();
   const list = useList('/api/access/operations?limit=100');
@@ -2335,6 +2456,70 @@ function EvidenceButton({ entityType,entityId,count }: { entityType:string;entit
   return <><button className="text" onClick={open}>Proof ({total})</button>{(files||error)&&<div className="modal-backdrop" role="dialog" aria-modal="true"><section className="notice-modal evidence-modal"><p className="eyebrow">SUPPORTING EVIDENCE</p><h2>Uploaded proof</h2>{error&&<Notice tone="error">{error}</Notice>}{files?.map((file)=><a className="evidence-link" key={String(file.storage_key)} href={`/api/files/${encodeURIComponent(String(file.storage_key))}`}>{String(file.original_name)} <small>{Math.ceil(Number(file.size_bytes)/1024)} KB</small></a>)}{files?.length===0&&<p>No accessible files were found.</p>}<button className="secondary wide" onClick={()=>{setFiles(null);setError('');}}>Close</button></section></div>}</>;
 }
 
+/**
+ * Watches one fingerprint capture until the reader answers.
+ *
+ * The operator is standing at a terminal with a person in front of them, so the
+ * page has to say what is happening second by second: the reader is armed, the
+ * finger has been read, the template is on its way to the other terminals. When
+ * the firmware cannot do it, the same panel says so and names the fallback
+ * instead of showing an unexplained failure.
+ */
+function FingerprintCapture({ captureId, onFinished, onCancel }: {
+  captureId: string;
+  onFinished: (status: 'captured'|'failed'|'cancelled'|'expired', capture: Row) => void;
+  onCancel: () => void;
+}) {
+  const [capture, setCapture] = useState<Row | null>(null);
+  const [stopped, setStopped] = useState(false);
+  // A read finger is finished, but the template is still travelling to the other
+  // terminals; keep watching for a short while so the operator sees where it
+  // landed instead of a last frame that says "sending".
+  const settlePolls = useRef(0);
+  useEffect(() => {
+    if (stopped) return;
+    let active = true;
+    const tick = () => {
+      api<Row>(`/api/access/fingerprints/captures/${captureId}`).then((value) => {
+        if (!active) return;
+        setCapture(value);
+        const status = String(value.status);
+        if (status === 'captured') {
+          const uploads = (value.uploads as Array<Row> | undefined) ?? [];
+          const settling = uploads.some((row) => row.status === 'pending' || row.status === 'sent');
+          if (settling && settlePolls.current < 15) { settlePolls.current += 1; return; }
+        }
+        if (status !== 'pending') {
+          setStopped(true);
+          onFinished(status as 'captured'|'failed'|'cancelled'|'expired', value);
+        }
+      }).catch(() => undefined);
+    };
+    tick();
+    const timer = window.setInterval(tick, 2000);
+    return () => { active = false; window.clearInterval(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [captureId, stopped]);
+  async function cancel() {
+    setStopped(true);
+    try { await api(`/api/access/fingerprints/captures/${captureId}/cancel`, { method: 'POST' }); } catch { /* the capture may already be finished */ }
+    onCancel();
+  }
+  const status = String(capture?.status ?? 'pending');
+  const uploads = (capture?.uploads as Array<Row> | undefined) ?? [];
+  return <section className={`enrollment-session ${status === 'captured' ? 'captured' : status === 'pending' ? '' : 'failed'}`}>
+    <p className="eyebrow">FINGERPRINT CAPTURE</p>
+    <h3>{status === 'pending' ? `Waiting for ${String(capture?.personName ?? 'the person')} to touch the reader…` : status === 'captured' ? 'Fingerprint read' : status === 'failed' ? 'Capture failed' : 'Capture stopped'}</h3>
+    <p>{status === 'pending'
+      ? <>The terminal’s own reader is armed. Ask <strong>{String(capture?.personName ?? 'the person')}</strong> to place finger <strong>{String(capture?.fingerNo ?? '')}</strong> on the glass. Nothing is typed on the terminal.</>
+      : status === 'captured'
+        ? <>{String(capture?.personName ?? 'The person')}’s template was read and is being written to the other terminals: {uploads.length ? uploads.map((row) => String(row.device_name)).join(', ') : 'no other terminal needs it'}.</>
+        : String(capture?.error ?? 'The terminal did not return a fingerprint.')}</p>
+    {uploads.length > 0 && <ul className="capture-uploads">{uploads.map((row, index) => <li key={index}>{String(row.device_name)} — {row.status === 'applied' ? 'written' : row.status === 'pending' || row.status === 'sent' ? 'sending' : row.status === 'manual_action_required' ? 'needs an operator on the terminal' : `failed: ${String(row.error_message ?? 'unknown reason')}`}</li>)}</ul>}
+    <div className="row-actions">{status === 'pending' && <button className="secondary" onClick={cancel}>Stop waiting</button>}{status !== 'pending' && <button className="secondary" onClick={onCancel}>Close</button>}</div>
+  </section>;
+}
+
 function useList(url: string) {
   return useAsync<ListResponse<Row>>(() => api(url), [url]);
 }
@@ -2419,7 +2604,7 @@ function initials(name: string): string { return name.split(/\s+/).slice(0,2).ma
 function navIcon(section: Section): string {
   return ({
     dashboard: '◫',
-    cards: '▤', events: '⌁', devices: '▣', remote: '◎', isapi: '⧉', operations: '↻',
+    cards: '▤', events: '⌁', devices: '▣', remote: '◎', isapi: '⧉', operations: '↻', sync: '⇄',
     residents: '●', residency: '♙', dependants: '♟', staff: '✦',
     properties: '⌂', bills: '₦', maintenance: '◇', bookings: '▦', notices: '!', emergency: '✚',
     visitors: '↔',

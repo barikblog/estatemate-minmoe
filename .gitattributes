@@ -1,0 +1,6 @@
+# Windows shell files are checked out with CRLF — cmd.exe is unhappy with
+# LF-only batch files around labels and parenthesised blocks, and the installer
+# kit ships these files to a Windows PC verbatim — while the repository itself
+# keeps LF, so diffs and the PowerShell linter stay sane.
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

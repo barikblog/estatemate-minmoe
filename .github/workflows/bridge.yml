@@ -27,6 +27,7 @@ on:
       - 'scripts/package-windows-bundle.mjs'
       - 'scripts/lib/**'
       - 'scripts/package-bridge-exe.mjs'
+      - 'scripts/package-bridge-msi.mjs'
       - 'scripts/bridge-exe-smoke-test.mjs'
       - 'scripts/build-bridge-apk.py'
       - 'scripts/verify-android-apk.py'
@@ -82,6 +83,7 @@ jobs:
           node --check windows-agent/agent.mjs
           node --check windows-agent/install-windows.mjs
           node --check scripts/package-windows-bundle.mjs
+          node --check scripts/package-bridge-msi.mjs
           node --check scripts/cloudflared-remote-access.mjs
           python3 -m py_compile scripts/verify-android-apk.py scripts/lint-powershell.py
 
@@ -96,6 +98,8 @@ jobs:
           node scripts/package-windows-bundle.mjs \
             --out "$RUNNER_TEMP/lint-bundle" --version lint --commit "$GITHUB_SHA" >/dev/null
           python3 scripts/lint-powershell.py \
+            bridge-apps/windows/msi/install-bridge.ps1 \
+            bridge-apps/windows/dashboard/EstateMateBridge.ps1 \
             "$RUNNER_TEMP/lint-bundle/install-service.ps1" \
             "$RUNNER_TEMP/lint-bundle/uninstall-service.ps1"
 
@@ -114,6 +118,54 @@ jobs:
           test -f "$RUNNER_TEMP/bundle-dryrun/agent-core.mjs"
           test -f "$RUNNER_TEMP/bundle-dryrun/estatemate-isapi-agent.cmd"
           echo "::notice::Packer dry-run staged the bundle successfully on ubuntu-latest."
+
+      # The MSI packer cannot run candle/light here, but --dry-run assembles the
+      # whole output stage (kit scripts, dashboard staging, SHA256SUMS,
+      # READ-ME-FIRST, the zip, BUILD-INFO) around a placeholder MSI. That is
+      # exactly how a missing function or a stale path in there gets caught in
+      # seconds on ubuntu instead of in the windows-latest job.
+      - name: Dry-run the MSI packer and inspect the kit
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The dry-run kit is assembled under os.tmpdir(); pin that to the
+          # runner temp directory so the check below knows where to look.
+          export TMPDIR="$RUNNER_TEMP"
+          head -c 8192 /dev/urandom > "$RUNNER_TEMP/fake-bridge.exe"
+          node scripts/package-bridge-msi.mjs \
+            --dry-run \
+            --exe "$RUNNER_TEMP/fake-bridge.exe" \
+            --out "$RUNNER_TEMP/msi-dryrun" \
+            --version 0.0.1 \
+            --commit "$GITHUB_SHA"
+          python3 - "$RUNNER_TEMP" <<'PY'
+          import json, sys, zipfile
+          from pathlib import Path
+          temp = Path(sys.argv[1])
+          built = sorted(temp.glob('estatemate-bridge-msi-dry-*/estatemate-bridge-0.0.1-win-x64-installer-kit.zip'))
+          if not built:
+              raise SystemExit('the MSI dry-run produced no installer kit')
+          kit = built[-1]
+          with zipfile.ZipFile(kit) as archive:
+              names = archive.namelist()
+          expected = {
+              'estatemate-bridge-0.0.1-win-x64.msi',
+              'Install-EstateMate-Bridge.cmd',
+              'install-bridge.ps1',
+              'dashboard/EstateMateBridge.exe',
+              'dashboard/EstateMateBridge.ps1',
+              'dashboard/EstateMateBridge.cmd',
+              'SHA256SUMS.txt',
+              'READ-ME-FIRST.txt',
+          }
+          if set(names) != expected:
+              raise SystemExit(f'kit contents unexpected: {names}')
+          info = json.loads((kit.parent / 'BUILD-INFO.json').read_text())
+          dashboard = info.get('dashboard') or {}
+          if not dashboard.get('launcherSha256'):
+              raise SystemExit('BUILD-INFO.json has no dashboard block')
+          print(f"::notice::MSI dry-run kit OK: {len(names)} files, dashboard launcher {dashboard['launcherSha256'][:16]}...")
+          PY
 
   # --------------------------------------------------------------------------
   # Windows agent bundle. Runs on windows-latest so node.exe integrity can be
@@ -656,6 +708,215 @@ jobs:
         shell: bash
         run: node scripts/bridge-exe-smoke-test.mjs --exe exe/estatemate-bridge-win-x64.exe
 
+      # The exe is a console tool, not an installer: double-clicking it flashes
+      # a window and closes, which reads as "it is not installing". The MSI is
+      # the real install, and the installer kit is what a PC that will not let
+      # an MSI finish actually runs: it verifies the download, keeps a verbose
+      # log, explains the exit code and falls back to a per-user install.
+      # Built with the WiX Toolset v3 this runner ships preinstalled.
+      - name: Build the MSI installer and the installer kit
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          case "$VERSION" in bridge-*) VERSION="${VERSION#bridge-}" ;; *) VERSION="0.2.0" ;; esac
+          node scripts/package-bridge-msi.mjs \
+            --exe exe/estatemate-bridge-win-x64.exe \
+            --out msi \
+            --version "$VERSION" \
+            --commit "$GITHUB_SHA"
+
+      # Prove the installer the way a user experiences it: install the MSI
+      # silently, smoke-test the executable from its installed location, then
+      # uninstall and check that everything is gone. Runners are admin, so the
+      # per-machine install needs no elevation dance.
+      - name: Install the MSI and smoke-test the installed executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Get-ChildItem -Path msi -Filter '*.msi' | Select-Object -First 1).FullName
+          Write-Host "Installing $msi"
+          $installLog = Join-Path $env:RUNNER_TEMP 'msi-install.log'
+          $install = Start-Process msiexec.exe -ArgumentList @('/i', "`"$msi`"", '/qn', "/l*v `"$installLog`"") -Wait -PassThru
+          if ($install.ExitCode -ne 0 -and $install.ExitCode -ne 3010) {
+            if (Test-Path $installLog) { Get-Content $installLog -Tail 40 | Write-Host }
+            throw "MSI install failed with exit code $($install.ExitCode)"
+          }
+
+          $installed = 'C:\Program Files\EstateMate Bridge\estatemate-bridge.exe'
+          if (-not (Test-Path $installed)) { throw "installed executable missing: $installed" }
+          Write-Host "Installed executable present: $installed"
+          & $installed version
+
+          # The full agent flow (fake Worker + fake terminal) against the copy
+          # the MSI actually installed.
+          node scripts/bridge-exe-smoke-test.mjs --exe $installed
+
+          # The PATH append: the current shell keeps its old environment, so
+          # read what the installer wrote instead of waiting for a new shell.
+          $machinePath = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment').PATH
+          if ($machinePath -notlike '*EstateMate Bridge*') { throw 'install directory missing from the machine PATH' }
+          $appPaths = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\estatemate-bridge.exe' -ErrorAction SilentlyContinue).'(default)'
+          if (-not $appPaths) { throw 'App Paths registry value missing' }
+          Write-Host "PATH and App Paths entries verified."
+
+          # The dashboard is the install people actually use: the Start Menu
+          # entry must exist, its launcher must be in Program Files next to the
+          # bridge, and running it the way the shortcut does must pass its own
+          # self-test (window builds, status --json parses, terminal table maps
+          # to the setup JSON) without a console window.
+          $dashboard = 'C:\Program Files\EstateMate Bridge\EstateMateBridge.exe'
+          $dashboardScript = 'C:\Program Files\EstateMate Bridge\EstateMateBridge.ps1'
+          foreach ($file in @($dashboard, $dashboardScript)) {
+            if (-not (Test-Path $file)) { throw "dashboard file missing after install: $file" }
+          }
+          $startMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\EstateMate Bridge'
+          $shortcut = Join-Path $startMenu 'EstateMate Bridge.lnk'
+          if (-not (Test-Path $shortcut)) { throw "Start Menu shortcut missing: $shortcut" }
+
+          # Annotate the failure text: the job log archive is not readable from
+          # this project's dev sandbox, annotations are.
+          function Esc([string] $text) {
+            return (($text -replace '%', '%25') -replace "`r", '%0D') -replace "`n", '%0A'
+          }
+          # The launcher is a GUI program, so it does not write to this console:
+          # it mirrors the dashboard's output into %TEMP% when it is given
+          # arguments, and that file is what a failure has to quote.
+          $selftestLog = Join-Path $env:TEMP 'estatemate-dashboard-last-run.txt'
+          Remove-Item -LiteralPath $selftestLog -Force -ErrorAction SilentlyContinue
+          & $dashboard -SelfTest | Out-Null
+          $code = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+          $output = ''
+          if (Test-Path -LiteralPath $selftestLog) { $output = [string](Get-Content -LiteralPath $selftestLog -Raw) }
+          Write-Host $output
+          if ($code -ne 0) {
+            Write-Host "::error title=dashboard-selftest::$($(Esc $output))"
+            throw "the installed dashboard failed its self-test (exit code $code)"
+          }
+          Write-Host 'Start Menu shortcut and the installed dashboard self-test verified.'
+
+          $removeLog = Join-Path $env:RUNNER_TEMP 'msi-uninstall.log'
+          $remove = Start-Process msiexec.exe -ArgumentList @('/x', "`"$msi`"", '/qn', "/l*v `"$removeLog`"") -Wait -PassThru
+          if ($remove.ExitCode -ne 0 -and $remove.ExitCode -ne 3010) {
+            if (Test-Path $removeLog) { Get-Content $removeLog -Tail 40 | Write-Host }
+            throw "MSI uninstall failed with exit code $($remove.ExitCode)"
+          }
+          if (Test-Path $installed) { throw 'executable still present after uninstall' }
+          Write-Host 'MSI install, installed-executable smoke test and uninstall all passed.'
+
+      # The kit is what a person downloads. Unzip it, double-click what is
+      # inside, and it must install - and, given a broken copy of the MSI, it
+      # must say the download is incomplete instead of failing mysteriously.
+      # Then the fallback: a per-user install that uses no Windows Installer at
+      # all, which is the escape hatch when an MSI cannot complete on a real PC.
+      - name: Install through the installer kit, then uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # The job log archive is not retrievable from this project's dev
+          # sandbox, so every failure in here reports itself as an annotation -
+          # the one channel that is always readable.
+          function Invoke-BridgeScript([string[]] $arguments) {
+            $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass @arguments 2>&1
+            $code = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            return [pscustomobject]@{ Code = $code; Output = ($output -join "`n") }
+          }
+          # Workflow commands need their own escaping: a raw newline in an
+          # ::error:: message truncates it, and this project reads failures
+          # through annotations because the job log archive is unreachable.
+          function Esc([string] $text) {
+            return (($text -replace '%', '%25') -replace "`r", '%0D') -replace "`n", '%0A'
+          }
+          function Stop-KitCheck([string] $message) { throw $message }
+
+          try {
+            $kitZip = (Get-ChildItem -Path msi -Filter '*installer-kit.zip' | Select-Object -First 1).FullName
+            Write-Host "Kit: $kitZip"
+            Expand-Archive -LiteralPath $kitZip -DestinationPath kit -Force
+            $kitDir = (Resolve-Path 'kit').Path
+            foreach ($expected in @('Install-EstateMate-Bridge.cmd', 'install-bridge.ps1', 'SHA256SUMS.txt', 'READ-ME-FIRST.txt')) {
+              if (-not (Test-Path (Join-Path $kitDir $expected))) { Stop-KitCheck "the kit is missing $expected" }
+            }
+            $kitMsi = (Get-ChildItem -Path $kitDir -Filter '*.msi' | Select-Object -First 1).FullName
+            $bridgeScript = Join-Path $kitDir 'install-bridge.ps1'
+            $installed = 'C:\Program Files\EstateMate Bridge\estatemate-bridge.exe'
+
+            # 1. The all-users install, through the launcher, exactly as a person runs it.
+            $installer = Join-Path $kitDir 'Install-EstateMate-Bridge.cmd'
+            $launcherOutput = & cmd.exe /c "`"$installer`" -Silent -NoPause" 2>&1
+            $launcherCode = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            Write-Host ($launcherOutput -join "`n")
+            if ($launcherCode -ne 0) { Stop-KitCheck "the kit launcher failed with exit code $launcherCode; it said: $(Esc ($launcherOutput -join "`n"))" }
+            if (-not (Test-Path $installed)) { Stop-KitCheck 'the kit launcher did not install the executable' }
+            & $installed version
+            Write-Host 'The kit launcher installed the MSI.'
+
+            $remove = Start-Process msiexec.exe -ArgumentList @('/x', "`"$kitMsi`"", '/qn') -Wait -PassThru
+            if ($remove.ExitCode -ne 0 -and $remove.ExitCode -ne 3010) { Stop-KitCheck "uninstall failed with exit code $($remove.ExitCode)" }
+            if (Test-Path $installed) { Stop-KitCheck 'the executable survived the uninstall' }
+
+            # 2. A truncated MSI must be named as such (exit 3), not attempted.
+            # Slice with a FileStream: indexing a 33 MB byte[] into a PowerShell
+            # array would build 33 million objects.
+            $brokenDir = Join-Path $env:RUNNER_TEMP 'broken-kit'
+            New-Item -ItemType Directory -Force -Path $brokenDir | Out-Null
+            Copy-Item (Join-Path $kitDir 'SHA256SUMS.txt') $brokenDir -Force
+            $brokenMsi = Join-Path $brokenDir (Split-Path -Leaf $kitMsi)
+            $source = [System.IO.File]::OpenRead($kitMsi)
+            try {
+              $keep = $source.Length - 1048576
+              $buffer = New-Object byte[] $keep
+              $read = $source.Read($buffer, 0, [int]$keep)
+              [System.IO.File]::WriteAllBytes($brokenMsi, $buffer[0..($read - 1)])
+            } finally {
+              $source.Close()
+            }
+            $broken = Invoke-BridgeScript @('-File', $bridgeScript, '-MsiPath', $brokenMsi, '-NoFallback', '-Silent', '-NoPause')
+            Write-Host "truncated-MSI run said: $($broken.Output)"
+            if ($broken.Code -ne 3) { Stop-KitCheck "a truncated MSI must be refused with exit code 3, got $($broken.Code); it said: $(Esc $broken.Output)" }
+            if (Test-Path $installed) { Stop-KitCheck 'the truncated MSI was installed anyway' }
+            Write-Host 'A truncated MSI is refused with the checksum message.'
+
+            # 3. The per-user fallback: no Windows Installer, no administrator rights.
+            $perUserExe = Join-Path $env:LOCALAPPDATA 'Programs\EstateMate Bridge\estatemate-bridge.exe'
+            $perUser = Invoke-BridgeScript @('-File', $bridgeScript, '-PerUser', '-Silent', '-NoPause')
+            Write-Host ($perUser.Output -join "`n")
+            if ($perUser.Code -ne 0) { Stop-KitCheck "the per-user install failed with exit code $($perUser.Code); it said: $(Esc $perUser.Output)" }
+            if (-not (Test-Path $perUserExe)) { Stop-KitCheck "the per-user install left no executable at $perUserExe" }
+            & $perUserExe version
+            $appPaths = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\estatemate-bridge.exe' -ErrorAction SilentlyContinue).'(default)'
+            if (-not $appPaths) { Stop-KitCheck 'the per-user install wrote no App Paths entry' }
+            if (-not (Test-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\EstateMate Bridge'))) {
+              Stop-KitCheck 'the per-user install wrote no Start Menu shortcuts'
+            }
+            # The fallback keeps the dashboard when the kit carried one: this
+            # install must not be the shape that still opens a console window.
+            $perUserDashboard = Join-Path $env:LOCALAPPDATA 'Programs\EstateMate Bridge\EstateMateBridge.exe'
+            $perUserShortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\EstateMate Bridge\EstateMate Bridge.lnk'
+            if (-not (Test-Path $perUserDashboard)) { Stop-KitCheck "the per-user install left no dashboard at $perUserDashboard" }
+            if (-not (Test-Path $perUserShortcut)) { Stop-KitCheck "the per-user install wrote no dashboard shortcut at $perUserShortcut" }
+            & $perUserDashboard -SelfTest | Out-Null
+            $selftest = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            if ($selftest -ne 0) { Stop-KitCheck "the per-user dashboard failed its self-test (exit code $selftest)" }
+            Write-Host 'The per-user install works without Windows Installer, with the dashboard.'
+
+            $perUserRemove = Invoke-BridgeScript @('-File', $bridgeScript, '-Uninstall', '-Silent', '-NoPause')
+            if ($perUserRemove.Code -ne 0) { Stop-KitCheck "the per-user uninstall failed with exit code $($perUserRemove.Code); it said: $(Esc $perUserRemove.Output)" }
+            if (Test-Path $perUserExe) { Stop-KitCheck 'the per-user uninstall left the executable behind' }
+            if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\EstateMateBridge') {
+              Stop-KitCheck 'the per-user uninstall left the Installed apps entry behind'
+            }
+            Write-Host 'Installer kit: install, checksum guard and per-user fallback all verified.'
+          } catch {
+            Write-Host "::error title=installer-kit::$($_.Exception.Message)"
+            exit 1
+          }
+
       - name: Upload the executable
         uses: actions/upload-artifact@v4
         with:
@@ -666,6 +927,20 @@ jobs:
             exe/SHA256SUMS.txt
             exe/BUILD-INFO.json
             exe/README.txt
+
+      - name: Upload the MSI installer and kit
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-msi
+          if-no-files-found: error
+          path: |
+            msi/*.msi
+            msi/*-installer-kit.zip
+            msi/Install-EstateMate-Bridge.cmd
+            msi/install-bridge.ps1
+            msi/READ-ME-FIRST.txt
+            msi/SHA256SUMS.txt
+            msi/BUILD-INFO.json
 
   # --------------------------------------------------------------------------
   # The Android bridge APK: no Gradle, no AndroidX, no Kotlin. aapt2 + javac +
@@ -826,20 +1101,29 @@ jobs:
             echo "Built from commit \`${GITHUB_SHA}\`."
             echo
             echo "### Artifacts"
+            echo "- **Windows installer kit** (\`estatemate-bridge-*-win-x64-installer-kit.zip\`) - unzip it and double-click **Install-EstateMate-Bridge.cmd**. That is the recommended install: it checks the MSI against its checksum, keeps a verbose installer log, says in plain English what an exit code means, and - if Windows will not let the MSI finish - installs the bridge for the current user under \`%LOCALAPPDATA%\\Programs\\EstateMate Bridge\` without using Windows Installer and without needing administrator rights."
+            echo "- **Windows bridge MSI** (\`estatemate-bridge-*-win-x64.msi\`) - the all-users installer on its own: double-click it, and the bridge lands in Program Files with **Start Menu -> EstateMate Bridge**, which opens the dashboard - a normal window for the agent id/secret, the terminals, the check and \"Start at boot\". No console, nothing to type. \`estatemate-bridge\` still goes on the PATH, and the uninstaller is in Settings -> Apps."
             echo "- **Windows bridge exe** (\`estatemate-bridge-win-x64.exe\`) - one file: no Node.js install and nothing to unzip. Run \`estatemate-bridge-win-x64.exe setup\`, then \`check\`, then \`install-service\`."
             echo "- **Android bridge APK** (\`estatemate-bridge-*.apk\`) - install on a phone or tablet on the same LAN as the terminals; the bridge runs in a foreground service and restarts after a reboot."
             echo "- **Windows agent bundle** (\`estatemate-isapi-agent-win-x64-*.zip\`) - self-contained; ships its own Node.js runtime, so the estate PC needs no Node.js install."
             echo "- **Android APK** (\`estatemate-android-*-debug.apk\`, plus \`-release.apk\` when signing secrets are configured)."
             echo "- Checksums for each artifact family, as \`SHA256SUMS.txt\` - qualified with the family name where two would otherwise collide, since release asset names are flat."
             echo
-            echo "### Setup wizard"
-            echo "The executable carries the interactive **setup wizard** (\`estatemate-bridge.exe setup\`): it reads the portal's **Download setup** script (\`--from-installer\`, or \`--from-installer -\` on stdin), adds each Hikvision terminal with a reachability test while you are still on site, and writes \`agent-config.json\` / \`isapi-devices.json\` with administrator-only permissions."
+            echo "### Two ways to configure, same commands"
+            echo "The **dashboard** in the Start Menu is the normal way: *Configuration* takes the portal's **Download setup** script (or the agent id, secret and Worker URL typed by hand) and the terminals as a table, *Status -> Run check* proves the Worker and every terminal, and *Service -> Start at boot* registers the boot task (Windows asks for the elevation)."
+            echo
+            echo "The executable still carries the interactive **setup wizard** (\`estatemate-bridge.exe setup\`): it reads the portal's **Download setup** script (\`--from-installer\`, or \`--from-installer -\` on stdin), adds each Hikvision terminal with a reachability test while you are still on site, and writes \`agent-config.json\` / \`isapi-devices.json\` with administrator-only permissions. \`setup --agent-id <uuid> --agent-secret <secret> [--worker-url <url>]\` does the same without prompting - that is what the dashboard uses."
             echo
             echo "On a PC with no configuration yet, **double-clicking the executable starts the wizard** - it explains the missing configuration instead of failing with a path. Only a bare double-click does this: any command or option (\`run\`, \`--data-dir\`, \`--no-prompt\`, \`--quiet\`, \`--json\`), a Scheduled Task, a service or a pipe keeps the previous behaviour, so nothing unattended is ever left waiting for an answer."
             echo
-            echo "Every release is smoke-tested end to end on Windows before it is published, the wizard included: \`setup --no-prompt --from-installer\` by path and from stdin, the content of both files it writes, that the one-time agent secret is never echoed, and that an unconfigured executable with no console refuses instead of prompting."
+            echo "Every release is smoke-tested end to end on Windows before it is published, the wizard and the dashboard included: \`setup --no-prompt --from-installer\` by path and from stdin, \`setup --agent-id/--agent-secret\`, the content of both files it writes, that the one-time agent secret is never echoed, that an unconfigured executable with no console refuses instead of prompting, and that the MSI-installed dashboard passes its own self-test from Program Files (and in the kit's per-user install)."
             echo
-            echo "### Windows install"
+            echo "### If the installer stops at \"Gathering information\""
+            echo "An installer window that says \"Gathering information...\" and then disappears installs nothing and shows no error. That is almost never the package: it is antivirus or endpoint security ending \`msiexec\`, a policy on a managed PC, a Windows Installer service that cannot be reached, or an MSI that did not finish downloading."
+            echo ""
+            echo "Unzip the installer kit and double-click **Install-EstateMate-Bridge.cmd** instead of the MSI directly. It names the cause, writes the log next to the MSI, and falls back to the per-user install, which needs no administrator rights and no Windows Installer."
+            echo ""
+            echo "### Windows agent bundle"
             echo "Unzip to \`C:\\EstateMate\\ISAPI-Agent\`, then in an Administrator PowerShell:"
             echo
             echo '```powershell'

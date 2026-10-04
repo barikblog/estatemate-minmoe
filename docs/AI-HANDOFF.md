@@ -1,5 +1,365 @@
 # AI handoff — EstateMate
 
+## People and fingerprints now reach the terminal itself (2026-10-04)
+
+Requested as: **"add feature for all users data on the portal to be auto
+synchronised to the access controls, remove from device, edit, suggest more. let
+the add finger print feature to be able to scan it from a seleted device (it
+should truely work. use this pdf file link as guide.
+https://raw.githubusercontent.com/loozhengyuan/hikvision-sdk/master/resources/isapi.pdf"**
+
+Until this change set the credential side of access control was one-directional
+in the worst way: cards were pushed, but the **person** a card belongs to was
+never written, and a fingerprint could only ever be an operator task on the
+terminal's own menu. Both are now automated, with the manual task kept as the
+honest answer for firmware that refuses the API.
+
+### Portal
+
+- **Person sync** (new left-hand section, id `sync`): a totals strip (people,
+  terminals, in step, waiting, manual, missing), one card per terminal showing
+  the agent gate, the capabilities that terminal's bridge advertises and the
+  synced/pending/manual/missing counts, and the people table with *Sync now*
+  (one person or the whole estate) and **Remove from devices** (person and
+  credentials, or the whole terminal copy). It answers the one question an
+  operator has after adding somebody: *is this person actually on the gate?*
+- **Add fingerprint now reads the finger from a chosen terminal.**
+  `POST /api/access/fingerprints/capture` names the person, the finger slot and
+  the terminal in front of the operator. The bridge arms that terminal's own
+  reader — nothing is typed on the keypad and nobody navigates the terminal menu
+  — the template comes back, is stored against the fingerprint credential, and
+  is fanned out to every other terminal that can take one. The Cards page and
+  the per-person **Cards & fingerprints** panel both use it, and both keep a
+  *Record without scanning* path for a finger enrolled on the terminal's own
+  menu.
+- The capture panel polls the capture and shows the states that matter:
+  *waiting for a finger*, *captured*, *the terminal refused it* (in the
+  terminal's own words) and, per terminal, where the template went.
+
+### Worker
+
+- **Migration `0019_person_sync_and_fingerprint_capture.sql`**: `device_operations`
+  rebuilt again (now also `user_id`, `household_member_id`, `capture_id`,
+  `result_json`; the operation CHECK covers the new person/fingerprint kinds),
+  `isapi_agents.capabilities`, `fingerprint_captures` (status
+  pending/captured/failed/cancelled/expired, `template_data`, `expires_at`) and
+  `device_person_state`.
+- **`src/device-sync.ts`** is the queueing brain: a person (employee number,
+  name, door rights) is written before any credential that names them; a
+  credential edit re-sends the person when the name changed and nothing when it
+  did not; removal deletes the person, which is what takes the cards and
+  fingerprints with it. `agentCan(device, capability)` gates all of it: an agent
+  that advertises nothing is a pre-0.3.0 bridge and keeps receiving card,
+  visitor and door work only, while person/fingerprint work becomes an operator
+  task instead of being dropped.
+- **API**: `GET /api/device-sync` (the overview the page renders),
+  `POST /api/device-sync/people` (`scope:'all'|'people'`, optional
+  `includeCredentials`, device subset), `POST /api/device-sync/remove`
+  (`fullRemoval`), the capture start/poll/cancel routes, plus
+  `POST /api/access/fingerprints/:id/sync` and
+  `POST /api/access/fingerprints/:id/remove-from-device`. Sync and removal are
+  Administrator/Manager; reads are Security too.
+- **Capture pipeline**: the operation carries only the *request* (finger 1–10 on
+  one terminal, claimed for 10 minutes and re-armed by the bridge every 5 s). The
+  template travels **once**, in the machine feed to the claiming agent, and is
+  never in a URL, a log line or a portal response (`hasTemplate` is a boolean).
+  A 180-second delivery TTL and the last-terminal rule keep it from sitting in
+  the database: once every terminal that can take the template has it — or the
+  only terminal has — the template is dropped, and a failure at the last
+  terminal is converted into an `enroll_fingerprint` task naming the slot and
+  employee number.
+- **Edit** is not a second code path: renaming a person, changing a card or
+  re-enrolling a finger queues the person/credential update for every enabled
+  terminal and the overview grid derives each person's state from the queued,
+  applied and failed rows (`refreshDevicePersonState`) rather than asserting it.
+
+### Bridge (agent `0.3.0`, i.e. the next `bridge-*` tag)
+
+`isapi-bridge/agent.mjs` gained the person/fingerprint half of the ISAPI
+surface, all JSON-first with the XML form only when the JSON URL is unsupported:
+`UserInfo/Record` → `Modify` → `SetUp` for a person (always with `doorRight` and
+`RightPlan` — a person stored without them authenticates and opens nothing),
+`UserInfoDetail/Delete` with a `UserInfo/Delete` fallback for removal,
+`FingerPrint/SetUp` for upload *and* slot delete, and `CaptureFingerPrint` for a
+live read. The heartbeat now advertises probed capabilities, cached for ten
+minutes and refreshed in the background so the probe can never hold up the
+heartbeat (that mistake broke the alertStream resolution test once; see
+`capabilitiesForHeartbeat()`).
+
+`isapi-bridge/agent.person-fingerprint.integration.mjs` is the proof: a
+simulated terminal with the exact JSON flavour of every endpoint, and ten checks
+covering the person body, the terminal's refusal of a card for an unknown
+person (so the person must be written first), rename via `Modify`, full removal
+and the fallback, template upload and slot delete, capture with the retry loop,
+unsupported-firmware messages, the capability probe plus its cache, and both
+template flavours. It runs in `npm test`.
+
+**Honest limits.** The AccessControl person/fingerprint URIs are *not* in the
+General Application ISAPI PDF the request pointed at — that document covers the
+`alertStream`, digest and XML plumbing; the URIs come from Hikvision's own
+access-control (TPP) material and matches what the terminals answer in the
+integration simulation. Real firmware still decides: a terminal that does not
+implement `CaptureFingerPrint` (or `FingerPrint/SetUp`) refuses the call, the
+bridge reports the terminal's words, the portal says the finger must be enrolled
+on the terminal, and the manual task stays. `bridge-0.2.8` — the release a PC
+installs today — predates this section, so until the next tag it receives card,
+visitor and door work only and every person/fingerprint item stays a manual task.
+The cloudflared kit, the MSI and the Android bridge are unchanged by this phase.
+
+
+## The MSI now installs a dashboard, not a console window (2026-10-04)
+
+Reported as: "thank you the msi file installed but it uses cmd, powerchell,
+please change it to normal user interface/dashboard for configuratio and start
+bridge".
+
+Fair reading of what shipped in 0.2.6/0.2.7: the MSI gave the console tool a real
+install, but every Start Menu entry opened `cmd /K estatemate-bridge ...`, so
+configuring the agent and starting the bridge still meant reading console output
+and typing commands. For the person who runs an estate PC that is the wrong
+shape.
+
+What is in this change set:
+
+- **`bridge-apps/windows/dashboard/EstateMateBridge.ps1`** — the window. WinForms
+  (`System.Windows.Forms`), so there is nothing to install and no browser and no
+  port: *Status* tab (activity + live log), *Configuration* tab (agent id,
+  secret, Worker URL, the portal's *Download setup* `.ps1`, and the Hikvision
+  terminals in an editable table), *Service* tab (*Start at boot* /
+  *Remove from boot*), toolbar with *Start bridge*, *Stop bridge*, *Run check*,
+  *Open logs* and *Restart as administrator*. It contains **no configuration
+  logic**: every action runs the existing CLI (`status --json`,
+  `setup --no-prompt --no-verify --devices-json …`, `check`, `install-service`,
+  `uninstall-service`, `run`) and the elevation prompt is handled with
+  `Start-Process -Verb RunAs`. `-SelfTest` builds every control and loads the
+  real state headlessly.
+- **`bridge-apps/windows/dashboard/Launcher.cs` + `build-dashboard.cmd`** — the
+  Start Menu target: `EstateMateBridge.exe`, compiled as a **GUI** program
+  (`/target:winexe`) that runs the script with `-WindowStyle Hidden`, so no
+  console window ever appears. The build script uses a C# compiler the machine
+  already has (Visual Studio's Roslyn via `vswhere`, else the one in
+  `%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319`), so the Windows runner
+  needs no SDK download. `EstateMateBridge.cmd` is the double-click launcher for
+  the kit/portable case.
+- **`bridge-apps/windows/msi/estatemate-bridge.wxs`** — new `BridgeDashboard`
+  component (exe + script + cmd) in the one feature, and the three `cmd /K`
+  shortcuts are replaced by a single *EstateMate Bridge* entry that opens the
+  dashboard. App Paths and the PATH append stay, because support and advanced
+  work still use the command line.
+- **`scripts/package-bridge-msi.mjs`** — stages the dashboard sources, compiles
+  the launcher with `build-dashboard.cmd`, passes the three files to candle
+  (`-dDashboardExeSource/-dDashboardScriptSource/-dDashboardLauncherSource`) and
+  records `dashboard {launcher, launcherSha256, script, compiled}` in
+  BUILD-INFO.json. `--dry-run` writes a placeholder launcher, so the whole
+  output stage still runs on Linux.
+- **`bridge-apps/windows/host/{setup,cli}.cjs`** — `setup` gained
+  `--agent-id`, `--agent-secret` and `--worker-url`: validation without prompts
+  (UUID agent id, ≥16-character secret, normalised Worker URL), which is what
+  lets the dashboard save the hand-typed form. The secret is still never
+  echoed, and `scripts/bridge-exe-smoke-test.mjs` (section 1d) proves it on the
+  built executable.
+- **`.github/workflows/bridge.yml`** — the MSI-install step now also asserts the
+  installed dashboard files and the Start Menu shortcut, then runs
+  `EstateMateBridge.exe -SelfTest` and reports a failure as an annotation (the
+  launcher mirrors its output to `%TEMP%\estatemate-dashboard-last-run.txt`,
+  which is what the annotation quotes). The validate job dry-runs the MSI packer
+  on ubuntu and inspects the kit, so a missing function or a stale path in the
+  packaging code fails in seconds instead of after the Windows job.
+
+Honest limits: the dashboard itself cannot be executed in the dev sandbox (no
+Windows, no PowerShell, no C# compiler). Local verification is `node --check`,
+an XML parse of the `.wxs`, the PowerShell linter and the packer's `--dry-run`;
+the real proof is the `windows-latest` job, which compiles the launcher and runs
+the self-test against the copy the MSI installed.
+
+What that Windows job found once the dashboard actually had to build — each one
+fixed, and each one is a self-test check now:
+
+- the terminal table set `EditMode = 'OnType'`, which is not a
+  `DataGridViewEditMode` on any .NET Framework, so `New-DashboardForm` threw and
+  the window never opened at all;
+- the elevated retry built its temp `.ps1` with cmd-style `\"` quoting, which
+  PowerShell does not understand: a `--devices-json` path under a user profile
+  with a space (`C:\Users\Estate Manager\…`) would have arrived as several
+  arguments. Values are single-quoted PowerShell literals with `'` doubled now;
+- the no-BOM check asserted on the `ConvertTo-Json` string (which cannot carry a
+  byte-order mark) and failed with no evidence. It now writes through
+  `Write-Utf8NoBom`, reads the first three bytes back and reports them, so it
+  tests the file `setup` actually parses.
+
+**`bridge-0.2.8`** (published 2026-10-04,
+<https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.2.8>)
+carries the dashboard and every other feature up to that tag in the MSI, the kit
+and the per-user install; the tag run's Windows job installs the MSI, runs the
+installed dashboard's self-test, installs through the kit, uninstalls and only
+then publishes. The person/fingerprint work documented in the section above
+landed **after** that tag, so it needs the next `bridge-*` release.
+
+## The Windows installer now explains itself and cannot dead-end (2026-10-04)
+
+Reported as: "the msi installer wont run complete on windows system, please fix
+and update the apk file also". Asked what the PC does, the person running it
+said: **"IT START INSTALLATION BY SAY GATHERING INFORMATION AND DISPEAR FROM
+THE SCREEN"** — the classic Windows Installer silent abort: the "Gathering
+information..." (costing) window closes, nothing is installed, no error dialog.
+Their account is an administrator.
+
+That symptom is not the package. The MSI is built, installed, smoke-tested,
+uninstalled and re-checked on a `windows-latest` runner in every release run
+(see the `bridge-exe` job: `msiexec /i … /qn`, installed-exe smoke test, PATH +
+App Paths assertions, `msiexec /x … /qn`, removal assertion), and the 0.2.6 run
+that published the release was green on that job. On a real PC the same silent
+stop is caused by antivirus/endpoint security ending `msiexec`, a managed-PC
+policy that forbids MSIs (`1625`), a Windows Installer service that cannot be
+reached, a dismissed UAC prompt, or an MSI that never finished downloading
+(`1619`/`1620`) — none of which a `.wxs` can prevent, and none of which show a
+message.
+
+So the fix is not another MSI guess; it is a way to *name the cause* and to
+*keep working*:
+
+- **`bridge-apps/windows/msi/install-bridge.ps1`** (new, lint-clean via
+  `scripts/lint-powershell.py`) — verifies the MSI against the shipped
+  `SHA256SUMS.txt` (a short download is reported as such, exit 3, nothing
+  installed), removes the Zone.Identifier mark browsers add, starts the
+  Windows Installer service when it is stopped, checks free disk space, runs
+  `msiexec /i … /l*v <log>` (UI by default, `/qn` under `-Silent`), decodes the
+  exit code in plain English (1601/1603/1618/1619/1620/1622/1625/1633/1638/
+  1641/1925/2502/2503/3010), echoes the `Return value 3` lines from the log,
+  copies the log and a report beside the MSI, and — when the MSI still cannot
+  finish — performs a **per-user install with no Windows Installer and no
+  administrator rights**: the payload comes from the portable exe in the kit if
+  present, otherwise from `msiexec /a` (administrative extraction) of the MSI
+  itself, and it is installed to `%LOCALAPPDATA%\Programs\EstateMate Bridge`
+  with HKCU App Paths, a length-checked user PATH entry, Start Menu console
+  shortcuts and an *Installed apps* uninstall entry. `-Uninstall` reverses all
+  of it.
+- **`bridge-apps/windows/msi/Install-EstateMate-Bridge.cmd`** — the thing a
+  person actually double-clicks. Passes its arguments through, never pauses when
+  run with `-Silent`/`-NoPause` (so CI can drive it).
+- **`scripts/package-bridge-msi.mjs`** (ported from the 0.2.6 line, then
+  extended) — builds the MSI with the runner's WiX v3, stages the launcher and
+  the script beside it, writes a `SHA256SUMS.txt` covering the MSI *and* the
+  scripts, writes `READ-ME-FIRST.txt`, and zips it all as
+  `estatemate-bridge-<version>-win-x64-installer-kit.zip` (the kit is the
+  recommended download now). `--dry-run` still works on Linux.
+- **`scripts/lib/zip-write.mjs`** (new) — a store-only ZIP writer with CRC-32,
+  no dependencies, so the kit can be built on the Windows runner without
+  7-Zip or `Compress-Archive`. Verified locally against Python's `zipfile`
+  (`testzip()` clean) and on Windows by `Expand-Archive` in CI.
+- **`scripts/lint-powershell.py`** — learned to skip `<# … #>` block comments
+  (the new script has a real header; the linter previously read its prose as
+  statements and flagged `param()`). Unterminated block comments are now an
+  error of their own.
+- **`bridge-apps/windows/msi/estatemate-bridge.wxs`** — ported from 0.2.6
+  (per-machine x64, App Paths, PATH append, Start Menu consoles, MajorUpgrade,
+  `light -sice:ICE43 -sice:ICE57`) plus a `VersionNT64` launch condition, so
+  32-bit Windows gets a sentence instead of a bare `1633`.
+- **CI (`bridge-exe` job)** — after the existing direct-MSI round trip, three
+  new checks on real Windows: unzip the kit with `Expand-Archive` and install
+  through the launcher exactly as a person does; truncate the MSI by 1 MB and
+  require the checksum guard to refuse it with exit 3 and install nothing; run
+  `-PerUser` and require the executable, HKCU App Paths and Start Menu
+  shortcuts, then `-Uninstall` and require all three gone.
+- **Docs**: `bridge-apps/windows/README.md` gained an *Installing* section with
+  the "Gathering information" troubleshooting entry; the release notes explain
+  the same and list the kit first.
+
+**Validation status (honest):** `node --check` on the packaging script,
+`--dry-run` staging on Linux, XML parse of the `.wxs`, ZIP verification with
+Python's `zipfile`, `yaml.safe_load` of the workflow, `lint-powershell.py` on
+the script and every `pwsh` step. The MSI compile, the ICE validation, the
+install/uninstall round trip, the kit launcher, the checksum guard and the
+per-user fallback all run in CI on `windows-latest` only — this sandbox has no
+Windows, no WiX and no PowerShell.
+
+## alertStream heartbeat, auth-failure diagnostics and stale-nonce retry (2026-10-04)
+
+Applied from Hikvision's *Intelligent Security API (General Application) Developer Guide*
+(the general ISAPI spec; §12.1/§15.3.4 event streams, §3.1 authentication, appendix A.3
+error codes and `XML_ResponseStatus_AuthenticationFailed`).
+
+- **Heartbeats are no longer filed as gate events.** The stream carries the terminal's
+  keep-alive heartbeat — `eventType` `videoloss` with `eventState` `inactive` — which
+  `normalizeHikvisionDocument` happily turned into an access event (`videoloss` passing the
+  "has an eventType" test). `isapi-bridge/agent.mjs` and the Android `AlertStreamReader` /
+  `BridgeService` now recognise and drop it, and `src/hikvision.ts` drops it too so an older
+  deployed agent cannot create junk either. A real video-loss alarm (`videoloss`/`active`)
+  still becomes an event, and a heartbeat still counts as proof the terminal is alive
+  (the Worker marks the device online before normalisation).
+- **Silent-stream warning.** The guide's heartbeat cadence is ~10 s with a 30 s timeout. The
+  Node agent logs (never flips stream state) when a *connected* stream has been silent for
+  90 s, because a half-open TCP socket looks alive while the terminal has stopped streaming.
+- **Refused credentials now say what the terminal said.** A 401 is reported with
+  `lockStatus`, `retryTimes` (remaining attempts) and `resLockTime` from
+  `XML_ResponseStatus_AuthenticationFailed`, e.g. `ISAPI 401: authentication failed
+  (lockStatus locked, 2 attempt(s) left, locked for 300s) - check the ISAPI username and
+  password`. The bridge still sends exactly one authenticated request per operation: the
+  guide locks the account when remaining attempts reach 0.
+- **Stale nonces are answered once.** A 401 that reissues a Digest challenge (RFC 2617
+  `stale="TRUE"`) is retried once with the fresh challenge, in both the Node `isapiRequest`
+  and the Android `IsapiClient.request`. A 401 without a fresh challenge is never repeated.
+- **Tests**: `isapi-bridge/agent.integration.mjs` (heartbeat recognised, never forwarded
+  end-to-end), `isapi-bridge/agent.card-operations.integration.mjs` (auth-failure summary,
+  digest re-challenge against a stale-nonce server), Android `ProtocolTest`
+  (`AlertStreamReader.isHeartbeatDocument`, re-challenge, auth summary — 94/94), and
+  `test/agent-event-stream.test.ts` (heartbeat rejected, device still marked online).
+- **Docs**: `docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md` gained the **Event-stream protocol the
+  agent relies on** section (framing, heartbeat, ResponseStatus code set, digest rules,
+  formats, and why Listening mode stays unused); the two bridge READMEs link it.
+- **Not changed / verified against the guide**: the card-path fixes from the earlier entry
+  (JSON-first, `CardInfoDelCond.CardNoList[].cardNo`, `Modify` on a duplicate card, XML only
+  when the URL is unsupported) match the spec's JSON naming rule (leaf lower camel case,
+  container upper camel case) and appendix A.3. Listening mode
+  (`/ISAPI/Event/notification/httpHosts`) remains deliberately unused per `AGENTS.md`.
+- **Compile note**: `BridgeService.java` needs the Android SDK, which the sandbox lacks, so
+  that one-line filter was syntax-checked with ECJ (no syntax errors; only the expected
+  missing-`android.*` resolution errors) and is compiled by `Build the bridge APK` in CI.
+
+## Card-operation protocol fixes folded into the bridge sources (2026-10-04)
+
+Requested as: "USE THIS INFORMATION WHERE NEEDED IN THE ISAPI BRIDGE" — the two
+uploaded bundles in the repository root (`estatemate-isapi-fix.zip`,
+`estatemate-bridge-android-fix.zip`).
+
+- **What the tree was missing.** Both LAN bridge implementations (`isapi-bridge/agent.mjs`
+  and the Android `IsapiClient.java`) still spoke the pre-fix card dialect: the delete
+  condition was a bare `{"CardNoList":[{"CardNo":"…"}]}` (terminals answer `Invalid Format /
+  badJsonFormat` and delete nothing), `upsert_visitor` wrote an XML `tempCard` (not a valid
+  `cardType` on these terminals), a JSON→XML retry ran after *content* rejections (which
+  buries the terminal's real reason), a duplicate `CardInfo/Record` was reported as a failure
+  instead of falling through to `CardInfo/Modify`, and success was judged on HTTP 2xx alone
+  (some firmware answers 200 with a `ResponseStatus` whose `statusCode` is not 1).
+- **Applied.** `isapi-bridge/agent.mjs`, `isapi-bridge/agent.card-operations.integration.mjs`,
+  `bridge-apps/android/app/src/main/java/com/estatemate/bridge/IsapiClient.java` and
+  `bridge-apps/android/tools/ProtocolTest.java` now carry the fix-bundle implementation:
+  `writeTerminalCard`/`writeCard` (Record, then Modify on `cardNoAlreadyExist`),
+  `deleteTerminalCard`/`deleteCard` (`CardInfoDelCond` with lower-case `cardNo`; an
+  already-absent card counts as removed, an unsupported call does not), visitors as a JSON
+  `normalCard` under the issued employee number, ISAPI-namespaced XML used only when the JSON
+  URL itself is unsupported, success read from the `ResponseStatus` `statusCode`, and failure
+  reasons summarised from `statusString`/`subStatusCode`/`errorMsg`. The two implementations
+  stay equivalent, as the project rules require.
+- **Nothing else in the bundles was newer.** The rest of `estatemate-bridge-android-fix.zip` is
+  `0.2.1`-era (`WorkerClient`, `BridgeService`, `BridgeRuntime`, the activity) and is
+  superseded by the tree — the tree's `IsapiClient` already had the employee-number guard,
+  `revoke_visitor`, remote door control and grouped `ResponseStatus` parsing that neither zip
+  contains. The only unique content in that zip (the card protocol) is the same fix as the
+  ISAPI bundle. The bundled zips can be deleted once this is merged; they are now redundant.
+- **Docs.** `docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md` gained a **Terminal protocol the card path
+  relies on** section (the rules above, which the simulated terminals enforce);
+  `isapi-bridge/README.md` section 5 and `bridge-apps/android/README.md` no longer describe the
+  `tempCard` / bare-`CardNoList` shapes.
+- **Verification.** `npm run test:isapi-bridge` passes — the card harness's simulated terminal
+  now enforces the real rules (JSON-only card writes, `cardNoAlreadyExist` on a duplicate
+  `Record`, `badJsonFormat` on a bare `CardNoList`, `cardNoNotExist` from `Modify`) — and the
+  Android `ProtocolTest` runs **90/90** against the fixed `IsapiClient`. Cross-check that the
+  tests catch the regression: compiling the *old* `IsapiClient` with the *new* `ProtocolTest`
+  fails exactly the six protocol checks (delete shape, visitor cardType, re-enable via Modify).
+- **Still outstanding.** No real terminal is reachable from the sandbox; the on-site firmware
+  verification checklist in `docs/device-profiles/DS-K1T808MFWX-B.md` remains the evidence gate
+  before claiming the model production-supported.
+
 ## Bridge setup wizard on first run, and the wizard release gate (2026-09-28)
 
 Requested as: "publish the wizard in a GitHub release" / "create a new exe bridge file with setup wizard".
@@ -48,7 +408,9 @@ and complete all six modules being rolled out.
   cost — same reason as the users import). Delete is the existing safe soft
   delete repeated per row with per-row blockers. Resync re-pushes every
   credential of selected people to every terminal, reusing open commands;
-  fingerprints stay operator tasks (no per-model template-upload evidence).
+  fingerprints are pushed as templates where the bridge advertises the
+  capability and stay operator tasks where it does not (see the top section —
+  this line predates that work).
 - **Visitor device accounts** (`VISITOR-DEVICE-ACCOUNTS.md`): created on
   request (`upsert_visitor` with `employeeNo = visitor-<credential>`, ≤32 chars);
   deleted from **every** device by `releaseExpiredVisitorDeviceAccounts` once
@@ -122,7 +484,7 @@ or shared with someone else, then enroll them on the terminal under the new numb
 
 ## Access control remote (2026-09-27)
 
-Administrators have an **Access control remote** page. It queues door commands (`remote_open`, `remote_close`, `remote_always_open`, `remote_always_close`, `remote_resume`), suspends or restores a person's cards and fingerprints, syncs or revokes visitor passes, retries failed commands, and assigns security gate posts. Delivery is the estate agent over ISAPI on the LAN. It is not ISUP and it does not send commands through a Cloudflare Tunnel. Automatic door control is best-effort: no device profile records a verified remote-door command, so a terminal rejection stays in Hardware actions for an operator. Fingerprints are still captured on the terminal. An already-installed bridge (tag `bridge-0.2.1` and earlier) does not know `remote_*` or `revoke_visitor`; those commands fail as unknown until that agent is rebuilt. Card enable/disable uses the existing operation kinds and works on the installed agent.
+Administrators have an **Access control remote** page. It queues door commands (`remote_open`, `remote_close`, `remote_always_open`, `remote_always_close`, `remote_resume`), suspends or restores a person's cards and fingerprints, syncs or revokes visitor passes, retries failed commands, and assigns security gate posts. Delivery is the estate agent over ISAPI on the LAN. It is not ISUP and it does not send commands through a Cloudflare Tunnel. Automatic door control is best-effort: no device profile records a verified remote-door command, so a terminal rejection stays in Hardware actions for an operator. Fingerprints are still captured on the terminal. An already-installed bridge (tag `bridge-0.2.1` and earlier) does not know `remote_*` or `revoke_visitor`; those commands fail as unknown until that agent is rebuilt. Card enable/disable uses the existing operation kinds and works on the installed agent. (Superseded 2026-10-04: capture on the terminal is still how a finger enters the estate, but the read itself is automated through the bridge where the terminal supports it — see the top section.)
 
 Updated: 2026-09-27 (Africa/Lagos) — **NEW: standalone Hikvision tunnel bridge worker** (`hikvision-tunnel-worker/`): a separately deployed Cloudflare Worker that pulls ISAPI AcsEvents into D1 `access_logs` (cron + `POST /pull-logs`, HTTP Digest over `TUNNEL_URL`) and pushes users to `/ISAPI/AccessControl/UserInfo/Record` (`POST /sync-user`); it does not change EstateMate's agent-only transport rule — see "Standalone Hikvision tunnel bridge worker". Previous: **Access cards & fingerprints phase (migration `0015_fingerprint_credentials.sql`):** the portal menu is now **Access cards & fingerprints** and lists cards and fingerprints from one endpoint; every person's profile (People and Tenancy & household) has a **Cards & fingerprints** panel where an Administrator or Manager can add either credential. A fingerprint is its own credential with the terminal's finger slot and employee number, and because a finger can only be captured on the terminal, every fingerprint operation is queued `manual_action_required` with instructions and is never handed to the agent. See "Access cards and fingerprints". Previous: **Cloudflare Tunnel remote-access kit (Free plan)** shipped as `86886f7` on PR #25 — `scripts/cloudflared-remote-access.mjs` generates a WARP private-routing config with a `--check` policy validator; ISUP was proven impossible on the free plan (the terminal cannot dial Cloudflare or complete an Access login). Previous: **Terminal presence promotion** (`c6d1ab3`): a heartbeat `stream:'up'` promotes a linked terminal from the `pending` registration default to `online`, `'down'` retires it (including a still-`pending` terminal), and the hourly sweep derives status from proof of life. Previous: **Bridge apps phase deployed to production:** `bridge-apps/` (single-file Windows bridge executable + Android bridge APK) and the agent's EstateMate-device-id resolution are on `main` as `a094d93` (PR #21) and Deploy EstateMate run `36178112448` deployed them successfully; production `GET /api/health` returns `ok: true` and the portal login screen renders. The earlier wording on this line ("not yet deployed") was stale and is corrected here — that phase is live. The merge kept the one `apps/web/src/App.tsx` conflict resolution and the operator-facing portal labels brought in line with the renamed **Device agent** page — see "Bridge apps phase, merged onto the Device-agent portal". Previous: **Device-agent portal cleanup deployed:** PR #17 merged as `6795c0e`; Deploy EstateMate run `36161420893` succeeded and the cache-busted production health check returned `ok: true`. The page is now named **Device agent**, replaces implementation-level connection-pattern and queue copy with a compact on-demand setup guide, points operators to the current single-file Windows bridge and Android bridge release, removes obsolete Node.js/`sc.exe` instructions, trims status tables, and fixes the phone layout so the heading and actions stack instead of forcing horizontal overflow. Setup downloads now match explicit secret rotation and are Administrator-only in both the UI and API; Managers can still connect, disconnect, and monitor terminals. Previous: **Bridge release CI phase** added `.github/workflows/bridge.yml` (Windows agent portable bundle + the project's first real Android compile), fixed the `API_BASE_URL` placeholder and the wrong `sc.exe`/`pkg` install advice. Previous: 2026-09-24 — Portal UX phase (migration `0014`) **deployed to production** via PR #11 (`f4e543d`), Deploy EstateMate run `36074600948`: administrator-published estate gate welcome image on the login screen and dashboard, searchable card-holder picker, and gate-scoped Security login sessions. Previous phase retired every access-device transport except the EstateMate agent; production domain is `https://estatemate.estatemate.workers.dev` Previous: **Credential-free `CI` gate for pull requests** (`.github/workflows/ci.yml` + `scripts/ci-checks.sh`) — see "Continuous integration".
 
@@ -155,7 +517,7 @@ Run `git log -1 --oneline` and check the latest GitHub Actions run before making
 - **Estate gate welcome image**: an Administrator uploads a photograph of the estate gate to the private GitHub repository; it is shown behind the welcome text on the login screen (and as a compact banner on phones, where the brand panel is hidden) and on every dashboard hero. Served by the unauthenticated `GET /api/portal-gate-image` because the login screen renders before a session exists; only a file explicitly published under the `portal-branding` category with an image content type can ever be returned.
 - **Searchable card-holder picker**: `GET /api/access/card-recipients` returns active main residents and active household members in one list, searchable by name, unit, email or phone, so issuing a card no longer means pasting a raw `residentId`/`householdMemberId`.
 - **Gate-scoped Security sessions**: every Security officer must choose a gate at login. Administrators and Managers may post officers at gates (`security_gate_assignments`), which restricts the choice to those posts; an officer with no posts picks from every active gate device (`selectableGates`). Such a freely chosen session carries an `openGate` JWT claim and ends as soon as the officer is assigned any post, so an administrator can always move him. Only when the estate has no active gate device at all does an officer sign in unscoped (`gateSelectionUnavailable`). The chosen gate scopes their visitor queue, gate activity, device list and device options for the whole session. Shift history is recorded in `security_gate_sessions`.
-- **Access cards & fingerprints (migration `0015`)**: one credential register. `fingerprint_credentials` stores a finger as its own credential — person (`resident_id` plus optional `household_member_id`), the terminal's finger slot (`finger_no` 1–10, unique per person), optional `finger_label`, the enrollment device, `employee_no` and the same status/expiry lifecycle as a card. `access_cards.card_uid` is untouched, so a card number is still a card number. The portal menu reads **Access cards & fingerprints** and lists both types from `GET /api/access/credentials`; every person's profile (People for main residents, Tenancy & household for dependants) has a **Cards & fingerprints** panel that adds either credential for Administrators and Managers only. A finger cannot be pushed from the cloud — it is captured on the terminal — so every fingerprint operation (`enroll_fingerprint`, `enable_fingerprint`, `disable_fingerprint`, `delete_fingerprint`) is queued `manual_action_required` with the exact step in `device_operations.manual_instruction` and is never handed to the agent; enrollment is queued for the terminal the operator chose, while suspend/revoke/fee-enforcement tasks go to every terminal. Gate events with no card number are attributed back through `employee_no` (`access_events.fingerprint_id`, resident and household member), and a matching card number stays authoritative when both match. Lifecycle parity with cards: fee-overdue expiry/restore, account deactivation, household-member deactivation, dependant deactivation and tenancy end all suspend or queue removal for fingerprints too.
+- **Access cards & fingerprints (migration `0015`)**: one credential register. `fingerprint_credentials` stores a finger as its own credential — person (`resident_id` plus optional `household_member_id`), the terminal's finger slot (`finger_no` 1–10, unique per person), optional `finger_label`, the enrollment device, `employee_no` and the same status/expiry lifecycle as a card. `access_cards.card_uid` is untouched, so a card number is still a card number. The portal menu reads **Access cards & fingerprints** and lists both types from `GET /api/access/credentials`; every person's profile (People for main residents, Tenancy & household for dependants) has a **Cards & fingerprints** panel that adds either credential for Administrators and Managers only. A finger cannot be pushed from the cloud — it is read on the terminal — so at the time of this phase every fingerprint operation (`enroll_fingerprint`, `enable_fingerprint`, `disable_fingerprint`, `delete_fingerprint`) was queued `manual_action_required` with the exact step in `device_operations.manual_instruction` and never handed to the agent; enrollment was queued for the terminal the operator chose, while suspend/revoke/fee-enforcement tasks went to every terminal. **Superseded 2026-10-04:** capture, template upload and device-side deletion are implemented and capability-gated (see the top section); the manual task remains only where the firmware refuses the API. Gate events with no card number are attributed back through `employee_no` (`access_events.fingerprint_id`, resident and household member), and a matching card number stays authoritative when both match. Lifecycle parity with cards: fee-overdue expiry/restore, account deactivation, household-member deactivation, dependant deactivation and tenancy end all suspend or queue removal for fingerprints too.
 - **Access-termination guide** on the operator dashboard: the ordered chain for ending access (card, dependant, tenancy/account, visitor passes, terminal, hardware-action confirmation) with deep links to each section.
 - **Cloudflare Tunnel remote access (Free plan)**: `scripts/cloudflared-remote-access.mjs` generates a `cloudflared` config with WARP private-network routing plus `SETUP.md`, and `--check` fails a config that would expose a terminal. Human access only — the agent remains the sole automatic transport, so gates keep working when the tunnel is down. See `docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md`.
 - People administration with available-property selection, bulk CSV registration, generated one-time passwords, editing, reset, lifecycle guards and history-preserving deletion.
@@ -200,7 +562,7 @@ Requested as: "Change the menu for Access cards to include finger prints. All us
 - **Lifecycle:** fee-overdue expiry and cleared-fee restoration, account suspension, household-member deactivation and tenancy end all cover fingerprints as well as cards, each queueing the matching terminal task.
 - **Tests:** `test/access-fingerprints.test.ts` (12 tests: enrollment and queue shape, device scoping, validation, duplicate slot, role restriction, unified list and filters, hardware-action fields, suspend/reactivate, delete-with-history, cardless event attribution, card-wins precedence, fee expiry/restore).
 - **Docs:** README scope and "still model dependent" lines, `AGENTS.md` non-negotiables, this file, `docs/TENANTS-DEPENDANTS-AND-TRANSFERS.md`, `docs/MANAGERS-IMPORTS-HIKCONNECT-SITE-SYNC.md`, `isapi-bridge/README.md`.
-- **Not done / still open:** no automated template upload or read-back — deliberate, because no per-model firmware evidence is recorded in `docs/device-profiles/`; a dependant fingerprint stays unattributable on the terminal until its `employee_no` is set.
+- **Not done / still open:** no automated template upload or read-back — deliberate at the time, because no per-model firmware evidence is recorded in `docs/device-profiles/`; a dependant fingerprint stays unattributable on the terminal until its `employee_no` is set. **Superseded 2026-10-04:** template upload and live capture are implemented in the bridge and gated on the capability it probes; the manual instruction remains only for firmware that refuses the API — see the top section.
 
 ## Cloudflare Tunnel remote access — Free plan (2026-09-26)
 
@@ -719,4 +1081,4 @@ The previous migration, `migrations/0010_maintenance_billing_and_verification.sq
 
 ## Deliberately not automated
 
-Full remote card/person command delivery remains model/account dependent. The hardware-action queue is authoritative until an approved Hikvision cloud API or genuinely compatible dedicated ISUP command gateway is configured. Do not mark queued actions applied merely because an HTTP event listener or Render relay exists.
+Full remote card/person command delivery remains model/account dependent. The hardware-action queue is authoritative until an approved Hikvision cloud API or genuinely compatible dedicated ISUP command gateway is configured — and since 2026-10-04 it is also the fallback whenever the terminal's bridge does not advertise the `person`/`fingerprint` capability, so a queued task is never silently dropped. Do not mark queued actions applied merely because an HTTP event listener or relay exists.

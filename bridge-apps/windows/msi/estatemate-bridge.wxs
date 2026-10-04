@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX source for the EstateMate Bridge MSI installer.
+
+  Built by scripts/package-bridge-msi.mjs with the WiX Toolset v3 that the
+  GitHub Actions windows-latest runner ships preinstalled:
+
+      candle -arch x64 -dVersion=<x.y.z> -dExeSource=<staged exe> \
+             -dReadmeSource=<staged readme> estatemate-bridge.wxs -out <obj>
+      light  -sice:ICE43 -sice:ICE57 <obj> -out estatemate-bridge-<x.y.z>-win-x64.msi
+
+  What the installer deliberately IS:
+
+    * the single-file bridge executable in "C:\Program Files\EstateMate Bridge",
+      plus a short README.txt with the five-minute setup;
+    * a Start Menu shortcut that opens the dashboard: EstateMateBridge.exe, a
+      GUI program (nothing to type, no console window) that configures the
+      terminal bridge and starts it. It drives this same executable's commands
+      behind the buttons, so the console and the window can never disagree
+      about what a valid setup is;
+    * an App Paths registry value, so Win+R "estatemate-bridge" works;
+    * the install directory appended to the system PATH, so any PowerShell or
+      cmd can run `estatemate-bridge` by name — the command line remains for
+      support and for advanced work, it is just no longer the only way in;
+    * a proper Programs-and-Features entry, upgrades in place (stable
+      UpgradeCode, same-version reinstalls allowed) and a clean uninstall.
+
+  The MSI is shipped inside the installer kit next to Install-EstateMate-
+  Bridge.cmd, which double-clicking runs: it verifies this MSI against
+  SHA256SUMS.txt, keeps a verbose msiexec log, explains the exit code, and
+  falls back to a per-user copy install (no Windows Installer, no administrator
+  rights) when Windows refuses to let this MSI finish. That fallback exists
+  because an MSI on a real PC can stop at "Gathering information..." and close
+  with no message when security software, a managed-machine policy or a broken
+  Windows Installer service interrupts it - none of which the package can
+  prevent from here.
+
+  What it deliberately is NOT:
+
+    * it does not register the start-at-boot scheduled task — that needs the
+      agent credentials from the portal first. The dashboard does both steps
+      (Configuration, then Service -> Start at boot) and asks Windows for the
+      administrator rights itself; from the command line it is `setup`, then
+      `check`, then `install-service` in an Administrator console;
+    * it does not touch %ProgramData%\EstateMate — configuration, secrets and
+      logs live there, so an uninstall or upgrade never destroys them.
+
+  The non-advertised shortcuts live in the per-machine component keyed on the
+  executable. ICE43 objects to non-advertised shortcuts without an HKCU
+  keypath and ICE57 reads the same shortcuts as per-user data in a
+  per-machine component — both are per-user-install heuristics that do not
+  apply to an all-users shortcut for a per-machine console tool, so light
+  suppresses those two ICEs; every other validation rule still runs.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <!-- Id="*" gives every build a fresh ProductCode; the UpgradeCode below is
+       permanent, and MajorUpgrade makes 0.2.0 -> 0.3.0 an in-place upgrade. -->
+  <Product Id="*" Name="EstateMate Bridge" Language="1033" Version="$(var.Version)"
+           Manufacturer="EstateMate" UpgradeCode="BE4C3E0B-927B-471E-92DE-A0BFAEF4C266">
+
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
+             Description="EstateMate access-device agent (Windows installer)" />
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of EstateMate Bridge is already installed. Remove it in Settings - Apps (run 'estatemate-bridge uninstall-service' first) and try again." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Shows up as the "Visit support site" link in Programs and Features. -->
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/barikblog/estatemate-minmoe" />
+
+    <!-- This is an x64 package: on 32-bit Windows msiexec fails with a bare
+         1633 and nothing else. A launch condition replaces that dead end with
+         a sentence that names the problem. (True on ARM64 Windows too, where
+         the x64 package runs under emulation.) -->
+    <Condition Message="EstateMate Bridge needs 64-bit Windows 10 or 11; this PC is running 32-bit Windows. Use the portable estatemate-bridge-win-x64.exe on a 64-bit PC instead.">
+      <![CDATA[VersionNT64]]>
+    </Condition>
+
+    <!-- Absent="disallow": the one feature is the product; there is no
+         optional-components UI anyway. (v3 spells it Absent, not AllowAbsent.) -->
+    <Feature Id="Main" Title="EstateMate Bridge" Level="1" Absent="disallow">
+      <ComponentRef Id="BridgeExecutable" />
+      <ComponentRef Id="BridgeDashboard" />
+      <ComponentRef Id="BridgeReadme" />
+    </Feature>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLDIR" Name="EstateMate Bridge">
+
+          <!-- The executable, the shortcuts and the PATH/App Paths entries
+               come and go together. -->
+          <Component Id="BridgeExecutable" Guid="*">
+            <File Id="BridgeExe" Name="estatemate-bridge.exe" Source="$(var.ExeSource)" KeyPath="yes" />
+
+            <!-- Win+R "estatemate-bridge" opens the bridge, no PATH needed. -->
+            <RegistryValue Root="HKLM"
+                           Key="SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\estatemate-bridge.exe"
+                           Type="string" Value="[INSTALLDIR]estatemate-bridge.exe" />
+
+            <!-- `estatemate-bridge` from any shell. Windows Installer appends
+                 this on install and removes exactly this entry on uninstall. -->
+            <Environment Id="BridgeOnPath" Name="PATH" Value="[INSTALLDIR]"
+                         Permanent="no" Part="last" Action="set" System="yes" />
+
+            <!-- Start Menu: one entry, the dashboard. Everything the installer
+                 README asks for happens in that window — no commands to type
+                 and no console that scares people off. The command line stays
+                 available for support; the README still documents it. -->
+            <Shortcut Id="StartMenuDashboard" Directory="ApplicationProgramsFolder"
+                      Name="EstateMate Bridge" Description="Configure the terminals and start the bridge"
+                      Target="[INSTALLDIR]EstateMateBridge.exe" WorkingDirectory="INSTALLDIR" />
+            <Shortcut Id="StartMenuReadme" Directory="ApplicationProgramsFolder"
+                      Name="Read me first" Description="The five-minute setup guide"
+                      Target="[INSTALLDIR]README.txt" WorkingDirectory="INSTALLDIR" />
+
+            <!-- Take the Start Menu folder away again when the last file goes. -->
+            <RemoveFolder Id="RemoveApplicationProgramsFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
+          </Component>
+
+          <!-- The dashboard: the launcher (a GUI program, so no console window
+               appears), the window itself as a script, and a launcher .cmd for
+               anyone who would rather double-click something in the folder. -->
+          <Component Id="BridgeDashboard" Guid="*">
+            <File Id="BridgeDashboardExe" Name="EstateMateBridge.exe" Source="$(var.DashboardExeSource)" KeyPath="yes" />
+            <File Id="BridgeDashboardScript" Name="EstateMateBridge.ps1" Source="$(var.DashboardScriptSource)" />
+            <File Id="BridgeDashboardLauncher" Name="EstateMateBridge.cmd" Source="$(var.DashboardLauncherSource)" />
+          </Component>
+
+          <Component Id="BridgeReadme" Guid="*">
+            <File Id="BridgeReadme" Name="README.txt" Source="$(var.ReadmeSource)" KeyPath="yes" />
+          </Component>
+
+        </Directory>
+      </Directory>
+
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="EstateMate Bridge" />
+      </Directory>
+    </Directory>
+
+  </Product>
+</Wix>

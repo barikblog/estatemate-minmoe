@@ -2,7 +2,7 @@
 
 The ISAPI bridge is a small Node.js agent that runs on the same LAN as Hikvision access devices. It does two things, both over ordinary outbound HTTPS to the Cloudflare Worker:
 
-1. **Applies card/visitor operations** — polls the Worker for pending card/visitor operations (created when facility fees expire, cards are issued, etc.) and applies them to the physical device via Hikvision ISAPI (HTTP Digest).
+1. **Applies card, person, fingerprint and visitor operations** — polls the Worker for pending operations (created when a card is issued, a person is edited, a facility fee expires, an operator captures a fingerprint, etc.) and applies them to the physical device via Hikvision ISAPI (HTTP Digest). Since bridge `0.3.0` the same poll also carries the *person record* every credential belongs to, and the **fingerprint templates** themselves.
 2. **Streams real-time access events** — holds one persistent `GET /ISAPI/Event/notification/alertStream` connection per device and forwards every swipe/alarm to the Worker in small batches, giving Gate activity latency of a few seconds without relying on the terminal's HTTP Listening push.
 
 It replaced and removed the former transports — direct HTTP Listening, the Render free relay, Hikvision cloud/OpenAPI and the dedicated ISUP SDK gateway (migration `0013_agent_only_transports.sql`). `manual_sync` remains as the auditable fallback for devices not linked to an agent.
@@ -18,7 +18,8 @@ For off-site support access to the terminals and this host, see [`../docs/CLOUDF
 ```
 Cloudflare Worker (D1, Queue)
   ├── POST /api/isapi/v1/agents/:id/heartbeat
-  ├── GET  /api/isapi/v1/agents/:id/operations  (pending card/visitor ops)
+  ├── GET  /api/isapi/v1/agents/:id/operations  (card / person / fingerprint / visitor / door ops,
+  │                                              with the transient fingerprint template when one is needed)
   ├── POST /api/isapi/v1/agents/:id/operations/:opId/result
   └── POST /api/isapi/v1/agents/:id/events      (batched alertStream events)
 
@@ -42,6 +43,7 @@ How it works:
 
 - The agent answers the device's Digest (or Basic) challenge once, then keeps the alertStream connection open.
 - Events arrive as `multipart/mixed` parts (JSON or XML documents). Firmware that streams bare JSON objects is handled by a brace-depth scanner fallback.
+- The stream also carries the terminal's keep-alive heartbeat (`eventType` **videoloss** with `eventState` **inactive**, per Hikvision's general-application ISAPI guide). It is counted as stream activity — a *connected* stream that goes silent for 90 s is logged, because a half-open TCP socket looks alive — but never forwarded as a gate event; the Worker drops it defensively as well, so an older agent cannot file a bogus `videoloss` entry. The rules are in [`../docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md`](../docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md#event-stream-protocol-the-agent-relies-on).
 - Documents are buffered and flushed to `POST /api/isapi/v1/agents/:id/events` — up to 50 items per request, or every `eventFlushSeconds` (default 5 s), whichever comes first. The Worker normalizes each document with the same pipeline as direct device posts (profile aliases, granted/denied inference, idempotency on `(device_id, vendor_event_id)`), updates device last-seen, and queues the batch as **one** Queue message so the Cloudflare Workers Free plan Queues allowance (10,000 operations/day ≈ one message ≈ 3 operations) is preserved even on busy estates.
 - On connection loss the agent reconnects with 5 s → 60 s exponential backoff. A local buffer (default 500 events) rides out Worker outages; on overflow the oldest documents are dropped with a warning.
 - Each stream loop's state travels with the heartbeat (`devices: [{ deviceId, stream: 'up'|'down', lastError }]`). The Worker marks the terminal **online** as soon as the stream is `up` — so a linked terminal no longer sits on the `pending` registration default until someone happens to swipe a card — and marks it **offline** immediately on `down`, without waiting for the hourly sweep.
@@ -58,6 +60,62 @@ Config knobs (`agent-config.json`):
 
 Per-device `"eventStream": false` in `isapi-devices.json` disables streaming for that terminal only.
 
+
+## People and fingerprints (bridge 0.3.0+)
+
+A terminal stores a card *against a person*: the ISAPI employee number. Field
+reports (and Hikvision's own integrators) are consistent that a person added
+without `doorRight`/`RightPlan` exists and is authorised for nothing — the card
+is recorded, the authentication succeeds, the door does not open. So the bridge
+writes the person first, then the credentials:
+
+| Operation | What the bridge sends |
+|---|---|
+| `upsert_person` | `POST /ISAPI/AccessControl/UserInfo/Record?format=json` with `{UserInfo:{employeeNo,name,userType,Valid,doorRight,RightPlan,localUIRight,gender}}`. A terminal that already holds the employee number answers a rejection, so the bridge falls through to `PUT …/UserInfo/Modify?format=json` and then `PUT …/UserInfo/SetUp?format=json`. XML is used only when the JSON URL is unsupported. |
+| `delete_person` | `PUT /ISAPI/AccessControl/UserInfoDetail/Delete?format=json` — the person **and** their cards, fingerprints and permissions. Falls back to the narrower `PUT …/UserInfo/Delete?format=json` when the firmware does not implement the detail call. |
+| `upload_fingerprint` | `POST /ISAPI/AccessControl/FingerPrint/SetUp?format=json` with `{FingerPrintCfg:{employeeNo,enableCardReader:[1],fingerPrintID,fingerType:"normalFP",fingerData,checkEmployeeNo}}`. `fingerData` is the Base64 template read from another terminal; it arrives with the operation and is never written to the bridge log or to disk. |
+| `delete_fingerprint_device` | The same call with `deleteFingerPrint: true`. The terminal answers success even when the slot was already empty. |
+| `capture_fingerprint` | `POST /ISAPI/AccessControl/CaptureFingerPrint?format=json` with `{CaptureFingerPrintCond:{fingerNo}}`. The terminal arms its own reader; while nobody is touching the glass it answers "no fingerprint", so the bridge re-arms every 5 s (up to ~100 s) and keeps its heartbeat fresh in between. When the finger is read it returns the Base64 template, which is reported back to the Worker. |
+
+`doorRight` and `RightPlan` are always sent, with the door numbers of the
+terminal's access points (door 1 when the estate has not recorded any). Without
+them the person is stored and cannot open anything — that is the bug this
+behaviour exists to prevent.
+
+### Capabilities
+
+Every heartbeat advertises what this bridge can actually do, probed against the
+terminals it serves:
+
+```json
+{ "capabilities": ["card", "door", "person", "fingerprint"] }
+```
+
+The Worker only hands a bridge the work it advertises. A bridge that sends
+nothing (every build before 0.3.0) keeps receiving card, visitor and door
+commands exactly as before, and person/fingerprint work is queued for an
+operator instead of failing silently on a terminal that cannot take it. The
+probe is cached for ten minutes and runs in the background — it can never delay
+the heartbeat. `card` and `door` are always claimed: those endpoints have been on
+every terminal EstateMate has been tested against.
+
+### What the firmware has to support
+
+- Person records: `UserInfo/Record`, `Modify`, `SetUp`, `Delete` and
+  `UserInfoDetail/Delete` on K1T/K26xx/K27xx/K28xx controllers. A missing URL is
+  detected (`404`/`405`/`501` or `notSupport`/`invalidURL`/`invalidOperation`) and
+  the portal keeps the manual instruction instead of showing a failed command.
+- Fingerprint **capture** (`CaptureFingerPrint`) and **write**
+  (`FingerPrint/SetUp`) are documented on the access-control terminals, but the
+  firmware that implements them varies. The bridge probes
+  `/ISAPI/AccessControl/CaptureFingerPrint/capabilities` and
+  `/ISAPI/AccessControl/FingerPrintCfg/capabilities` before advertising
+  `fingerprint`, and a terminal that refuses the call is reported with the
+  terminal's own words. The portal then says so and queues the manual enrolment
+  (slot + employee number) — it never pretends the finger was captured.
+
+Knobs (environment, mainly for testing): `ESTATEMATE_CAPTURE_RETRY_MS`
+(default `5000`) and `ESTATEMATE_CAPTURE_MAX_MS` (default `100000`).
 
 ## Setup
 
@@ -102,7 +160,7 @@ Or use **Access-control devices** → edit device → set connection pattern to 
 
 ### 4. Test
 
-- Issue a test card in portal → **Access cards & fingerprints** → create (a card operation is claimed by the agent; a fingerprint operation never is — fingerprints are always an operator task).
+- Issue a test card in portal → **Access cards & fingerprints** → create. A card operation is claimed by the agent, and so is the person record it belongs to; a fingerprint is claimed only when the terminal's bridge advertises the `fingerprint` capability, and otherwise appears as an operator task.
 - Check **Hardware actions** — status should be `pending` (not `manual_action_required`) when device uses ISAPI pattern.
 - On agent host, check logs: `C:\EstateMate\ISAPI-Agent\logs\` or journalctl.
 - After ~30s, operation should be claimed and applied via ISAPI, then status becomes `applied`.
@@ -110,14 +168,25 @@ Or use **Access-control devices** → edit device → set connection pattern to 
 
 ### 5. ISAPI endpoint reference (model dependent)
 
-- `POST /ISAPI/AccessControl/CardInfo/Record?format=json` — add/update card
-- `PUT /ISAPI/AccessControl/CardInfo/Delete?format=json` — delete card
+The card path is JSON-first, and the terminal's answer decides whether a fallback
+is worth trying — see
+[`../docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md`](../docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md#terminal-protocol-the-card-path-relies-on)
+for the behaviour the agent depends on.
+
+- `POST /ISAPI/AccessControl/CardInfo/Record?format=json` — add card
+- `PUT /ISAPI/AccessControl/CardInfo/Modify?format=json` — update a card the terminal already holds (a duplicate `Record` is an error, so re-enable/re-issue lands here)
+- `PUT /ISAPI/AccessControl/CardInfo/Delete?format=json` — delete card; the body must be `{"CardInfoDelCond":{"CardNoList":[{"cardNo":"…"}]}}`. A bare `{"CardNoList":[{"CardNo":"…"}]}` is answered `Invalid Format / badJsonFormat`.
 - `GET /ISAPI/AccessControl/CardInfo/Record?format=json` — list cards
-- Some firmware uses XML: `/ISAPI/AccessControl/CardInfo/Record` with `Content-Type: application/xml`.
+- Some firmware implements only the XML form: the same URLs without `?format=json` and with the ISAPI namespace on the root element (`<CardInfo xmlns="http://www.isapi.org/ver20/XMLSchema" version="2.0">`). The agent tries XML **only** when the JSON URL is unsupported (404/405/501 or `notSupport`/`invalidURL`/`invalidOperation`), never after a content rejection.
+- A 2xx is not proof of success: some firmware answers 200 with a `ResponseStatus` whose `statusCode` is not 1 (OK). Success is `statusCode == 1`.
 
 Test manually:
 ```bash
 curl -i http://192.168.1.100/ISAPI/System/deviceInfo --digest -u admin:password
+curl -i -X PUT --digest -u admin:password \
+  -H 'Content-Type: application/json' \
+  'http://192.168.1.100/ISAPI/AccessControl/CardInfo/Delete?format=json' \
+  -d '{"CardInfoDelCond":{"CardNoList":[{"cardNo":"10000001"}]}}'
 ```
 
 ## Troubleshooting
@@ -125,16 +194,8 @@ curl -i http://192.168.1.100/ISAPI/System/deviceInfo --digest -u admin:password
 - **401 Unauthorized**: Check ISAPI username/password, device allows digest auth, IP not blocked.
 - **No operations**: Device not linked to agent, or connection pattern still `manual_sync`. Set it to `isapi_bridge` / `windows_agent` and link it.
 - **Operation stuck in sent**: Agent not reporting result. Check agent logs, network to Cloudflare, secret.
-- **Card not opening door**: Card added but not assigned to access group / door. Some models require separate Person + Card + Access Group linking. This bridge currently does simple card add; for full person management, extend `applyCardOperation` to create Person first (`/ISAPI/AccessControl/UserInfo/Record`).
-
-## Extending for full Person/Access Group
-
-Hikvision's newer ISAPI requires:
-1. Create Person (`/ISAPI/AccessControl/UserInfo/Record` with employeeNo)
-2. Create Card linked to Person (`/ISAPI/AccessControl/CardInfo/Record`)
-3. Assign to Access Group / Door (`/ISAPI/AccessControl/UserRight/...`)
-
-Update `agent.mjs` `applyCardOperation` to implement those steps for your firmware.
+- **Card not opening door**: the card is on the terminal but the *person* is not, so the employee number has no door rights. Since bridge 0.3.0 the person record is written first (`UserInfo/Record` with `doorRight`/`RightPlan`) and the portal's **Person sync** page shows which terminal still says `missing` for that person. On a terminal with no linked bridge (or a pre-0.3.0 bridge) the same page lists the work as an operator task.
+- **Fingerprint capture says the terminal cannot do it**: the firmware refused `CaptureFingerPrint`. Open **Hardware actions** and enrol the finger on the terminal's own menu in the slot the task names; the portal records it and sends it to the other terminals the next time a template is held.
 
 ## License
 

@@ -49,6 +49,9 @@ const FLAG_SPEC = {
   'log-file': 'value',
   'from-installer': 'value',
   'devices-json': 'value',
+  'agent-id': 'value',
+  'agent-secret': 'value',
+  'worker-url': 'value',
   'task-name': 'value',
   user: 'value',
   quiet: 'bool',
@@ -92,6 +95,9 @@ Options
   --log-file <file>        default: <data-dir>\\logs\\bridge.log
   --from-installer <file>  portal installer script; "-" reads stdin
   --devices-json <file>    device list to import during setup; "-" reads stdin
+  --agent-id <uuid>        agent id to use when there is no portal script
+  --agent-secret <secret>  agent secret to go with --agent-id
+  --worker-url <url>       Worker base URL (default: the public estateMate Worker)
   --no-prompt              never ask questions (setup/init only)
   --no-verify              skip the Worker call during setup
   --task-name <name>       Scheduled Task name (default: EstateMateBridge)
@@ -103,6 +109,7 @@ Options
 
 Examples
   estatemate-bridge.exe setup --from-installer .\\installer.ps1
+  estatemate-bridge.exe setup --no-prompt --agent-id <uuid> --agent-secret <secret>
   estatemate-bridge.exe check --json
   estatemate-bridge.exe install-service
 `;
@@ -238,6 +245,7 @@ async function commandRun({ ctx, logger }) {
     configPath: ctx.paths.configPath,
     devicesPath: ctx.paths.devicesPath,
     standby: false,
+    version: ctx.version,
     logger,
   });
 
@@ -424,6 +432,9 @@ async function runCli(meta) {
         options: {
           fromInstaller: flags['from-installer'] || null,
           devicesJson: flags['devices-json'] || null,
+          agentId: flags['agent-id'] || null,
+          agentSecret: flags['agent-secret'] || null,
+          workerUrl: flags['worker-url'] || null,
           prompt: !flags['no-prompt'],
           verify: !flags['no-verify'],
           force: Boolean(flags.force),

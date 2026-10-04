@@ -18,9 +18,11 @@ What it does, on the estate LAN:
   terminal over ISAPI (HTTP Digest);
 * heartbeats every minute so the portal shows the agent as online.
 
-See [`docs/BRIDGE-EXE-AND-APK.md`](../../docs/BRIDGE-EXE-AND-APK.md) for the
-full picture, and [`isapi-bridge/README.md`](../../isapi-bridge/README.md) for the
-protocol documentation.
+See
+[`docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md`](../../docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md)
+for the full picture, and
+[`isapi-bridge/README.md`](../../isapi-bridge/README.md) for the protocol
+documentation.
 
 ## Requirements
 
@@ -35,6 +37,75 @@ protocol documentation.
 > port-forward ISAPI or the device web UI to the Internet. The bridge only ever
 > makes *outbound* connections.
 
+## Installing
+
+Three shapes, same agent:
+
+| | How | Best for |
+|---|---|---|
+| **Installer kit** (`estatemate-bridge-<version>-win-x64-installer-kit.zip`) | Unzip it and double-click `Install-EstateMate-Bridge.cmd`. | The normal case, and any PC where the MSI has ever refused to finish. |
+| **MSI installer** (`estatemate-bridge-<version>-win-x64.msi`) | Double-click it, or `msiexec /i <file>`. Installs to `C:\Program Files\EstateMate Bridge`, adds **Start Menu → EstateMate Bridge**, which opens the dashboard window, and puts `estatemate-bridge` on the PATH and in *Settings → Apps* for upgrades and uninstall. | A PC an administrator manages directly. |
+| **Portable exe** (`estatemate-bridge-win-x64.exe`) | Copy it anywhere and run it; no install, no administrator rights. | USB sticks, testing, machines you may not install on. |
+
+If double-clicking the **exe** seemed to do nothing: it is a console tool, not an
+installer — the window opens, prints and closes.
+
+The MSI removes that whole problem: **Start Menu → EstateMate Bridge** opens the
+dashboard, a normal window (`EstateMateBridge.exe`, a GUI program, so no console
+appears at all) with three tabs:
+
+- **Status** — what the bridge is doing, what your last action returned, and the
+  live log;
+- **Configuration** — the agent id, secret and Worker URL, the portal's
+  *Download setup* `.ps1`, and the Hikvision terminals as an editable table;
+- **Service** — *Start at boot* / *Remove from boot*, which are `install-service`
+  and `uninstall-service` with the elevation prompt handled for you.
+
+Every button runs exactly the commands documented below, so the window and the
+console can never disagree about what a valid setup is. The dashboard lives in
+`bridge-apps/windows/dashboard/` (`EstateMateBridge.ps1` is the window,
+`Launcher.cs` compiles to the no-console `.exe`, `build-dashboard.cmd` finds a
+C# compiler the machine already has); it is wired into the MSI by
+`scripts/package-bridge-msi.mjs` and self-tested on the Windows runner
+(`EstateMateBridge.exe -SelfTest`).
+
+### The installer window says "Gathering information" and then disappears
+
+That is Windows Installer stopping before it installs anything. Nothing is
+installed, no error is shown, and the cause is *not* the package — the release
+build installs and uninstalls the MSI on a Windows runner every time. On a real
+PC the cause is one of:
+
+* antivirus or endpoint security ending `msiexec` (most common with an unsigned
+  installer);
+* a policy on a managed PC that forbids MSI installs (`1625`);
+* the Windows Installer service not running, or a broken installer repository;
+* a UAC prompt that was dismissed;
+* an MSI that did not finish downloading — the file is 33 MB and a browser that
+  resumed an old download can leave it short (`1619`/`1620`).
+
+Run the kit's **Install-EstateMate-Bridge.cmd** instead of the MSI directly. It
+verifies the MSI against `SHA256SUMS.txt`, removes the downloaded-from-the-
+Internet mark, starts the Windows Installer service if needed, keeps a verbose
+`msiexec` log beside the MSI, prints the exit code in plain English, and — when
+the MSI still cannot complete — installs the bridge for the current user under
+`%LOCALAPPDATA%\Programs\EstateMate Bridge`. That fallback uses no Windows
+Installer and needs no administrator rights, so antivirus policy or a broken
+installer service cannot stop it.
+
+> The build is unsigned (this project uses no code-signing certificate). If
+> Windows shows *"Windows protected your PC"*, choose **More info → Run
+> anyway**, or right-click the file → **Properties → Unblock** first; the kit's
+> launcher does that for you.
+
+### What the MSI deliberately does *not* do
+
+* It does **not** register the start-at-boot task — that needs the agent
+  credentials from the portal first (the `setup` → `check` →
+  `install-service` steps below).
+* It never touches `%ProgramData%\EstateMate`, so configuration, secrets and
+  logs survive every upgrade and uninstall.
+
 ## Five-minute setup
 
 1. **Portal** — sign in as Administrator → *Device agent* →
@@ -48,9 +119,15 @@ protocol documentation.
    the one thing worth carrying to the PC: nothing above has to be retyped, and
    neither does the EstateMate device id — the bridge resolves each terminal from
    the portal by its LAN address.
-3. **Estate PC** — copy `estatemate-bridge.exe` and the `.ps1` to the PC. On a PC
-   that has no configuration yet, **double-click the executable**: it notices the
-   missing configuration, says so, and starts the setup wizard itself. The wizard
+3. **Estate PC** — install the kit (or the MSI), or copy the portable
+   `estatemate-bridge.exe` and the `.ps1` to the PC. With the kit or the MSI
+   installed, **Start Menu → EstateMate Bridge** opens the dashboard: pick the
+   `.ps1` in *Configuration* (or type the agent id and secret by hand), add each
+   Hikvision terminal in the table, press **Save all settings**, press **Run
+   check**, then **Start at boot** on the *Service* tab. On a PC that has no
+   configuration yet, **double-clicking the portable executable** also works: it
+   notices the missing configuration, says so, and starts the setup wizard
+   itself. The wizard
    asks for the `.ps1` (paste its path; typing the agent id and secret by hand
    still works), adds each Hikvision terminal with a reachability test while you
    are still on site, and writes both configuration files with administrator-only
@@ -61,6 +138,9 @@ protocol documentation.
    .\estatemate-bridge.exe check            # Worker + every terminal, one report
    .\estatemate-bridge.exe install-service  # Administrator shell: start at boot
    ```
+
+   The dashboard drives those same commands (headless, never a prompt) — the
+   console route stays for support and for anyone who prefers it.
 
    The wizard only starts itself for a bare double-click: with any option, a
    command, `--no-prompt`, or no console at all (a Scheduled Task, a service, a

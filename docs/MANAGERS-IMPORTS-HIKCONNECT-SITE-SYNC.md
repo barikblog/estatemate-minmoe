@@ -61,7 +61,7 @@ Optional: `card_label,status,expires_at`
 
 Active imported cards are placed into the existing device-operation synchronization queue.
 
-Fingerprints are **not** part of a CSV import: a CSV cannot capture a finger. They are recorded per person from **Access cards & fingerprints** or from the person's profile, and each one queues an operator task under **Hardware actions** (see [`TENANTS-DEPENDANTS-AND-TRANSFERS.md`](TENANTS-DEPENDANTS-AND-TRANSFERS.md)).
+Fingerprints are **not** part of a CSV import: a CSV cannot read a finger. They are recorded per person from **Access cards & fingerprints** or from the person's profile — preferably by letting the portal arm a chosen terminal's reader (**Add fingerprint** → pick the terminal), which stores the template and sends it to the other terminals. Where the terminal's firmware refuses the ISAPI capture, the same action records the credential and queues an operator task under **Hardware actions** (see [`TENANTS-DEPENDANTS-AND-TRANSFERS.md`](TENANTS-DEPENDANTS-AND-TRANSFERS.md)).
 
 ## Retired integration
 

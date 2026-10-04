@@ -108,9 +108,11 @@ terminal:
 
 - **active cards** → `upsert_card` with the person's current Employee ID;
 - **inactive cards** → `disable_card` (hardware stops matching the portal);
-- **fingerprints** → operator tasks, always. A finger has to be physically
-  present at the terminal and no per-model evidence for template upload exists
-  in `docs/device-profiles/`, so fingerprint work is never handed to the agent.
+- **fingerprints** → the person record plus a template per finger, or an
+  operator task. Where the terminal's bridge advertises the `fingerprint`
+  capability the resync re-sends the stored template through the agent; where it
+  does not (or the terminal refuses the call), the finger stays an operator task
+  naming the slot and the employee number, exactly as before.
 
 Open commands are reused, not duplicated — pressing resynchronise twice fills
 nothing new into the Hardware actions queue.

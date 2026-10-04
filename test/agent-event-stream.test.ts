@@ -148,6 +148,56 @@ describe('Agent event streaming and queue batching', () => {
     expect((broadcast[0] as { events: unknown[] }).events.length).toBe(2);
   });
 
+  it('ignores the alertStream keep-alive heartbeat instead of filing it as a gate event', async () => {
+    const { deviceId, agentId, agentSecret } = await createDeviceAndAgent();
+    // The ISAPI guide's heartbeat: eventType "videoloss" + eventState "inactive".
+    // An older deployed bridge may still forward it, so the Worker drops it too.
+    const heartbeat = JSON.stringify({
+      EventNotificationAlert: {
+        ipAddress: '192.168.1.101',
+        eventType: 'videoloss',
+        eventState: 'inactive',
+        eventDescription: 'videoloss alarm',
+        dateTime: '2026-09-24T10:15:30+01:00',
+        activePostCount: 12,
+      },
+    });
+    const res = await callAgentEventsRaw(env, agentId, agentSecret, [
+      { deviceId, document: heartbeat },
+      { deviceId, document: eventDocument('12345678') },
+    ]);
+    expect(res.status).toBe(200);
+    expect(res.json.accepted).toBe(1);
+    expect(res.json.rejected).toBe(1);
+
+    // The heartbeat is still proof the terminal is alive…
+    const device = db.one(`SELECT status,last_seen_at FROM hikvision_devices WHERE id=?`, deviceId);
+    expect(device?.status).toBe('online');
+    expect(device?.last_seen_at).toBeTruthy();
+    // …but only the real event reaches the queue.
+    const sends = queueSendsOf(env);
+    expect(sends.length).toBe(1);
+    const single = sends[0]!.body as { cardUid: string | null; eventType: string };
+    expect(single.cardUid).toBe('12345678');
+    expect(single.eventType).toBe('AccessControllerEvent');
+
+    // A real video-loss alarm is eventType "videoloss" + eventState "active" and stays an event.
+    const alarm = await callAgentEventsRaw(env, agentId, agentSecret, [
+      {
+        deviceId,
+        document: JSON.stringify({
+          EventNotificationAlert: {
+            eventType: 'videoloss',
+            eventState: 'active',
+            eventDescription: 'video loss',
+            dateTime: '2026-09-24T10:16:00+01:00',
+          },
+        }),
+      },
+    ]);
+    expect(alarm.json.accepted).toBe(1);
+  });
+
   it('consumer still accepts legacy single-event messages', async () => {
     const { deviceId, agentId, agentSecret } = await createDeviceAndAgent();
     await callAgentEventsRaw(env, agentId, agentSecret, [{ deviceId, document: eventDocument('12345678') }]);
