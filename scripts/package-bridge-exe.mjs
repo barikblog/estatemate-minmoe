@@ -285,6 +285,11 @@ async function shaSumsFor(version, cacheDir) {
 function collectAssets() {
   const assets = [
     ['agent/agent.mjs', path.join(repoRoot, 'isapi-bridge/agent.mjs')],
+    // Extracted next to the agent, because the agent resolves these by relative
+    // path: `agent/zkteco-push-server.mjs`. Omit one and the bridge exits at
+    // import time on every machine that installs this exe.
+    ['agent/zkteco-push.mjs', path.join(repoRoot, 'isapi-bridge/zkteco-push.mjs')],
+    ['agent/zkteco-push-server.mjs', path.join(repoRoot, 'isapi-bridge/zkteco-push-server.mjs')],
     ['host/agent-loader.cjs', path.join(repoRoot, 'bridge-apps/windows/host/agent-loader.cjs')],
     ['host/cli.cjs', path.join(repoRoot, 'bridge-apps/windows/host/cli.cjs')],
     ['host/config.cjs', path.join(repoRoot, 'bridge-apps/windows/host/config.cjs')],

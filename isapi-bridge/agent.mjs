@@ -18,6 +18,8 @@ import { readFileSync, existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
+import { applyPushOperation, startZktecoPushServer } from './zkteco-push-server.mjs';
+import { pinPolicy } from './zkteco-push.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -67,6 +69,27 @@ const eventFlushSeconds = Math.max(1, Number(config.eventFlushSeconds || 5));
 const eventBufferLimit = Math.max(eventFlushCount * 4, Number(config.eventBufferLimit || 500));
 const alertStreamPath = String(config.alertStreamPath || '/ISAPI/Event/notification/alertStream?format=json');
 
+// ZKTeco PUSH (ADMS) transport.
+//
+// Off unless an agent-config.json says otherwise, so every deployed Hikvision
+// bridge behaves exactly as it did before this code existed. The terminal is
+// what dials us (§7 of the vendor doc), so unlike the ISAPI path this one needs
+// a listening port, and that is the whole reason the default bind is loopback:
+// an estate that wants a terminal to reach a bridge on another host sets
+// `pushBindAddress` deliberately and reads the warning it prints.
+const pushEnabled = config.zktecoPush === true || (config.zktecoPush && config.zktecoPush.enabled !== false);
+// 0 is meaningful here: it lets the OS pick a free port, which is what the
+// integration checks want and what an installer gets by setting "port": 0.
+const pushPortConfigured = config.zktecoPush && config.zktecoPush.port !== undefined ? Number(config.zktecoPush.port) : 8089;
+const pushPort = Number.isInteger(pushPortConfigured) && pushPortConfigured >= 0 && pushPortConfigured <= 65535 ? pushPortConfigured : 8089;
+const pushBindAddress = String((config.zktecoPush && config.zktecoPush.bindAddress) || '127.0.0.1');
+const pushRequireAgentKey = Boolean(config.zktecoPush && config.zktecoPush.requireAgentKey);
+const pushAgentKey = String((config.zktecoPush && config.zktecoPush.agentKey) || '').trim();
+// How long an operation waits for the terminal's Return= before it is reported as
+// still queued. A terminal polls on RequestDelay, so this is deliberately longer
+// than one poll cycle.
+const pushAckTimeoutMs = Math.max(5000, Number((config.zktecoPush && config.zktecoPush.ackTimeoutSeconds) || 180) * 1000);
+
 if (!/^[0-9a-f-]{36}$/i.test(agentId)) {
   console.error('Invalid agentId, must be UUID');
   process.exit(1);
@@ -87,8 +110,11 @@ const isUuid = (value) => UUID_PATTERN.test(String(value || '').trim());
 const devices = new Map();
 const unresolvedDevices = [];
 for (const d of devicesConfig.devices || []) {
-  if (!d.isapiHost) continue;
   if (d.enabled === false) continue;
+  // A ZKTeco terminal on the PUSH transport is not polled over ISAPI at all: the
+  // terminal calls us, so it has no isapiHost and must not be skipped for that.
+  const isPushDevice = d.transport === 'zkteco_push' || (pushEnabled && !d.isapiHost && d.pushSerial);
+  if (!d.isapiHost && !isPushDevice) continue;
   const device = {
     estateMateDeviceId: String(d.estateMateDeviceId || '').trim(),
     name: String(d.name || d.isapiHost),
@@ -98,6 +124,8 @@ for (const d of devicesConfig.devices || []) {
     isapiPassword: String(d.isapiPassword || ''),
     protocol: d.protocol === 'https' ? 'https' : 'http',
     eventStream: d.eventStream !== false,
+    transport: isPushDevice ? 'zkteco_push' : 'isapi',
+    pushSerial: String(d.pushSerial || '').trim() || null,
   };
   if (isUuid(device.estateMateDeviceId)) devices.set(device.estateMateDeviceId, device);
   else unresolvedDevices.push(device);
@@ -132,6 +160,7 @@ async function resolveDeviceIds() {
 
   const matched = new Set();
   for (const device of unresolvedDevices) {
+    if (device.transport === 'zkteco_push') continue; // bound by its own serial, at registration
     const host = device.isapiHost.toLowerCase();
     const candidates = linked.filter((item) => String(item.isapi_host || '').trim().toLowerCase() === host);
     const exact = candidates.filter((item) => !item.isapi_port || Number(item.isapi_port) === device.isapiPort);
@@ -150,7 +179,7 @@ async function resolveDeviceIds() {
     const known = linked.length
       ? linked.map((item) => `${item.device_name || item.device_id} (${item.isapi_host}${item.isapi_port ? `:${item.isapi_port}` : ''})`).join(', ')
       : 'none';
-    for (const device of unresolved) {
+    for (const device of unresolved.filter((entry) => entry.transport !== 'zkteco_push')) {
       console.error(
         `Terminal "${device.name}" (${device.protocol}://${device.isapiHost}:${device.isapiPort}) has no EstateMate device id and the portal does not list it` +
           ` — link it to this agent (Device agent → Connect terminal), or paste the terminal's EstateMate device ID from Connected terminals.`,
@@ -160,11 +189,94 @@ async function resolveDeviceIds() {
     process.exit(1);
   }
 
+  // A push terminal that has not phoned home yet cannot be bound by host, because
+  // it has no host: its serial arrives in its first registration. Refusing to
+  // start would be wrong (the terminal is the one that decides when to call), so
+  // this says what is pending and binds it on arrival.
+  const pendingPush = unresolvedDevices.filter((device) => device.transport === 'zkteco_push' && !device.pushSerial && !devices.has(device.estateMateDeviceId));
+  for (const device of pendingPush) {
+    log('warn', `Terminal "${device.name}" is on the ZKTeco PUSH transport and will be bound to the first serial that registers with this bridge.`);
+  }
+
   const linkedIds = linked.map((item) => String(item.device_id || '').trim()).filter(Boolean);
   const orphans = linkedIds.filter((id) => !devices.has(id));
   if (orphans.length) {
     log('warn', `${orphans.length} device(s) linked to this agent in the portal are not in the devices file — operations for them stay queued until a terminal is configured for them.`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// ZKTeco PUSH (ADMS) transport state
+//
+// Serial -> device, built from the config and from what terminals register with.
+// The bridge is the only place that can answer "which EstateMate device is this
+// serial?", because it is the only place the serial is ever seen.
+// ---------------------------------------------------------------------------
+const pushSerialBindings = new Map();
+const pushState = { registered: 0, eventsForwarded: 0, listener: null };
+
+function pushDevicesFor() {
+  // Both lists, deduplicated: a terminal that arrives with an EstateMate id lives
+  // in `devices`, one the portal has yet to be matched against lives in
+  // `unresolvedDevices` until resolveDeviceIds() succeeds, and after that it is in
+  // both. A PUSH terminal with no id at all is a normal way to start an install —
+  // the id can be looked up from the serial once the terminal first calls in.
+  const every = new Set([...devices.values(), ...unresolvedDevices]);
+  return [...every].filter((device) => device.transport === 'zkteco_push');
+}
+
+/** Resolves a reporting serial to its local device, binding an unbound one. */
+function resolvePushDevice(serial, reportedOptions = {}) {
+  const configured = pushDevicesFor().find((device) => device.pushSerial === serial);
+  if (configured) return configured;
+  const bound = pushSerialBindings.get(serial);
+  if (bound) return bound;
+  // Bind automatically only when exactly one PUSH terminal is unclaimed.
+  // Choosing between two gates is how a resident ends up with a card on the
+  // wrong door, so with two or more configured this returns null and the log
+  // tells the installer to write pushSerial by hand.
+  const free = pushDevicesFor().filter((device) => !device.pushSerial);
+  if (free.length === 1) {
+    const device = free[0];
+    device.pushSerial = serial;
+    pushSerialBindings.set(serial, device);
+    log('info', `Bound ZKTeco terminal serial ${serial}${reportedOptions.DeviceName ? ` (${reportedOptions.DeviceName})` : ''} to "${device.name}" (the only PUSH device on this bridge; set pushSerial to pin it down)`);
+    return device;
+  }
+  if (free.length > 1) {
+    log('warn', `ZKTeco terminal ${serial} registered but ${free.length} PUSH devices are unbound — set "pushSerial" on each device entry to say which terminal is which gate.`);
+  }
+  return null;
+}
+
+function startPushListener() {
+  if (!pushEnabled || pushState.listener) return pushState.listener;
+  pushState.listener = startZktecoPushServer({
+    port: pushPort,
+    bindAddress: pushBindAddress,
+    log,
+    requireAgentKey: pushRequireAgentKey,
+    agentKey: pushAgentKey,
+    ackTimeoutMs: pushAckTimeoutMs,
+    resolveDevice: (serial, reportedOptions) => resolvePushDevice(serial, reportedOptions),
+    onEvent: (deviceId, document) => {
+      pushState.eventsForwarded += 1;
+      queueEvent(deviceId, document);
+    },
+    onDeviceInfo: (serial, parsed) => {
+      pushState.registered += 1;
+      const policy = pinPolicy(parsed);
+      log('info', `ZKTeco terminal ${serial} stores ${policy.allowStringPin ? 'string User IDs' : 'numeric User IDs only'} (StringPinFunOn=${policy.stringPinReported ? parsed.StringPinFunOn : 'not reported'})`);
+      // A terminal that has just told us who it is can now be handed work.
+      const device = resolvePushDevice(serial, parsed);
+      if (device) {
+        device.pushSerial = serial;
+        pushSerialBindings.set(serial, device);
+        if (device.estateMateDeviceId) devices.set(device.estateMateDeviceId, device);
+      }
+    },
+  });
+  return pushState.listener;
 }
 
 function log(level, ...args) {
@@ -227,7 +339,17 @@ function capabilitiesForHeartbeat() {
 async function probeCapabilities() {
   if (capabilityCache.value && Date.now() - capabilityCache.at < CAPABILITY_TTL_MS) return capabilityCache.value;
   const found = new Set(['card', 'door']);
+  // The PUSH transport writes a person a person with `DATA UPDATE USERINFO`, which is the
+  // same unit of work the Worker gates behind 'person'. It is advertised only for
+  // a terminal that has actually registered: the capability is the terminal's,
+  // not the bridge's. Fingerprint work is deliberately absent — this transport
+  // refuses it, and the portal keeps the manual instruction (see the profile doc).
+  if (pushEnabled && pushState.registered > 0) found.add('person');
   for (const device of devices.values()) {
+    // A terminal on the PUSH transport has no ISAPI to ask; it advertises its own
+    // parameters when it registers, and probing it over HTTP would burn the probe
+    // timeout on every refresh for a device that answers no ISAPI at all.
+    if (device.transport === 'zkteco_push') continue;
     try {
       const person = await isapiRequest(device, 'GET', '/ISAPI/AccessControl/UserInfo/capabilities?format=json', null, false);
       if (isapiOk(person) || (!isapiUnsupported(person) && person.status >= 200 && person.status < 300)) found.add('person');
@@ -259,6 +381,17 @@ async function heartbeat() {
           eventsDropped: eventStats.dropped,
           eventsPending: pendingEvents.length,
           eventStream: eventStreamEnabled,
+          ...(pushEnabled ? {
+            pushTransport: {
+              registered: pushState.registered,
+              bound: pushDevicesFor().filter((device) => device.pushSerial).length,
+              eventsForwarded: pushState.eventsForwarded,
+              commandsSent: pushState.listener?.handler.stats.commandsSent ?? 0,
+              commandsConfirmed: pushState.listener?.handler.stats.commandsConfirmed ?? 0,
+              commandsUnconfirmed: pushState.listener?.handler.stats.commandsTimedOut ?? 0,
+              unmappedUploads: pushState.listener?.handler.stats.unmapped ?? 0,
+            },
+          } : {}),
         },
         // What this bridge can actually do, probed against the terminals it
         // serves rather than claimed. EstateMate only hands a bridge person and
@@ -1133,6 +1266,35 @@ async function applyCardOperation(device, operation) {
   const employeeNo = terminalEmployeeNo(payload);
   const op = operation.operation;
 
+  // A ZKTeco terminal on the PUSH transport is not an ISAPI device: the same
+  // operation vocabulary is delivered as a queued command the terminal picks up
+  // on its next call, and it counts as applied only when the terminal answers
+  // Return=0. Everything below is the Hikvision path and must stay untouched.
+  if (device.transport === 'zkteco_push') {
+    const serial = device.pushSerial;
+    // Guard first: a null listener here would throw past pollAndApply's own
+    // catch and take the rest of the batch with it. This is the state an
+    // installer reaches by editing one file and not the other, so the answer has
+    // to name the config key rather than be an exception in a log.
+    if (!pushState.listener) {
+      return { success: false, error: pushEnabled
+        ? 'the ZKTeco PUSH listener is not up on this bridge yet; it starts with the agent, so retry once the service has finished starting'
+        : 'this terminal is on the ZKTeco PUSH transport but the bridge has it switched off: set "zktecoPush": {"enabled": true} in agent-config.json and restart the agent' };
+    }
+    if (!serial) {
+      return { success: false, error: 'this terminal has not registered with the bridge yet; it decides when to call in, so the work stays queued until it does' };
+    }
+    log('info', `Queueing ${op} for ZKTeco terminal ${device.name} (serial ${serial}) opId=${operation.id}`);
+    return applyPushOperation({
+      handler: pushState.listener.handler,
+      serial,
+      operation,
+      employeeNo: payload.employeeId || payload.employeeNo || employeeNo,
+      log,
+      ackTimeoutMs: pushAckTimeoutMs,
+    });
+  }
+
   log('info', `Applying ${op} for device ${device.name} (${device.estateMateDeviceId}) card=${cardUid} opId=${operation.id}`);
 
   try {
@@ -1312,6 +1474,28 @@ async function main() {
   const streamDevices = [...devices.values()].filter((device) => device.eventStream !== false);
   log('info', `Agent: ${agentId}, Worker: ${workerUrl}, Devices: ${devices.size}, Interval: ${syncInterval}s, EventStream: ${eventStreamEnabled ? `on (${streamDevices.length} device(s))` : 'off'}`);
 
+  if (pushEnabled) {
+    const listener = startPushListener();
+    const pushDeviceCount = pushDevicesFor().length;
+    log('info', `ZKTeco PUSH transport: ${pushDeviceCount} device(s), listening on ${pushBindAddress}:${pushPort} under /iclock/ (terminals must be pointed at this address)`);
+    if (!pushDeviceCount) {
+      log('warn', 'ZKTeco PUSH is enabled but no device uses it — add "transport": "zkteco_push" to a device entry, or turn zktecoPush off.');
+    }
+    if (listener?.server) {
+      // Bind failures are loud and non-fatal: the ISAPI half of this bridge still
+      // has work to do and must not be taken down by a port clash.
+      listener.server.once('error', (err) => log('error', `ZKTeco PUSH listener error: ${err.code || err.message}`));
+    }
+  }
+
+  // A PUSH terminal with the transport switched off is a device nobody will ever
+  // serve: it has no ISAPI to fall back on, so say it here rather than letting
+  // every operation for it fail with the same message minutes later.
+  const disabledPushDevices = pushDevicesFor();
+  if (!pushEnabled && disabledPushDevices.length) {
+    log('warn', `${disabledPushDevices.length} device(s) are on the ZKTeco PUSH transport but zktecoPush is disabled — no terminal can reach them. Set "zktecoPush": {"enabled": true, "port": ${pushPort}} in agent-config.json.`);
+  }
+
   await heartbeat();
   await pollAndApply();
 
@@ -1334,6 +1518,11 @@ async function main() {
     for (const deviceId of [...streamStates.keys()]) {
       setStreamState(deviceId, 'down', 'agent shutting down');
     }
+    // Stop accepting terminal calls before anything else, so a punch that arrives
+    // mid-shutdown is not lost between the listener and the event buffer.
+    if (pushState.listener) {
+      pushState.listener.close().catch(() => undefined);
+    }
     heartbeat()
       .catch(() => undefined)
       .then(() => flushEvents())
@@ -1348,6 +1537,13 @@ async function main() {
 // Windows service wrapper. Set ESTATEMATE_AGENT_STANDBY=1 to import the
 // exported functions for testing without starting the main loops.
 export {
+  // Exported for the ZKTeco PUSH checks and for the config wizard: the transport
+  // is only real if the agent routes work to it, so this is asserted through the
+  // agent rather than only against the standalone module.
+  resolvePushDevice,
+  startPushListener,
+  pushDevicesFor,
+  pushState,
   createMultipartEventParser,
   createJsonEventScanner,
   queueEvent,

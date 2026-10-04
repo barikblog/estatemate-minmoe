@@ -10,5 +10,13 @@
   "eventBufferLimit": 500,
   "logLevel": "info",
   "isapiTimeoutMs": 15000,
-  "maxRetries": 3
+  "maxRetries": 3,
+  "zktecoPush": {
+    "enabled": false,
+    "port": 8089,
+    "bindAddress": "127.0.0.1",
+    "ackTimeoutSeconds": 180,
+    "requireAgentKey": false,
+    "agentKey": ""
+  }
 }
