@@ -74,6 +74,21 @@ function toIso(value: string | null): string {
   return Number.isNaN(date.valueOf()) ? new Date().toISOString() : date.toISOString();
 }
 
+/**
+ * The ISAPI alertStream carries the terminal's keep-alive heartbeat alongside
+ * events: eventType "videoloss" with eventState "inactive" (and a subscription
+ * heartbeat as "heartBeat"). Those are not gate events, and a bridge that
+ * forwarded one would otherwise file a bogus "videoloss" event against the
+ * terminal. Current bridges filter them; this guards against an older deployed
+ * agent. A real video-loss alarm is "videoloss" with "active" and is kept.
+ */
+function isStreamHeartbeat(eventType: string | null, eventState: string | null): boolean {
+  const type = (eventType ?? '').trim().toLowerCase();
+  if (type === 'heartbeat') return true;
+  if (type !== 'videoloss') return false;
+  return (eventState ?? '').trim().toLowerCase() === 'inactive';
+}
+
 function normalizeDirection(value: string | null, fallback: DeviceIdentity['direction']): 'entry' | 'exit' {
   if (value && /out|exit|check.?out|leave|egress|2/i.test(value)) return 'exit';
   if (value && /in|entry|check.?in|enter|ingress|1/i.test(value)) return 'entry';
@@ -126,6 +141,7 @@ export async function normalizeHikvisionDocument(
   }
 
   if (!fields.eventType && !fields.cardUid && !fields.employeeNo) return null;
+  if (isStreamHeartbeat(fields.eventType, fields.status)) return null;
   const eventType = fields.eventType ?? 'access';
   const deviceTimestamp = toIso(fields.timestamp);
   const direction = normalizeDirection(fields.direction, device.direction);

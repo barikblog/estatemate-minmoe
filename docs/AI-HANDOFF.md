@@ -1,5 +1,48 @@
 # AI handoff — EstateMate
 
+## alertStream heartbeat, auth-failure diagnostics and stale-nonce retry (2026-10-04)
+
+Applied from Hikvision's *Intelligent Security API (General Application) Developer Guide*
+(the general ISAPI spec; §12.1/§15.3.4 event streams, §3.1 authentication, appendix A.3
+error codes and `XML_ResponseStatus_AuthenticationFailed`).
+
+- **Heartbeats are no longer filed as gate events.** The stream carries the terminal's
+  keep-alive heartbeat — `eventType` `videoloss` with `eventState` `inactive` — which
+  `normalizeHikvisionDocument` happily turned into an access event (`videoloss` passing the
+  "has an eventType" test). `isapi-bridge/agent.mjs` and the Android `AlertStreamReader` /
+  `BridgeService` now recognise and drop it, and `src/hikvision.ts` drops it too so an older
+  deployed agent cannot create junk either. A real video-loss alarm (`videoloss`/`active`)
+  still becomes an event, and a heartbeat still counts as proof the terminal is alive
+  (the Worker marks the device online before normalisation).
+- **Silent-stream warning.** The guide's heartbeat cadence is ~10 s with a 30 s timeout. The
+  Node agent logs (never flips stream state) when a *connected* stream has been silent for
+  90 s, because a half-open TCP socket looks alive while the terminal has stopped streaming.
+- **Refused credentials now say what the terminal said.** A 401 is reported with
+  `lockStatus`, `retryTimes` (remaining attempts) and `resLockTime` from
+  `XML_ResponseStatus_AuthenticationFailed`, e.g. `ISAPI 401: authentication failed
+  (lockStatus locked, 2 attempt(s) left, locked for 300s) - check the ISAPI username and
+  password`. The bridge still sends exactly one authenticated request per operation: the
+  guide locks the account when remaining attempts reach 0.
+- **Stale nonces are answered once.** A 401 that reissues a Digest challenge (RFC 2617
+  `stale="TRUE"`) is retried once with the fresh challenge, in both the Node `isapiRequest`
+  and the Android `IsapiClient.request`. A 401 without a fresh challenge is never repeated.
+- **Tests**: `isapi-bridge/agent.integration.mjs` (heartbeat recognised, never forwarded
+  end-to-end), `isapi-bridge/agent.card-operations.integration.mjs` (auth-failure summary,
+  digest re-challenge against a stale-nonce server), Android `ProtocolTest`
+  (`AlertStreamReader.isHeartbeatDocument`, re-challenge, auth summary — 94/94), and
+  `test/agent-event-stream.test.ts` (heartbeat rejected, device still marked online).
+- **Docs**: `docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md` gained the **Event-stream protocol the
+  agent relies on** section (framing, heartbeat, ResponseStatus code set, digest rules,
+  formats, and why Listening mode stays unused); the two bridge READMEs link it.
+- **Not changed / verified against the guide**: the card-path fixes from the earlier entry
+  (JSON-first, `CardInfoDelCond.CardNoList[].cardNo`, `Modify` on a duplicate card, XML only
+  when the URL is unsupported) match the spec's JSON naming rule (leaf lower camel case,
+  container upper camel case) and appendix A.3. Listening mode
+  (`/ISAPI/Event/notification/httpHosts`) remains deliberately unused per `AGENTS.md`.
+- **Compile note**: `BridgeService.java` needs the Android SDK, which the sandbox lacks, so
+  that one-line filter was syntax-checked with ECJ (no syntax errors; only the expected
+  missing-`android.*` resolution errors) and is compiled by `Build the bridge APK` in CI.
+
 ## Card-operation protocol fixes folded into the bridge sources (2026-10-04)
 
 Requested as: "USE THIS INFORMATION WHERE NEEDED IN THE ISAPI BRIDGE" — the two

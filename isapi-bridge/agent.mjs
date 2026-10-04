@@ -305,6 +305,26 @@ async function isapiRequest(device, method, path, body = null, isXml = true) {
       body: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : undefined,
       signal: controller.signal,
     });
+    if (res.status === 401) {
+      // A nonce can go stale and be reissued, which RFC 2617 answers with a
+      // fresh challenge. Answer it once. This is the only retry: a 401 without
+      // a new Digest challenge is an authentication failure, and repeating it
+      // risks locking the account (the guide: remaining attempts 0 ⇒ the next
+      // attempt locks the user).
+      const reChallenge = res.headers.get('www-authenticate') || '';
+      if (reChallenge.toLowerCase().includes('digest')) {
+        await res.text().catch(() => '');
+        res = await fetch(url, {
+          method,
+          headers: {
+            Authorization: buildDigestAuthHeader(device, method, path, reChallenge),
+            'Content-Type': isXml ? 'application/xml; charset=utf-8' : 'application/json',
+          },
+          body: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : undefined,
+          signal: controller.signal,
+        });
+      }
+    }
     const text = await res.text();
     clearTimeout(timeout);
     return { status: res.status, body: text, headers: res.headers };
@@ -329,6 +349,11 @@ const eventStats = { forwarded: 0, dropped: 0 };
 const pendingEvents = [];
 let flushTimer = null;
 let flushing = false;
+
+// The guide's alertStream heartbeat is ~10 s with a 30 s timeout; three windows
+// of silence is worth a warning, checked on a coarse timer.
+const STREAM_IDLE_WARN_MS = 90 * 1000;
+const STREAM_IDLE_CHECK_MS = 15 * 1000;
 
 /**
  * Per-terminal alertStream state, keyed by EstateMate device id.
@@ -553,12 +578,38 @@ async function deviceEventLoop(device) {
           log('info', `Event stream connected for ${device.name}${boundary ? ' (multipart)' : ' (bare JSON)'}`);
           setStreamState(device.estateMateDeviceId, 'up');
           const decoder = new TextDecoder();
+          // The stream carries the terminal's keep-alive heartbeat as well as
+          // events. Keeping the link alive is the heartbeat's only job, so it is
+          // counted as activity but never forwarded as a gate event.
+          let lastActivityAt = Date.now();
+          const onDocument = (document) => {
+            lastActivityAt = Date.now();
+            if (isStreamHeartbeat(document)) {
+              log('debug', `Heartbeat on ${device.name}`);
+              return;
+            }
+            queueEvent(device.estateMateDeviceId, document);
+          };
           const feed = boundary
-            ? createMultipartEventParser(boundary, (document) => queueEvent(device.estateMateDeviceId, document))
-            : createJsonEventScanner((document) => queueEvent(device.estateMateDeviceId, document));
-          for await (const chunk of res.body) {
-            if (shutdownRequested) break;
-            feed(decoder.decode(chunk, { stream: true }));
+            ? createMultipartEventParser(boundary, onDocument)
+            : createJsonEventScanner(onDocument);
+          // The guide's heartbeat cadence is ~10 s with a 30 s timeout; a TCP
+          // connection can stay open while the terminal stops streaming, so warn
+          // (log only — the stream state must not flip on a guess) once a stream
+          // goes quiet for three of those windows.
+          const idleTimer = setInterval(() => {
+            const quietMs = Date.now() - lastActivityAt;
+            if (quietMs < STREAM_IDLE_WARN_MS) return;
+            lastActivityAt = Date.now();
+            log('warn', `No heartbeat or event from ${device.name} for ${Math.round(quietMs / 1000)}s; the terminal may have stopped streaming even though the connection is open`);
+          }, STREAM_IDLE_CHECK_MS);
+          try {
+            for await (const chunk of res.body) {
+              if (shutdownRequested) break;
+              feed(decoder.decode(chunk, { stream: true }));
+            }
+          } finally {
+            clearInterval(idleTimer);
           }
           log('warn', `Event stream closed for ${device.name}`);
           setStreamState(device.estateMateDeviceId, 'down', 'terminal closed the event stream');
@@ -593,6 +644,13 @@ function terminalEmployeeNo(payload) {
  * ResponseStatus (JSON or XML); its statusString / subStatusCode / errorMsg name
  * the cause, e.g. "Invalid Content / badParameters / employeeNo". A raw 200-byte
  * slice of the XML used to cut off right before that field name.
+ *
+ * A 401 is the terminal refusing the credentials, and the guide defines the
+ * authentication-failed document that carries the remaining attempts
+ * (retryTimes), the lock state and the lock time — a lockout the operator needs
+ * to see before the account is barred. A 401 is only repeated when the terminal
+ * reissues the challenge (a stale nonce); a bare 401 never is, because "if the
+ * remaining attempts is 0, the user will be locked at the next attempt".
  */
 function describeIsapiFailure(result) {
   const body = String(result.body || '');
@@ -602,8 +660,38 @@ function describeIsapiFailure(result) {
     const xml = new RegExp(`<${name}>([^<]*)</${name}>`).exec(body);
     return xml ? xml[1] : '';
   };
+  if (result.status === 401) {
+    const notes = [];
+    if (field('lockStatus')) notes.push(`lockStatus ${field('lockStatus')}`);
+    if (field('retryTimes')) notes.push(`${field('retryTimes')} attempt(s) left`);
+    if (field('resLockTime')) notes.push(`locked for ${field('resLockTime')}s`);
+    if (field('subStatusCode')) notes.push(field('subStatusCode'));
+    const suffix = notes.length ? ` (${notes.join(', ')})` : '';
+    return `ISAPI 401: authentication failed${suffix} — check the ISAPI username and password`;
+  }
   const reason = [field('statusString'), field('subStatusCode'), field('errorMsg')].filter(Boolean).join(' / ');
   return `ISAPI ${result.status}: ${reason || body.slice(0, 200)}`;
+}
+
+/**
+ * Whether an alertStream document is the terminal's keep-alive heartbeat rather
+ * than a gate event. The guide defines the heartbeat as eventType "videoloss"
+ * with eventState "inactive" (a subscription heartbeat is "heartBeat"/"active").
+ * Forwarding one files a bogus "videoloss" entry against the terminal in
+ * EstateMate. A real video-loss alarm is "videoloss"/"active" and is kept.
+ */
+function isStreamHeartbeat(document) {
+  const text = String(document || '');
+  const pick = (name) => {
+    const json = new RegExp(`"${name}"\\s*:\\s*"([^"]*)"`).exec(text);
+    if (json) return json[1];
+    const xml = new RegExp(`<${name}>([^<]*)</${name}>`).exec(text);
+    return xml ? xml[1] : '';
+  };
+  const eventType = pick('eventType').trim().toLowerCase();
+  if (eventType === 'heartbeat') return true;
+  if (eventType !== 'videoloss') return false;
+  return pick('eventState').trim().toLowerCase() === 'inactive';
 }
 
 /**
@@ -890,6 +978,7 @@ export {
   // employee-number rules against a simulated terminal without the main loops.
   applyCardOperation,
   describeIsapiFailure,
+  isStreamHeartbeat,
   terminalEmployeeNo,
   resolveDeviceIds,
   isUuid,

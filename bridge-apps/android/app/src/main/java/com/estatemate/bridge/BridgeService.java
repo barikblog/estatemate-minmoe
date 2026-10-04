@@ -444,6 +444,10 @@ public final class BridgeService extends Service {
                                 + (stream.contentType.contains("multipart") ? " (multipart)" : " (bare JSON)"));
                         AlertStreamReader reader = AlertStreamReader.forContentType(stream.contentType, new AlertStreamReader.Sink() {
                             public void onDocument(String document) {
+                                // The terminal's keep-alive heartbeat is not a gate
+                                // event; forwarding it would file a bogus
+                                // "videoloss" entry against the terminal.
+                                if (AlertStreamReader.isHeartbeatDocument(document)) return;
                                 BridgeRuntime.queue(device.estateMateDeviceId, document);
                             }
                         });

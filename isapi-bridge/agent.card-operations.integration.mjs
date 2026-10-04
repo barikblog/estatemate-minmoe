@@ -200,7 +200,61 @@ try {
     assert.equal(agent.describeIsapiFailure({ status: 500, body: 'gateway exploded' }), 'ISAPI 500: gateway exploded');
     assert.equal(agent.terminalEmployeeNo({ employeeNo: ' 842317765 ' }), '842317765');
     assert.equal(agent.terminalEmployeeNo({ employeeNo: 'x'.repeat(33) }), null);
+
+    // A refused credential is reported with the terminal's own lock state and
+    // remaining attempts (XML_ResponseStatus_AuthenticationFailed) — the guide
+    // locks the account once the remaining attempts reach 0, so an operator has
+    // to see this before the next attempt.
+    const authFailed = '<ResponseStatus version="1.0" xmlns="http://www.std-cgi.org/ver20/XMLSchema">'
+      + '<requestURL>/ISAPI/AccessControl/CardInfo/Record</requestURL><statusCode>4</statusCode>'
+      + '<statusString>Invalid Operation</statusString><subStatusCode>badAuthorization</subStatusCode>'
+      + '<lockStatus>locked</lockStatus><retryTimes>2</retryTimes><resLockTime>300</resLockTime></ResponseStatus>';
+    const authSummary = agent.describeIsapiFailure({ status: 401, body: authFailed });
+    assert.ok(authSummary.startsWith('ISAPI 401: authentication failed'), authSummary);
+    assert.ok(authSummary.includes('2 attempt(s) left'), authSummary);
+    assert.ok(authSummary.includes('locked for 300s'), authSummary);
+    assert.ok(authSummary.includes('check the ISAPI username and password'), authSummary);
     console.log('ISAPI failure summaries OK');
+  }
+
+  // 5. Digest: a stale nonce is reissued by the terminal (RFC 2617) and answered
+  //    exactly once — the credential itself is never repeated blindly, because a
+  //    wrong password locks the account at remaining attempts 0.
+  {
+    let authenticatedAttempts = 0;
+    const digestServer = createServer((req, res) => {
+      if (!req.headers.authorization) {
+        res.writeHead(401, { 'WWW-Authenticate': 'Digest qop="auth", realm="IP Camera(C2183)", nonce="nonce-1", stale="FALSE"' });
+        res.end();
+        return;
+      }
+      authenticatedAttempts++;
+      if (authenticatedAttempts === 1) {
+        res.writeHead(401, { 'WWW-Authenticate': 'Digest qop="auth", realm="IP Camera(C2183)", nonce="nonce-2", stale="TRUE"' });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ statusCode: 1, statusString: 'OK', subStatusCode: 'ok' }));
+    });
+    await new Promise((resolve) => digestServer.listen(0, '127.0.0.1', resolve));
+    const digestDevice = {
+      estateMateDeviceId: deviceId,
+      name: 'Digest Terminal',
+      isapiHost: '127.0.0.1',
+      isapiPort: digestServer.address().port,
+      isapiUsername: 'admin',
+      isapiPassword: 'device-password',
+      protocol: 'http',
+    };
+    try {
+      const result = await agent.isapiRequest(digestDevice, 'GET', '/ISAPI/System/deviceInfo?format=json', null, false);
+      assert.equal(result.status, 200, `the reissued nonce must be answered: ${result.status} ${result.body}`);
+      assert.equal(authenticatedAttempts, 2, `exactly one re-challenge may be sent, got ${authenticatedAttempts}`);
+      console.log('digest re-challenge OK');
+    } finally {
+      digestServer.close();
+    }
   }
 
   console.log('ISAPI bridge card-operation checks passed');

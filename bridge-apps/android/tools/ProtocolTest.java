@@ -313,6 +313,28 @@ public final class ProtocolTest {
         fallbackPayload.put("employeeNo", "RES-11");
         IsapiClient.OpResult fallback = client.applyOperation(device, "upsert_card", fallbackPayload);
         check("a firmware that rejects JSON falls back to XML", fallback.success && !fake.xmlCardRecords.isEmpty(), String.valueOf(fallback.error));
+        fake.rejectJsonCards = false;
+
+        // A nonce can go stale and be reissued (RFC 2617): the terminal answers
+        // with a fresh challenge, which is answered once. The credentials are
+        // never repeated blindly — remaining attempts 0 locks the account.
+        fake.staleNonceOnce = true;
+        IsapiClient.Response staleAnswer = client.request(device, "GET", "/ISAPI/System/time?format=json", null, false);
+        check("a reissued (stale) nonce is answered once",
+                staleAnswer.status == 200 && fake.staleNonceChallenges == 1,
+                "status=" + staleAnswer.status + " stale=" + fake.staleNonceChallenges);
+
+        // A refused credential reports the terminal's lock state and remaining
+        // attempts, from XML_ResponseStatus_AuthenticationFailed.
+        String authFailed = "<ResponseStatus version=\"1.0\" xmlns=\"http://www.std-cgi.org/ver20/XMLSchema\">"
+                + "<statusCode>4</statusCode><statusString>Invalid Operation</statusString>"
+                + "<subStatusCode>badAuthorization</subStatusCode><lockStatus>locked</lockStatus>"
+                + "<retryTimes>2</retryTimes><resLockTime>300</resLockTime></ResponseStatus>";
+        String authSummary = IsapiClient.describeFailure(401, authFailed);
+        check("a refused credential reports the remaining attempts",
+                authSummary.startsWith("ISAPI 401: authentication failed")
+                        && authSummary.contains("2 attempt(s) left") && authSummary.contains("locked for 300s"),
+                authSummary);
 
         fake.server.stop(0);
     }
@@ -342,6 +364,18 @@ public final class ProtocolTest {
         bare.feed("No\":\"3\"}}{\"EventNotificationAlert\":{\"cardNo\":\"4\"}}");
         check("bare JSON events are extracted across chunk boundaries", bareDocs.size() == 2, bareDocs.toString());
         check("a document split mid-string is reassembled", bareDocs.get(0).contains("\"cardNo\":\"3\""), bareDocs.get(0));
+
+        // The stream's keep-alive heartbeat is not a gate event: the ISAPI guide
+        // defines it as "videoloss"/"inactive" (subscription heartbeat
+        // "heartBeat"/"active"). A real alarm is "videoloss"/"active".
+        check("the keep-alive heartbeat is recognised",
+                AlertStreamReader.isHeartbeatDocument("{\"EventNotificationAlert\":{\"eventType\":\"videoloss\",\"eventState\":\"inactive\"}}")
+                        && AlertStreamReader.isHeartbeatDocument("<EventNotificationAlert><eventType>heartBeat</eventType><eventState>active</eventState></EventNotificationAlert>"),
+                "heartbeat documents must be recognised");
+        check("a gate event and a video-loss alarm are not heartbeats",
+                !AlertStreamReader.isHeartbeatDocument("{\"EventNotificationAlert\":{\"eventType\":\"videoloss\",\"eventState\":\"active\"}}")
+                        && !AlertStreamReader.isHeartbeatDocument("{\"EventNotificationAlert\":{\"eventType\":\"AccessControllerEvent\",\"cardNo\":\"1\"}}"),
+                "real events and alarms must not be filtered");
     }
 
     // ----------------------------------------------------------------- Worker --
@@ -441,6 +475,8 @@ public final class ProtocolTest {
         int rejected;
         boolean rejectJsonCards;
         boolean rejectContent;
+        boolean staleNonceOnce;
+        int staleNonceChallenges;
         final java.util.Set<String> heldCards = new java.util.HashSet<String>();
         final List<String> modifyRequests = new ArrayList<String>();
         final List<String> cardRecords = new ArrayList<String>();
@@ -471,12 +507,30 @@ public final class ProtocolTest {
                 Map<String, String> fields = Digest.parseChallenge(authorization);
                 String ha1 = Digest.md5("admin:" + REALM + ":password");
                 String ha2 = Digest.md5(exchange.getRequestMethod() + ":" + fields.get("uri"));
-                String expected = Digest.md5(ha1 + ":" + NONCE + ":" + fields.get("nc") + ":" + fields.get("cnonce") + ":" + fields.get("qop") + ":" + ha2);
-                if (!expected.equals(fields.get("response")) || !"admin".equals(fields.get("username"))) {
+                String nonce = fields.get("nonce");
+                String expected = Digest.md5(ha1 + ":" + nonce + ":" + fields.get("nc") + ":" + fields.get("cnonce") + ":" + fields.get("qop") + ":" + ha2);
+                // NONCE-2 is the reissued nonce the stale-nonce path hands out.
+                boolean knownNonce = NONCE.equals(nonce) || (NONCE + "-2").equals(nonce);
+                if (!knownNonce || !expected.equals(fields.get("response")) || !"admin".equals(fields.get("username"))) {
                     device.rejected++;
                     challenge(exchange);
                     return;
                 }
+            }
+
+            // Like real firmware: the nonce went stale, so the credential is
+            // accepted but the call must be repeated against a fresh challenge.
+            if (path.equals("/ISAPI/System/time") && device.staleNonceOnce) {
+                device.staleNonceOnce = false;
+                device.staleNonceChallenges++;
+                exchange.getResponseHeaders().add("WWW-Authenticate",
+                        "Digest realm=\"" + REALM + "\", qop=\"auth\", nonce=\"" + NONCE + "-2\", stale=\"TRUE\", opaque=\"protocol-test\"");
+                respond(exchange, 401, "{\"statusCode\":4,\"statusString\":\"Invalid Operation\",\"subStatusCode\":\"badAuthorization\",\"retryTimes\":3}");
+                return;
+            }
+            if (path.equals("/ISAPI/System/time")) {
+                respond(exchange, 200, "{\"statusCode\":1,\"statusString\":\"OK\"}");
+                return;
             }
 
             if (path.equals("/ISAPI/System/deviceInfo")) {

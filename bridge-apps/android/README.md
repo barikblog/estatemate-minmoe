@@ -66,7 +66,8 @@ receives under the tag `EstateMateBridge`.
 * holds one persistent `GET /ISAPI/Event/notification/alertStream` connection per
   terminal (multipart or bare-JSON firmware) and forwards events to the Worker in
   batches of up to 50, buffering up to `eventBufferLimit` documents while the
-  network is down;
+  network is down; the stream's keep-alive heartbeat (`videoloss`/`inactive`) is
+  read as activity but never forwarded as a gate event;
 * polls the Worker every `syncIntervalSeconds` for queued operations and applies
   them over ISAPI with HTTP Digest: `upsert_card` / `enable_card` (JSON
   `CardInfo/Record`, then `CardInfo/Modify` when the terminal already holds the

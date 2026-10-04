@@ -122,14 +122,33 @@ public final class IsapiClient {
         }
 
         HttpURLConnection retry = open(url, method);
+        String reChallenge = null;
         try {
             retry.setRequestProperty("Content-Type", contentType);
             retry.setRequestProperty("Authorization", authorization);
             if (body != null) writeBody(retry, body);
             int status = retry.getResponseCode();
-            return readResponse(retry, status);
+            if (status != 401) return readResponse(retry, status);
+            reChallenge = retry.getHeaderField("WWW-Authenticate");
+            if (!Digest.isDigest(reChallenge)) return readResponse(retry, status);
+            // The credentials were fine but the nonce went stale: the terminal
+            // reissued a challenge (RFC 2617 stale="TRUE"), so answer it once.
+            // A 401 without a fresh Digest challenge is an authentication
+            // failure and is never repeated — remaining attempts 0 locks the
+            // account on the next attempt.
+            drain(retry);
         } finally {
             retry.disconnect();
+        }
+
+        HttpURLConnection reanswered = open(url, method);
+        try {
+            reanswered.setRequestProperty("Content-Type", contentType);
+            reanswered.setRequestProperty("Authorization", Digest.buildHeader(device, method, path, reChallenge));
+            if (body != null) writeBody(reanswered, body);
+            return readResponse(reanswered, reanswered.getResponseCode());
+        } finally {
+            reanswered.disconnect();
         }
     }
 
@@ -504,6 +523,25 @@ public final class IsapiClient {
      */
     static String describeFailure(int status, String body) {
         String text = body == null ? "" : body;
+        if (status == 401) {
+            // The terminal refused the credentials. The guide's
+            // authentication-failed document names the lock state, the remaining
+            // attempts and the lock time — an operator needs those before the
+            // account is barred. The bridge never repeats a 401 for that reason.
+            StringBuilder notes = new StringBuilder();
+            String[] authFields = { "lockStatus", "retryTimes", "resLockTime", "subStatusCode" };
+            for (int i = 0; i < authFields.length; i++) {
+                String value = responseField(text, authFields[i]);
+                if (value == null) continue;
+                if (notes.length() > 0) notes.append(", ");
+                if ("retryTimes".equals(authFields[i])) notes.append(value).append(" attempt(s) left");
+                else if ("resLockTime".equals(authFields[i])) notes.append("locked for ").append(value).append("s");
+                else if ("lockStatus".equals(authFields[i])) notes.append("lockStatus ").append(value);
+                else notes.append(value);
+            }
+            return "ISAPI 401: authentication failed" + (notes.length() > 0 ? " (" + notes + ")" : "")
+                    + " - check the ISAPI username and password";
+        }
         StringBuilder reason = new StringBuilder();
         String[] fields = { "statusString", "subStatusCode", "errorMsg" };
         for (int i = 0; i < fields.length; i++) {
