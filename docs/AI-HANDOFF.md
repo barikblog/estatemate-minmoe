@@ -1,5 +1,49 @@
 # AI handoff — EstateMate
 
+## Card-operation protocol fixes folded into the bridge sources (2026-10-04)
+
+Requested as: "USE THIS INFORMATION WHERE NEEDED IN THE ISAPI BRIDGE" — the two
+uploaded bundles in the repository root (`estatemate-isapi-fix.zip`,
+`estatemate-bridge-android-fix.zip`).
+
+- **What the tree was missing.** Both LAN bridge implementations (`isapi-bridge/agent.mjs`
+  and the Android `IsapiClient.java`) still spoke the pre-fix card dialect: the delete
+  condition was a bare `{"CardNoList":[{"CardNo":"…"}]}` (terminals answer `Invalid Format /
+  badJsonFormat` and delete nothing), `upsert_visitor` wrote an XML `tempCard` (not a valid
+  `cardType` on these terminals), a JSON→XML retry ran after *content* rejections (which
+  buries the terminal's real reason), a duplicate `CardInfo/Record` was reported as a failure
+  instead of falling through to `CardInfo/Modify`, and success was judged on HTTP 2xx alone
+  (some firmware answers 200 with a `ResponseStatus` whose `statusCode` is not 1).
+- **Applied.** `isapi-bridge/agent.mjs`, `isapi-bridge/agent.card-operations.integration.mjs`,
+  `bridge-apps/android/app/src/main/java/com/estatemate/bridge/IsapiClient.java` and
+  `bridge-apps/android/tools/ProtocolTest.java` now carry the fix-bundle implementation:
+  `writeTerminalCard`/`writeCard` (Record, then Modify on `cardNoAlreadyExist`),
+  `deleteTerminalCard`/`deleteCard` (`CardInfoDelCond` with lower-case `cardNo`; an
+  already-absent card counts as removed, an unsupported call does not), visitors as a JSON
+  `normalCard` under the issued employee number, ISAPI-namespaced XML used only when the JSON
+  URL itself is unsupported, success read from the `ResponseStatus` `statusCode`, and failure
+  reasons summarised from `statusString`/`subStatusCode`/`errorMsg`. The two implementations
+  stay equivalent, as the project rules require.
+- **Nothing else in the bundles was newer.** The rest of `estatemate-bridge-android-fix.zip` is
+  `0.2.1`-era (`WorkerClient`, `BridgeService`, `BridgeRuntime`, the activity) and is
+  superseded by the tree — the tree's `IsapiClient` already had the employee-number guard,
+  `revoke_visitor`, remote door control and grouped `ResponseStatus` parsing that neither zip
+  contains. The only unique content in that zip (the card protocol) is the same fix as the
+  ISAPI bundle. The bundled zips can be deleted once this is merged; they are now redundant.
+- **Docs.** `docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md` gained a **Terminal protocol the card path
+  relies on** section (the rules above, which the simulated terminals enforce);
+  `isapi-bridge/README.md` section 5 and `bridge-apps/android/README.md` no longer describe the
+  `tempCard` / bare-`CardNoList` shapes.
+- **Verification.** `npm run test:isapi-bridge` passes — the card harness's simulated terminal
+  now enforces the real rules (JSON-only card writes, `cardNoAlreadyExist` on a duplicate
+  `Record`, `badJsonFormat` on a bare `CardNoList`, `cardNoNotExist` from `Modify`) — and the
+  Android `ProtocolTest` runs **90/90** against the fixed `IsapiClient`. Cross-check that the
+  tests catch the regression: compiling the *old* `IsapiClient` with the *new* `ProtocolTest`
+  fails exactly the six protocol checks (delete shape, visitor cardType, re-enable via Modify).
+- **Still outstanding.** No real terminal is reachable from the sandbox; the on-site firmware
+  verification checklist in `docs/device-profiles/DS-K1T808MFWX-B.md` remains the evidence gate
+  before claiming the model production-supported.
+
 ## Bridge setup wizard on first run, and the wizard release gate (2026-09-28)
 
 Requested as: "publish the wizard in a GitHub release" / "create a new exe bridge file with setup wizard".

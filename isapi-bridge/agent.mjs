@@ -606,6 +606,97 @@ function describeIsapiFailure(result) {
   return `ISAPI ${result.status}: ${reason || body.slice(0, 200)}`;
 }
 
+/**
+ * Whether a terminal accepted a request. A 2xx is normally enough, but some
+ * firmware answers 200 with a ResponseStatus whose statusCode is not 1 (OK).
+ */
+function isapiOk(result) {
+  if (result.status < 200 || result.status >= 300) return false;
+  const body = String(result.body || '');
+  const code = /"statusCode"\s*:\s*(\d+)/.exec(body) || /<statusCode>(\d+)<\/statusCode>/.exec(body);
+  return !code || Number(code[1]) === 1;
+}
+
+/**
+ * The terminal does not implement this URL or format at all (as opposed to
+ * rejecting the content we sent). Only then is it worth retrying in another
+ * format: retrying a content error in XML just buries the real reason.
+ */
+function isapiUnsupported(result) {
+  if (result.status === 404 || result.status === 405 || result.status === 501) return true;
+  return /notSupport|invalidURL|invalidOperation/i.test(String(result.body || ''));
+}
+
+/** The failure reasons worth showing: real rejections, else the unsupported ones. */
+function describeAttempts(attempts) {
+  const rejections = attempts.filter((attempt) => !isapiUnsupported(attempt));
+  return (rejections.length ? rejections : attempts).map(describeIsapiFailure).join('; then ');
+}
+
+const ISAPI_XML_NS = 'xmlns="http://www.isapi.org/ver20/XMLSchema" version="2.0"';
+
+/**
+ * Adds a card to the terminal, or updates it when the terminal already has that
+ * card number. Terminals answer a duplicate Record with an error, so a re-enable
+ * or re-issue of an existing card must fall through to Modify.
+ * JSON is the format these terminals speak; XML is only tried when the JSON URL
+ * is not supported.
+ */
+async function writeTerminalCard(device, employeeNo, cardNo) {
+  const body = JSON.stringify({ CardInfo: { employeeNo: String(employeeNo), cardNo: String(cardNo), cardType: 'normalCard' } });
+  const attempts = [];
+  let result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/CardInfo/Record?format=json', body, false);
+  attempts.push(result);
+  if (isapiOk(result)) return { ok: true, result, attempts };
+  if (!isapiUnsupported(result)) {
+    const modify = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/CardInfo/Modify?format=json', body, false);
+    if (isapiOk(modify)) return { ok: true, result: modify, attempts: [...attempts, modify] };
+    // "No such card" from Modify means the card was never the problem: Record's
+    // own rejection is the reason worth reporting.
+    if (alreadyGone(modify)) return { ok: false, result, attempts };
+    attempts.push(modify);
+    return { ok: false, result: modify, attempts };
+  }
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<CardInfo ${ISAPI_XML_NS}>
+  <employeeNo>${employeeNo}</employeeNo>
+  <cardNo>${cardNo}</cardNo>
+  <cardType>normalCard</cardType>
+</CardInfo>`;
+  result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/CardInfo/Record', xml, true);
+  attempts.push(result);
+  return { ok: isapiOk(result), result, attempts };
+}
+
+/**
+ * Removes a card. The delete condition must be wrapped in CardInfoDelCond with a
+ * lower-case cardNo; a bare {CardNoList:[{CardNo}]} is what produced
+ * "Invalid Format / badJsonFormat". A card that is already gone counts as removed,
+ * but a terminal that simply does not support the call does not.
+ */
+async function deleteTerminalCard(device, cardNo) {
+  const body = JSON.stringify({ CardInfoDelCond: { CardNoList: [{ cardNo: String(cardNo) }] } });
+  const attempts = [];
+  let result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/CardInfo/Delete?format=json', body, false);
+  attempts.push(result);
+  if (!isapiOk(result) && isapiUnsupported(result) && !alreadyGone(result)) {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<CardInfoDelCond ${ISAPI_XML_NS}>
+  <CardNoList>
+    <cardNo>${cardNo}</cardNo>
+  </CardNoList>
+</CardInfoDelCond>`;
+    result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/CardInfo/Delete', xml, true);
+    attempts.push(result);
+  }
+  if (isapiOk(result) || alreadyGone(result)) return { ok: true, result, attempts };
+  return { ok: false, result, attempts };
+}
+
+function alreadyGone(result) {
+  return /not ?exist|not ?found|cardNoNotExist/i.test(String(result.body || '')) && !/notSupport/i.test(String(result.body || ''));
+}
+
 async function applyCardOperation(device, operation) {
   const payload = operation.payload || {};
   const cardUid = payload.cardUid || payload.cardNo || payload.card_number;
@@ -614,106 +705,44 @@ async function applyCardOperation(device, operation) {
 
   log('info', `Applying ${op} for device ${device.name} (${device.estateMateDeviceId}) card=${cardUid} opId=${operation.id}`);
 
-  // Example ISAPI payloads - these vary by model/firmware. Adjust per your device manual.
-  // This is a best-effort generic implementation; test against your specific model.
-
   try {
     if (op === 'upsert_card' || op === 'enable_card') {
       if (!cardUid) return { success: false, error: 'operation has no card number' };
       if (!employeeNo) {
         return { success: false, error: 'operation has no valid EstateMate employee number; refusing to guess which terminal person owns the card' };
       }
-      // Check if card exists
-      // PUT /ISAPI/AccessControl/CardInfo/Record?format=json or /ISAPI/AccessControl/CardInfo/SetUp?format=json
-      // For simplicity, we attempt to create/update card via ISAPI JSON if supported.
-      const cardXml = `<?xml version="1.0" encoding="UTF-8"?>
-<CardInfo>
-  <employeeNo>${employeeNo}</employeeNo>
-  <cardNo>${cardUid}</cardNo>
-  <cardType>normalCard</cardType>
-</CardInfo>`;
-
-      // Try JSON first (newer firmware)
-      const jsonBody = {
-        CardInfo: {
-          employeeNo: String(employeeNo),
-          cardNo: String(cardUid),
-          cardType: 'normalCard',
-        },
-      };
-
-      const jsonResult = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/CardInfo/Record?format=json', JSON.stringify(jsonBody), false);
-      let result = jsonResult;
-      if (result.status >= 400) {
-        // Older firmware only accepts the XML form.
-        result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/CardInfo/Record', cardXml, true);
-      }
-
-      if (result.status >= 200 && result.status < 300) {
-        log('info', `Card ${cardUid} upsert OK on ${device.name}: ${result.status}`);
+      const written = await writeTerminalCard(device, employeeNo, cardUid);
+      if (written.ok) {
+        log('info', `Card ${cardUid} upsert OK on ${device.name}: ${written.result.status}`);
         return { success: true };
-      } else {
-        log('warn', `Card upsert failed on ${device.name}: ${result.status} ${result.body.slice(0, 500)}`);
-        // Some devices return 200 with error in body, parse
-        if (result.body.includes('ok') || result.body.includes('success')) return { success: true };
-        // Report both answers when the XML retry also failed: the JSON one is
-        // usually the firmware's real objection.
-        const reason = result === jsonResult
-          ? describeIsapiFailure(result)
-          : `${describeIsapiFailure(jsonResult)}; XML retry ${describeIsapiFailure(result)}`;
-        return { success: false, error: reason };
       }
+      log('warn', `Card upsert failed on ${device.name}: ${written.result.status} ${String(written.result.body).slice(0, 500)}`);
+      return { success: false, error: describeAttempts(written.attempts) };
     } else if (op === 'disable_card' || op === 'delete_card') {
-      // Delete or disable - for disable we could update card status, but many firmwares only support delete.
-      // We attempt delete.
-      const deleteXml = `<?xml version="1.0" encoding="UTF-8"?>
-<CardInfoDelCond>
-  <CardNoList>
-    <CardNo>${cardUid}</CardNo>
-  </CardNoList>
-</CardInfoDelCond>`;
-
-      let result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/CardInfo/Delete?format=json', JSON.stringify({ CardNoList: [{ CardNo: cardUid }] }), false);
-      if (result.status >= 400) {
-        result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/CardInfo/Delete', deleteXml, true);
-      }
-
-      if (result.status >= 200 && result.status < 300) {
+      if (!cardUid) return { success: false, error: 'operation has no card number' };
+      const removed = await deleteTerminalCard(device, cardUid);
+      if (removed.ok) {
         log('info', `Card ${cardUid} delete/disable OK on ${device.name}`);
         return { success: true };
-      } else {
-        log('warn', `Card delete failed on ${device.name}: ${result.status} ${result.body.slice(0, 500)}`);
-        // If card not found, treat as success (idempotent)
-        if (result.body.includes('not exist') || result.body.includes('not found') || result.status === 404) return { success: true };
-        return { success: false, error: describeIsapiFailure(result) };
       }
+      log('warn', `Card delete failed on ${device.name}: ${removed.result.status} ${String(removed.result.body).slice(0, 500)}`);
+      return { success: false, error: describeAttempts(removed.attempts) };
     } else if (op === 'revoke_visitor') {
       const visitorCard = payload.credentialNumber || cardUid;
       if (!visitorCard) return { success: false, error: 'Missing credential number' };
-      let result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/CardInfo/Delete?format=json', JSON.stringify({ CardNoList: [{ CardNo: visitorCard }] }), false);
-      if (result.status >= 400) {
-        const deleteXml = `<?xml version="1.0" encoding="UTF-8"?>\n<CardInfoDelCond>\n  <CardNoList>\n    <CardNo>${visitorCard}</CardNo>\n  </CardNoList>\n</CardInfoDelCond>`;
-        result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/CardInfo/Delete', deleteXml, true);
-      }
-      if (result.status >= 200 && result.status < 300) return { success: true };
-      if (result.body.includes('not exist') || result.body.includes('not found') || result.status === 404) return { success: true };
-      return { success: false, error: `Visitor revoke ISAPI ${result.status}: ${result.body.slice(0, 200)}` };
+      const removed = await deleteTerminalCard(device, visitorCard);
+      if (removed.ok) return { success: true };
+      return { success: false, error: `Visitor revoke ${describeAttempts(removed.attempts)}` };
     } else if (op === 'upsert_visitor') {
-      // Visitor credential - map to temporary card or visitor via ISAPI
-      // This is highly model-dependent. We log and mark as applied with note.
-      log('info', `Visitor operation ${op} for ${device.name} credential=${payload.credentialNumber} - manual mapping may be required`);
-      // For now, treat visitor as card with limited validity
+      // A visitor credential is filed as a normal card under the visitor's issued
+      // employee number. "tempCard" is not a valid cardType value on these terminals.
       const visitorCard = payload.credentialNumber || cardUid;
       if (!visitorCard) return { success: false, error: 'Missing credential number' };
-      const visitorXml = `<?xml version="1.0" encoding="UTF-8"?>
-<CardInfo>
-  <employeeNo>visitor-${payload.credentialNumber}</employeeNo>
-  <cardNo>${visitorCard}</cardNo>
-  <cardType>tempCard</cardType>
-</CardInfo>`;
-      let result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/CardInfo/Record', visitorXml, true);
-      if (result.status >= 200 && result.status < 300) return { success: true };
-      return { success: false, error: `Visitor ISAPI ${result.status}` };
+      const visitorEmployeeNo = employeeNo || (TERMINAL_EMPLOYEE_NO.test(`visitor-${payload.credentialNumber}`) ? `visitor-${payload.credentialNumber}` : null);
+      if (!visitorEmployeeNo) return { success: false, error: 'operation has no valid visitor employee number' };
+      const written = await writeTerminalCard(device, visitorEmployeeNo, visitorCard);
+      if (written.ok) return { success: true };
+      return { success: false, error: `Visitor ${describeAttempts(written.attempts)}` };
     }
 
     const doorCmd = {
@@ -728,15 +757,16 @@ async function applyCardOperation(device, operation) {
       if (!Number.isInteger(doorNo) || doorNo < 1 || doorNo > 8) return { success: false, error: 'doorNo must be 1-8' };
       // Best-effort Hikvision RemoteControl. Not verified per firmware in
       // docs/device-profiles/; a rejection is reported so an operator can apply it.
-      const jsonBody = JSON.stringify({ RemoteControlDoor: { cmd: doorCmd } });
-      let result = await isapiRequest(device, 'PUT', `/ISAPI/AccessControl/RemoteControl/door/${doorNo}?format=json`, jsonBody, false);
-      if (result.status >= 400) {
-        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<RemoteControlDoor><cmd>${doorCmd}</cmd></RemoteControlDoor>`;
+      const attempts = [];
+      let result = await isapiRequest(device, 'PUT', `/ISAPI/AccessControl/RemoteControl/door/${doorNo}?format=json`, JSON.stringify({ RemoteControlDoor: { cmd: doorCmd } }), false);
+      attempts.push(result);
+      if (!isapiOk(result)) {
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<RemoteControlDoor ${ISAPI_XML_NS}><cmd>${doorCmd}</cmd></RemoteControlDoor>`;
         result = await isapiRequest(device, 'PUT', `/ISAPI/AccessControl/RemoteControl/door/${doorNo}`, xml, true);
+        attempts.push(result);
       }
-      if (result.status >= 200 && result.status < 300) return { success: true };
-      if (result.body.includes('ok') || result.body.includes('success')) return { success: true };
-      return { success: false, error: `Door ISAPI ${result.status}: ${result.body.slice(0, 200)}` };
+      if (isapiOk(result)) return { success: true };
+      return { success: false, error: `Door ${describeAttempts(attempts)}` };
     }
 
     return { success: false, error: `Unknown operation ${op}` };

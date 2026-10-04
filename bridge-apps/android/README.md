@@ -68,9 +68,13 @@ receives under the tag `EstateMateBridge`.
   batches of up to 50, buffering up to `eventBufferLimit` documents while the
   network is down;
 * polls the Worker every `syncIntervalSeconds` for queued operations and applies
-  them over ISAPI with HTTP Digest: `upsert_card` / `enable_card` (JSON first,
-  XML fallback), `disable_card` / `delete_card` (PUT `CardInfo/Delete`),
-  `upsert_visitor` (XML `tempCard`);
+  them over ISAPI with HTTP Digest: `upsert_card` / `enable_card` (JSON
+  `CardInfo/Record`, then `CardInfo/Modify` when the terminal already holds the
+  card number), `disable_card` / `delete_card` (PUT `CardInfo/Delete` with the
+  `CardInfoDelCond` condition), `upsert_visitor` (JSON `normalCard` under the
+  visitor's employee number — `tempCard` is not a valid card type), `revoke_visitor`
+  and the remote door commands; XML is used only when a firmware does not
+  implement the JSON URL, never as a retry of a content rejection;
 * heartbeats every `heartbeatIntervalSeconds` with the same stats payload the
   Windows host sends, so the portal's agent row looks identical — including the
   per-terminal alertStream state (`devices: [{ deviceId, stream, lastError }]`),

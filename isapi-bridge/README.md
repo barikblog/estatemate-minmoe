@@ -110,14 +110,25 @@ Or use **Access-control devices** → edit device → set connection pattern to 
 
 ### 5. ISAPI endpoint reference (model dependent)
 
-- `POST /ISAPI/AccessControl/CardInfo/Record?format=json` — add/update card
-- `PUT /ISAPI/AccessControl/CardInfo/Delete?format=json` — delete card
+The card path is JSON-first, and the terminal's answer decides whether a fallback
+is worth trying — see
+[`../docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md`](../docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md#terminal-protocol-the-card-path-relies-on)
+for the behaviour the agent depends on.
+
+- `POST /ISAPI/AccessControl/CardInfo/Record?format=json` — add card
+- `PUT /ISAPI/AccessControl/CardInfo/Modify?format=json` — update a card the terminal already holds (a duplicate `Record` is an error, so re-enable/re-issue lands here)
+- `PUT /ISAPI/AccessControl/CardInfo/Delete?format=json` — delete card; the body must be `{"CardInfoDelCond":{"CardNoList":[{"cardNo":"…"}]}}`. A bare `{"CardNoList":[{"CardNo":"…"}]}` is answered `Invalid Format / badJsonFormat`.
 - `GET /ISAPI/AccessControl/CardInfo/Record?format=json` — list cards
-- Some firmware uses XML: `/ISAPI/AccessControl/CardInfo/Record` with `Content-Type: application/xml`.
+- Some firmware implements only the XML form: the same URLs without `?format=json` and with the ISAPI namespace on the root element (`<CardInfo xmlns="http://www.isapi.org/ver20/XMLSchema" version="2.0">`). The agent tries XML **only** when the JSON URL is unsupported (404/405/501 or `notSupport`/`invalidURL`/`invalidOperation`), never after a content rejection.
+- A 2xx is not proof of success: some firmware answers 200 with a `ResponseStatus` whose `statusCode` is not 1 (OK). Success is `statusCode == 1`.
 
 Test manually:
 ```bash
 curl -i http://192.168.1.100/ISAPI/System/deviceInfo --digest -u admin:password
+curl -i -X PUT --digest -u admin:password \
+  -H 'Content-Type: application/json' \
+  'http://192.168.1.100/ISAPI/AccessControl/CardInfo/Delete?format=json' \
+  -d '{"CardInfoDelCond":{"CardNoList":[{"cardNo":"10000001"}]}}'
 ```
 
 ## Troubleshooting

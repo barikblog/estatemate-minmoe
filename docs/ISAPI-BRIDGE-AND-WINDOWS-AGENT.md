@@ -17,9 +17,11 @@ The ISAPI bridge is a small Node.js agent that runs on the same LAN as Hikvision
    - `GET /api/isapi/v1/agents/:id/operations` — card upsert/enable/disable/delete, visitor upsert. Fingerprint operations are **not** in this list: a finger is captured on the terminal, so they are queued as `manual_action_required` operator tasks instead (migration `0015`)
    - Auth: `X-EstateMate-Agent-Key: <secret>` or `Authorization: Bearer <secret>`
 2. Applies them via Hikvision ISAPI (HTTP Digest Auth) to the device:
-   - `POST /ISAPI/AccessControl/CardInfo/Record?format=json`
-   - `PUT /ISAPI/AccessControl/CardInfo/Delete?format=json`
-   - XML fallback: `/ISAPI/AccessControl/CardInfo/Record`
+   - `POST /ISAPI/AccessControl/CardInfo/Record?format=json` — add a card
+   - `PUT /ISAPI/AccessControl/CardInfo/Modify?format=json` — when the terminal already holds that card number (a duplicate `Record` is an error, so a re-enable or re-issue falls through to `Modify`)
+   - `PUT /ISAPI/AccessControl/CardInfo/Delete?format=json` — remove a card; the condition must be wrapped as `{"CardInfoDelCond":{"CardNoList":[{"cardNo":"…"}]}}`
+   - `PUT /ISAPI/AccessControl/RemoteControl/door/{n}?format=json` — remote door command (model-dependent)
+   - XML fallback: the same bodies with the ISAPI namespace (`xmlns="http://www.isapi.org/ver20/XMLSchema" version="2.0"`), tried **only** when the JSON URL itself is unsupported — never after a content rejection
 3. Reports result:
    - `POST /api/isapi/v1/agents/:id/operations/:opId/result` with `{kind, status: applied|failed, errorMessage, durationMs}`
 4. Heartbeats:
@@ -30,6 +32,19 @@ No SDK required — uses documented ISAPI endpoints available on most K1T, K26xx
 ### Card identity guard
 
 Card upsert and re-enable operations must carry the holder's canonical EstateMate `employee_id`, which is bounded to 32 characters by migration `0018` and the terminal's ISAPI limit. Both the Node and Android bridge validate it before making a terminal request. A missing or unsafe value fails closed; the bridge never substitutes the resident's 36-character UUID or a guessed `1` (which could attach the card to another terminal person). ISAPI `ResponseStatus` fields are included in failure diagnostics so a terminal rejection such as `Invalid Content / badParameters / employeeNo` remains actionable. Regression coverage is in `isapi-bridge/agent.card-operations.integration.mjs` and the Android `ProtocolTest`.
+
+### Terminal protocol the card path relies on
+
+Recorded from the terminals these bridges were fixed against; the simulated terminals in both test suites enforce the same rules, so a regression fails the tests rather than the gate.
+
+- **JSON is the format.** `CardInfo/Record`, `CardInfo/Modify` and `CardInfo/Delete` are JSON calls (`?format=json`, `Content-Type: application/json`). The XML form is a legacy fallback that is attempted **only** when the JSON URL itself is unsupported — a `404`/`405`/`501`, or a `ResponseStatus` saying `notSupport`, `invalidURL` or `invalidOperation`. Retrying a *content* rejection (`Invalid Content` / `badParameters` / `badJsonFormat`) as XML buries the terminal's real reason; the client reports it instead.
+- **A 2xx is not proof.** Some firmware answers HTTP 200 with a `ResponseStatus` whose `statusCode` is not `1` (OK). That is a failure; success is `statusCode == 1` in the body when a body carries one.
+- **Duplicate cards are an error.** `POST CardInfo/Record` for a card number the terminal already holds answers `cardNoAlreadyExist`. The bridge treats that as "update in place" and issues `PUT CardInfo/Modify` with the same `CardInfo` body, which is what makes a re-enabled or re-issued card work. If `Modify` answers `cardNoNotExist`, the card is genuinely absent and `Record`'s own reason is reported.
+- **Delete conditions are wrapped.** `PUT CardInfo/Delete` accepts `{"CardInfoDelCond":{"CardNoList":[{"cardNo":"…"}]}}` — lower-case `cardNo` inside `CardInfoDelCond`. The bare `{"CardNoList":[{"CardNo":"…"}]}` shape answers `Invalid Format / badJsonFormat` and deletes nothing.
+- **Already-absent cards count as removed.** `cardNoNotExist` / `not exist` / `not found` on a delete is success (idempotent), but a terminal that does not implement the call at all (`notSupport`) is **not** — that is a real failure an operator must see.
+- **`tempCard` is not a valid card type.** Visitor credentials are written as `normalCard` under the visitor's issued employee number (`visitor-<credential>` only when no employee number was issued and it passes the 32-byte person-ID check). The old `tempCard` XML write was rejected by the terminals.
+- **XML bodies carry the namespace**: `<CardInfo xmlns="http://www.isapi.org/ver20/XMLSchema" version="2.0">`, likewise `<CardInfoDelCond>` and `<RemoteControlDoor>`.
+- **Failures are summarised, not truncated.** The reason is read from the `ResponseStatus` fields (`statusString` / `subStatusCode` / `errorMsg`), from JSON or XML, and both attempts are shown when a fallback was legitimately tried — real rejections first, unsupported-URL answers only if there are no rejections.
 
 ## Presence: how online/offline is decided
 

@@ -234,13 +234,16 @@ public final class ProtocolTest {
 
         IsapiClient.OpResult delete = client.applyOperation(device, "delete_card", payload);
         check("delete_card succeeds", delete.success, String.valueOf(delete.error));
-        check("delete_card uses PUT with CardNoList", fake.deleteRequests.size() == 1 && fake.deleteRequests.get(0).contains("99887766"), fake.deleteRequests.toString());
+        check("delete_card uses PUT with the CardInfoDelCond shape", fake.deleteRequests.size() == 1 && fake.deleteRequests.get(0).contains("99887766")
+                && fake.deleteRequests.get(0).contains("\"CardInfoDelCond\"") && fake.deleteRequests.get(0).contains("\"cardNo\":\"99887766\""), fake.deleteRequests.toString());
 
         Map<String, Object> visitor = new LinkedHashMap<String, Object>();
         visitor.put("credentialNumber", "VIS-7");
+        visitor.put("employeeNo", "VIS-7");
         IsapiClient.OpResult visitorResult = client.applyOperation(device, "upsert_visitor", visitor);
         check("upsert_visitor succeeds", visitorResult.success, String.valueOf(visitorResult.error));
-        check("upsert_visitor posts the XML tempCard", fake.visitorRecords.size() == 1 && fake.visitorRecords.get(0).contains("tempCard"), fake.visitorRecords.toString());
+        check("upsert_visitor posts a JSON normalCard, not tempCard", fake.visitorRecords.size() == 1 && fake.visitorRecords.get(0).contains("normalCard")
+                && !fake.visitorRecords.get(0).contains("tempCard"), fake.visitorRecords.toString());
 
         Map<String, Object> revoke = new LinkedHashMap<String, Object>();
         revoke.put("credentialNumber", "VIS-7");
@@ -282,7 +285,28 @@ public final class ProtocolTest {
         check("an ISAPI rejection is summarised from its ResponseStatus",
                 "ISAPI 400: Invalid Content / badParameters / employeeNo".equals(rejection), rejection);
 
-        // Older firmware: the JSON card endpoint answers 400 and the XML one is used.
+        // A content rejection is reported as is and never retried as XML.
+        int xmlBefore = fake.xmlCardRecords.size();
+        fake.rejectContent = true;
+        Map<String, Object> contentPayload = new LinkedHashMap<String, Object>();
+        contentPayload.put("cardUid", "33334444");
+        contentPayload.put("employeeNo", "RES-33");
+        IsapiClient.OpResult contentResult = client.applyOperation(device, "upsert_card", contentPayload);
+        check("a content rejection is reported with its reason",
+                !contentResult.success && contentResult.error != null && contentResult.error.contains("badParameters"), String.valueOf(contentResult.error));
+        check("a content rejection is not retried as XML", fake.xmlCardRecords.size() == xmlBefore, String.valueOf(fake.xmlCardRecords.size()));
+        fake.rejectContent = false;
+
+        // A card the terminal already holds is updated in place.
+        Map<String, Object> heldPayload = new LinkedHashMap<String, Object>();
+        heldPayload.put("cardUid", "77776666");
+        heldPayload.put("employeeNo", "RES-77");
+        IsapiClient.OpResult firstWrite = client.applyOperation(device, "upsert_card", heldPayload);
+        IsapiClient.OpResult again = client.applyOperation(device, "enable_card", heldPayload);
+        check("re-enabling a card the terminal holds succeeds via Modify",
+                firstWrite.success && again.success && fake.modifyRequests.size() == 1, String.valueOf(again.error) + fake.modifyRequests);
+
+        // Older firmware: the JSON card endpoint is unsupported and the XML one is used.
         fake.rejectJsonCards = true;
         Map<String, Object> fallbackPayload = new LinkedHashMap<String, Object>();
         fallbackPayload.put("cardUid", "11112222");
@@ -416,6 +440,9 @@ public final class ProtocolTest {
         int challenges;
         int rejected;
         boolean rejectJsonCards;
+        boolean rejectContent;
+        final java.util.Set<String> heldCards = new java.util.HashSet<String>();
+        final List<String> modifyRequests = new ArrayList<String>();
         final List<String> cardRecords = new ArrayList<String>();
         final List<String> xmlCardRecords = new ArrayList<String>();
         final List<String> deleteRequests = new ArrayList<String>();
@@ -462,18 +489,47 @@ public final class ProtocolTest {
                 return;
             }
             if (path.equals("/ISAPI/AccessControl/CardInfo/Record")) {
-                if (exchange.getRequestURI().getQuery() != null && device.rejectJsonCards
-                        && exchange.getRequestURI().getQuery().contains("format=json")) {
-                    respond(exchange, 400, "{\"statusCode\":4,\"statusString\":\"badJsonContent\"}");
+                boolean json = exchange.getRequestURI().getQuery() != null && exchange.getRequestURI().getQuery().contains("format=json");
+                if (json && device.rejectJsonCards) {
+                    respond(exchange, 404, "{\"statusCode\":4,\"statusString\":\"Invalid Operation\",\"subStatusCode\":\"notSupport\"}");
                     return;
                 }
-                if (body.contains("tempCard")) device.visitorRecords.add(body);
-                else if (body.startsWith("{")) device.cardRecords.add(body);
-                else device.xmlCardRecords.add(body);
+                if (device.rejectContent) {
+                    respond(exchange, 400, "{\"statusCode\":6,\"statusString\":\"Invalid Content\",\"subStatusCode\":\"badParameters\",\"errorMsg\":\"employeeNo\"}");
+                    return;
+                }
+                if (!json) {
+                    device.xmlCardRecords.add(body);
+                } else {
+                    java.util.regex.Matcher cardNo = java.util.regex.Pattern.compile("\"cardNo\":\"([^\"]*)\"").matcher(body);
+                    String held = cardNo.find() ? cardNo.group(1) : "";
+                    if (device.heldCards.contains(held)) {
+                        respond(exchange, 400, "{\"statusCode\":6,\"statusString\":\"Invalid Content\",\"subStatusCode\":\"cardNoAlreadyExist\",\"errorMsg\":\"cardNo\"}");
+                        return;
+                    }
+                    device.heldCards.add(held);
+                    if (body.contains("\"employeeNo\":\"VIS-")) device.visitorRecords.add(body);
+                    else device.cardRecords.add(body);
+                }
+                respond(exchange, 200, "{\"statusCode\":1,\"statusString\":\"OK\"}");
+                return;
+            }
+            if (path.equals("/ISAPI/AccessControl/CardInfo/Modify")) {
+                java.util.regex.Matcher modifyCard = java.util.regex.Pattern.compile("\"cardNo\":\"([^\"]*)\"").matcher(body);
+                if (!modifyCard.find() || !device.heldCards.contains(modifyCard.group(1))) {
+                    respond(exchange, 400, "{\"statusCode\":6,\"statusString\":\"Invalid Content\",\"subStatusCode\":\"cardNoNotExist\",\"errorMsg\":\"cardNo\"}");
+                    return;
+                }
+                device.modifyRequests.add(body);
                 respond(exchange, 200, "{\"statusCode\":1,\"statusString\":\"OK\"}");
                 return;
             }
             if (path.equals("/ISAPI/AccessControl/CardInfo/Delete")) {
+                // Like a real terminal: only {CardInfoDelCond:{CardNoList:[{cardNo}]}} is valid.
+                if (!body.contains("\"CardInfoDelCond\"") || !body.contains("\"cardNo\"")) {
+                    respond(exchange, 400, "{\"statusCode\":6,\"statusString\":\"Invalid Format\",\"subStatusCode\":\"badJsonFormat\",\"errorMsg\":\"badJsonFormat\"}");
+                    return;
+                }
                 device.deleteRequests.add(exchange.getRequestMethod() + " " + body);
                 respond(exchange, 200, "{\"statusCode\":1,\"statusString\":\"OK\"}");
                 return;

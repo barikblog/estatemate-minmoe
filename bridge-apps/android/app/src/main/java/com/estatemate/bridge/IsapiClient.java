@@ -336,74 +336,28 @@ public final class IsapiClient {
                 if (employeeNo == null) {
                     return new OpResult(false, "operation has no valid EstateMate employee number; refusing to guess which terminal person owns the card");
                 }
-                Map<String, Object> card = new LinkedHashMap<String, Object>();
-                card.put("employeeNo", employeeNo);
-                card.put("cardNo", cardUid);
-                card.put("cardType", "normalCard");
-                Map<String, Object> jsonBody = new LinkedHashMap<String, Object>();
-                jsonBody.put("CardInfo", card);
-
-                Response response = request(device, "POST", "/ISAPI/AccessControl/CardInfo/Record?format=json", Json.write(jsonBody), false);
-                if (response.status >= 400) {
-                    // Older firmware only accepts the XML form.
-                    String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CardInfo>\n"
-                            + "  <employeeNo>" + employeeNo + "</employeeNo>\n"
-                            + "  <cardNo>" + cardUid + "</cardNo>\n"
-                            + "  <cardType>normalCard</cardType>\n"
-                            + "</CardInfo>";
-                    response = request(device, "POST", "/ISAPI/AccessControl/CardInfo/Record", xml, true);
-                }
-                return judge(response, true);
+                return writeCard(device, employeeNo, cardUid, "");
             }
 
             if (op.equals("disable_card") || op.equals("delete_card")) {
                 if (cardUid == null) return new OpResult(false, "operation has no card number");
-                Map<String, Object> cardRef = new LinkedHashMap<String, Object>();
-                cardRef.put("CardNo", cardUid);
-                java.util.ArrayList<Object> list = new java.util.ArrayList<Object>();
-                list.add(cardRef);
-                Map<String, Object> jsonBody = new LinkedHashMap<String, Object>();
-                jsonBody.put("CardNoList", list);
-
-                Response response = request(device, "PUT", "/ISAPI/AccessControl/CardInfo/Delete?format=json", Json.write(jsonBody), false);
-                if (response.status >= 400) {
-                    String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CardInfoDelCond>\n"
-                            + "  <CardNoList>\n    <CardNo>" + cardUid + "</CardNo>\n  </CardNoList>\n"
-                            + "</CardInfoDelCond>";
-                    response = request(device, "PUT", "/ISAPI/AccessControl/CardInfo/Delete", xml, true);
-                }
-                return judge(response, true);
+                return deleteCard(device, cardUid, "");
             }
 
             if (op.equals("revoke_visitor")) {
                 String credential = firstNonEmpty(Json.string(payload, "credentialNumber", null), cardUid);
                 if (credential == null) return new OpResult(false, "Missing credential number");
-                Map<String, Object> cardRef = new LinkedHashMap<String, Object>();
-                cardRef.put("CardNo", credential);
-                java.util.ArrayList<Object> list = new java.util.ArrayList<Object>();
-                list.add(cardRef);
-                Map<String, Object> jsonBody = new LinkedHashMap<String, Object>();
-                jsonBody.put("CardNoList", list);
-                Response response = request(device, "PUT", "/ISAPI/AccessControl/CardInfo/Delete?format=json", Json.write(jsonBody), false);
-                if (response.status >= 400) {
-                    String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CardInfoDelCond>\n"
-                            + "  <CardNoList>\n    <CardNo>" + credential + "</CardNo>\n  </CardNoList>\n"
-                            + "</CardInfoDelCond>";
-                    response = request(device, "PUT", "/ISAPI/AccessControl/CardInfo/Delete", xml, true);
-                }
-                return judge(response, true);
+                return deleteCard(device, credential, "Visitor revoke ");
             }
 
             if (op.equals("upsert_visitor")) {
                 String credential = firstNonEmpty(Json.string(payload, "credentialNumber", null), cardUid);
                 if (credential == null) return new OpResult(false, "Missing credential number");
-                String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CardInfo>\n"
-                        + "  <employeeNo>visitor-" + credential + "</employeeNo>\n"
-                        + "  <cardNo>" + credential + "</cardNo>\n"
-                        + "  <cardType>tempCard</cardType>\n"
-                        + "</CardInfo>";
-                Response response = request(device, "POST", "/ISAPI/AccessControl/CardInfo/Record", xml, true);
-                return judge(response, false);
+                // Filed as a normal card under the visitor's issued employee number;
+                // "tempCard" is not a valid cardType on these terminals.
+                String visitorEmployeeNo = employeeNo != null ? employeeNo : terminalEmployeeNo("visitor-" + credential);
+                if (visitorEmployeeNo == null) return new OpResult(false, "operation has no valid visitor employee number");
+                return writeCard(device, visitorEmployeeNo, credential, "Visitor ");
             }
 
             String doorCmd = doorCommand(op);
@@ -415,11 +369,13 @@ public final class IsapiClient {
                 Map<String, Object> jsonBody = new LinkedHashMap<String, Object>();
                 jsonBody.put("RemoteControlDoor", cmd);
                 Response response = request(device, "PUT", "/ISAPI/AccessControl/RemoteControl/door/" + door + "?format=json", Json.write(jsonBody), false);
-                if (response.status >= 400) {
-                    String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<RemoteControlDoor><cmd>" + doorCmd + "</cmd></RemoteControlDoor>";
-                    response = request(device, "PUT", "/ISAPI/AccessControl/RemoteControl/door/" + door, xml, true);
+                if (!accepted(response)) {
+                    String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<RemoteControlDoor " + XML_NS + "><cmd>" + doorCmd + "</cmd></RemoteControlDoor>";
+                    Response xmlResponse = request(device, "PUT", "/ISAPI/AccessControl/RemoteControl/door/" + door, xml, true);
+                    if (accepted(xmlResponse)) return new OpResult(true, null);
+                    return new OpResult(false, "Door " + describeAttempts(response, xmlResponse));
                 }
-                return judge(response, false);
+                return new OpResult(true, null);
             }
 
             return new OpResult(false, "Unknown operation " + op);
@@ -430,19 +386,114 @@ public final class IsapiClient {
         }
     }
 
+    private static final String XML_NS = "xmlns=\"http://www.isapi.org/ver20/XMLSchema\" version=\"2.0\"";
+
     /**
-     * Success is a 2xx, or a body that says so despite the status code — some
-     * firmware answers 200 with an error document and 500 with "already exists".
+     * A terminal accepted the request: a 2xx, unless the body is a ResponseStatus
+     * whose statusCode is not 1 (OK) — some firmware answers 200 with an error.
      */
-    private OpResult judge(Response response, boolean tolerateMissing) {
-        if (response.ok()) return new OpResult(true, null);
+    static boolean accepted(Response response) {
+        if (response.status < 200 || response.status >= 300) return false;
         String body = response.body == null ? "" : response.body;
-        String lower = body.toLowerCase();
-        if (lower.contains("ok") || lower.contains("success")) return new OpResult(true, null);
-        if (tolerateMissing && (lower.contains("not exist") || lower.contains("not found") || response.status == 404)) {
-            return new OpResult(true, null);
+        java.util.regex.Matcher code = java.util.regex.Pattern
+                .compile("\"statusCode\"\\s*:\\s*(\\d+)|<statusCode>(\\d+)</statusCode>").matcher(body);
+        if (!code.find()) return true;
+        String value = code.group(1) != null ? code.group(1) : code.group(2);
+        return "1".equals(value);
+    }
+
+    /**
+     * The terminal does not implement this URL or format (as opposed to rejecting
+     * the content sent). Only then is a retry in another format worthwhile:
+     * retrying a content error as XML just buries the real reason.
+     */
+    static boolean unsupported(Response response) {
+        if (response.status == 404 || response.status == 405 || response.status == 501) return true;
+        String body = response.body == null ? "" : response.body;
+        return java.util.regex.Pattern.compile("notSupport|invalidURL|invalidOperation", java.util.regex.Pattern.CASE_INSENSITIVE)
+                .matcher(body).find();
+    }
+
+    /** The card is already absent from the terminal (and the call is otherwise supported). */
+    static boolean alreadyGone(Response response) {
+        String body = response.body == null ? "" : response.body;
+        return java.util.regex.Pattern.compile("not ?exist|not ?found|cardNoNotExist", java.util.regex.Pattern.CASE_INSENSITIVE)
+                .matcher(body).find()
+                && !java.util.regex.Pattern.compile("notSupport", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(body).find();
+    }
+
+    /** Real rejections if there are any, else the unsupported answers. */
+    static String describeAttempts(Response... attempts) {
+        StringBuilder out = new StringBuilder();
+        boolean anyRejection = false;
+        for (Response attempt : attempts) if (!unsupported(attempt)) anyRejection = true;
+        for (Response attempt : attempts) {
+            if (anyRejection && unsupported(attempt)) continue;
+            if (out.length() > 0) out.append("; then ");
+            out.append(describeFailure(attempt.status, attempt.body));
         }
-        return new OpResult(false, describeFailure(response.status, body));
+        return out.toString();
+    }
+
+    /**
+     * Adds a card, or updates it when the terminal already holds that card number
+     * (a duplicate Record is an error, so a re-enable or re-issue must fall through
+     * to Modify). JSON is what these terminals speak; XML is tried only when the
+     * JSON URL is unsupported.
+     */
+    private OpResult writeCard(Device device, String employeeNo, String cardNo, String errorPrefix) throws IOException {
+        Map<String, Object> card = new LinkedHashMap<String, Object>();
+        card.put("employeeNo", employeeNo);
+        card.put("cardNo", cardNo);
+        card.put("cardType", "normalCard");
+        Map<String, Object> jsonBody = new LinkedHashMap<String, Object>();
+        jsonBody.put("CardInfo", card);
+        String body = Json.write(jsonBody);
+
+        Response record = request(device, "POST", "/ISAPI/AccessControl/CardInfo/Record?format=json", body, false);
+        if (accepted(record)) return new OpResult(true, null);
+        if (!unsupported(record)) {
+            Response modify = request(device, "PUT", "/ISAPI/AccessControl/CardInfo/Modify?format=json", body, false);
+            if (accepted(modify)) return new OpResult(true, null);
+            // "No such card" from Modify means the card was never the problem.
+            if (alreadyGone(modify)) return new OpResult(false, errorPrefix + describeAttempts(record));
+            return new OpResult(false, errorPrefix + describeAttempts(record, modify));
+        }
+        String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CardInfo " + XML_NS + ">\n"
+                + "  <employeeNo>" + employeeNo + "</employeeNo>\n"
+                + "  <cardNo>" + cardNo + "</cardNo>\n"
+                + "  <cardType>normalCard</cardType>\n"
+                + "</CardInfo>";
+        Response legacy = request(device, "POST", "/ISAPI/AccessControl/CardInfo/Record", xml, true);
+        if (accepted(legacy)) return new OpResult(true, null);
+        return new OpResult(false, errorPrefix + describeAttempts(record, legacy));
+    }
+
+    /**
+     * Removes a card. The condition must be wrapped in CardInfoDelCond with a
+     * lower-case cardNo; a bare {CardNoList:[{CardNo}]} is what the terminal
+     * answers with "Invalid Format / badJsonFormat". An already-removed card counts
+     * as removed; a terminal that simply lacks the call does not.
+     */
+    private OpResult deleteCard(Device device, String cardNo, String errorPrefix) throws IOException {
+        Map<String, Object> cardRef = new LinkedHashMap<String, Object>();
+        cardRef.put("cardNo", cardNo);
+        java.util.ArrayList<Object> list = new java.util.ArrayList<Object>();
+        list.add(cardRef);
+        Map<String, Object> cond = new LinkedHashMap<String, Object>();
+        cond.put("CardNoList", list);
+        Map<String, Object> jsonBody = new LinkedHashMap<String, Object>();
+        jsonBody.put("CardInfoDelCond", cond);
+
+        Response response = request(device, "PUT", "/ISAPI/AccessControl/CardInfo/Delete?format=json", Json.write(jsonBody), false);
+        if (accepted(response) || alreadyGone(response)) return new OpResult(true, null);
+        if (!unsupported(response)) return new OpResult(false, errorPrefix + describeAttempts(response));
+        String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CardInfoDelCond " + XML_NS + ">\n"
+                + "  <CardNoList>\n    <cardNo>" + cardNo + "</cardNo>\n  </CardNoList>\n"
+                + "</CardInfoDelCond>";
+        Response legacy = request(device, "PUT", "/ISAPI/AccessControl/CardInfo/Delete", xml, true);
+        if (accepted(legacy) || alreadyGone(legacy)) return new OpResult(true, null);
+        return new OpResult(false, errorPrefix + describeAttempts(response, legacy));
     }
 
     /**

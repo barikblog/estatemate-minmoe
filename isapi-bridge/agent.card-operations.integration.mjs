@@ -42,6 +42,31 @@ const deviceServer = createServer((req, res) => {
         ? JSON.stringify({ requestURL: req.url, statusCode: 6, statusString: 'Invalid Content', subStatusCode, errorCode: 1610612737, errorMsg })
         : `<?xml version="1.0" encoding="UTF-8"?>\n<ResponseStatus version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema"><requestURL>${req.url}</requestURL><statusCode>6</statusCode><statusString>Invalid Content</statusString><subStatusCode>${subStatusCode}</subStatusCode><errorMsg>${errorMsg}</errorMsg></ResponseStatus>`);
     };
+    const ok = () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ statusCode: 1, statusString: 'OK', subStatusCode: 'ok' }));
+    };
+    // Like the real terminals: card writes and deletes are JSON only, and a
+    // delete condition that is not {CardInfoDelCond:{CardNoList:[{cardNo}]}} is
+    // "Invalid Format / badJsonFormat".
+    if (!json && req.url.startsWith('/ISAPI/AccessControl/CardInfo/')) return reject('badXmlContent', 'unsupported on this firmware');
+    if (req.method === 'PUT' && req.url.startsWith('/ISAPI/AccessControl/CardInfo/Delete')) {
+      let list;
+      try { list = JSON.parse(body).CardInfoDelCond?.CardNoList; } catch { list = null; }
+      if (!Array.isArray(list) || list.some((entry) => typeof entry?.cardNo !== 'string')) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ requestURL: req.url, statusCode: 6, statusString: 'Invalid Format', subStatusCode: 'badJsonFormat', errorMsg: 'badJsonFormat' }));
+        return;
+      }
+      for (const entry of list) cards.delete(entry.cardNo);
+      return ok();
+    }
+    if (req.method === 'PUT' && req.url.startsWith('/ISAPI/AccessControl/CardInfo/Modify')) {
+      const { employeeNo, cardNo } = JSON.parse(body).CardInfo || {};
+      if (!cards.has(cardNo)) return reject('cardNoNotExist', 'cardNo');
+      cards.set(cardNo, employeeNo);
+      return ok();
+    }
     if (req.method === 'POST' && req.url.startsWith('/ISAPI/AccessControl/CardInfo/Record')) {
       let employeeNo;
       let cardNo;
@@ -53,10 +78,9 @@ const deviceServer = createServer((req, res) => {
       }
       if (!employeeNo || !cardNo) return reject('MessageParametersLack', 'CardInfo');
       if (Buffer.byteLength(employeeNo) > 32 || refusedEmployeeNumbers.has(employeeNo)) return reject('badParameters', 'employeeNo');
+      if (cards.has(cardNo)) return reject('cardNoAlreadyExist', 'cardNo');
       cards.set(cardNo, employeeNo);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ statusCode: 1, statusString: 'OK', subStatusCode: 'ok' }));
-      return;
+      return ok();
     }
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ statusCode: 4, statusString: 'Invalid Operation', subStatusCode: 'notSupport' }));
@@ -127,12 +151,43 @@ try {
   {
     const result = await apply('upsert_card', { cardUid: '10000006', employeeNo: '900000008' });
     assert.equal(result.success, false);
-    assert.equal(
-      result.error,
-      'ISAPI 400: Invalid Content / badParameters / employeeNo; XML retry ISAPI 400: Invalid Content / badParameters / employeeNo',
-    );
+    assert.equal(result.error, 'ISAPI 400: Invalid Content / badParameters / employeeNo');
+    assert.equal(requests.some((request) => request.url === '/ISAPI/AccessControl/CardInfo/Record' && !request.url.includes('format=json')), false, 'a content error must not be retried as XML');
     assert.equal(cardWrites().filter((request) => !request.body).length, 0, 'no empty-body card request may be sent');
     console.log('terminal rejection reason reported OK:', result.error);
+  }
+
+  // 3b. A card number the terminal already holds is updated in place (re-enable /
+  //     re-issue), not reported as a failure.
+  {
+    const result = await apply('enable_card', { cardUid: '10000001', employeeNo: '842317765', enabled: true });
+    assert.deepEqual(result, { success: true });
+    assert.equal(cards.get('10000001'), '842317765');
+    console.log('existing card updated in place OK');
+  }
+
+  // 3c. Deleting sends the CardInfoDelCond shape (a bare CardNoList is
+  //     "badJsonFormat"), and an already-removed card counts as removed.
+  {
+    const first = await apply('disable_card', { cardUid: '10000001' });
+    assert.deepEqual(first, { success: true });
+    assert.equal(cards.has('10000001'), false, 'the card must be gone from the terminal');
+    const again = await apply('delete_card', { cardUid: '10000001' });
+    assert.deepEqual(again, { success: true });
+    const revoke = await apply('revoke_visitor', { credentialNumber: '77123456' });
+    assert.deepEqual(revoke, { success: true });
+    console.log('card delete uses CardInfoDelCond OK');
+  }
+
+  // 3d. A visitor credential is written as a JSON normalCard, never XML/tempCard.
+  {
+    const before = requests.length;
+    const result = await apply('upsert_visitor', { credentialNumber: '55443322', employeeNo: 'VIS55443322' });
+    assert.deepEqual(result, { success: true });
+    assert.equal(cards.get('55443322'), 'VIS55443322');
+    const sent = requests.slice(before);
+    assert.equal(sent.every((request) => request.url.includes('format=json') && !request.body.includes('tempCard')), true);
+    console.log('visitor credential written as JSON normalCard OK');
   }
 
   // 4. The summariser reads JSON and XML ResponseStatus documents and falls back
