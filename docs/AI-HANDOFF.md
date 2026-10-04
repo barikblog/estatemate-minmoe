@@ -1,5 +1,75 @@
 # AI handoff — EstateMate
 
+## ZKTeco terminals can now be provisioned and can talk back (2026-10-04, bridge `0.4.0`)
+
+Requested as: **ship the new agent capability** — ZKTeco PUSH (ADMS) as a second
+terminal protocol inside the same agent. It is the first time EstateMate speaks to
+an access device that **refuses to be polled**: on the PUSH protocol the terminal
+initiates every HTTP request in both directions, so the bridge became a server the
+gate dials, and provisioning became an asynchronous queue the device drains when it
+feels like it.
+
+### What is new
+
+- **`isapi-bridge/zkteco-push.mjs`** — the codec: §7.4 registration parsing
+  (`~`-prefixed optional keys), `ATTLOG` record parsing in both field shapes, the
+  `DATA UPDATE/DELETE USERINFO` command encoders, the `C:<id>:<command>` response
+  builder, per-serial command queue with `Return=` correlation, and the terminal's
+  local wall-clock read as local (not silently as UTC).
+- **`isapi-bridge/zkteco-push-server.mjs`** — the listener (`/iclock/cdata`,
+  `/iclock/registry`, `/iclock/getrequest`, `/iclock/devicecmd`, `/iclock/ping`),
+  `RegistryCode`/`SessionID` issuance, `Realtime=1` configuration, the optional
+  shared-key guard, and `applyPushOperation` — the place where every refusal is
+  decided so no operation path can skip it.
+- **`isapi-bridge/agent.mjs`** — `zktecoPush` config, hostless devices in the
+  devices file (`transport: "zkteco_push"`), serial→device binding, the listener in
+  `main()` and closed before the event flush on shutdown, push counters in the
+  heartbeat `stats`, and `person` in the advertised capabilities **only once a PUSH
+  terminal has registered**. `applyCardOperation` branches to the transport before
+  any ISAPI call; the Hikvision path is untouched.
+- **`src/hikvision-profiles.ts`** — profile `zkteco_push` for event normalisation,
+  matched from documented model families (ZKTeco ZAM/SF/X-series/UA/MB/iFace, and
+  eSSL, whose firmware speaks the same protocol). A test asserts no ZKTeco pattern
+  can claim a `DS-*` model. A profile labels events; it never authorises a write.
+
+### Two rules this capability had to be built around
+
+1. **Numeric PIN.** A ZKTeco person key is a `PIN` and is digits-only unless the
+   terminal declares `StringPinFunOn=1` at registration. EstateMate's default
+   Employee ID is a 32-char hex UUID — letters, and 32 characters. Truncating or
+   hashing it would file a resident under a number that opens the gate for someone
+   else, so the bridge **refuses the write** and names the fix (give the person a
+   numeric Employee ID, or enable alphanumeric IDs on the terminal). Consequence
+   that is now true and was chosen deliberately: `visitor-*` employee numbers are
+   not storable on a numeric-only terminal, so **visitor card issuance at a ZKTeco
+   gate fails visibly**; a per-device numeric alias map is the follow-up and needs a
+   migration, not an agent-side substitution.
+2. **Card-only revocation is refused.** This protocol has no card table:
+   `DATA DELETE USERINFO` takes the person's fingerprint and face templates with
+   the card. "Take this resident's lost card off the gate" must not silently revoke
+   their identity, so `disable_card`/`delete_card`/`revoke_visitor` stay queued
+   with that explanation.
+
+### Known deviations, recorded rather than left as gaps
+
+- **Android is not equivalent.** `AGENTS.md` requires Node/Android parity; the
+  Android bridge is client-only by design (foreground service, wake lock, no
+  `ServerSocket`), and PUSH needs a long-lived inbound listener. ZKTeco support is
+  therefore **Node/Windows-agent only** in 0.4.0, and an estate whose only bridge is
+  a tablet cannot use a ZKTeco gate. Follow-up: make the portal refuse a
+  `zkteco_push` device on an agent that cannot serve one.
+- **Nothing here has been run against a physical terminal.** CI proves the bridge
+  speaks the specification against a simulated terminal (23 checks). Fingerprint,
+  door and card-only operations are refused by design. `CONTROL BOARD` is not sent.
+- **The Windows installer opens no port.** The bridge used to be outbound-only, so
+  no firewall rule exists; a real terminal will hang at "connecting" behind Windows
+  Defender Firewall until `install-bridge.ps1` adds one when `zktecoPush.enabled`.
+- Time zone handling (`Date` header sync, `MachineTZFunOn`) and protocol
+  encryption (§7.2/§7.3 key exchange, `authKey`) are **not** implemented; the
+  listener binds loopback by default and stays LAN-only per `AGENTS.md`.
+
+Full record, with sources and the bench checklist: `docs/device-profiles/ZKTECO-PUSH.md`.
+
 ## People and fingerprints now reach the terminal itself (2026-10-04)
 
 Requested as: **"add feature for all users data on the portal to be auto
@@ -1086,6 +1156,10 @@ The previous migration, `migrations/0010_maintenance_billing_and_verification.sq
 - DS-K1T808MFWX-B documents card/fingerprint/PIN rather than an integrated QR reader.
 - DS-K2802 is a controller. QR requires a compatible attached reader.
 - QR access at a terminal requires both QR-capable hardware and credential provisioning. The EstateMate phone scanner works independently of terminal QR support.
+- ZKTeco PUSH (ADMS) is device-initiated in **both** directions: the bridge cannot poll or force a command out, only queue one for the terminal's next `getrequest`. `Return=0` is the only evidence a write happened, and `Realtime=1` must be returned at registration or events arrive on a two-minute timer.
+- A ZKTeco `PIN` is digits-only unless the terminal reports `StringPinFunOn=1` (and 14 digits is a documented common default, not 32). EstateMate's Employee ID is therefore validated before every PUSH write and the write is refused with an actionable message — never truncated, hashed or defaulted.
+- The PUSH protocol has no card-only delete: `DATA DELETE USERINFO` removes the person's fingerprint and face templates too, so card revocation at a ZKTeco gate stays a queued manual task rather than being mapped onto that command.
+- `AGENTS.md`'s Node/Android equivalence rule is knowingly broken for this transport in 0.4.0: serving a dial-in terminal needs an inbound listener the Android bridge's foreground-service design does not have. See `docs/device-profiles/ZKTECO-PUSH.md`.
 
 ## Safe continuation process
 

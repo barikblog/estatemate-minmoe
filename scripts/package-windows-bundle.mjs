@@ -157,6 +157,14 @@ console.log(`Staging EstateMate Windows agent bundle ${bundleVersion} (${commit}
 // Core agent + Windows wrapper. The wrapper is the entrypoint; the core is the
 // documented ./agent-core.mjs fallback so both live in one flat directory.
 copyRepo('isapi-bridge/agent.mjs', 'agent-core.mjs');
+// The core agent is no longer a single file: the ZKTeco PUSH transport lives in
+// two modules it imports by relative path. This bundle is FLAT and staged by name,
+// so a sibling import that is not copied here ships as a bridge that dies on
+// startup — on every estate, ZKTeco terminal or not, because the import happens
+// before any configuration is read. `verifyCoreImports` below is what keeps the
+// next module added to the core from being shipped the same way.
+copyRepo('isapi-bridge/zkteco-push.mjs', 'zkteco-push.mjs');
+copyRepo('isapi-bridge/zkteco-push-server.mjs', 'zkteco-push-server.mjs');
 copyRepo('windows-agent/agent.mjs', 'agent.mjs');
 copyRepo('windows-agent/install-windows.mjs', 'install-windows.mjs');
 copyRepo('windows-agent/agent-config.example.json', 'agent-config.example.json');
@@ -164,6 +172,35 @@ copyRepo('isapi-bridge/isapi-devices.example.json', 'isapi-devices.example.json'
 copyRepo('windows-agent/README.md', 'docs/windows-agent-README.md');
 copyRepo('isapi-bridge/README.md', 'docs/isapi-bridge-README.md');
 
+
+// ------------------------------------------------------ import resolution ---
+
+/**
+ * Every relative module the staged core agent imports must be in the bundle.
+ *
+ * A flat, hand-listed bundle fails this silently at build time and loudly on a
+ * customer's gate PC, so the check is cheap and it is fatal: the packer exists to
+ * produce something that starts.
+ */
+function verifyCoreImports() {
+  const core = join(outDir, 'agent-core.mjs');
+  const source = readFileSync(core, 'utf8');
+  const specifiers = new Set();
+  for (const match of source.matchAll(/(?:from|import)\s*['"](\.\/[^'"]+\.mjs)['"]/g)) {
+    specifiers.add(match[1]);
+  }
+  const absent = [...specifiers].filter((spec) => !existsSync(join(outDir, spec)));
+  if (absent.length) {
+    console.error(`Bundle is missing module(s) the staged core agent imports: ${absent.join(', ')}`);
+    console.error('Add a copyRepo() line for each — a flat bundle must list every file the core resolves by relative path.');
+    process.exit(1);
+  }
+  if (specifiers.size) {
+    console.log(`Core agent imports verified against the bundle: ${[...specifiers].sort().join(', ')}`);
+  }
+}
+
+verifyCoreImports();
 
 // ------------------------------------------------------------- launcher .cmd ---
 

@@ -11,6 +11,7 @@ export type HikvisionProfileKey =
   | 'controller_k2600'
   | 'controller_k2700_k2800'
   | 'generic_network_access'
+  | 'zkteco_push'
   | 'generic_isapi';
 
 export type ConnectionPattern =
@@ -224,6 +225,49 @@ export const HIKVISION_PROFILES: HikvisionProfile[] = [
     supportedConnections: ['manual_sync'],
     defaultConnection: 'manual_sync',
     aliases: aliases(),
+    grantedPatterns: commonGranted,
+    deniedPatterns: commonDenied,
+  },
+  {
+    key: 'zkteco_push',
+    label: 'ZKTeco/eSSL terminal on the PUSH (ADMS) transport',
+    family: 'Vendor-neutral access',
+    description:
+      'A ZKTeco access terminal that dials the EstateMate agent over the PUSH (ADMS/iClock) protocol. The agent ' +
+      'translates a push record into the access-event shape EstateMate normalises; events stay attributable by the ' +
+      'terminal User ID. Capability limits, including the numeric User ID rule, are recorded in ' +
+      'docs/device-profiles/ZKTECO-PUSH.md.',
+    // Model families this transport is documented for, from the sources cited in
+    // docs/device-profiles/ZKTECO-PUSH.md: ZKTeco ZAM/SpeedFace/SenseFace, the
+    // X-series controllers, UA/MB attendance terminals, iFace/uFace/eFace face
+    // terminals, and eSSL, whose firmware speaks the same protocol. It is a
+    // labelling and alias aid only — what the bridge will actually *write* is
+    // decided by the transport and the capabilities the terminal reported, never
+    // by a model string matching here. Anything unlisted stays on its own
+    // profile rather than being absorbed by this one.
+    modelPatterns: ['^ZK', '^ZAM', '^SF', '^SENSEFACE', '^SPEEDFACE', '^UA', '^MB', '^X\\d', '^IFACE', '^UFACE', '^EFACE', '^ICLOCK', '^K14', '^ESSL', '^INBIO', '^IN-BIO'],
+    devicePattern: 'standalone_terminal',
+    // What the transport is known to carry. Password/PIN and card are what the
+    // PUSH user record holds; a biometric template can travel over PUSH but this
+    // bridge does not write or read one, so it is not listed.
+    authenticationMethods: ['card', 'PIN'],
+    supportedConnections: AGENT_CONNECTIONS,
+    defaultConnection: 'isapi_bridge',
+    aliases: aliases({
+      // The agent's synthesised document, plus the terminal's own field names so
+      // a raw push record pasted into a device profile still resolves.
+      cardUid: ['Card', 'cardNo', 'CardNo', 'credentialNo'],
+      employeeNo: ['PIN', 'UserID', 'employeeNoString', 'employeeNo', 'personId', 'userID'],
+      personName: ['Name', 'name', 'employeeName', 'personName'],
+      timestamp: ['Time', 'dateTime', 'time', 'eventTime', 'occurTime'],
+      credentialType: ['VerifyMode', 'currentVerifyMode', 'verifyMode', 'credentialType', 'authType'],
+      status: ['Enable', 'eventState', 'status', 'currentVerifyMode', 'verifyMode'],
+      description: ['statusCode', 'workCode', 'eventDescription', 'subEventType', 'minorEventType', 'minor', 'attendanceStatus'],
+      doorNo: ['doorNo', 'LockID', 'doorIndex', 'channelID', 'channelId'],
+    }),
+    // An access punch carries no verdict. The agent marks the record it has and
+    // the verdict is left unknown rather than inferred from a verify mode, which
+    // is the difference between a feed and a lie.
     grantedPatterns: commonGranted,
     deniedPatterns: commonDenied,
   },

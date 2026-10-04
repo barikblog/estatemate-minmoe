@@ -117,6 +117,124 @@ every terminal EstateMate has been tested against.
 Knobs (environment, mainly for testing): `ESTATEMATE_CAPTURE_RETRY_MS`
 (default `5000`) and `ESTATEMATE_CAPTURE_MAX_MS` (default `100000`).
 
+## ZKTeco terminals on the PUSH (ADMS) transport (bridge 0.4.0+)
+
+A ZKTeco access terminal does not answer ISAPI, and — more importantly — it does
+not answer *inbound* anything. Its "PUSH" protocol (vendor name: *Attendance /
+Security PUSH Communication Protocol*; on the terminal's menu it is **ADMS**,
+"Cloud Server", "Cloud Sync" or "iClock Proxy") is plain HTTP that **the terminal
+initiates**, for every request in both directions. The bridge therefore hosts a
+listener and the terminal calls it:
+
+| The terminal does | The bridge answers |
+| --- | --- |
+| `GET /iclock/cdata?SN=..&pushver=..&options=all` | `OK` (register yourself) or `registry=ok` + configuration |
+| `POST /iclock/registry?SN=..` | `OK`, and the terminal's own parameters are remembered |
+| `POST /iclock/cdata?SN=..&table=ATTLOG` | `OK`, and the punch is queued as a gate event |
+| `GET /iclock/getrequest?SN=..` | `C:<id>:DATA UPDATE USERINFO PIN=..` — or `OK` when idle |
+| `POST /iclock/devicecmd?SN=..&Return=0&ID=..` | `OK`, and the queued operation is finally **applied** |
+
+Consequences that shape how you use it:
+
+- **A command cannot be forced out.** Work is queued and travels on the
+  terminal's next poll (`RequestDelay`, which this bridge sets to 5 s). A bridge
+  that is up and a terminal that is asleep look the same until it calls in, so an
+  unconfirmed write is reported as *queued*, never as applied.
+- **Applied means `Return=0`.** Anything else is carried back to the portal with
+  the terminal's own meaning attached (`-1002` is "your syntax was wrong",
+  `-1004` is "this model has no such table") — not a timeout, and not a shrug.
+- **`Realtime=1`** is set in the configuration the bridge returns, so a punch
+  travels when it happens instead of on the protocol's two-minute default.
+
+### Enable it
+
+```jsonc
+// agent-config.json
+{
+  "zktecoPush": {
+    "enabled": true,
+    "port": 8089,               // 0 lets the OS choose, which is what the tests do
+    "bindAddress": "192.168.1.20", // loopback default: see the security note
+    "ackTimeoutSeconds": 180,
+    "requireAgentKey": false,
+    "agentKey": ""
+  }
+}
+```
+
+```jsonc
+// isapi-devices.json — a PUSH terminal has no host, because nothing dials it
+{
+  "estateMateDeviceId": "33333333-3333-4333-a333-333333333333",
+  "name": "Palmerie Gate ZKTeco",
+  "transport": "zkteco_push",
+  "pushSerial": "0123456789"     // optional: the SN= the terminal reports
+}
+```
+
+Then in the terminal's own menu, point **Comm > Cloud Server / ADMS** at
+`http://<bridge address>:<port>` with no path (the bridge serves `/iclock/…`
+itself), and set **TransInterval** low or leave real-time on. On a bridge bound to
+loopback, that means the terminal and the bridge are on one host — which is fine
+for a Raspberry-Pi-on-the-gate setup and useless otherwise.
+
+`pushSerial` is optional and deliberately not required: the terminal tells the
+bridge its serial when it registers, and an estate with **one** PUSH gate gets it
+bound automatically (the log says so). With two or more unbound gates nothing is
+guessed — a serial is never attached to whichever entry happens to come first,
+because that is how a resident ends up with a card on the wrong door. Write
+`pushSerial` on each entry and the ambiguity is gone.
+
+### The numeric-PIN rule (read this before blaming the bridge)
+
+A ZKTeco terminal identifies a person by **User ID** (`PIN`). Most firmware stores
+*digits only*: the terminal declares whether it can hold a string User ID at
+registration, in the parameter `StringPinFunOn` (§7.4: "Specify whether to support
+the string-type user ID"). EstateMate's Employee ID, by contrast, defaults to a
+UUID without its hyphens — 32 hex characters, i.e. **full of letters**.
+
+So for a numeric-only terminal the bridge **refuses the write** and says why,
+naming the fix:
+
+> this terminal only accepts a numeric User ID (StringPinFunOn=0), and the
+> EstateMate Employee ID "a1b2c3d4…" contains letters. Set a numeric Employee ID
+> for this person, or enable alphanumeric User IDs on the terminal if its firmware
+> supports them
+
+Refusing is the whole point. Truncating, hashing or substituting would file a
+person under a number that belongs to somebody else at the gate — the failure this
+project already refuses for card numbers — and a gate that opens for the wrong
+resident is not a bug an operator can diagnose from a log. **Fix it in the
+portal**: give the resident a numeric Employee ID (People → Edit → Employee ID),
+or turn on the terminal's alphanumeric User ID option if that model has it, then
+sync again.
+
+### What this transport does and does not do
+
+| Work | Over PUSH, today |
+| --- | --- |
+| Gate events (card/PIN punch, `table=ATTLOG`) | **Yes** — attributed by the terminal's User ID |
+| Add / update a person (`DATA UPDATE USERINFO`) | **Yes**, once `Return=0` |
+| Issue or update a card | **Yes** — a card rides on the person record |
+| Remove a person (`DATA DELETE USERINFO`) | **Yes** — and it takes their templates with it |
+| Revoke **one card** while keeping the person | **No.** The protocol has no card-only delete; the person delete would strip their fingerprints and face too, so the task stays queued with that explanation |
+| Fingerprint capture / template delivery | **No** — the terminal's own reader and menu remain the way |
+| Remote open/close | **No** — `CONTROL BOARD` is documented but unproven here, and EstateMate does not ship an unproven gate command |
+| Visitor slots with a `visitor-…` Employee ID | **No**, on a numeric-PIN terminal — same rule as above |
+
+### Security
+
+The protocol authenticates a terminal to a server with nothing but a serial
+number, so this listener is LAN-only by default (`bindAddress: 127.0.0.1`).
+Binding `0.0.0.0` is supported for a real gate on another host and logs a warning
+every start; the rules in `AGENTS.md` still apply — never publish it, never put
+it behind the Cloudflare Tunnel, and treat the agent host as part of the
+access-control trust boundary. `requireAgentKey` + `agentKey` adds a shared
+secret that the bridge checks on `Key=` for firmwares that send it. A serial no
+configured device claims gets `OK` (so the terminal stops retrying in a loop) and
+**no commands at all**, and every upload it tried to make is counted in the
+heartbeat as `unmappedUploads` so the gap is visible from the portal.
+
 ## Setup
 
 ### 1. Register agent in EstateMate portal
