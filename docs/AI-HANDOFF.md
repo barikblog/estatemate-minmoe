@@ -101,10 +101,18 @@ access-control (TPP) material and matches what the terminals answer in the
 integration simulation. Real firmware still decides: a terminal that does not
 implement `CaptureFingerPrint` (or `FingerPrint/SetUp`) refuses the call, the
 bridge reports the terminal's words, the portal says the finger must be enrolled
-on the terminal, and the manual task stays. `bridge-0.2.8` — the release a PC
-installs today — predates this section, so until the next tag it receives card,
-visitor and door work only and every person/fingerprint item stays a manual task.
-The cloudflared kit, the MSI and the Android bridge are unchanged by this phase.
+on the terminal, and the manual task stays. The cloudflared kit, the MSI and the
+Android bridge are unchanged by this phase.
+
+**Shipped 2026-10-04.** PR #42 merged as `1846393`; Deploy EstateMate run
+`37192510918` applied migration `0019` and deployed the Worker, and the
+Production smoke test run `37192562228` passed. The bridge half is
+[`bridge-0.3.0`](https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.3.0)
+(published 2026-10-04T09:41:10Z from the merge commit, tag run `37192596929`
+green: MSI, installer kit, portable exe, Windows agent bundle, bridge APK and
+Android APK, 20 assets). A PC still on `bridge-0.2.8` receives card, visitor and
+door work only and shows every person/fingerprint item as a manual task; updating
+it through the dashboard's installer kit is what turns the new capture flow on.
 
 
 ## The MSI now installs a dashboard, not a console window (2026-10-04)
@@ -193,7 +201,7 @@ carries the dashboard and every other feature up to that tag in the MSI, the kit
 and the per-user install; the tag run's Windows job installs the MSI, runs the
 installed dashboard's self-test, installs through the kit, uninstalls and only
 then publishes. The person/fingerprint work documented in the section above
-landed **after** that tag, so it needs the next `bridge-*` release.
+landed after that tag and ships in `bridge-0.3.0` (see that section).
 
 ## The Windows installer now explains itself and cannot dead-end (2026-10-04)
 
