@@ -375,7 +375,33 @@ function writeOutputs({ outDir, msiPath, msiName, version, commit, exePath, wix 
     )}\n`,
   );
 
-  return sha256(msiPath);
+  return { msiSha: sha256(msiPath), kitPath, kitName };
+}
+
+/** The last thing the build prints: what landed where, and how big it is. */
+function printSummary({ msiPath, msiName, msiSha, kitPath, kitName, quiet, dryRun = false, dryOut, outDir }) {
+  const sizeMb = fs.statSync(msiPath).size / (1024 * 1024);
+  if (quiet) {
+    console.log(`${msiName}  ${sizeMb.toFixed(1)} MB  sha256 ${msiSha.slice(0, 16)}…`);
+    console.log(`${kitName}  sha256 ${sha256(kitPath).slice(0, 16)}…`);
+    return;
+  }
+  console.log('');
+  if (dryRun) {
+    console.log(`[dry-run] assembled a real kit around a placeholder MSI in ${dryOut}:`);
+    for (const file of fs.readdirSync(dryOut).sort()) console.log(`  ${file}`);
+    console.log(`[dry-run] --out ${outDir} would receive exactly those files once candle and light`);
+    console.log('[dry-run] have run; the MSI itself is not built here.');
+    return;
+  }
+  console.log(`MSI ready: ${msiPath}`);
+  console.log(`  ${msiName}  ${sizeMb.toFixed(1)} MB  sha256 ${msiSha.slice(0, 16)}…`);
+  console.log('  installs to C:\\Program Files\\EstateMate Bridge (per-machine, x64)');
+  console.log('  Start Menu shortcuts + App Paths + PATH; no service registration (see README.txt)');
+  console.log(`Installer kit ready: ${kitPath}`);
+  console.log('  double-click Install-EstateMate-Bridge.cmd inside the kit: it verifies the');
+  console.log('  download, logs the install, explains a failure, and falls back to a per-user');
+  console.log('  install (no administrator rights, no Windows Installer) when the MSI cannot finish');
 }
 
 function main() {
@@ -444,7 +470,7 @@ function main() {
       const dryOut = fs.mkdtempSync(path.join(os.tmpdir(), 'estatemate-bridge-msi-dry-'));
       const placeholder = path.join(dryOut, msiName);
       fs.writeFileSync(placeholder, 'placeholder: candle and light were not run\n', 'utf8');
-      writeOutputs({
+      const output = writeOutputs({
         outDir: dryOut,
         msiPath: placeholder,
         msiName,
@@ -453,12 +479,15 @@ function main() {
         exePath,
         wix: { candle: 'candle.exe (not run)', light: 'light.exe (not run)' },
       });
-      console.log('\n[dry-run] would write:');
-      for (const file of fs.readdirSync(dryOut).sort()) {
-        console.log(`  ${path.join(outDir, file)}  (from ${path.join(dryOut, file)})`);
-      }
-      console.log('\n[dry-run] the kit above was assembled from a placeholder MSI, so the');
-      console.log('[dry-run] packaging code is exercised but the MSI itself is not built.');
+      printSummary({
+        ...output,
+        msiPath: placeholder,
+        msiName,
+        quiet: false,
+        dryRun: true,
+        dryOut,
+        outDir,
+      });
       return;
     }
 
@@ -483,7 +512,7 @@ function main() {
       fail(`light reported success but ${msiPath} is missing or implausibly small`);
     }
 
-    const msiSha = writeOutputs({
+    const output = writeOutputs({
       outDir,
       msiPath,
       msiName,
@@ -492,22 +521,7 @@ function main() {
       exePath,
       wix: { candle: path.basename(candle), light: path.basename(light) },
     });
-
-    const sizeMb = fs.statSync(msiPath).size / (1024 * 1024);
-    if (!flags.quiet) {
-      console.log('');
-      console.log(`MSI ready: ${msiPath}`);
-      console.log(`  ${msiName}  ${sizeMb.toFixed(1)} MB  sha256 ${msiSha.slice(0, 16)}…`);
-      console.log('  installs to C:\\Program Files\\EstateMate Bridge (per-machine, x64)');
-      console.log('  Start Menu shortcuts + App Paths + PATH; no service registration (see README.txt)');
-      console.log(`Installer kit ready: ${kitPath}`);
-      console.log('  double-click Install-EstateMate-Bridge.cmd inside the kit: it verifies the');
-      console.log('  download, logs the install, explains a failure, and falls back to a per-user');
-      console.log('  install (no administrator rights, no Windows Installer) when the MSI cannot finish');
-    } else {
-      console.log(`${msiName}  ${sizeMb.toFixed(1)} MB  sha256 ${msiSha.slice(0, 16)}…`);
-      console.log(`${kitName}  sha256 ${sha256(kitPath).slice(0, 16)}…`);
-    }
+    printSummary({ ...output, msiPath, msiName, quiet: flags.quiet });
   } finally {
     if (flags.keepBuildDir) {
       console.log(`  staging directory kept at ${buildDir}`);
