@@ -221,6 +221,38 @@ describe('Person synchronisation and fingerprint capture', () => {
     expect(String(task?.manual_instruction)).toMatch(/employee number/i);
   });
 
+  it('walks the one-finger Hardware-actions task for a named terminal end to end', async () => {
+    // The exact shape of an operator's task: one person, one finger, one terminal
+    // whose bridge cannot write a template, an employee number at the 32-character
+    // ISAPI limit, and "mark this action applied" once the finger is on the glass.
+    const { deviceId } = await createAgentFor('GATE1 Pedestrian', ['card', 'person', 'door']);
+    db.run(`UPDATE users SET employee_id='f6c76d98707443349e5a9662623b92ff', name='rig' WHERE id=?`, estate.residentId);
+
+    const recorded = await call(env, 'POST', '/api/access/fingerprints', {
+      token: adminToken,
+      body: { residentId: estate.residentId, fingerNo: 1, deviceId },
+    });
+    expect(recorded.status).toBe(201);
+    expect(recorded.json.hardwareSync).toBe('manual_action_required');
+    expect(recorded.json.employeeNo).toBe('f6c76d98707443349e5a9662623b92ff');
+
+    const task = db.one(`SELECT id,operation,status,manual_instruction FROM device_operations WHERE fingerprint_id=?`, String(recorded.json.id));
+    expect(task?.operation).toBe('enroll_fingerprint');
+    expect(String(task?.status)).toBe('manual_action_required');
+    const instruction = String(task?.manual_instruction);
+    expect(instruction).toContain('rig');
+    expect(instruction).toContain('GATE1 Pedestrian');
+    expect(instruction).toContain('finger slot 1');
+    expect(instruction).toContain('f6c76d98707443349e5a9662623b92ff');
+    expect(instruction).toMatch(/mark this action applied/i);
+
+    // The operator enrols the finger on the terminal and marks the task applied,
+    // which is the only moment the portal is allowed to call it done.
+    const applied = await call(env, 'PATCH', `/api/access/operations/${String(task!.id)}`, { token: adminToken, body: { status: 'applied' } });
+    expect(applied.status).toBe(200);
+    expect(db.one(`SELECT status FROM device_operations WHERE id=?`, String(task!.id))?.status).toBe('applied');
+  });
+
   it('removes a person from a terminal with their cards, fingerprints and permissions', async () => {
     const gateA = await createAgentFor('Gate A', ['card', 'person', 'fingerprint', 'door']);
     db.run(`UPDATE users SET employee_id='EMP-7' WHERE id=?`, estate.residentId);
