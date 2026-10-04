@@ -83,6 +83,7 @@ jobs:
           node --check windows-agent/agent.mjs
           node --check windows-agent/install-windows.mjs
           node --check scripts/package-windows-bundle.mjs
+          node --check scripts/package-bridge-msi.mjs
           node --check scripts/cloudflared-remote-access.mjs
           python3 -m py_compile scripts/verify-android-apk.py scripts/lint-powershell.py
 
@@ -98,6 +99,7 @@ jobs:
             --out "$RUNNER_TEMP/lint-bundle" --version lint --commit "$GITHUB_SHA" >/dev/null
           python3 scripts/lint-powershell.py \
             bridge-apps/windows/msi/install-bridge.ps1 \
+            bridge-apps/windows/dashboard/EstateMateBridge.ps1 \
             "$RUNNER_TEMP/lint-bundle/install-service.ps1" \
             "$RUNNER_TEMP/lint-bundle/uninstall-service.ps1"
 
@@ -116,6 +118,51 @@ jobs:
           test -f "$RUNNER_TEMP/bundle-dryrun/agent-core.mjs"
           test -f "$RUNNER_TEMP/bundle-dryrun/estatemate-isapi-agent.cmd"
           echo "::notice::Packer dry-run staged the bundle successfully on ubuntu-latest."
+
+      # The MSI packer cannot run candle/light here, but --dry-run assembles the
+      # whole output stage (kit scripts, dashboard staging, SHA256SUMS,
+      # READ-ME-FIRST, the zip, BUILD-INFO) around a placeholder MSI. That is
+      # exactly how a missing function or a stale path in there gets caught in
+      # seconds on ubuntu instead of in the windows-latest job.
+      - name: Dry-run the MSI packer and inspect the kit
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The dry-run kit is assembled under os.tmpdir(); pin that to the
+          # runner temp directory so the check below knows where to look.
+          export TMPDIR="$RUNNER_TEMP"
+          head -c 8192 /dev/urandom > "$RUNNER_TEMP/fake-bridge.exe"
+          node scripts/package-bridge-msi.mjs \
+            --dry-run \
+            --exe "$RUNNER_TEMP/fake-bridge.exe" \
+            --out "$RUNNER_TEMP/msi-dryrun" \
+            --version 0.0.1 \
+            --commit "$GITHUB_SHA"
+          python3 - "$RUNNER_TEMP" <<'PY'
+          import json, sys, zipfile
+          from pathlib import Path
+          temp = Path(sys.argv[1])
+          built = sorted(temp.glob('estatemate-bridge-msi-dry-*/estatemate-bridge-0.0.1-win-x64-installer-kit.zip'))
+          if not built:
+              raise SystemExit('the MSI dry-run produced no installer kit')
+          kit = built[-1]
+          with zipfile.ZipFile(kit) as archive:
+              names = archive.namelist()
+          expected = {
+              'estatemate-bridge-0.0.1-win-x64.msi',
+              'Install-EstateMate-Bridge.cmd',
+              'install-bridge.ps1',
+              'SHA256SUMS.txt',
+              'READ-ME-FIRST.txt',
+          }
+          if set(names) != expected:
+              raise SystemExit(f'kit contents unexpected: {names}')
+          info = json.loads((kit.parent / 'BUILD-INFO.json').read_text())
+          dashboard = info.get('dashboard') or {}
+          if not dashboard.get('launcherSha256'):
+              raise SystemExit('BUILD-INFO.json has no dashboard block')
+          print(f"::notice::MSI dry-run kit OK: {len(names)} files, dashboard launcher {dashboard['launcherSha256'][:16]}...")
+          PY
 
   # --------------------------------------------------------------------------
   # Windows agent bundle. Runs on windows-latest so node.exe integrity can be
@@ -709,6 +756,42 @@ jobs:
           $appPaths = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\estatemate-bridge.exe' -ErrorAction SilentlyContinue).'(default)'
           if (-not $appPaths) { throw 'App Paths registry value missing' }
           Write-Host "PATH and App Paths entries verified."
+
+          # The dashboard is the install people actually use: the Start Menu
+          # entry must exist, its launcher must be in Program Files next to the
+          # bridge, and running it the way the shortcut does must pass its own
+          # self-test (window builds, status --json parses, terminal table maps
+          # to the setup JSON) without a console window.
+          $dashboard = 'C:\Program Files\EstateMate Bridge\EstateMateBridge.exe'
+          $dashboardScript = 'C:\Program Files\EstateMate Bridge\EstateMateBridge.ps1'
+          foreach ($file in @($dashboard, $dashboardScript)) {
+            if (-not (Test-Path $file)) { throw "dashboard file missing after install: $file" }
+          }
+          $startMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\EstateMate Bridge'
+          $shortcut = Join-Path $startMenu 'EstateMate Bridge.lnk'
+          if (-not (Test-Path $shortcut)) { throw "Start Menu shortcut missing: $shortcut" }
+
+          # Annotate the failure text: the job log archive is not readable from
+          # this project's dev sandbox, annotations are.
+          function Esc([string] $text) {
+            return (($text -replace '%', '%25') -replace "`r", '%0D') -replace "`n", '%0A'
+          }
+          # The launcher is a GUI program, so it does not write to this console:
+          # it mirrors the dashboard's output into %TEMP% when it is given
+          # arguments, and that file is what a failure has to quote.
+          $selftestLog = Join-Path $env:TEMP 'estatemate-dashboard-last-run.txt'
+          Remove-Item -LiteralPath $selftestLog -Force -ErrorAction SilentlyContinue
+          & $dashboard -SelfTest | Out-Null
+          $code = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+          $output = ''
+          if (Test-Path -LiteralPath $selftestLog) { $output = [string](Get-Content -LiteralPath $selftestLog -Raw) }
+          Write-Host $output
+          if ($code -ne 0) {
+            Write-Host "::error title=dashboard-selftest::$($(Esc $output))"
+            throw "the installed dashboard failed its self-test (exit code $code)"
+          }
+          Write-Host 'Start Menu shortcut and the installed dashboard self-test verified.'
 
           $removeLog = Join-Path $env:RUNNER_TEMP 'msi-uninstall.log'
           $remove = Start-Process msiexec.exe -ArgumentList @('/x', "`"$msi`"", '/qn', "/l*v `"$removeLog`"") -Wait -PassThru

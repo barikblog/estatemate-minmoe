@@ -10,8 +10,9 @@
  * double-clicking it runs `estatemate-bridge run` in a window that flashes and
  * closes, which reads as "the exe is not installing". The MSI gives it a real
  * Windows install story: Program Files, Programs and Features, upgrade and
- * uninstall, Start Menu console shortcuts that stay open, App Paths (Win+R)
- * and the install directory on the system PATH.
+ * uninstall, a Start Menu entry that opens the dashboard window (the launcher
+ * compiled from bridge-apps/windows/dashboard), App Paths (Win+R) and the
+ * install directory on the system PATH.
  *
  * The installer is authored in WiX v3 (bridge-apps/windows/msi/estatemate-
  * bridge.wxs), which the GitHub Actions windows-latest runner ships
@@ -54,6 +55,27 @@ const KIT_SCRIPTS = [
   { source: path.join(repoRoot, 'bridge-apps', 'windows', 'msi', 'Install-EstateMate-Bridge.cmd'), name: 'Install-EstateMate-Bridge.cmd' },
   { source: path.join(repoRoot, 'bridge-apps', 'windows', 'msi', 'install-bridge.ps1'), name: 'install-bridge.ps1' },
 ];
+
+/**
+ * The dashboard that the Start Menu shortcut opens: the window itself (a
+ * script, so it stays readable and editable on a support call), a .cmd launcher
+ * for people who prefer double-clicking something in Program Files, and the
+ * source of the GUI launcher that runs the script with no console window.
+ *
+ * The launcher is compiled to a Windows GUI executable on the runner by
+ * build-dashboard.cmd, which finds a C# compiler the machine already has
+ * (Visual Studio's Roslyn, else the one in the .NET Framework directory) and
+ * needs no SDK download. --dry-run therefore stages a placeholder launcher and
+ * prints the command it would run, and the real build fails loudly if the
+ * compiler is missing.
+ */
+const DASHBOARD_DIR = path.join(repoRoot, 'bridge-apps', 'windows', 'dashboard');
+const DASHBOARD_SOURCES = [
+  { source: path.join(DASHBOARD_DIR, 'EstateMateBridge.ps1'), name: 'EstateMateBridge.ps1', staged: 'script' },
+  { source: path.join(DASHBOARD_DIR, 'EstateMateBridge.cmd'), name: 'EstateMateBridge.cmd', staged: 'launcher' },
+];
+const DASHBOARD_LAUNCHER_SOURCE = path.join(DASHBOARD_DIR, 'Launcher.cs');
+const DASHBOARD_BUILD_SCRIPT = path.join(DASHBOARD_DIR, 'build-dashboard.cmd');
 
 /** Places candle/light live when they are not on PATH. */
 const WIX_INSTALL_DIRS = [
@@ -220,21 +242,33 @@ function readmeText(version) {
     '',
     'Five-minute setup',
     '-----------------',
-    '1. On the EstateMate portal (Administrator): Device agent -> Add agent,',
-    '   then Connect terminal for each terminal. Use "Download setup" and carry',
-    '   the .ps1 to this PC - it already contains the agent id and secret.',
-    '2. Start Menu -> EstateMate Bridge -> "EstateMate Bridge Console" (or open',
-    '   any PowerShell; estatemate-bridge is on the PATH) and run:',
+    '',
+    'Everything happens in one window: Start Menu -> EstateMate Bridge.',
+    '',
+    '1. Configuration tab. In the EstateMate portal (Administrator) go to',
+    '   Device agent -> Add agent, choose "Download setup" and save the .ps1 it',
+    '   gives you (it already contains the agent id and secret). In the',
+    '   dashboard press Browse and pick that file. If you would rather type the',
+    '   values, the same tab takes the agent id, the secret and the Worker URL.',
+    '',
+    '2. Still on Configuration: add every Hikvision terminal on this LAN (name,',
+    '   address, ISAPI user and password, and the device id the portal shows).',
+    '   Then press "Save all settings".',
+    '',
+    '3. Status tab: press "Run check". It authenticates with the EstateMate',
+    '   server and probes every terminal, and tells you what did not answer.',
+    '',
+    '4. Service tab: press "Start at boot". Windows asks for administrator',
+    '   rights; after that the bridge keeps running through logoff and reboot.',
+    '',
+    'Prefer a command line? The same four steps are',
     '',
     '       estatemate-bridge setup',
     '       estatemate-bridge check',
+    '       estatemate-bridge install-service      (Administrator console)',
     '',
-    '3. When the check passes, from an ADMINISTRATOR console:',
-    '',
-    '       estatemate-bridge install-service',
-    '',
-    '   That registers the start-at-boot task. The service keeps running after',
-    '   you log off; check it any time with "Service status" in the Start Menu.',
+    'and `estatemate-bridge status --json` prints everything support will ask you',
+    'for. The dashboard drives exactly those commands.',
     '',
     'Where things live',
     '-----------------',
@@ -285,6 +319,10 @@ function kitReadmeText(version) {
     'including the case where the installer window says "Gathering information"',
     'and then disappears with nothing installed.',
     '',
+    'After installing, the Start Menu entry "EstateMate Bridge" opens a normal',
+    'window: type in the agent and terminal details, press "Run check", press',
+    '"Start at boot". Nothing to type into a console.',
+    '',
     'Why a script and not just the MSI:',
     '  * it checks the MSI against SHA256SUMS.txt, so a download that stopped',
     '    half-way says so instead of failing silently;',
@@ -329,7 +367,7 @@ function kitNameFor(version) {
  * WiX: --dry-run produces a real kit from a fake MSI and every reference in
  * here is exercised.
  */
-function writeOutputs({ outDir, msiPath, msiName, version, commit, exePath, wix }) {
+function writeOutputs({ outDir, msiPath, msiName, version, commit, exePath, wix, dashboard = null }) {
   const kitFiles = [{ name: msiName, path: msiPath }];
   for (const script of KIT_SCRIPTS) {
     const destination = path.join(outDir, script.name);
@@ -363,6 +401,7 @@ function writeOutputs({ outDir, msiPath, msiName, version, commit, exePath, wix 
         platform: 'win-x64',
         commit,
         source: { exe: path.basename(exePath), exeSha256: sha256(exePath) },
+        dashboard,
         wix,
         kit: {
           name: kitName,
@@ -397,7 +436,8 @@ function printSummary({ msiPath, msiName, msiSha, kitPath, kitName, quiet, dryRu
   console.log(`MSI ready: ${msiPath}`);
   console.log(`  ${msiName}  ${sizeMb.toFixed(1)} MB  sha256 ${msiSha.slice(0, 16)}…`);
   console.log('  installs to C:\\Program Files\\EstateMate Bridge (per-machine, x64)');
-  console.log('  Start Menu shortcuts + App Paths + PATH; no service registration (see README.txt)');
+  console.log('  Start Menu "EstateMate Bridge" opens the dashboard (a window, no console)');
+  console.log('  App Paths + PATH still work for the command line; no service registration (see README.txt)');
   console.log(`Installer kit ready: ${kitPath}`);
   console.log('  double-click Install-EstateMate-Bridge.cmd inside the kit: it verifies the');
   console.log('  download, logs the install, explains a failure, and falls back to a per-user');
@@ -429,6 +469,36 @@ function main() {
     for (const script of KIT_SCRIPTS) {
       if (!isFile(script.source)) fail(`installer kit file missing: ${script.source}`);
     }
+    for (const source of [...DASHBOARD_SOURCES, { source: DASHBOARD_LAUNCHER_SOURCE }, { source: DASHBOARD_BUILD_SCRIPT }]) {
+      if (!isFile(source.source)) fail(`dashboard file missing: ${source.source}`);
+    }
+
+    // ---- the dashboard the Start Menu shortcut opens ------------------------
+    const stagedDashboard = {
+      exe: path.join(buildDir, 'EstateMateBridge.exe'),
+      script: path.join(buildDir, 'EstateMateBridge.ps1'),
+      launcher: path.join(buildDir, 'EstateMateBridge.cmd'),
+    };
+    for (const source of DASHBOARD_SOURCES) {
+      fs.copyFileSync(source.source, stagedDashboard[source.staged]);
+    }
+    if (flags.dryRun) {
+      fs.writeFileSync(stagedDashboard.exe, 'placeholder: build-dashboard.cmd was not run\n', 'utf8');
+    } else {
+      console.log('Compiling the dashboard launcher (no console window)');
+      run('cmd', ['/c', DASHBOARD_BUILD_SCRIPT, buildDir], 'build-dashboard.cmd');
+      if (!isFile(stagedDashboard.exe)) fail(`build-dashboard.cmd did not produce ${stagedDashboard.exe}`);
+      if (fs.statSync(stagedDashboard.exe).size < 4096) {
+        fail(`the compiled dashboard launcher is implausibly small (${fs.statSync(stagedDashboard.exe).size} bytes)`);
+      }
+    }
+
+    const dashboardInfo = {
+      launcher: 'EstateMateBridge.exe',
+      launcherSha256: sha256(stagedDashboard.exe),
+      script: 'EstateMateBridge.ps1',
+      compiled: !flags.dryRun,
+    };
 
     const msiName = `estatemate-bridge-${version}-win-x64.msi`;
     const msiPath = path.join(outDir, msiName);
@@ -439,6 +509,9 @@ function main() {
       `-dVersion=${version}`,
       `-dExeSource=${stagedExe}`,
       `-dReadmeSource=${stagedReadme}`,
+      `-dDashboardExeSource=${stagedDashboard.exe}`,
+      `-dDashboardScriptSource=${stagedDashboard.script}`,
+      `-dDashboardLauncherSource=${stagedDashboard.launcher}`,
       '-out', wixobjPath,
       wxsPath,
     ];
@@ -459,7 +532,11 @@ function main() {
       for (const script of KIT_SCRIPTS) {
         console.log(`  kit    : ${script.source} (${fs.statSync(script.source).size} bytes)`);
       }
+      for (const source of DASHBOARD_SOURCES) {
+        console.log(`  dashboard: ${source.name} (${fs.statSync(source.source).size} bytes)`);
+      }
       console.log('\n[dry-run] would run:');
+      console.log(`  cmd /c "${DASHBOARD_BUILD_SCRIPT}" "${buildDir}"   # -> EstateMateBridge.exe`);
       console.log(`  candle ${candleArgs.join(' ')}`);
       console.log(`  light  ${lightArgs.join(' ')}`);
 
@@ -478,6 +555,7 @@ function main() {
         commit: flags.commit || null,
         exePath,
         wix: { candle: 'candle.exe (not run)', light: 'light.exe (not run)' },
+        dashboard: dashboardInfo,
       });
       printSummary({
         ...output,
@@ -520,6 +598,7 @@ function main() {
       commit: flags.commit || null,
       exePath,
       wix: { candle: path.basename(candle), light: path.basename(light) },
+      dashboard: dashboardInfo,
     });
     printSummary({ ...output, msiPath, msiName, quiet: flags.quiet });
   } finally {

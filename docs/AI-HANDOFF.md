@@ -1,5 +1,70 @@
 # AI handoff — EstateMate
 
+## The MSI now installs a dashboard, not a console window (2026-10-04)
+
+Reported as: "thank you the msi file installed but it uses cmd, powerchell,
+please change it to normal user interface/dashboard for configuratio and start
+bridge".
+
+Fair reading of what shipped in 0.2.6/0.2.7: the MSI gave the console tool a real
+install, but every Start Menu entry opened `cmd /K estatemate-bridge ...`, so
+configuring the agent and starting the bridge still meant reading console output
+and typing commands. For the person who runs an estate PC that is the wrong
+shape.
+
+What is in this change set:
+
+- **`bridge-apps/windows/dashboard/EstateMateBridge.ps1`** — the window. WinForms
+  (`System.Windows.Forms`), so there is nothing to install and no browser and no
+  port: *Status* tab (activity + live log), *Configuration* tab (agent id,
+  secret, Worker URL, the portal's *Download setup* `.ps1`, and the Hikvision
+  terminals in an editable table), *Service* tab (*Start at boot* /
+  *Remove from boot*), toolbar with *Start bridge*, *Stop bridge*, *Run check*,
+  *Open logs* and *Restart as administrator*. It contains **no configuration
+  logic**: every action runs the existing CLI (`status --json`,
+  `setup --no-prompt --no-verify --devices-json …`, `check`, `install-service`,
+  `uninstall-service`, `run`) and the elevation prompt is handled with
+  `Start-Process -Verb RunAs`. `-SelfTest` builds every control and loads the
+  real state headlessly.
+- **`bridge-apps/windows/dashboard/Launcher.cs` + `build-dashboard.cmd`** — the
+  Start Menu target: `EstateMateBridge.exe`, compiled as a **GUI** program
+  (`/target:winexe`) that runs the script with `-WindowStyle Hidden`, so no
+  console window ever appears. The build script uses a C# compiler the machine
+  already has (Visual Studio's Roslyn via `vswhere`, else the one in
+  `%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319`), so the Windows runner
+  needs no SDK download. `EstateMateBridge.cmd` is the double-click launcher for
+  the kit/portable case.
+- **`bridge-apps/windows/msi/estatemate-bridge.wxs`** — new `BridgeDashboard`
+  component (exe + script + cmd) in the one feature, and the three `cmd /K`
+  shortcuts are replaced by a single *EstateMate Bridge* entry that opens the
+  dashboard. App Paths and the PATH append stay, because support and advanced
+  work still use the command line.
+- **`scripts/package-bridge-msi.mjs`** — stages the dashboard sources, compiles
+  the launcher with `build-dashboard.cmd`, passes the three files to candle
+  (`-dDashboardExeSource/-dDashboardScriptSource/-dDashboardLauncherSource`) and
+  records `dashboard {launcher, launcherSha256, script, compiled}` in
+  BUILD-INFO.json. `--dry-run` writes a placeholder launcher, so the whole
+  output stage still runs on Linux.
+- **`bridge-apps/windows/host/{setup,cli}.cjs`** — `setup` gained
+  `--agent-id`, `--agent-secret` and `--worker-url`: validation without prompts
+  (UUID agent id, ≥16-character secret, normalised Worker URL), which is what
+  lets the dashboard save the hand-typed form. The secret is still never
+  echoed, and `scripts/bridge-exe-smoke-test.mjs` (section 1d) proves it on the
+  built executable.
+- **`.github/workflows/bridge.yml`** — the MSI-install step now also asserts the
+  installed dashboard files and the Start Menu shortcut, then runs
+  `EstateMateBridge.exe -SelfTest` and reports a failure as an annotation (the
+  launcher mirrors its output to `%TEMP%\estatemate-dashboard-last-run.txt`,
+  which is what the annotation quotes). The validate job dry-runs the MSI packer
+  on ubuntu and inspects the kit, so a missing function or a stale path in the
+  packaging code fails in seconds instead of after the Windows job.
+
+Honest limits: the dashboard itself cannot be executed in the dev sandbox (no
+Windows, no PowerShell, no C# compiler). Local verification is `node --check`,
+an XML parse of the `.wxs`, the PowerShell linter and the packer's `--dry-run`;
+the real proof is the `windows-latest` job, which compiles the launcher and runs
+the self-test against the copy the MSI installed.
+
 ## The Windows installer now explains itself and cannot dead-end (2026-10-04)
 
 Reported as: "the msi installer wont run complete on windows system, please fix

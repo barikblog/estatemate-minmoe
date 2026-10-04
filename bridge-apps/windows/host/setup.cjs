@@ -9,6 +9,10 @@
  *     file path interactively, and reads it from stdin with `-` so a technician
  *     can pipe it in:  Get-Content installer.ps1 | .\estatemate-bridge.exe setup --from-installer -
  *   * `--devices-json <file>`      a prepared device list.
+ *   * `--agent-id` / `--agent-secret` / `--worker-url`  the same values typed by
+ *     hand - the Windows dashboard sends these instead of writing
+ *     agent-config.json itself, so validation and file hardening live in one
+ *     place.
  *   * interactive prompts          for everything else.
  */
 'use strict';
@@ -213,6 +217,26 @@ async function acquireIdentity({ ctx, logger, options, prompter }) {
     }
     logger.info(`Installer script accepted: agent ${parsed.agentId}${parsed.workerUrl ? `, worker ${parsed.workerUrl}` : ''}`);
     return parsed;
+  }
+
+  // Values typed into a form instead of a portal file - the Windows dashboard
+  // sends them here rather than writing agent-config.json itself, so there is
+  // exactly one implementation of "what a valid configuration looks like" and
+  // exactly one place that hardens the file's permissions.
+  if (options.agentId || options.agentSecret) {
+    const agentId = String(options.agentId || '').trim();
+    const agentSecret = String(options.agentSecret || '');
+    const workerUrl = String(options.workerUrl || DEFAULT_WORKER_URL).replace(/\/+$/, '');
+    if (!isUuid(agentId)) {
+      logger.error(`"${agentId}" is not an agent id (the portal shows it as a UUID when the agent is registered)`);
+      return null;
+    }
+    if (agentSecret.length < 16) {
+      logger.error('The agent secret is at least 16 characters long.');
+      return null;
+    }
+    logger.info(`Using the agent id and secret given on the command line: agent ${agentId}${options.workerUrl ? `, worker ${workerUrl}` : ''}`);
+    return { agentId, agentSecret, workerUrl, installerKey: null };
   }
 
   if (!prompter) {

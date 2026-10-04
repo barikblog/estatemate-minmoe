@@ -31,7 +31,8 @@ Retired transports: direct HTTP Listening, the Render free relay, Hikvision clou
 - Pull-request quality gate (no deploy, no credentials): `.github/workflows/ci.yml`, backed by `scripts/ci-checks.sh` for the PR-relative checks
 - CI deployment: `.github/workflows/deploy.yml`
 - Client artifact builds (Windows agent bundle + Android APK): `.github/workflows/bridge.yml`, on `bridge-*` tags
-- Windows install: `bridge-apps/windows/msi/` — the WiX source (`estatemate-bridge.wxs`) and the kit launcher (`Install-EstateMate-Bridge.cmd` + `install-bridge.ps1`), packaged by `scripts/package-bridge-msi.mjs`. The launcher verifies the MSI, logs the install, explains the exit code and falls back to a per-user install (no Windows Installer, no admin) when an MSI cannot complete on a real PC
+- Windows install: `bridge-apps/windows/msi/` — the WiX source (`estatemate-bridge.wxs`) and the kit launcher (`Install-EstateMate-Bridge.cmd` + `install-bridge.ps1`), packaged by `scripts/package-bridge-msi.mjs`. The launcher verifies the MSI, logs the install, explains the exit code and falls back to a per-user install (no Windows Installer, no admin) when an MSI cannot complete on a real PC. The MSI also installs the dashboard
+- Windows dashboard: `bridge-apps/windows/dashboard/` — `EstateMateBridge.ps1` (WinForms window: status, configuration, service), `Launcher.cs` + `build-dashboard.cmd` (compiles `EstateMateBridge.exe`, a GUI launcher, using a compiler the machine already has), `EstateMateBridge.cmd`. It drives the bridge CLI for everything, so it holds no configuration logic of its own; `EstateMateBridge.exe -SelfTest` is the headless check the Windows runner runs after installing the MSI
 - Remote support access (Cloudflare Tunnel / Zero Trust Free): `scripts/cloudflared-remote-access.mjs` (+ `.integration.mjs`), documented in `docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md`
 
 ## Non-negotiable project rules

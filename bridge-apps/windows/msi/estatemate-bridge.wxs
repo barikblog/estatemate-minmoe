@@ -13,13 +13,15 @@
 
     * the single-file bridge executable in "C:\Program Files\EstateMate Bridge",
       plus a short README.txt with the five-minute setup;
-    * Start Menu shortcuts that open console windows that STAY OPEN — the bare
-      exe is a console tool, and double-clicking it directly flashes a window
-      and exits, which is exactly the "it is not installing" confusion this
-      installer exists to remove;
+    * a Start Menu shortcut that opens the dashboard: EstateMateBridge.exe, a
+      GUI program (nothing to type, no console window) that configures the
+      terminal bridge and starts it. It drives this same executable's commands
+      behind the buttons, so the console and the window can never disagree
+      about what a valid setup is;
     * an App Paths registry value, so Win+R "estatemate-bridge" works;
     * the install directory appended to the system PATH, so any PowerShell or
-      cmd can run `estatemate-bridge` by name;
+      cmd can run `estatemate-bridge` by name — the command line remains for
+      support and for advanced work, it is just no longer the only way in;
     * a proper Programs-and-Features entry, upgrades in place (stable
       UpgradeCode, same-version reinstalls allowed) and a clean uninstall.
 
@@ -36,8 +38,10 @@
   What it deliberately is NOT:
 
     * it does not register the start-at-boot scheduled task — that needs the
-      agent credentials from the portal first (`estatemate-bridge setup`, then
-      `check`, then `install-service` from an Administrator console);
+      agent credentials from the portal first. The dashboard does both steps
+      (Configuration, then Service -> Start at boot) and asks Windows for the
+      administrator rights itself; from the command line it is `setup`, then
+      `check`, then `install-service` in an Administrator console;
     * it does not touch %ProgramData%\EstateMate — configuration, secrets and
       logs live there, so an uninstall or upgrade never destroys them.
 
@@ -75,6 +79,7 @@
          optional-components UI anyway. (v3 spells it Absent, not AllowAbsent.) -->
     <Feature Id="Main" Title="EstateMate Bridge" Level="1" Absent="disallow">
       <ComponentRef Id="BridgeExecutable" />
+      <ComponentRef Id="BridgeDashboard" />
       <ComponentRef Id="BridgeReadme" />
     </Feature>
 
@@ -97,26 +102,28 @@
             <Environment Id="BridgeOnPath" Name="PATH" Value="[INSTALLDIR]"
                          Permanent="no" Part="last" Action="set" System="yes" />
 
-            <!-- Start Menu: each shortcut opens a console that stays open in
-                 the install directory, so follow-up commands just work. -->
-            <Shortcut Id="StartMenuConsole" Directory="ApplicationProgramsFolder"
-                      Name="EstateMate Bridge Console" Description="Open a console for the EstateMate bridge commands"
-                      Target="[System64Folder]cmd.exe" Arguments="/K estatemate-bridge.exe help"
-                      WorkingDirectory="INSTALLDIR" />
-            <Shortcut Id="StartMenuCheck" Directory="ApplicationProgramsFolder"
-                      Name="Check configuration" Description="Validate the config, the Worker and every terminal"
-                      Target="[System64Folder]cmd.exe" Arguments="/K estatemate-bridge.exe check"
-                      WorkingDirectory="INSTALLDIR" />
-            <Shortcut Id="StartMenuStatus" Directory="ApplicationProgramsFolder"
-                      Name="Service status" Description="Paths, scheduled-task state and recent log lines"
-                      Target="[System64Folder]cmd.exe" Arguments="/K estatemate-bridge.exe status"
-                      WorkingDirectory="INSTALLDIR" />
+            <!-- Start Menu: one entry, the dashboard. Everything the installer
+                 README asks for happens in that window — no commands to type
+                 and no console that scares people off. The command line stays
+                 available for support; the README still documents it. -->
+            <Shortcut Id="StartMenuDashboard" Directory="ApplicationProgramsFolder"
+                      Name="EstateMate Bridge" Description="Configure the terminals and start the bridge"
+                      Target="[INSTALLDIR]EstateMateBridge.exe" WorkingDirectory="INSTALLDIR" />
             <Shortcut Id="StartMenuReadme" Directory="ApplicationProgramsFolder"
                       Name="Read me first" Description="The five-minute setup guide"
                       Target="[INSTALLDIR]README.txt" WorkingDirectory="INSTALLDIR" />
 
             <!-- Take the Start Menu folder away again when the last file goes. -->
             <RemoveFolder Id="RemoveApplicationProgramsFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
+          </Component>
+
+          <!-- The dashboard: the launcher (a GUI program, so no console window
+               appears), the window itself as a script, and a launcher .cmd for
+               anyone who would rather double-click something in the folder. -->
+          <Component Id="BridgeDashboard" Guid="*">
+            <File Id="BridgeDashboardExe" Name="EstateMateBridge.exe" Source="$(var.DashboardExeSource)" KeyPath="yes" />
+            <File Id="BridgeDashboardScript" Name="EstateMateBridge.ps1" Source="$(var.DashboardScriptSource)" />
+            <File Id="BridgeDashboardLauncher" Name="EstateMateBridge.cmd" Source="$(var.DashboardLauncherSource)" />
           </Component>
 
           <Component Id="BridgeReadme" Guid="*">
