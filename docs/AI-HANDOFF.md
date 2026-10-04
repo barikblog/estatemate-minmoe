@@ -1,5 +1,83 @@
 # AI handoff — EstateMate
 
+## The Windows installer now explains itself and cannot dead-end (2026-10-04)
+
+Reported as: "the msi installer wont run complete on windows system, please fix
+and update the apk file also". Asked what the PC does, the person running it
+said: **"IT START INSTALLATION BY SAY GATHERING INFORMATION AND DISPEAR FROM
+THE SCREEN"** — the classic Windows Installer silent abort: the "Gathering
+information..." (costing) window closes, nothing is installed, no error dialog.
+Their account is an administrator.
+
+That symptom is not the package. The MSI is built, installed, smoke-tested,
+uninstalled and re-checked on a `windows-latest` runner in every release run
+(see the `bridge-exe` job: `msiexec /i … /qn`, installed-exe smoke test, PATH +
+App Paths assertions, `msiexec /x … /qn`, removal assertion), and the 0.2.6 run
+that published the release was green on that job. On a real PC the same silent
+stop is caused by antivirus/endpoint security ending `msiexec`, a managed-PC
+policy that forbids MSIs (`1625`), a Windows Installer service that cannot be
+reached, a dismissed UAC prompt, or an MSI that never finished downloading
+(`1619`/`1620`) — none of which a `.wxs` can prevent, and none of which show a
+message.
+
+So the fix is not another MSI guess; it is a way to *name the cause* and to
+*keep working*:
+
+- **`bridge-apps/windows/msi/install-bridge.ps1`** (new, lint-clean via
+  `scripts/lint-powershell.py`) — verifies the MSI against the shipped
+  `SHA256SUMS.txt` (a short download is reported as such, exit 3, nothing
+  installed), removes the Zone.Identifier mark browsers add, starts the
+  Windows Installer service when it is stopped, checks free disk space, runs
+  `msiexec /i … /l*v <log>` (UI by default, `/qn` under `-Silent`), decodes the
+  exit code in plain English (1601/1603/1618/1619/1620/1622/1625/1633/1638/
+  1641/1925/2502/2503/3010), echoes the `Return value 3` lines from the log,
+  copies the log and a report beside the MSI, and — when the MSI still cannot
+  finish — performs a **per-user install with no Windows Installer and no
+  administrator rights**: the payload comes from the portable exe in the kit if
+  present, otherwise from `msiexec /a` (administrative extraction) of the MSI
+  itself, and it is installed to `%LOCALAPPDATA%\Programs\EstateMate Bridge`
+  with HKCU App Paths, a length-checked user PATH entry, Start Menu console
+  shortcuts and an *Installed apps* uninstall entry. `-Uninstall` reverses all
+  of it.
+- **`bridge-apps/windows/msi/Install-EstateMate-Bridge.cmd`** — the thing a
+  person actually double-clicks. Passes its arguments through, never pauses when
+  run with `-Silent`/`-NoPause` (so CI can drive it).
+- **`scripts/package-bridge-msi.mjs`** (ported from the 0.2.6 line, then
+  extended) — builds the MSI with the runner's WiX v3, stages the launcher and
+  the script beside it, writes a `SHA256SUMS.txt` covering the MSI *and* the
+  scripts, writes `READ-ME-FIRST.txt`, and zips it all as
+  `estatemate-bridge-<version>-win-x64-installer-kit.zip` (the kit is the
+  recommended download now). `--dry-run` still works on Linux.
+- **`scripts/lib/zip-write.mjs`** (new) — a store-only ZIP writer with CRC-32,
+  no dependencies, so the kit can be built on the Windows runner without
+  7-Zip or `Compress-Archive`. Verified locally against Python's `zipfile`
+  (`testzip()` clean) and on Windows by `Expand-Archive` in CI.
+- **`scripts/lint-powershell.py`** — learned to skip `<# … #>` block comments
+  (the new script has a real header; the linter previously read its prose as
+  statements and flagged `param()`). Unterminated block comments are now an
+  error of their own.
+- **`bridge-apps/windows/msi/estatemate-bridge.wxs`** — ported from 0.2.6
+  (per-machine x64, App Paths, PATH append, Start Menu consoles, MajorUpgrade,
+  `light -sice:ICE43 -sice:ICE57`) plus a `VersionNT64` launch condition, so
+  32-bit Windows gets a sentence instead of a bare `1633`.
+- **CI (`bridge-exe` job)** — after the existing direct-MSI round trip, three
+  new checks on real Windows: unzip the kit with `Expand-Archive` and install
+  through the launcher exactly as a person does; truncate the MSI by 1 MB and
+  require the checksum guard to refuse it with exit 3 and install nothing; run
+  `-PerUser` and require the executable, HKCU App Paths and Start Menu
+  shortcuts, then `-Uninstall` and require all three gone.
+- **Docs**: `bridge-apps/windows/README.md` gained an *Installing* section with
+  the "Gathering information" troubleshooting entry; the release notes explain
+  the same and list the kit first.
+
+**Validation status (honest):** `node --check` on the packaging script,
+`--dry-run` staging on Linux, XML parse of the `.wxs`, ZIP verification with
+Python's `zipfile`, `yaml.safe_load` of the workflow, `lint-powershell.py` on
+the script and every `pwsh` step. The MSI compile, the ICE validation, the
+install/uninstall round trip, the kit launcher, the checksum guard and the
+per-user fallback all run in CI on `windows-latest` only — this sandbox has no
+Windows, no WiX and no PowerShell.
+
 ## alertStream heartbeat, auth-failure diagnostics and stale-nonce retry (2026-10-04)
 
 Applied from Hikvision's *Intelligent Security API (General Application) Developer Guide*

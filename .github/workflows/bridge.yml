@@ -27,6 +27,7 @@ on:
       - 'scripts/package-windows-bundle.mjs'
       - 'scripts/lib/**'
       - 'scripts/package-bridge-exe.mjs'
+      - 'scripts/package-bridge-msi.mjs'
       - 'scripts/bridge-exe-smoke-test.mjs'
       - 'scripts/build-bridge-apk.py'
       - 'scripts/verify-android-apk.py'
@@ -96,6 +97,7 @@ jobs:
           node scripts/package-windows-bundle.mjs \
             --out "$RUNNER_TEMP/lint-bundle" --version lint --commit "$GITHUB_SHA" >/dev/null
           python3 scripts/lint-powershell.py \
+            bridge-apps/windows/msi/install-bridge.ps1 \
             "$RUNNER_TEMP/lint-bundle/install-service.ps1" \
             "$RUNNER_TEMP/lint-bundle/uninstall-service.ps1"
 
@@ -656,6 +658,139 @@ jobs:
         shell: bash
         run: node scripts/bridge-exe-smoke-test.mjs --exe exe/estatemate-bridge-win-x64.exe
 
+      # The exe is a console tool, not an installer: double-clicking it flashes
+      # a window and closes, which reads as "it is not installing". The MSI is
+      # the real install, and the installer kit is what a PC that will not let
+      # an MSI finish actually runs: it verifies the download, keeps a verbose
+      # log, explains the exit code and falls back to a per-user install.
+      # Built with the WiX Toolset v3 this runner ships preinstalled.
+      - name: Build the MSI installer and the installer kit
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          case "$VERSION" in bridge-*) VERSION="${VERSION#bridge-}" ;; *) VERSION="0.2.0" ;; esac
+          node scripts/package-bridge-msi.mjs \
+            --exe exe/estatemate-bridge-win-x64.exe \
+            --out msi \
+            --version "$VERSION" \
+            --commit "$GITHUB_SHA"
+
+      # Prove the installer the way a user experiences it: install the MSI
+      # silently, smoke-test the executable from its installed location, then
+      # uninstall and check that everything is gone. Runners are admin, so the
+      # per-machine install needs no elevation dance.
+      - name: Install the MSI and smoke-test the installed executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Get-ChildItem -Path msi -Filter '*.msi' | Select-Object -First 1).FullName
+          Write-Host "Installing $msi"
+          $installLog = Join-Path $env:RUNNER_TEMP 'msi-install.log'
+          $install = Start-Process msiexec.exe -ArgumentList @('/i', "`"$msi`"", '/qn', "/l*v `"$installLog`"") -Wait -PassThru
+          if ($install.ExitCode -ne 0 -and $install.ExitCode -ne 3010) {
+            if (Test-Path $installLog) { Get-Content $installLog -Tail 40 | Write-Host }
+            throw "MSI install failed with exit code $($install.ExitCode)"
+          }
+
+          $installed = 'C:\Program Files\EstateMate Bridge\estatemate-bridge.exe'
+          if (-not (Test-Path $installed)) { throw "installed executable missing: $installed" }
+          Write-Host "Installed executable present: $installed"
+          & $installed version
+
+          # The full agent flow (fake Worker + fake terminal) against the copy
+          # the MSI actually installed.
+          node scripts/bridge-exe-smoke-test.mjs --exe $installed
+
+          # The PATH append: the current shell keeps its old environment, so
+          # read what the installer wrote instead of waiting for a new shell.
+          $machinePath = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment').PATH
+          if ($machinePath -notlike '*EstateMate Bridge*') { throw 'install directory missing from the machine PATH' }
+          $appPaths = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\estatemate-bridge.exe' -ErrorAction SilentlyContinue).'(default)'
+          if (-not $appPaths) { throw 'App Paths registry value missing' }
+          Write-Host "PATH and App Paths entries verified."
+
+          $removeLog = Join-Path $env:RUNNER_TEMP 'msi-uninstall.log'
+          $remove = Start-Process msiexec.exe -ArgumentList @('/x', "`"$msi`"", '/qn', "/l*v `"$removeLog`"") -Wait -PassThru
+          if ($remove.ExitCode -ne 0 -and $remove.ExitCode -ne 3010) {
+            if (Test-Path $removeLog) { Get-Content $removeLog -Tail 40 | Write-Host }
+            throw "MSI uninstall failed with exit code $($remove.ExitCode)"
+          }
+          if (Test-Path $installed) { throw 'executable still present after uninstall' }
+          Write-Host 'MSI install, installed-executable smoke test and uninstall all passed.'
+
+      # The kit is what a person downloads. Unzip it, double-click what is
+      # inside, and it must install - and, given a broken copy of the MSI, it
+      # must say the download is incomplete instead of failing mysteriously.
+      # Then the fallback: a per-user install that uses no Windows Installer at
+      # all, which is the escape hatch when an MSI cannot complete on a real PC.
+      - name: Install through the installer kit, then uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kitZip = (Get-ChildItem -Path msi -Filter '*installer-kit.zip' | Select-Object -First 1).FullName
+          Write-Host "Kit: $kitZip"
+          Expand-Archive -LiteralPath $kitZip -DestinationPath kit -Force
+          $kitDir = (Resolve-Path 'kit').Path
+          foreach ($expected in @('Install-EstateMate-Bridge.cmd', 'install-bridge.ps1', 'SHA256SUMS.txt', 'READ-ME-FIRST.txt')) {
+            if (-not (Test-Path (Join-Path $kitDir $expected))) { throw "the kit is missing $expected" }
+          }
+          $kitMsi = (Get-ChildItem -Path $kitDir -Filter '*.msi' | Select-Object -First 1).FullName
+
+          # 1. The all-users install, through the launcher, exactly as a person runs it.
+          $installer = Join-Path $kitDir 'Install-EstateMate-Bridge.cmd'
+          & cmd.exe /c "`"$installer`" -Silent -NoPause"
+          $launcherCode = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+          if ($launcherCode -ne 0) { throw "the kit launcher failed with exit code $launcherCode" }
+          $installed = 'C:\Program Files\EstateMate Bridge\estatemate-bridge.exe'
+          if (-not (Test-Path $installed)) { throw 'the kit launcher did not install the executable' }
+          & $installed version
+          Write-Host 'The kit launcher installed the MSI.'
+
+          $remove = Start-Process msiexec.exe -ArgumentList @('/x', "`"$kitMsi`"", '/qn') -Wait -PassThru
+          if ($remove.ExitCode -ne 0 -and $remove.ExitCode -ne 3010) { throw "uninstall failed with exit code $($remove.ExitCode)" }
+          if (Test-Path $installed) { throw 'the executable survived the uninstall' }
+
+          # 2. A truncated MSI must be named as such (exit 3), not attempted.
+          $brokenDir = Join-Path $env:RUNNER_TEMP 'broken-kit'
+          New-Item -ItemType Directory -Force -Path $brokenDir | Out-Null
+          Copy-Item (Join-Path $kitDir 'SHA256SUMS.txt') $brokenDir -Force
+          $brokenMsi = Join-Path $brokenDir (Split-Path -Leaf $kitMsi)
+          $bytes = [System.IO.File]::ReadAllBytes($kitMsi)
+          [System.IO.File]::WriteAllBytes($brokenMsi, $bytes[0..($bytes.Length - 1048577)])
+          $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $kitDir 'install-bridge.ps1') -MsiPath $brokenMsi -NoFallback -Silent -NoPause 2>&1
+          $brokenCode = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+          if ($brokenCode -ne 3) { throw "a truncated MSI must be refused with exit code 3, got $brokenCode`: $output" }
+          if (Test-Path $installed) { throw 'the truncated MSI was installed anyway' }
+          Write-Host 'A truncated MSI is refused with the checksum message.'
+
+          # 3. The per-user fallback: no Windows Installer, no administrator rights.
+          $perUserExe = Join-Path $env:LOCALAPPDATA 'Programs\EstateMate Bridge\estatemate-bridge.exe'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $kitDir 'install-bridge.ps1') -PerUser -Silent -NoPause
+          $perUserCode = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+          if ($perUserCode -ne 0) { throw "the per-user install failed with exit code $perUserCode" }
+          if (-not (Test-Path $perUserExe)) { throw "the per-user install left no executable at $perUserExe" }
+          & $perUserExe version
+          $appPaths = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\estatemate-bridge.exe' -ErrorAction SilentlyContinue).'(default)'
+          if (-not $appPaths) { throw 'the per-user install wrote no App Paths entry' }
+          if (-not (Test-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\EstateMate Bridge'))) {
+            throw 'the per-user install wrote no Start Menu shortcuts'
+          }
+          Write-Host 'The per-user install works without Windows Installer.'
+
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $kitDir 'install-bridge.ps1') -Uninstall -Silent -NoPause
+          $uninstallCode = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+          if ($uninstallCode -ne 0) { throw "the per-user uninstall failed with exit code $uninstallCode" }
+          if (Test-Path $perUserExe) { throw 'the per-user uninstall left the executable behind' }
+          if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\EstateMateBridge') {
+            throw 'the per-user uninstall left the Installed apps entry behind'
+          }
+          Write-Host 'Installer kit: install, checksum guard and per-user fallback all verified.'
+
       - name: Upload the executable
         uses: actions/upload-artifact@v4
         with:
@@ -666,6 +801,20 @@ jobs:
             exe/SHA256SUMS.txt
             exe/BUILD-INFO.json
             exe/README.txt
+
+      - name: Upload the MSI installer and kit
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-msi
+          if-no-files-found: error
+          path: |
+            msi/*.msi
+            msi/*-installer-kit.zip
+            msi/Install-EstateMate-Bridge.cmd
+            msi/install-bridge.ps1
+            msi/READ-ME-FIRST.txt
+            msi/SHA256SUMS.txt
+            msi/BUILD-INFO.json
 
   # --------------------------------------------------------------------------
   # The Android bridge APK: no Gradle, no AndroidX, no Kotlin. aapt2 + javac +
@@ -826,6 +975,8 @@ jobs:
             echo "Built from commit \`${GITHUB_SHA}\`."
             echo
             echo "### Artifacts"
+            echo "- **Windows installer kit** (\`estatemate-bridge-*-win-x64-installer-kit.zip\`) - unzip it and double-click **Install-EstateMate-Bridge.cmd**. That is the recommended install: it checks the MSI against its checksum, keeps a verbose installer log, says in plain English what an exit code means, and - if Windows will not let the MSI finish - installs the bridge for the current user under \`%LOCALAPPDATA%\\Programs\\EstateMate Bridge\` without using Windows Installer and without needing administrator rights."
+            echo "- **Windows bridge MSI** (\`estatemate-bridge-*-win-x64.msi\`) - the all-users installer on its own: double-click it, and the bridge lands in Program Files with Start Menu shortcuts, \`estatemate-bridge\` on the PATH and a proper uninstaller. Then run \`estatemate-bridge setup\`, \`check\` and \`install-service\`."
             echo "- **Windows bridge exe** (\`estatemate-bridge-win-x64.exe\`) - one file: no Node.js install and nothing to unzip. Run \`estatemate-bridge-win-x64.exe setup\`, then \`check\`, then \`install-service\`."
             echo "- **Android bridge APK** (\`estatemate-bridge-*.apk\`) - install on a phone or tablet on the same LAN as the terminals; the bridge runs in a foreground service and restarts after a reboot."
             echo "- **Windows agent bundle** (\`estatemate-isapi-agent-win-x64-*.zip\`) - self-contained; ships its own Node.js runtime, so the estate PC needs no Node.js install."
@@ -839,7 +990,12 @@ jobs:
             echo
             echo "Every release is smoke-tested end to end on Windows before it is published, the wizard included: \`setup --no-prompt --from-installer\` by path and from stdin, the content of both files it writes, that the one-time agent secret is never echoed, and that an unconfigured executable with no console refuses instead of prompting."
             echo
-            echo "### Windows install"
+            echo "### If the installer stops at \"Gathering information\""
+            echo "An installer window that says \"Gathering information...\" and then disappears installs nothing and shows no error. That is almost never the package: it is antivirus or endpoint security ending \`msiexec\`, a policy on a managed PC, a Windows Installer service that cannot be reached, or an MSI that did not finish downloading."
+            echo ""
+            echo "Unzip the installer kit and double-click **Install-EstateMate-Bridge.cmd** instead of the MSI directly. It names the cause, writes the log next to the MSI, and falls back to the per-user install, which needs no administrator rights and no Windows Installer."
+            echo ""
+            echo "### Windows agent bundle"
             echo "Unzip to \`C:\\EstateMate\\ISAPI-Agent\`, then in an Administrator PowerShell:"
             echo
             echo '```powershell'

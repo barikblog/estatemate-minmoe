@@ -31,6 +31,7 @@ Retired transports: direct HTTP Listening, the Render free relay, Hikvision clou
 - Pull-request quality gate (no deploy, no credentials): `.github/workflows/ci.yml`, backed by `scripts/ci-checks.sh` for the PR-relative checks
 - CI deployment: `.github/workflows/deploy.yml`
 - Client artifact builds (Windows agent bundle + Android APK): `.github/workflows/bridge.yml`, on `bridge-*` tags
+- Windows install: `bridge-apps/windows/msi/` — the WiX source (`estatemate-bridge.wxs`) and the kit launcher (`Install-EstateMate-Bridge.cmd` + `install-bridge.ps1`), packaged by `scripts/package-bridge-msi.mjs`. The launcher verifies the MSI, logs the install, explains the exit code and falls back to a per-user install (no Windows Installer, no admin) when an MSI cannot complete on a real PC
 - Remote support access (Cloudflare Tunnel / Zero Trust Free): `scripts/cloudflared-remote-access.mjs` (+ `.integration.mjs`), documented in `docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md`
 
 ## Non-negotiable project rules
