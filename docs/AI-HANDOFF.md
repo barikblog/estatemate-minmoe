@@ -65,6 +65,26 @@ an XML parse of the `.wxs`, the PowerShell linter and the packer's `--dry-run`;
 the real proof is the `windows-latest` job, which compiles the launcher and runs
 the self-test against the copy the MSI installed.
 
+What that Windows job found once the dashboard actually had to build — each one
+fixed, and each one is a self-test check now:
+
+- the terminal table set `EditMode = 'OnType'`, which is not a
+  `DataGridViewEditMode` on any .NET Framework, so `New-DashboardForm` threw and
+  the window never opened at all;
+- the elevated retry built its temp `.ps1` with cmd-style `\"` quoting, which
+  PowerShell does not understand: a `--devices-json` path under a user profile
+  with a space (`C:\Users\Estate Manager\…`) would have arrived as several
+  arguments. Values are single-quoted PowerShell literals with `'` doubled now;
+- the no-BOM check asserted on the `ConvertTo-Json` string (which cannot carry a
+  byte-order mark) and failed with no evidence. It now writes through
+  `Write-Utf8NoBom`, reads the first three bytes back and reports them, so it
+  tests the file `setup` actually parses.
+
+**`bridge-0.2.8`** is the release that carries the dashboard and every other
+feature of this branch in the MSI, the kit and the per-user install; the tag
+run's Windows job installs the MSI, runs the installed dashboard's self-test,
+installs through the kit, uninstalls and only then publishes.
+
 ## The Windows installer now explains itself and cannot dead-end (2026-10-04)
 
 Reported as: "the msi installer wont run complete on windows system, please fix
