@@ -309,8 +309,10 @@ public final class OfflineServerTest {
                 check(delivered == 2, "broadcast reaches both clients", "delivered " + delivered);
                 String fromOne = one.readText();
                 String fromTwo = two.readText();
-                check(fromOne.contains("access_events") && fromTwo.contains("access_events"),
-                        "both clients got the batch");
+                check(fromOne != null && fromTwo != null && fromOne.contains("access_events")
+                        && fromTwo.contains("access_events"),
+                        "both clients got the batch",
+                        "one=" + fromOne + " two=" + fromTwo);
 
                 one.sendClose(1000);
                 String closeEcho = one.readCloseFrame();
@@ -374,6 +376,7 @@ public final class OfflineServerTest {
 
         boolean readHandshake() throws IOException {
             String statusLine = readLine(in);
+            if (statusLine == null) throw new IOException("server closed during the upgrade handshake");
             if (!statusLine.contains("101")) return false;
             String line;
             while (!(line = readLine(in)).isEmpty()) {

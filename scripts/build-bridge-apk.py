@@ -74,9 +74,16 @@ def run(command: list[str], what: str, quiet: bool = False) -> str:
         # so replay the tool's own error lines as check annotations too — the
         # one channel that is always readable (javac/aapt2/d8/apksigner
         # diagnostics all carry "error" in the actionable lines).
-        for line in detail.splitlines():
-            if "error" not in line.lower() and "warning" not in line.lower():
-                continue
+        lines = [line for line in detail.splitlines() if line.strip()]
+        interesting = [
+            line for line in lines
+            if ("error" in line.lower() or "warning" in line.lower()
+                or "exception" in line.lower() or line.lstrip().startswith("at ")
+                or "caused by" in line.lower())
+        ]
+        # Whatever the pattern missed, the tail of the output is where the
+        # failure detail lives (stack traces, javac summaries, ...).
+        for line in (interesting + lines[-10:])[:30]:
             escaped = line.strip()[:900].replace("%", "%25").replace("\r", "%0D")
             print(f"::error title={pathlib.Path(command[0]).name}::{escaped}")
         raise BuildError(f"{what} failed (exit {result.returncode}):\n{detail.strip()}")

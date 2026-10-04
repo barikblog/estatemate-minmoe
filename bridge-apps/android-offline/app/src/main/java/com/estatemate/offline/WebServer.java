@@ -200,11 +200,17 @@ public final class WebServer {
                 synchronized (openSockets) { openSockets.add(socket); }
                 pool.execute(new Runnable() {
                     public void run() {
+                        boolean handedOff = false;
                         try {
-                            serve(socket);
+                            handedOff = serve(socket);
                         } finally {
                             synchronized (openSockets) { openSockets.remove(socket); }
-                            try { socket.close(); } catch (IOException ignored) { /* fine */ }
+                            // An approved upgrade handed the socket to the
+                            // hub's reader thread; closing it here would kill
+                            // the live feed the moment the handshake ended.
+                            if (!handedOff) {
+                                try { socket.close(); } catch (IOException ignored) { /* fine */ }
+                            }
                         }
                     }
                 });
@@ -214,7 +220,8 @@ public final class WebServer {
         }
     }
 
-    private void serve(Socket socket) {
+    /** @return true when an upgrade handler now owns the socket. */
+    private boolean serve(Socket socket) {
         try {
             BufferedInputStream in = new BufferedInputStream(socket.getInputStream(), 32 * 1024);
             OutputStream out = socket.getOutputStream();
@@ -224,13 +231,13 @@ public final class WebServer {
                     request = readRequest(in, out);
                 } catch (PayloadTooLarge tooLarge) {
                     writeSimple(out, 413, "{\"error\":\"Payload too large\"}", true);
-                    return;
+                    return false;
                 } catch (SocketTimeoutException idle) {
-                    return; // idle keep-alive connection
+                    return false; // idle keep-alive connection
                 } catch (IOException malformed) {
-                    return; // half-open or garbage; nothing to answer
+                    return false; // half-open or garbage; nothing to answer
                 }
-                if (request == null) return;
+                if (request == null) return false;
 
                 if (isWebSocketUpgrade(request)) {
                     boolean approved;
@@ -242,10 +249,10 @@ public final class WebServer {
                     }
                     if (!approved) {
                         writeSimple(out, 401, "{\"error\":\"Authentication required\"}", true);
-                        return;
+                        return false;
                     }
                     upgradeHandler.handle(socket, in, request);
-                    return; // the hub owns the socket from here
+                    return true; // the hub owns the socket from here
                 }
 
                 Response response;
@@ -257,11 +264,12 @@ public final class WebServer {
                 }
                 boolean close = !wantsKeepAlive(request) || "close".equalsIgnoreCase(String.valueOf(request.header("Connection")));
                 writeResponse(out, request.method, response, close);
-                if (close) return;
+                if (close) return false;
             }
         } catch (IOException error) {
             if (running) logger.log("warn", "connection error: " + error);
         }
+        return false;
     }
 
     private static boolean isWebSocketUpgrade(Request request) {
