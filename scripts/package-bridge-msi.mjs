@@ -272,8 +272,110 @@ function readmeText(version) {
   ].join('\r\n');
 }
 
+/** One page for the person who unzipped the kit, before they double-click anything. */
+function kitReadmeText(version) {
+  return [
+    `EstateMate Bridge ${version} - Windows installer kit`,
+    '==================================================',
+    '',
+    'DOUBLE-CLICK:  Install-EstateMate-Bridge.cmd',
+    '',
+    'That is the whole instruction. It installs the MSI in this folder, and it',
+    'prints exactly what went wrong if Windows will not let the MSI finish -',
+    'including the case where the installer window says "Gathering information"',
+    'and then disappears with nothing installed.',
+    '',
+    'Why a script and not just the MSI:',
+    '  * it checks the MSI against SHA256SUMS.txt, so a download that stopped',
+    '    half-way says so instead of failing silently;',
+    '  * it removes the "downloaded from the Internet" mark that SmartScreen and',
+    '    some antivirus products refuse;',
+    '  * it starts the Windows Installer service if it is not running, checks',
+    '    free disk space, and asks for administrator rights only when needed;',
+    '  * it writes a verbose installer log beside the MSI and explains the exit',
+    '    code in plain English;',
+    '  * if the MSI still cannot complete - antivirus, a policy on a managed PC,',
+    '    a broken Windows Installer, a refused elevation prompt - it installs',
+    '    the bridge for the current user instead, under',
+    '%LOCALAPPDATA%\\Programs\\EstateMate Bridge, using no Windows Installer',
+    '    and needing no administrator rights at all.',
+    '',
+    'Files in this kit',
+    '  Install-EstateMate-Bridge.cmd   double-click this',
+    '  install-bridge.ps1              what it runs (readable - it is a script)',
+    `  ${kitNameFor(version)}   the MSI it installs`,
+    '  SHA256SUMS.txt                  checksums the script verifies',
+    '',
+    'Prefer no installer at all? The release also carries',
+    'estatemate-bridge-win-x64.exe - one file, no install, no administrator',
+    'rights, no Windows Installer. Copy it anywhere and run it.',
+    '',
+    'The build is unsigned (this project uses no code-signing certificate).',
+    '',
+  ].join('\r\n');
+}
+
 function kitNameFor(version) {
   return `estatemate-bridge-${version}-win-x64-installer-kit.zip`;
+}
+
+/**
+ * Everything that lands in the output directory: the MSI, the launcher and its
+ * script beside it, the checksums install-bridge.ps1 verifies the MSI against,
+ * a one-page READ-ME-FIRST.txt and the zip a person actually downloads.
+ *
+ * Returns the MSI's sha256. Called by the real build and by --dry-run (with a
+ * placeholder MSI), so this code cannot rot unnoticed on a platform without
+ * WiX: --dry-run produces a real kit from a fake MSI and every reference in
+ * here is exercised.
+ */
+function writeOutputs({ outDir, msiPath, msiName, version, commit, exePath, wix }) {
+  const kitFiles = [{ name: msiName, path: msiPath }];
+  for (const script of KIT_SCRIPTS) {
+    const destination = path.join(outDir, script.name);
+    fs.copyFileSync(script.source, destination);
+    kitFiles.push({ name: script.name, path: destination });
+  }
+
+  // install-bridge.ps1 reads this to verify the MSI before trusting it.
+  const sums = kitFiles.map((file) => `${sha256(file.path)}  ${file.name}`).join('\n');
+  fs.writeFileSync(path.join(outDir, 'SHA256SUMS.txt'), `${sums}\n`);
+
+  const kitReadme = path.join(outDir, 'READ-ME-FIRST.txt');
+  fs.writeFileSync(kitReadme, kitReadmeText(version), 'utf8');
+
+  const kitName = kitNameFor(version);
+  const kitPath = path.join(outDir, kitName);
+  const zipEntries = [
+    ...kitFiles.map((file) => ({ name: file.name, path: file.path })),
+    { name: 'SHA256SUMS.txt', path: path.join(outDir, 'SHA256SUMS.txt') },
+    { name: 'READ-ME-FIRST.txt', path: kitReadme },
+  ];
+  fs.writeFileSync(kitPath, createZip(zipEntries));
+
+  fs.writeFileSync(
+    path.join(outDir, 'BUILD-INFO.json'),
+    `${JSON.stringify(
+      {
+        product: 'estatemate-bridge-msi',
+        version,
+        upgradeCode: 'BE4C3E0B-927B-471E-92DE-A0BFAEF4C266',
+        platform: 'win-x64',
+        commit,
+        source: { exe: path.basename(exePath), exeSha256: sha256(exePath) },
+        wix,
+        kit: {
+          name: kitName,
+          sha256: sha256(kitPath),
+          files: zipEntries.map((entry) => entry.name),
+        },
+      },
+      null,
+      2,
+    )}\n`,
+  );
+
+  return sha256(msiPath);
 }
 
 function main() {
@@ -334,9 +436,29 @@ function main() {
       console.log('\n[dry-run] would run:');
       console.log(`  candle ${candleArgs.join(' ')}`);
       console.log(`  light  ${lightArgs.join(' ')}`);
-      console.log(`\n[dry-run] output would be ${msiPath}`);
-      console.log(`[dry-run] plus Install-EstateMate-Bridge.cmd, install-bridge.ps1,`);
-      console.log(`          READ-ME-FIRST.txt and ${kitNameFor(version)}`);
+
+      // Assemble the whole output tree against a placeholder MSI, in a
+      // throwaway directory: the packaging code (checksums, READ-ME-FIRST, the
+      // zip, BUILD-INFO) then gets exercised on every platform instead of only
+      // where candle and light exist. What it cannot prove is the MSI itself.
+      const dryOut = fs.mkdtempSync(path.join(os.tmpdir(), 'estatemate-bridge-msi-dry-'));
+      const placeholder = path.join(dryOut, msiName);
+      fs.writeFileSync(placeholder, 'placeholder: candle and light were not run\n', 'utf8');
+      writeOutputs({
+        outDir: dryOut,
+        msiPath: placeholder,
+        msiName,
+        version,
+        commit: flags.commit || null,
+        exePath,
+        wix: { candle: 'candle.exe (not run)', light: 'light.exe (not run)' },
+      });
+      console.log('\n[dry-run] would write:');
+      for (const file of fs.readdirSync(dryOut).sort()) {
+        console.log(`  ${path.join(outDir, file)}  (from ${path.join(dryOut, file)})`);
+      }
+      console.log('\n[dry-run] the kit above was assembled from a placeholder MSI, so the');
+      console.log('[dry-run] packaging code is exercised but the MSI itself is not built.');
       return;
     }
 
@@ -361,55 +483,15 @@ function main() {
       fail(`light reported success but ${msiPath} is missing or implausibly small`);
     }
 
-    // ---- the installer kit -------------------------------------------------
-    // The launcher and its script ship beside the MSI, so the same folder can
-    // install it, verify it and explain a failure; the zip is what a person
-    // actually downloads.
-    const msiSha = sha256(msiPath);
-    const kitFiles = [{ name: msiName, path: msiPath }];
-    for (const script of KIT_SCRIPTS) {
-      const destination = path.join(outDir, script.name);
-      fs.copyFileSync(script.source, destination);
-      kitFiles.push({ name: script.name, path: destination });
-    }
-
-    // install-bridge.ps1 reads this to verify the MSI before trusting it.
-    const sums = kitFiles.map((file) => `${sha256(file.path)}  ${file.name}`).join('\n');
-    fs.writeFileSync(path.join(outDir, 'SHA256SUMS.txt'), `${sums}\n`);
-
-    const kitReadme = path.join(outDir, 'READ-ME-FIRST.txt');
-    fs.writeFileSync(kitReadme, kitReadmeText(version), 'utf8');
-
-    const kitName = kitNameFor(version);
-    const kitPath = path.join(outDir, kitName);
-    const zipEntries = [
-      ...kitFiles.map((file) => ({ name: file.name, path: file.path })),
-      { name: 'SHA256SUMS.txt', path: path.join(outDir, 'SHA256SUMS.txt') },
-      { name: 'READ-ME-FIRST.txt', path: kitReadme },
-    ];
-    fs.writeFileSync(kitPath, createZip(zipEntries));
-
-    fs.writeFileSync(
-      path.join(outDir, 'BUILD-INFO.json'),
-      `${JSON.stringify(
-        {
-          product: 'estatemate-bridge-msi',
-          version,
-          upgradeCode: 'BE4C3E0B-927B-471E-92DE-A0BFAEF4C266',
-          platform: 'win-x64',
-          commit: flags.commit || null,
-          source: { exe: path.basename(exePath), exeSha256: sha256(exePath) },
-          wix: { candle: path.basename(candle), light: path.basename(light) },
-          kit: {
-            name: kitName,
-            sha256: sha256(kitPath),
-            files: zipEntries.map((entry) => entry.name),
-          },
-        },
-        null,
-        2,
-      )}\n`,
-    );
+    const msiSha = writeOutputs({
+      outDir,
+      msiPath,
+      msiName,
+      version,
+      commit: flags.commit || null,
+      exePath,
+      wix: { candle: path.basename(candle), light: path.basename(light) },
+    });
 
     const sizeMb = fs.statSync(msiPath).size / (1024 * 1024);
     if (!flags.quiet) {
