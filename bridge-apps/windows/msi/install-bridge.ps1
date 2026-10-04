@@ -83,15 +83,38 @@ function Test-Admin {
 }
 
 function Get-Sha256($file) {
-  return (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+  # .NET directly, not Get-FileHash: that cmdlet lives in a module the host may
+  # not auto-load. (A locked-down or freshly-imaged Windows install can refuse to
+  # load Microsoft.PowerShell.Utility, and then the checksum check - the whole
+  # point of this script - would fail with "not recognized as the name of a
+  # cmdlet". This is exactly what a release smoke test on a Windows runner hit.)
+  $stream = [System.IO.File]::OpenRead($file)
+  try {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      $hash = $sha.ComputeHash($stream)
+      return ([System.BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+    } finally {
+      $sha.Dispose()
+    }
+  } finally {
+    $stream.Dispose()
+  }
 }
 
 function Clear-DownloadMark($file) {
   # A file saved from a browser carries a Zone.Identifier stream. Removing it is
   # what the Properties -> Unblock checkbox does, and it is the difference
-  # between security software reading the file and refusing it.
+  # between security software reading the file and refusing it. Two routes,
+  # because Unblock-File is another cmdlet that may not be loaded.
   try {
     Unblock-File -LiteralPath $file -ErrorAction SilentlyContinue
+    return $true
+  } catch {
+    # fall through to the stream removal below
+  }
+  try {
+    Remove-Item -LiteralPath $file -Stream 'Zone.Identifier' -Force -ErrorAction SilentlyContinue
     return $true
   } catch {
     return $false
@@ -178,12 +201,16 @@ function Get-MsiFailureHelp($code) {
 
 function Show-LogEvidence($log) {
   if (-not (Test-Path -LiteralPath $log)) { return }
-  $matches = @(Select-String -LiteralPath $log -Pattern 'Return value 3|^\s*Error|ERROR_|Installation failed' -ErrorAction SilentlyContinue |
+  # Get-Content + Where-Object rather than Select-String: the fewer cmdlets from
+  # loadable modules this script depends on, the fewer ways it can fail on a
+  # machine that is already refusing an installer.
+  $interesting = @(Get-Content -LiteralPath $log -ErrorAction SilentlyContinue |
+    Where-Object { $_ -match 'Return value 3' -or $_ -match '^\s*Error' -or $_ -match 'ERROR_' -or $_ -match 'Installation failed' } |
     Select-Object -Last 12)
-  if ($matches.Count -gt 0) {
+  if ($interesting.Count -gt 0) {
     Write-Step 'the installer log says:'
-    foreach ($match in $matches) {
-      $line = $match.Line.Trim()
+    foreach ($raw in $interesting) {
+      $line = ([string]$raw).Trim()
       if ($line.Length -gt 150) { $line = $line.Substring(0, 150) + '...' }
       Write-Host "      $line" -ForegroundColor DarkGray
     }
@@ -340,14 +367,15 @@ function Invoke-MsiInstall($msi, $log) {
     return 1925
   }
 
-  $service = Get-Service -Name 'msiserver' -ErrorAction SilentlyContinue
+  $service = $null
+  try { $service = Get-Service -Name 'msiserver' -ErrorAction SilentlyContinue } catch { }
   if (-not $service) {
     Write-Bad 'the Windows Installer service is not installed on this PC'
     return 1601
   }
   if ($service.Status -ne 'Running') {
     Write-Step 'starting the Windows Installer service'
-    try { Start-Service -Name 'msiserver' } catch { Write-Warn "could not start msiserver: $($_.Exception.Message)" }
+    try { Start-Service -Name 'msiserver' -ErrorAction SilentlyContinue } catch { Write-Warn "could not start msiserver: $($_.Exception.Message)" }
   }
 
   $free = Get-FreeSpaceMb $msi
