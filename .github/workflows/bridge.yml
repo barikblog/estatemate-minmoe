@@ -728,68 +728,92 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $kitZip = (Get-ChildItem -Path msi -Filter '*installer-kit.zip' | Select-Object -First 1).FullName
-          Write-Host "Kit: $kitZip"
-          Expand-Archive -LiteralPath $kitZip -DestinationPath kit -Force
-          $kitDir = (Resolve-Path 'kit').Path
-          foreach ($expected in @('Install-EstateMate-Bridge.cmd', 'install-bridge.ps1', 'SHA256SUMS.txt', 'READ-ME-FIRST.txt')) {
-            if (-not (Test-Path (Join-Path $kitDir $expected))) { throw "the kit is missing $expected" }
+
+          # The job log archive is not retrievable from this project's dev
+          # sandbox, so every failure in here reports itself as an annotation -
+          # the one channel that is always readable.
+          function Invoke-BridgeScript([string[]] $arguments) {
+            $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass @arguments 2>&1
+            $code = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            return [pscustomobject]@{ Code = $code; Output = ($output -join "`n") }
           }
-          $kitMsi = (Get-ChildItem -Path $kitDir -Filter '*.msi' | Select-Object -First 1).FullName
+          function Stop-KitCheck([string] $message) { throw $message }
 
-          # 1. The all-users install, through the launcher, exactly as a person runs it.
-          $installer = Join-Path $kitDir 'Install-EstateMate-Bridge.cmd'
-          & cmd.exe /c "`"$installer`" -Silent -NoPause"
-          $launcherCode = $LASTEXITCODE
-          $global:LASTEXITCODE = 0
-          if ($launcherCode -ne 0) { throw "the kit launcher failed with exit code $launcherCode" }
-          $installed = 'C:\Program Files\EstateMate Bridge\estatemate-bridge.exe'
-          if (-not (Test-Path $installed)) { throw 'the kit launcher did not install the executable' }
-          & $installed version
-          Write-Host 'The kit launcher installed the MSI.'
+          try {
+            $kitZip = (Get-ChildItem -Path msi -Filter '*installer-kit.zip' | Select-Object -First 1).FullName
+            Write-Host "Kit: $kitZip"
+            Expand-Archive -LiteralPath $kitZip -DestinationPath kit -Force
+            $kitDir = (Resolve-Path 'kit').Path
+            foreach ($expected in @('Install-EstateMate-Bridge.cmd', 'install-bridge.ps1', 'SHA256SUMS.txt', 'READ-ME-FIRST.txt')) {
+              if (-not (Test-Path (Join-Path $kitDir $expected))) { Stop-KitCheck "the kit is missing $expected" }
+            }
+            $kitMsi = (Get-ChildItem -Path $kitDir -Filter '*.msi' | Select-Object -First 1).FullName
+            $bridgeScript = Join-Path $kitDir 'install-bridge.ps1'
+            $installed = 'C:\Program Files\EstateMate Bridge\estatemate-bridge.exe'
 
-          $remove = Start-Process msiexec.exe -ArgumentList @('/x', "`"$kitMsi`"", '/qn') -Wait -PassThru
-          if ($remove.ExitCode -ne 0 -and $remove.ExitCode -ne 3010) { throw "uninstall failed with exit code $($remove.ExitCode)" }
-          if (Test-Path $installed) { throw 'the executable survived the uninstall' }
+            # 1. The all-users install, through the launcher, exactly as a person runs it.
+            $installer = Join-Path $kitDir 'Install-EstateMate-Bridge.cmd'
+            $launcherOutput = & cmd.exe /c "`"$installer`" -Silent -NoPause" 2>&1
+            $launcherCode = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            Write-Host ($launcherOutput -join "`n")
+            if ($launcherCode -ne 0) { Stop-KitCheck "the kit launcher failed with exit code $launcherCode" }
+            if (-not (Test-Path $installed)) { Stop-KitCheck 'the kit launcher did not install the executable' }
+            & $installed version
+            Write-Host 'The kit launcher installed the MSI.'
 
-          # 2. A truncated MSI must be named as such (exit 3), not attempted.
-          $brokenDir = Join-Path $env:RUNNER_TEMP 'broken-kit'
-          New-Item -ItemType Directory -Force -Path $brokenDir | Out-Null
-          Copy-Item (Join-Path $kitDir 'SHA256SUMS.txt') $brokenDir -Force
-          $brokenMsi = Join-Path $brokenDir (Split-Path -Leaf $kitMsi)
-          $bytes = [System.IO.File]::ReadAllBytes($kitMsi)
-          [System.IO.File]::WriteAllBytes($brokenMsi, $bytes[0..($bytes.Length - 1048577)])
-          $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $kitDir 'install-bridge.ps1') -MsiPath $brokenMsi -NoFallback -Silent -NoPause 2>&1
-          $brokenCode = $LASTEXITCODE
-          $global:LASTEXITCODE = 0
-          if ($brokenCode -ne 3) { throw "a truncated MSI must be refused with exit code 3, got $brokenCode`: $output" }
-          if (Test-Path $installed) { throw 'the truncated MSI was installed anyway' }
-          Write-Host 'A truncated MSI is refused with the checksum message.'
+            $remove = Start-Process msiexec.exe -ArgumentList @('/x', "`"$kitMsi`"", '/qn') -Wait -PassThru
+            if ($remove.ExitCode -ne 0 -and $remove.ExitCode -ne 3010) { Stop-KitCheck "uninstall failed with exit code $($remove.ExitCode)" }
+            if (Test-Path $installed) { Stop-KitCheck 'the executable survived the uninstall' }
 
-          # 3. The per-user fallback: no Windows Installer, no administrator rights.
-          $perUserExe = Join-Path $env:LOCALAPPDATA 'Programs\EstateMate Bridge\estatemate-bridge.exe'
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $kitDir 'install-bridge.ps1') -PerUser -Silent -NoPause
-          $perUserCode = $LASTEXITCODE
-          $global:LASTEXITCODE = 0
-          if ($perUserCode -ne 0) { throw "the per-user install failed with exit code $perUserCode" }
-          if (-not (Test-Path $perUserExe)) { throw "the per-user install left no executable at $perUserExe" }
-          & $perUserExe version
-          $appPaths = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\estatemate-bridge.exe' -ErrorAction SilentlyContinue).'(default)'
-          if (-not $appPaths) { throw 'the per-user install wrote no App Paths entry' }
-          if (-not (Test-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\EstateMate Bridge'))) {
-            throw 'the per-user install wrote no Start Menu shortcuts'
+            # 2. A truncated MSI must be named as such (exit 3), not attempted.
+            # Slice with a FileStream: indexing a 33 MB byte[] into a PowerShell
+            # array would build 33 million objects.
+            $brokenDir = Join-Path $env:RUNNER_TEMP 'broken-kit'
+            New-Item -ItemType Directory -Force -Path $brokenDir | Out-Null
+            Copy-Item (Join-Path $kitDir 'SHA256SUMS.txt') $brokenDir -Force
+            $brokenMsi = Join-Path $brokenDir (Split-Path -Leaf $kitMsi)
+            $source = [System.IO.File]::OpenRead($kitMsi)
+            try {
+              $keep = $source.Length - 1048576
+              $buffer = New-Object byte[] $keep
+              $read = $source.Read($buffer, 0, [int]$keep)
+              [System.IO.File]::WriteAllBytes($brokenMsi, $buffer[0..($read - 1)])
+            } finally {
+              $source.Close()
+            }
+            $broken = Invoke-BridgeScript @('-File', $bridgeScript, '-MsiPath', $brokenMsi, '-NoFallback', '-Silent', '-NoPause')
+            Write-Host "truncated-MSI run said: $($broken.Output)"
+            if ($broken.Code -ne 3) { Stop-KitCheck "a truncated MSI must be refused with exit code 3, got $($broken.Code)" }
+            if (Test-Path $installed) { Stop-KitCheck 'the truncated MSI was installed anyway' }
+            Write-Host 'A truncated MSI is refused with the checksum message.'
+
+            # 3. The per-user fallback: no Windows Installer, no administrator rights.
+            $perUserExe = Join-Path $env:LOCALAPPDATA 'Programs\EstateMate Bridge\estatemate-bridge.exe'
+            $perUser = Invoke-BridgeScript @('-File', $bridgeScript, '-PerUser', '-Silent', '-NoPause')
+            Write-Host ($perUser.Output -join "`n")
+            if ($perUser.Code -ne 0) { Stop-KitCheck "the per-user install failed with exit code $($perUser.Code)" }
+            if (-not (Test-Path $perUserExe)) { Stop-KitCheck "the per-user install left no executable at $perUserExe" }
+            & $perUserExe version
+            $appPaths = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\estatemate-bridge.exe' -ErrorAction SilentlyContinue).'(default)'
+            if (-not $appPaths) { Stop-KitCheck 'the per-user install wrote no App Paths entry' }
+            if (-not (Test-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\EstateMate Bridge'))) {
+              Stop-KitCheck 'the per-user install wrote no Start Menu shortcuts'
+            }
+            Write-Host 'The per-user install works without Windows Installer.'
+
+            $perUserRemove = Invoke-BridgeScript @('-File', $bridgeScript, '-Uninstall', '-Silent', '-NoPause')
+            if ($perUserRemove.Code -ne 0) { Stop-KitCheck "the per-user uninstall failed with exit code $($perUserRemove.Code)" }
+            if (Test-Path $perUserExe) { Stop-KitCheck 'the per-user uninstall left the executable behind' }
+            if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\EstateMateBridge') {
+              Stop-KitCheck 'the per-user uninstall left the Installed apps entry behind'
+            }
+            Write-Host 'Installer kit: install, checksum guard and per-user fallback all verified.'
+          } catch {
+            Write-Host "::error title=installer-kit::$($_.Exception.Message)"
+            exit 1
           }
-          Write-Host 'The per-user install works without Windows Installer.'
-
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $kitDir 'install-bridge.ps1') -Uninstall -Silent -NoPause
-          $uninstallCode = $LASTEXITCODE
-          $global:LASTEXITCODE = 0
-          if ($uninstallCode -ne 0) { throw "the per-user uninstall failed with exit code $uninstallCode" }
-          if (Test-Path $perUserExe) { throw 'the per-user uninstall left the executable behind' }
-          if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\EstateMateBridge') {
-            throw 'the per-user uninstall left the Installed apps entry behind'
-          }
-          Write-Host 'Installer kit: install, checksum guard and per-user fallback all verified.'
 
       - name: Upload the executable
         uses: actions/upload-artifact@v4
