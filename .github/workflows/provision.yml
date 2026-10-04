@@ -1,0 +1,67 @@
+name: Provision Cloudflare resources
+
+# Manual-only counterpart to the ship paths. Cloudflare Workers Builds can build
+# and deploy, and it can apply D1 migrations inside the build (see
+# scripts/cloudflare-builds-deploy.mjs), but two operations do not belong in a
+# per-push deploy:
+#
+#   * creating the private-storage encryption secret — `wrangler secret put`
+#     publishes a new Worker version, so running it on every push would race
+#     whichever system is currently shipping;
+#   * reading what migrations production still owes — a diagnostic, not a step.
+#
+# Nothing here deploys the Worker or applies a migration. Run it on demand.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: estatemate-provision
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Report the configured ship path
+        run: |
+          if [ "${VAR_AUTHORITATIVE:-}" = "true" ]; then
+            echo "Ship path: Cloudflare Workers Builds (CLOUDFLARE_BUILDS_AUTHORITATIVE=true)."
+            echo "This workflow will not apply migrations; the Cloudflare build does, before it deploys."
+          else
+            echo "Ship path: GitHub Actions (.github/workflows/deploy.yml)."
+          fi
+        env:
+          VAR_AUTHORITATIVE: ${{ vars.CLOUDFLARE_BUILDS_AUTHORITATIVE }}
+
+      # Idempotent: only ever creates the secret, never rotates it. Rotating
+      # STORAGE_ENCRYPTION_KEY would make files stored under the old key
+      # unreadable, so that stays a deliberate Administrator action.
+      - name: Ensure private-storage encryption secret exists
+        run: |
+          set -euo pipefail
+          if npx wrangler secret list | grep -q 'STORAGE_ENCRYPTION_KEY'; then
+            echo "STORAGE_ENCRYPTION_KEY is present — leaving it untouched (rotating it would orphan already-encrypted files)."
+          else
+            echo "STORAGE_ENCRYPTION_KEY is missing — creating it."
+            openssl rand -base64 48 | npx wrangler secret put STORAGE_ENCRYPTION_KEY
+          fi
+
+      - name: List Worker secrets (names only)
+        run: npx wrangler secret list
+
+      # Read-only: shows what `scripts/cloudflare-builds-deploy.mjs` would apply.
+      - name: Show pending remote D1 migrations
+        run: npx wrangler d1 migrations list estatemate-db --remote
