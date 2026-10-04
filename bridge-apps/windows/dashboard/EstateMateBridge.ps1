@@ -105,11 +105,12 @@ function Invoke-BridgeElevated([string[]] $Arguments) {
   # runs with -File, because Start-Process does not quote a -Command argument.
   $outFile = Join-Path $env:TEMP ('estatemate-bridge-elevated-' + [Guid]::NewGuid().ToString('N') + '.txt')
   $scriptFile = Join-Path $env:TEMP ('estatemate-bridge-elevated-' + [Guid]::NewGuid().ToString('N') + '.ps1')
-  $quoted = @()
-  foreach ($argument in $Arguments) {
-    if ($argument -match '[\s"]') { $quoted += '"' + ($argument -replace '"', '\"') + '"' } else { $quoted += $argument }
-  }
-  $body = "& '$($script:BridgeExe)' $($quoted -join ' ') *> '$outFile'`r`nexit `$LASTEXITCODE`r`n"
+  # Each value becomes a single-quoted PowerShell literal with ' doubled, so a
+  # secret or a path with spaces, quotes or an apostrophe cannot break the
+  # command line the elevated window runs.
+  function Quote-Literal([string] $value) { "'" + ($value -replace "'", "''") + "'" }
+  $literals = @(foreach ($argument in $Arguments) { Quote-Literal $argument })
+  $body = "& $(Quote-Literal $script:BridgeExe) $($literals -join ' ') *> $(Quote-Literal $outFile)`r`nexit `$LASTEXITCODE`r`n"
   Write-Utf8NoBom $scriptFile $body
   $code = 1223
   try {
