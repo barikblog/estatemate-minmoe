@@ -83,7 +83,7 @@ A dependant card displays the actual card holder but retains the main resident a
 
 ### Access cards and fingerprints
 
-The portal menu **Access cards & fingerprints** holds both credential types, and every person's profile has the same panel: **Cards & fingerprints** on a row in People (main residents) or in Tenancy & household (dependants). Only Administrators and Managers may add either credential.
+The portal menu **Access cards & fingerprints** holds both credential types, and every person's profile has the same panel: **Cards & fingerprints** on a row in People → Accounts (main residents) or People → Household members (dependants). Only Administrators and Managers may add either credential.
 
 - **Card** — enter a UID, or tap the card at a selected device to capture its number.
 - **Fingerprint** — choose the finger slot (1–10), an optional "which finger" label, the employee number the terminal knows the person by (it defaults to the EstateMate person ID for a main resident) and, optionally, the terminal the finger will be captured at.

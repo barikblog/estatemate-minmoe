@@ -1,15 +1,26 @@
-# Estate modules: dependants, staff, bookings, emergency contacts, documents
+# Estate modules: People, workforce attendance, bookings, emergency contacts, documents
 
-The six modules added to the menu in the grouped-navigation phase are live with
-real tables, routes and permission rules (migration
-`0018_employee_id_bulk_people_visitor_device_lifecycle_modules.sql`).
+These modules are live with real tables, routes and permission rules. The original
+estate collections use migration
+`0018_employee_id_bulk_people_visitor_device_lifecycle_modules.sql`; dedicated
+Facility Staff accounts and attendance use
+`0020_facility_staff_attendance.sql`.
+
+Navigation is consolidated to match how the workflows relate: **People** has
+Accounts and Household members tabs; **Property & tenancy** stays a separate
+occupation/ownership workflow; **Documents & governance** has Guides & forms and
+Legal & governance collection tabs. Facility Staff receive a separate limited
+Time & attendance workspace.
 
 The permission model mirrors the rest of the portal:
 
-- residents see their own household and request bookings;
+- residents open **My household** to see their own household and submit new members for approval, and can request bookings;
+- Facility Staff can see and record only their own attendance and read estate
+  notices; they cannot access the staff directory, property, resident, billing,
+  device or other attendance APIs;
 - **Managers** run estate operations (staff, facilities, emergencies, documents,
-  approval decisions) but stay operational-only — no billing control, no global
-  settings, no private storage control;
+  attendance review and approval decisions) but stay operational-only — no billing
+  control, no global settings, no private storage control;
 - **Admin/Cashier** own anything that raises or waives money;
 - **Admin** owns global settings.
 
@@ -26,14 +37,14 @@ pending, domestic staff & caregivers, with-logins.
 - Cashier: read-only roster.
 - Approve / reject / deactivate from the roster (existing household routes);
   deactivated dependants keep their record — only the credentials stop.
-- New dependants: Tenancy & household (single) or **People → Bulk tools** (CSV).
+- New household members: **People → Household members** (single) or **People → Accounts → Bulk tools** (CSV).
 - Every dependant gets their own 32-char Employee ID at creation — see
   [EMPLOYEE-ID-AND-BULK-PEOPLE.md](EMPLOYEE-ID-AND-BULK-PEOPLE.md).
 
 ## Staff management (`GET /api/staff`, `…/api/staff/shifts`)
 
-Lists every non-resident account — administrators, managers, cashiers, security —
-with role, Employee ID, phone, **gate postings** (from
+Lists every non-resident account — administrators, managers, cashiers, security,
+and Facility Staff — with role, Employee ID, phone, **gate postings** (from
 `security_gate_assignments`), count and next scheduled shift, and audit
 footprint (`audit_log` count + last action, so accountability has one table).
 
@@ -43,6 +54,32 @@ duty. Duties: gate, patrol, office, cashier, supervisor, standby. Optional gate
 link (the same `hikvision_devices` posts). Operators create/edit; mark
 worked/cancelled/swapped; delete only future *scheduled* shifts — past shifts
 stay as history. All changes audit-logged (`staff_shift` entity).
+
+## Facility Staff attendance (`staff_attendance`)
+
+A Facility Staff account is a dedicated least-privilege role, stored compatibly
+as Security plus `is_facility_staff=1`. The API exposes it as `facility_staff`;
+it is not a gate Security account and does not receive gate assignment controls.
+Administrators and Managers can create/import these accounts from People.
+
+- Staff clock themselves in and out. The Worker stamps UTC instants; the work
+  date and displayed times use the estate's configured IANA timezone.
+- One open session per staff member is enforced both in the API and with a
+  partial unique index. Multiple closed sessions in one work date are allowed.
+- Staff can read only their own records. An API-level allow-list also blocks
+  attempts to open other modules, even if a menu is bypassed.
+- Admin/Manager monthly reports include staff summaries, sessions, work dates,
+  duration, open punches, and account status. The table exports to Excel/PDF.
+  HR may enter a missing session or correct a punch; entries require a reason,
+  reject future/overlapping times, record the editor and are written to the audit
+  log. Accounts with attendance history cannot be converted to another role;
+  deactivate them instead to retain HR history.
+- Gate events are contextual evidence only. A gate swipe does not prove a full
+  shift or determine paid time. Payroll/salary data and GPS tracking are outside
+  this workflow.
+
+See [FACILITY-STAFF-ATTENDANCE.md](FACILITY-STAFF-ATTENDANCE.md) for operation,
+reporting and migration details.
 
 ## Facility bookings (`facilities`, `facility_bookings`)
 
@@ -78,11 +115,12 @@ Admin/Manager create, edit, hide/show and delete; directory renders with
 tap-to-call on mobile. Staff-only numbers never render for residents — Security
 counts as staff.
 
-## Information hub & Legal/governance (`estate_documents`)
+## Documents & governance (`estate_documents`)
 
-One library behind both menu pages, separated by `category`:
+One menu item and one library, separated by internal collection tabs and
+`category`:
 
-- **Information hub** (`set=info`): guides, forms, other resident documents.
+- **Guides & forms** (`set=info`): resident guides, forms, other resident documents.
 - **Legal & governance** (`set=legal`): by-laws, house rules, privacy/data
   notices, residents' agreements, meeting minutes, policies.
 
