@@ -147,12 +147,21 @@ function Find-Msi {
 }
 
 function Test-MsiIntegrity($msi) {
-  # The sums file ships in the same kit; when it is absent (someone passed
-  # -MsiPath to a lone MSI) there is nothing to compare against.
-  $sumsFile = Join-Path (Split-Path -Parent $msi) 'SHA256SUMS.txt'
+  # The sums file ships in the same kit. It may also be the qualified name the
+  # release page uses: GitHub stores assets flat, so two artifact families both
+  # shipping SHA256SUMS.txt means one of them is published as
+  # bridge-msi-SHA256SUMS.txt. Accept either.
+  $folder = Split-Path -Parent $msi
+  $sumsFile = Join-Path $folder 'SHA256SUMS.txt'
   if (-not (Test-Path -LiteralPath $sumsFile)) {
-    Write-Warn 'SHA256SUMS.txt not found next to the MSI; skipping the download-integrity check'
-    return $true
+    $candidate = @(Get-ChildItem -LiteralPath $folder -Filter '*SHA256SUMS*.txt' -File -ErrorAction SilentlyContinue |
+      Select-Object -First 1)
+    if ($candidate.Count -eq 0) {
+      Write-Warn 'no SHA256SUMS.txt or *SHA256SUMS*.txt next to the MSI; skipping the download-integrity check'
+      return $true
+    }
+    $sumsFile = $candidate[0].FullName
+    Write-Step "checksum file: $(Split-Path -Leaf $sumsFile)"
   }
   $name = Split-Path -Leaf $msi
   $expected = $null
