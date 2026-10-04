@@ -245,6 +245,7 @@ async function commandRun({ ctx, logger }) {
     configPath: ctx.paths.configPath,
     devicesPath: ctx.paths.devicesPath,
     standby: false,
+    version: ctx.version,
     logger,
   });
 

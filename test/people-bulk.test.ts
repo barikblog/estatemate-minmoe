@@ -178,12 +178,22 @@ describe('bulk people operations', () => {
       body: { scope: 'people', people: [{ id: estate.residentId }] },
     });
     expect(first.status).toBe(200);
+    expect(first.status).toBe(200);
     expect(first.json.people).toBe(1);
     expect(first.json.cards).toBe(1);
     expect(first.json.fingerprints).toBe(1);
-    // One card to each of 2 devices, plus 2 fingerprint operator tasks.
+    // One card to each of 2 devices. The person record and the fingerprint task
+    // are for an operator here: these terminals have no linked agent at all, so
+    // nothing can be handed to a bridge and the queue says so.
     expect(first.json.queued).toBe(2);
-    expect(first.json.manual).toBe(2);
+    expect(first.json.manual).toBe(4);
+    const personTasks = database.query(`SELECT status,operation FROM device_operations WHERE operation='upsert_person' AND user_id='user-resident'`);
+    expect(personTasks).toHaveLength(2);
+    expect(personTasks.every((task) => task.status === 'manual_action_required')).toBe(true);
+    // The person is written *because* a terminal stores a card against a person:
+    // a card whose employee number the terminal has never seen is stored but
+    // cannot open anything.
+    expect(personTasks.length).toBe(2);
     const employeeNo = String(database.one(`SELECT employee_id FROM users WHERE id=?`, estate.residentId)!.employee_id);
     const payload = database.one(`SELECT payload_json FROM device_operations WHERE card_id='card-resync' AND device_id='device-a'`);
     expect(payload?.payload_json && JSON.parse(String(payload.payload_json)).employeeNo).toBe(employeeNo);
@@ -199,7 +209,7 @@ describe('bulk people operations', () => {
     expect(second.status).toBe(200);
     expect(second.json.queued).toBe(0);
     expect(second.json.manual).toBe(0);
-    expect(second.json.skipped).toBe(4);
+    expect(second.json.skipped).toBe(6);
   });
 
   it('scope=all only touches people who actually hold a credential', async () => {

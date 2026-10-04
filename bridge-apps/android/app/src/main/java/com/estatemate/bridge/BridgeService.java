@@ -339,7 +339,7 @@ public final class BridgeService extends Service {
     private void sendHeartbeat() {
         Map<String, Object> stats = BridgeRuntime.stats();
         stats.put("eventStream", Boolean.valueOf(config.eventStreamEnabled));
-        WorkerClient.Reply reply = worker.heartbeat(VERSION, android.os.Build.MODEL + " (" + android.os.Build.VERSION.RELEASE + ")", "android", stats, BridgeRuntime.streamStates());
+        WorkerClient.Reply reply = worker.heartbeat(VERSION, android.os.Build.MODEL + " (" + android.os.Build.VERSION.RELEASE + ")", "android", stats, BridgeRuntime.streamStates(), capabilities());
         if (reply.ok()) {
             BridgeRuntime.setWorkerOnline(true);
             BridgeRuntime.setWorkerStatus("online");
@@ -384,9 +384,12 @@ public final class BridgeService extends Service {
                 continue;
             }
             long started = System.currentTimeMillis();
-            IsapiClient.OpResult result = isapi.applyOperation(device, name, Json.asObject(operation.get("payload")));
+            // The template for an upload travels in the item, not the payload: the
+            // Worker attaches it once, only to the agent that claimed the work.
+            String fingerData = Json.string(operation, "fingerData", null);
+            IsapiClient.OpResult result = isapi.applyOperation(device, name, Json.asObject(operation.get("payload")), fingerData);
             long duration = System.currentTimeMillis() - started;
-            WorkerClient.Reply reported = worker.reportResult(operationId, kind, result.success, result.error, duration);
+            WorkerClient.Reply reported = worker.reportResult(operationId, kind, result.success, result.error, result.result, duration);
             if (reported.ok()) {
                 BridgeLog.append(result.success ? "info" : "warn",
                         (result.success ? "applied" : "failed") + " " + name + " for " + device.name + " in " + duration + " ms");
@@ -395,6 +398,34 @@ public final class BridgeService extends Service {
             }
             sleep(500);
         }
+    }
+
+    /**
+     * What the terminals behind this phone can actually do, probed against them
+     * rather than assumed. EstateMate only hands a bridge person and fingerprint
+     * work when the matching capability is advertised here, which is what keeps
+     * an older phone build working unchanged instead of collecting failed
+     * operations it cannot apply.
+     */
+    private volatile List<String> capabilityCache = null;
+    private volatile long capabilityCacheAt = 0L;
+
+    private List<String> capabilities() {
+        if (capabilityCache != null && System.currentTimeMillis() - capabilityCacheAt < 10 * 60 * 1000L) return capabilityCache;
+        List<String> found = new java.util.ArrayList<String>();
+        try {
+            for (Device device : config.devices()) {
+                for (String capability : isapi.probeCapabilities(device)) {
+                    if (!found.contains(capability)) found.add(capability);
+                }
+            }
+        } catch (Exception error) {
+            BridgeLog.append("warn", "capability probe failed: " + error.getMessage());
+        }
+        if (found.isEmpty()) return capabilityCache; // keep the previous answer rather than claiming nothing works
+        capabilityCache = found;
+        capabilityCacheAt = System.currentTimeMillis();
+        return capabilityCache;
     }
 
     private void flushLoop() {

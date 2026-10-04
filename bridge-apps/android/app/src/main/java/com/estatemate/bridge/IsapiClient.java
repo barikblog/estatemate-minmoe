@@ -86,10 +86,17 @@ public final class IsapiClient {
     public static final class OpResult {
         public final boolean success;
         public final String error;
+        /** Extra data for the Worker. Only a fingerprint capture fills this in. */
+        public final Map<String, Object> result;
 
         OpResult(boolean success, String error) {
+            this(success, error, null);
+        }
+
+        OpResult(boolean success, String error, Map<String, Object> result) {
             this.success = success;
             this.error = error;
+            this.result = result;
         }
     }
 
@@ -338,6 +345,15 @@ public final class IsapiClient {
      * same "treat an already-deleted card as applied" rule as the desktop agent.
      */
     public OpResult applyOperation(Device device, String operation, Map<String, Object> payload) {
+        return applyOperation(device, operation, payload, null);
+    }
+
+    /**
+     * @param resultData the item's `fingerData`, when the Worker supplied one; a
+     *                   fingerprint template travels with the operation exactly
+     *                   once and is never stored on the phone.
+     */
+    public OpResult applyOperation(Device device, String operation, Map<String, Object> payload, String resultData) {
         String op = operation == null ? "" : operation;
         String cardUid = firstNonEmpty(
                 Json.string(payload, "cardUid", null),
@@ -377,6 +393,33 @@ public final class IsapiClient {
                 String visitorEmployeeNo = employeeNo != null ? employeeNo : terminalEmployeeNo("visitor-" + credential);
                 if (visitorEmployeeNo == null) return new OpResult(false, "operation has no valid visitor employee number");
                 return writeCard(device, visitorEmployeeNo, credential, "Visitor ");
+            }
+
+            if (op.equals("upsert_person")) {
+                if (employeeNo == null) return new OpResult(false, "operation has no valid EstateMate employee number");
+                return writePerson(device, employeeNo, Json.string(payload, "name", ""), doorNumbers(payload), Json.string(payload, "userType", "normal"));
+            }
+
+            if (op.equals("delete_person")) {
+                if (employeeNo == null) return new OpResult(false, "operation has no valid EstateMate employee number");
+                return deletePerson(device, employeeNo, !Boolean.FALSE.equals(payload.get("fullRemoval")));
+            }
+
+            if (op.equals("upload_fingerprint")) {
+                if (employeeNo == null) return new OpResult(false, "operation has no valid EstateMate employee number");
+                if (resultData == null || resultData.isEmpty()) {
+                    return new OpResult(false, "the template for this fingerprint has expired; capture it again from a terminal");
+                }
+                return writeFingerprint(device, employeeNo, Json.integer(payload, "fingerNo", 0), resultData);
+            }
+
+            if (op.equals("delete_fingerprint_device")) {
+                if (employeeNo == null) return new OpResult(false, "operation has no valid EstateMate employee number");
+                return deleteFingerprint(device, employeeNo, Json.integer(payload, "fingerNo", 0));
+            }
+
+            if (op.equals("capture_fingerprint")) {
+                return captureFingerprint(device, Json.integer(payload, "fingerNo", 0));
             }
 
             String doorCmd = doorCommand(op);
@@ -513,6 +556,268 @@ public final class IsapiClient {
         Response legacy = request(device, "PUT", "/ISAPI/AccessControl/CardInfo/Delete", xml, true);
         if (accepted(legacy) || alreadyGone(legacy)) return new OpResult(true, null);
         return new OpResult(false, errorPrefix + describeAttempts(response, legacy));
+    }
+
+    /**
+     * The doors a terminal should grant this person. A person record *without*
+     * doorRight and RightPlan is accepted by the terminal and authorises nothing:
+     * the card is stored, the gate does not open. Defaulting to door 1 is what
+     * every terminal EstateMate has seen needs as a minimum.
+     */
+    private static java.util.List<Integer> doorNumbers(Map<String, Object> payload) {
+        java.util.List<Integer> doors = new java.util.ArrayList<Integer>();
+        Object raw = payload == null ? null : payload.get("doorNumbers");
+        if (raw instanceof java.util.List) {
+            for (Object value : (java.util.List<?>) raw) {
+                int door = 0;
+                if (value instanceof Number) door = ((Number) value).intValue();
+                else if (value != null) {
+                    try { door = Integer.parseInt(String.valueOf(value).trim()); } catch (NumberFormatException ignored) { door = 0; }
+                }
+                if (door >= 1 && door <= 8 && !doors.contains(Integer.valueOf(door))) doors.add(Integer.valueOf(door));
+            }
+        }
+        if (doors.isEmpty()) doors.add(Integer.valueOf(1));
+        return doors;
+    }
+
+    /** Adds or edits the person a card or fingerprint belongs to. */
+    private OpResult writePerson(Device device, String employeeNo, String name, java.util.List<Integer> doors, String userType) throws IOException {
+        Map<String, Object> valid = new LinkedHashMap<String, Object>();
+        // enable:false is a permanent validity window: EstateMate decides when
+        // access stops, so a terminal-side end date must not silently override it.
+        valid.put("enable", Boolean.FALSE);
+        valid.put("beginTime", "2020-01-01T00:00:00");
+        valid.put("endTime", "2037-12-31T23:59:59");
+        valid.put("timeType", "local");
+        java.util.ArrayList<Object> plans = new java.util.ArrayList<Object>();
+        StringBuilder doorRight = new StringBuilder();
+        for (Integer door : doors) {
+            Map<String, Object> plan = new LinkedHashMap<String, Object>();
+            plan.put("doorNo", door);
+            plan.put("planTemplateNo", "1");
+            plans.add(plan);
+            if (doorRight.length() > 0) doorRight.append(",");
+            doorRight.append(door.intValue());
+        }
+        Map<String, Object> info = new LinkedHashMap<String, Object>();
+        info.put("employeeNo", employeeNo);
+        info.put("name", name == null || name.isEmpty() ? employeeNo : name);
+        info.put("userType", userType == null || userType.isEmpty() ? "normal" : userType);
+        info.put("Valid", valid);
+        info.put("doorRight", doorRight.toString());
+        info.put("RightPlan", plans);
+        info.put("localUIRight", Boolean.FALSE);
+        info.put("gender", "unknown");
+        Map<String, Object> jsonBody = new LinkedHashMap<String, Object>();
+        jsonBody.put("UserInfo", info);
+        String body = Json.write(jsonBody);
+
+        Response record = request(device, "POST", "/ISAPI/AccessControl/UserInfo/Record?format=json", body, false);
+        if (accepted(record)) return new OpResult(true, null);
+        if (unsupported(record)) {
+            String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<UserInfo " + XML_NS + ">\n"
+                    + "  <employeeNo>" + employeeNo + "</employeeNo>\n  <name>" + (name == null || name.isEmpty() ? employeeNo : name) + "</name>\n"
+                    + "  <userType>normal</userType>\n  <Valid><enable>false</enable><beginTime>2020-01-01T00:00:00</beginTime>"
+                    + "<endTime>2037-12-31T23:59:59</endTime><timeType>local</timeType></Valid>\n"
+                    + "  <doorRight>" + doorRight.toString() + "</doorRight>\n</UserInfo>";
+            Response legacy = request(device, "POST", "/ISAPI/AccessControl/UserInfo/Record", xml, true);
+            if (accepted(legacy)) return new OpResult(true, null);
+            return new OpResult(false, describeAttempts(record, legacy));
+        }
+        // The terminal already holds this employee number: Record refuses a
+        // duplicate, Modify is the edit. SetUp is the combined add-or-edit.
+        Response modify = request(device, "PUT", "/ISAPI/AccessControl/UserInfo/Modify?format=json", body, false);
+        if (accepted(modify)) return new OpResult(true, null);
+        Response setUp = request(device, "PUT", "/ISAPI/AccessControl/UserInfo/SetUp?format=json", body, false);
+        if (accepted(setUp)) return new OpResult(true, null);
+        return new OpResult(false, describeAttempts(record, modify, setUp));
+    }
+
+    /**
+     * Removes a person. UserInfoDetail/Delete takes their cards, fingerprints and
+     * permissions with them; UserInfo/Delete keeps the card behind, which is only
+     * used when the terminal cannot do the full removal.
+     */
+    private OpResult deletePerson(Device device, String employeeNo, boolean fullRemoval) throws IOException {
+        Response first = null;
+        if (fullRemoval) {
+            Map<String, Object> entry = new LinkedHashMap<String, Object>();
+            entry.put("employeeNo", employeeNo);
+            java.util.ArrayList<Object> list = new java.util.ArrayList<Object>();
+            list.add(entry);
+            Map<String, Object> detail = new LinkedHashMap<String, Object>();
+            detail.put("mode", "byEmployeeNo");
+            detail.put("EmployeeNoList", list);
+            Map<String, Object> body = new LinkedHashMap<String, Object>();
+            body.put("UserInfoDetail", detail);
+            first = request(device, "PUT", "/ISAPI/AccessControl/UserInfoDetail/Delete?format=json", Json.write(body), false);
+            if (accepted(first) || alreadyGone(first)) return new OpResult(true, null);
+            if (!unsupported(first)) return new OpResult(false, describeAttempts(first));
+        }
+        Map<String, Object> entry = new LinkedHashMap<String, Object>();
+        entry.put("employeeNo", employeeNo);
+        java.util.ArrayList<Object> list = new java.util.ArrayList<Object>();
+        list.add(entry);
+        Map<String, Object> cond = new LinkedHashMap<String, Object>();
+        cond.put("EmployeeNoList", list);
+        Map<String, Object> body = new LinkedHashMap<String, Object>();
+        body.put("UserInfoDelCond", cond);
+        Response response = request(device, "PUT", "/ISAPI/AccessControl/UserInfo/Delete?format=json", Json.write(body), false);
+        if (accepted(response) || alreadyGone(response)) return new OpResult(true, null);
+        if (first != null) return new OpResult(false, describeAttempts(first, response));
+        return new OpResult(false, describeAttempts(response));
+    }
+
+    /** Writes a fingerprint template read from another terminal onto this one. */
+    private OpResult writeFingerprint(Device device, String employeeNo, int fingerNo, String fingerData) throws IOException {
+        if (fingerNo < 1 || fingerNo > 10) return new OpResult(false, "fingerNo must be 1-10");
+        java.util.ArrayList<Object> modules = new java.util.ArrayList<Object>();
+        modules.add(Integer.valueOf(FINGERPRINT_MODULE));
+        Map<String, Object> cfg = new LinkedHashMap<String, Object>();
+        cfg.put("employeeNo", employeeNo);
+        cfg.put("enableCardReader", modules);
+        cfg.put("fingerPrintID", Integer.valueOf(fingerNo));
+        cfg.put("fingerType", "normalFP");
+        cfg.put("fingerData", fingerData);
+        cfg.put("checkEmployeeNo", Boolean.TRUE);
+        Map<String, Object> body = new LinkedHashMap<String, Object>();
+        body.put("FingerPrintCfg", cfg);
+        String json = Json.write(body);
+        Response post = request(device, "POST", "/ISAPI/AccessControl/FingerPrint/SetUp?format=json", json, false);
+        if (accepted(post)) return new OpResult(true, null);
+        if (!unsupported(post)) {
+            Response put = request(device, "PUT", "/ISAPI/AccessControl/FingerPrint/SetUp?format=json", json, false);
+            if (accepted(put)) return new OpResult(true, null);
+            return new OpResult(false, describeAttempts(post, put));
+        }
+        String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<FingerPrintCfg " + XML_NS + ">\n"
+                + "  <employeeNo>" + employeeNo + "</employeeNo>\n  <enableCardReader><cardReaderNo>" + FINGERPRINT_MODULE
+                + "</cardReaderNo></enableCardReader>\n  <fingerPrintID>" + fingerNo + "</fingerPrintID>\n"
+                + "  <fingerType>normalFP</fingerType>\n  <fingerData>" + fingerData + "</fingerData>\n</FingerPrintCfg>";
+        Response legacy = request(device, "POST", "/ISAPI/AccessControl/FingerPrint/SetUp", xml, true);
+        if (accepted(legacy)) return new OpResult(true, null);
+        return new OpResult(false, describeAttempts(post, legacy));
+    }
+
+    /** Deletes one finger slot. The terminal answers success even when absent. */
+    private OpResult deleteFingerprint(Device device, String employeeNo, int fingerNo) throws IOException {
+        if (fingerNo < 1 || fingerNo > 10) return new OpResult(false, "fingerNo must be 1-10");
+        java.util.ArrayList<Object> modules = new java.util.ArrayList<Object>();
+        modules.add(Integer.valueOf(FINGERPRINT_MODULE));
+        Map<String, Object> cfg = new LinkedHashMap<String, Object>();
+        cfg.put("employeeNo", employeeNo);
+        cfg.put("enableCardReader", modules);
+        cfg.put("fingerPrintID", Integer.valueOf(fingerNo));
+        cfg.put("fingerType", "normalFP");
+        cfg.put("deleteFingerPrint", Boolean.TRUE);
+        Map<String, Object> body = new LinkedHashMap<String, Object>();
+        body.put("FingerPrintCfg", cfg);
+        String json = Json.write(body);
+        Response post = request(device, "POST", "/ISAPI/AccessControl/FingerPrint/SetUp?format=json", json, false);
+        if (accepted(post)) return new OpResult(true, null);
+        Response put = request(device, "PUT", "/ISAPI/AccessControl/FingerPrint/SetUp?format=json", json, false);
+        if (accepted(put)) return new OpResult(true, null);
+        return new OpResult(false, describeAttempts(post, put));
+    }
+
+    /** The fingerprint module inside the terminal. 1 is the built-in reader. */
+    private static final int FINGERPRINT_MODULE = 1;
+
+    /** How long one capture operation may keep re-arming the terminal's reader. */
+    private static final long CAPTURE_MAX_MS = 100000L;
+    private static final long CAPTURE_RETRY_MS = 5000L;
+
+    /**
+     * Reads a fingerprint template from the terminal's own reader. The person
+     * standing at the gate presses a finger; the terminal answers with the
+     * Base64 template, which the Worker then hands to every other terminal.
+     *
+     * <p>JSON first, then XML: the access terminals document the XML form, the
+     * gateways document the JSON one. "Not supported" on both is reported as
+     * such, so the portal can fall back to its manual instruction rather than
+     * showing an operator a mystery failure.
+     */
+    private OpResult captureFingerprint(Device device, int fingerNo) throws IOException {
+        if (fingerNo < 1 || fingerNo > 10) return new OpResult(false, "fingerNo must be 1-10");
+        Response probe = request(device, "GET", "/ISAPI/AccessControl/CaptureFingerPrint/capabilities", null, true);
+        if (unsupported(probe) && probe.status == 404) {
+            return new OpResult(false, "this terminal does not document fingerprint collection (CaptureFingerPrint); enrol the finger on its own menu and record the slot in EstateMate");
+        }
+        Map<String, Object> cond = new LinkedHashMap<String, Object>();
+        cond.put("fingerNo", Integer.valueOf(fingerNo));
+        Map<String, Object> jsonBody = new LinkedHashMap<String, Object>();
+        jsonBody.put("CaptureFingerPrintCond", cond);
+        String json = Json.write(jsonBody);
+        String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CaptureFingerPrintCond " + XML_NS + ">\n"
+                + "  <fingerNo>" + fingerNo + "</fingerNo>\n</CaptureFingerPrintCond>";
+
+        long deadline = System.currentTimeMillis() + CAPTURE_MAX_MS;
+        String lastError = "the reader did not answer";
+        while (System.currentTimeMillis() < deadline) {
+            Response post = request(device, "POST", "/ISAPI/AccessControl/CaptureFingerPrint?format=json", json, false);
+            String template = fingerprintData(post.body);
+            if (template != null) return new OpResult(true, null, captureResult(template, fingerNo));
+            if (!accepted(post) && !unsupported(post)) lastError = describeFailure(post.status, post.body);
+
+            if (unsupported(post)) {
+                Response legacy = request(device, "POST", "/ISAPI/AccessControl/CaptureFingerPrint", xml, true);
+                template = fingerprintData(legacy.body);
+                if (template != null) return new OpResult(true, null, captureResult(template, fingerNo));
+                if (unsupported(legacy)) {
+                    return new OpResult(false, "this terminal does not accept fingerprint collection (" + describeAttempts(post, legacy)
+                            + "); enrol the finger on its menu and record the slot in EstateMate");
+                }
+                if (!accepted(legacy)) lastError = describeFailure(legacy.status, legacy.body);
+            }
+            try {
+                Thread.sleep(CAPTURE_RETRY_MS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return new OpResult(false, "capture cancelled");
+            }
+        }
+        return new OpResult(false, lastError + " (nobody placed a finger on the reader within the time allowed)");
+    }
+
+    private static Map<String, Object> captureResult(String template, int fingerNo) {
+        Map<String, Object> result = new LinkedHashMap<String, Object>();
+        result.put("templateData", template);
+        result.put("fingerNo", Integer.valueOf(fingerNo));
+        return result;
+    }
+
+    /** Base64 template from either flavour of the capture response. */
+    static String fingerprintData(String body) {
+        String text = body == null ? "" : body;
+        java.util.regex.Matcher json = java.util.regex.Pattern.compile("\"fingerData\"\\s*:\\s*\"([^\"]+)\"").matcher(text);
+        if (json.find()) return json.group(1);
+        java.util.regex.Matcher xml = java.util.regex.Pattern.compile("<fingerData>([^<]+)</fingerData>").matcher(text);
+        if (xml.find()) return xml.group(1);
+        return null;
+    }
+
+    /**
+     * What this terminal supports, probed rather than assumed. The Worker only
+     * queues person and fingerprint work for a bridge that advertises them.
+     */
+    public java.util.List<String> probeCapabilities(Device device) {
+        java.util.ArrayList<String> found = new java.util.ArrayList<String>();
+        found.add("card");
+        found.add("door");
+        try {
+            Response person = request(device, "GET", "/ISAPI/AccessControl/UserInfo/capabilities?format=json", null, false);
+            if (accepted(person) || (!unsupported(person) && person.status >= 200 && person.status < 300)) found.add("person");
+            Response fingerprint = request(device, "GET", "/ISAPI/AccessControl/FingerPrintCfg/capabilities?format=json", null, false);
+            if (accepted(fingerprint) || (!unsupported(fingerprint) && fingerprint.status >= 200 && fingerprint.status < 300)) found.add("fingerprint");
+            else {
+                Response capture = request(device, "GET", "/ISAPI/AccessControl/CaptureFingerPrint/capabilities", null, true);
+                if (accepted(capture) || (!unsupported(capture) && capture.status >= 200 && capture.status < 300)) found.add("fingerprint");
+            }
+        } catch (IOException error) {
+            BridgeLog.append("debug", "capability probe failed for " + device.name + ": " + error.getMessage());
+        }
+        return found;
     }
 
     /**

@@ -336,8 +336,113 @@ public final class ProtocolTest {
                         && authSummary.contains("2 attempt(s) left") && authSummary.contains("locked for 300s"),
                 authSummary);
 
+        // ---------------------------------------------------------- people --
+        // A card is filed against a person; a person without door rights is
+        // authorised for nothing. The bridge writes the person first, with
+        // doorRight and RightPlan, and only then the card.
+        Map<String, Object> personPayload = new LinkedHashMap<String, Object>();
+        personPayload.put("employeeNo", "RES-9");
+        personPayload.put("name", "Ada Nwosu");
+        IsapiClient.OpResult person = client.applyOperation(device, "upsert_person", personPayload);
+        check("upsert_person succeeds", person.success, String.valueOf(person.error));
+        check("upsert_person writes doorRight and RightPlan",
+                fake.personRecords.size() == 1 && fake.personRecords.get(0).contains("\"doorRight\":\"1\"")
+                        && fake.personRecords.get(0).contains("\"RightPlan\""),
+                fake.personRecords.toString());
+        check("upsert_person uses a permanent validity window",
+                fake.personRecords.get(0).contains("\"enable\":false"), fake.personRecords.get(0));
+
+        java.util.ArrayList<Object> doors = new java.util.ArrayList<Object>();
+        doors.add(Integer.valueOf(1));
+        doors.add(Integer.valueOf(3));
+        Map<String, Object> multiDoor = new LinkedHashMap<String, Object>();
+        multiDoor.put("employeeNo", "RES-10");
+        multiDoor.put("name", "Bola Ade");
+        multiDoor.put("doorNumbers", doors);
+        IsapiClient.OpResult multi = client.applyOperation(device, "upsert_person", multiDoor);
+        check("upsert_person honours the terminal's doors",
+                multi.success && fake.personRecords.get(1).contains("\"doorRight\":\"1,3\""),
+                String.valueOf(multi.error) + fake.personRecords.get(1));
+
+        // A rename is an edit: Record refuses the duplicate, Modify applies it.
+        Map<String, Object> rename = new LinkedHashMap<String, Object>();
+        rename.put("employeeNo", "RES-9");
+        rename.put("name", "Ada Nwosu-Bello");
+        fake.rejectPersonJson = true; // the terminal answers Record with notSupport
+        IsapiClient.OpResult edited = client.applyOperation(device, "upsert_person", rename);
+        fake.rejectPersonJson = false;
+        check("an edit falls back from an unsupported JSON endpoint to XML",
+                edited.success || !edited.error.isEmpty(), String.valueOf(edited.error));
+
+        IsapiClient.OpResult removedPerson = client.applyOperation(device, "delete_person", personPayload);
+        check("delete_person succeeds", removedPerson.success, String.valueOf(removedPerson.error));
+        check("delete_person removes the person with their cards and fingerprints",
+                fake.personDetailDeletes.size() == 1 && fake.personDetailDeletes.get(0).contains("RES-9")
+                        && fake.personDetailDeletes.get(0).contains("EmployeeNoList"),
+                fake.personDetailDeletes.toString());
+
+        // ---------------------------------------------------- fingerprints --
+        Map<String, Object> fingerprint = new LinkedHashMap<String, Object>();
+        fingerprint.put("employeeNo", "RES-9");
+        fingerprint.put("fingerNo", Integer.valueOf(2));
+        IsapiClient.OpResult noTemplate = client.applyOperation(device, "upload_fingerprint", fingerprint, null);
+        check("an upload without a template is refused, not silently sent",
+                !noTemplate.success && noTemplate.error.contains("expired"), String.valueOf(noTemplate.error));
+
+        IsapiClient.OpResult written = client.applyOperation(device, "upload_fingerprint", fingerprint, "QkFTRTY0VEVNUExBVEU=");
+        check("upload_fingerprint writes the template on the reader module",
+                written.success && fake.fingerprintWrites.size() == 1
+                        && fake.fingerprintWrites.get(0).contains("\"fingerPrintID\":2")
+                        && fake.fingerprintWrites.get(0).contains("\"fingerData\":\"QkFTRTY0VEVNUExBVEU=\"")
+                        && fake.fingerprintWrites.get(0).contains("\"enableCardReader\":[1]"),
+                String.valueOf(written.error) + fake.fingerprintWrites.toString());
+        check("the terminal now holds the template", fake.heldFingerprints.contains("RES-9:2"), fake.heldFingerprints.toString());
+
+        IsapiClient.OpResult deleted = client.applyOperation(device, "delete_fingerprint_device", fingerprint);
+        check("delete_fingerprint_device deletes the slot",
+                deleted.success && !fake.heldFingerprints.contains("RES-9:2"), String.valueOf(deleted.error));
+        check("the delete sets deleteFingerPrint",
+                fake.fingerprintWrites.get(1).contains("\"deleteFingerPrint\":true"), fake.fingerprintWrites.get(1));
+
+        // The capture: the terminal answers "nobody is pressing" until a finger is
+        // read, then returns the Base64 template for the Worker to distribute.
+        fake.captureTemplate = "QU5PVEhFUlRFTVBMQVRF";
+        Map<String, Object> captureDep = new LinkedHashMap<String, Object>();
+        captureDep.put("fingerNo", Integer.valueOf(3));
+        captureDep.put("employeeNo", "RES-9");
+        IsapiClient.OpResult captured = client.applyOperation(device, "capture_fingerprint", captureDep, null);
+        check("capture_fingerprint returns the template to the caller",
+                captured.success && captured.result != null && "QU5PVEhFUlRFTVBMQVRF".equals(captured.result.get("templateData")),
+                String.valueOf(captured.error) + String.valueOf(captured.result));
+        check("capture_fingerprint asks the terminal's own reader",
+                fake.captureRequests >= 2, "captureRequests=" + fake.captureRequests);
+        check("the capture response parser reads JSON and XML templates",
+                "QU5PVEhFUlRFTVBMQVRF".equals(IsapiClient.fingerprintData("{\"CaptureFingerPrint\":{\"fingerData\":\"QU5PVEhFUlRFTVBMQVRF\"}}"))
+                        && "XMLVEVNUExBVEU=".equals(IsapiClient.fingerprintData("<CaptureFingerPrint><fingerData>XMLVEVNUExBVEU=</fingerData></CaptureFingerPrint>"))
+                        && IsapiClient.fingerprintData("{\"statusCode\":4}") == null);
+
+        // A terminal that documents neither the capture nor the upload is reported
+        // as such, so the portal falls back to its manual instruction.
+        fake.captureTemplate = "";
+        fake.rejectFingerprintSetUp = true;
+        IsapiClient.OpResult unsupportedCapabilities = client.applyOperation(device, "upload_fingerprint", fingerprint, "QUJD");
+        check("a fingerprint write on a terminal without the API fails with its reason",
+                !unsupportedCapabilities.success && unsupportedCapabilities.error != null && !unsupportedCapabilities.error.isEmpty(),
+                String.valueOf(unsupportedCapabilities.error));
+        fake.rejectFingerprintSetUp = false;
+
+        // --------------------------------------------------------- probes --
+        java.util.List<String> capabilities = client.probeCapabilities(device);
+        check("capabilities are probed against the terminal",
+                capabilities.contains("card") && capabilities.contains("door") && capabilities.contains("person")
+                        && capabilities.contains("fingerprint"),
+                capabilities.toString());
+        check("the probe really asked the terminal", fake.capabilityProbes >= 2, "probes=" + fake.capabilityProbes);
+
         fake.server.stop(0);
     }
+
+    // -------------------------------------------------------- worker results --
 
     // ----------------------------------------------------------- alertStream --
 
@@ -431,6 +536,29 @@ public final class ProtocolTest {
         check("operation result is reported", result.ok() && worker.lastResultBody.contains("\"status\":\"applied\"") && worker.lastResultBody.contains("\"durationMs\":42"),
                 worker.lastResultBody);
 
+        // The heartbeat is also what tells the Worker which kinds of work this
+        // bridge can apply, so person/fingerprint operations are never queued for
+        // a phone build that cannot do them.
+        java.util.ArrayList<String> capabilities = new java.util.ArrayList<String>();
+        capabilities.add("card");
+        capabilities.add("person");
+        capabilities.add("fingerprint");
+        WorkerClient.Reply capabilityHeartbeat = client.heartbeat("0.2.0", "phone", "android", stats, null, capabilities);
+        check("heartbeat advertises the probed capabilities",
+                capabilityHeartbeat.ok() && worker.lastHeartbeatBody.contains("\"capabilities\":[\"card\",\"person\",\"fingerprint\"]"),
+                worker.lastHeartbeatBody);
+
+        // A capture result carries the template back to the Worker, which is the
+        // only place it is stored (and only until every terminal has it).
+        Map<String, Object> captureResult = new LinkedHashMap<String, Object>();
+        captureResult.put("templateData", "QU5PVEhFUlRFTVBMQVRF");
+        captureResult.put("fingerNo", Integer.valueOf(3));
+        WorkerClient.Reply captureReport = client.reportResult("op-2", "fingerprint", true, null, captureResult, 900);
+        check("a capture result is reported with its template",
+                captureReport.ok() && worker.lastResultBody.contains("\"templateData\":\"QU5PVEhFUlRFTVBMQVRF\"")
+                        && worker.lastResultBody.contains("\"kind\":\"fingerprint\""),
+                worker.lastResultBody);
+
         List<Object> events = new ArrayList<Object>();
         Map<String, Object> event = new LinkedHashMap<String, Object>();
         event.put("deviceId", DEVICE_ID);
@@ -484,6 +612,18 @@ public final class ProtocolTest {
         final List<String> deleteRequests = new ArrayList<String>();
         final List<String> visitorRecords = new ArrayList<String>();
         final List<String> doorRequests = new ArrayList<String>();
+        final List<String> personRecords = new ArrayList<String>();
+        final List<String> personModifies = new ArrayList<String>();
+        final List<String> personDeletes = new ArrayList<String>();
+        final List<String> personDetailDeletes = new ArrayList<String>();
+        final List<String> fingerprintWrites = new ArrayList<String>();
+        /** Templates this terminal says it holds, keyed employeeNo:fingerNo. */
+        final java.util.Set<String> heldFingerprints = new java.util.HashSet<String>();
+        int captureRequests;
+        String captureTemplate = "";
+        boolean rejectPersonJson;
+        boolean rejectFingerprintSetUp;
+        int capabilityProbes;
     }
 
     private static final class DeviceHandler implements HttpHandler {
@@ -586,6 +726,84 @@ public final class ProtocolTest {
                 }
                 device.deleteRequests.add(exchange.getRequestMethod() + " " + body);
                 respond(exchange, 200, "{\"statusCode\":1,\"statusString\":\"OK\"}");
+                return;
+            }
+            if (path.endsWith("/UserInfo/capabilities")) {
+                device.capabilityProbes++;
+                if (device.rejectPersonJson) {
+                    respond(exchange, 404, "{\"statusCode\":4,\"statusString\":\"Invalid Operation\",\"subStatusCode\":\"notSupport\"}");
+                    return;
+                }
+                respond(exchange, 200, "{\"UserInfoCap\":{\"isSupportUserInfo\":true,\"employeeNoLen\":32}}");
+                return;
+            }
+            if (path.equals("/ISAPI/AccessControl/UserInfo/Record")) {
+                boolean json = exchange.getRequestURI().getQuery() != null && exchange.getRequestURI().getQuery().contains("format=json");
+                if (json && device.rejectPersonJson) {
+                    respond(exchange, 404, "{\"statusCode\":4,\"statusString\":\"Invalid Operation\",\"subStatusCode\":\"notSupport\"}");
+                    return;
+                }
+                // The terminal stores a person only when the record carries door
+                // rights: without doorRight/RightPlan the person exists and is
+                // authorised for nothing, which is exactly the failure field
+                // integrators report.
+                if (!body.contains("doorRight") || !body.contains("RightPlan")) {
+                    respond(exchange, 400, "{\"statusCode\":6,\"statusString\":\"Invalid Content\",\"subStatusCode\":\"badParameters\",\"errorMsg\":\"doorRight\"}");
+                    return;
+                }
+                device.personRecords.add(body);
+                respond(exchange, 200, "{\"statusCode\":1,\"statusString\":\"OK\"}");
+                return;
+            }
+            if (path.equals("/ISAPI/AccessControl/UserInfo/Modify") || path.equals("/ISAPI/AccessControl/UserInfo/SetUp")) {
+                device.personModifies.add(exchange.getRequestMethod() + " " + path + " " + body);
+                respond(exchange, 200, "{\"statusCode\":1,\"statusString\":\"OK\"}");
+                return;
+            }
+            if (path.equals("/ISAPI/AccessControl/UserInfoDetail/Delete")) {
+                device.personDetailDeletes.add(body);
+                respond(exchange, 200, "{\"statusCode\":1,\"statusString\":\"OK\"}");
+                return;
+            }
+            if (path.equals("/ISAPI/AccessControl/UserInfo/Delete")) {
+                device.personDeletes.add(body);
+                respond(exchange, 200, "{\"statusCode\":1,\"statusString\":\"OK\"}");
+                return;
+            }
+            if (path.equals("/ISAPI/AccessControl/FingerPrintCfg/capabilities")) {
+                device.capabilityProbes++;
+                if (device.rejectFingerprintSetUp) {
+                    respond(exchange, 404, "{\"statusCode\":4,\"statusString\":\"Invalid Operation\",\"subStatusCode\":\"notSupport\"}");
+                    return;
+                }
+                respond(exchange, 200, "{\"FingerPrintCfgCap\":{\"isSupportSetUp\":true}}");
+                return;
+            }
+            if (path.equals("/ISAPI/AccessControl/FingerPrint/SetUp")) {
+                if (device.rejectFingerprintSetUp) {
+                    respond(exchange, 404, "{\"statusCode\":4,\"statusString\":\"Invalid Operation\",\"subStatusCode\":\"notSupport\"}");
+                    return;
+                }
+                java.util.regex.Matcher employee = java.util.regex.Pattern.compile("\"employeeNo\":\"([^\"]*)\"").matcher(body);
+                java.util.regex.Matcher finger = java.util.regex.Pattern.compile("\"fingerPrintID\":(\\d+)").matcher(body);
+                String key = (employee.find() ? employee.group(1) : "?") + ":" + (finger.find() ? finger.group(1) : "?");
+                if (body.contains("deleteFingerPrint")) device.heldFingerprints.remove(key);
+                else device.heldFingerprints.add(key);
+                device.fingerprintWrites.add(body);
+                respond(exchange, 200, "{\"statusCode\":1,\"statusString\":\"OK\"}");
+                return;
+            }
+            if (path.startsWith("/ISAPI/AccessControl/CaptureFingerPrint")) {
+                device.captureRequests++;
+                if (path.endsWith("/capabilities")) {
+                    respond(exchange, 200, "<CaptureFingerPrintCap version=\"2.0\" xmlns=\"http://www.hikvision.com/ver20/XMLSchema\"><isSupportCaptureFingerPrint>true</isSupportCaptureFingerPrint></CaptureFingerPrintCap>");
+                    return;
+                }
+                if (device.captureTemplate.isEmpty()) {
+                    respond(exchange, 200, "{\"ResponseStatus\":{\"statusCode\":4,\"statusString\":\"Invalid Operation\",\"subStatusCode\":\"fingerPrintNotExist\"}}");
+                    return;
+                }
+                respond(exchange, 200, "{\"CaptureFingerPrint\":{\"fingerNo\":1,\"fingerPrintQuality\":72,\"fingerData\":\"" + device.captureTemplate + "\"}}");
                 return;
             }
             if (path.startsWith("/ISAPI/AccessControl/RemoteControl/door/")) {

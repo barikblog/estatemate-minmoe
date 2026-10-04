@@ -20,7 +20,8 @@ Included:
 - LAN-agent event ingestion: the agent streams JSON/XML device events (ISAPI alertStream) to the Worker in batches; retired transports (direct HTTP Listening, Render relay, Hikvision cloud, ISUP gateway) were removed in migration 0013.
 - Per-device one-time credentials; editable/soft-deletable device inventory; Queue buffering; D1 event persistence; Durable Object live WebSocket feed.
 - Device-tap card enrollment, phone/device visitor-code scanning, QR + Code 128 visitor passes, and preview-before-entry Security decisions.
-- **Access cards & fingerprints** as one credential register: cards keep their real card number, fingerprints are their own credential with the terminal's finger slot (1–10) and employee number. Administrators and Managers add either from the person's profile (People, and Tenancy & household for dependants) or from the Access cards & fingerprints page. A finger can only be captured on the terminal itself, so every fingerprint change is queued as an operator task with instructions under Hardware actions, and gate events that carry no card are attributed back to the person through the employee number.
+- **Access cards & fingerprints** as one credential register: cards keep their real card number, fingerprints are their own credential with the terminal's finger slot (1–10) and employee number. Administrators and Managers add either from the person's profile (People, and Tenancy & household for dependants) or from the Access cards & fingerprints page. Adding a fingerprint can read the finger straight from a chosen terminal through the bridge (**Add fingerprint** → pick the terminal → the reader arms and the template is sent to the other terminals); a terminal whose firmware refuses the ISAPI capture keeps the operator task with instructions under Hardware actions. Gate events that carry no card are attributed back to the person through the employee number.
+- **Person sync** page: every person's record, cards and fingerprints kept in step with every enabled terminal, with the per-terminal state (synced, waiting, manual, missing), *Sync now* for one person or the whole estate, and **Remove from devices** for one terminal or a full removal.
 - Hourly facility-fee expiry/reactivation job and hardware-action audit queue.
 - Role-aware React portal for Administrator, Manager, Resident, Cashier, and Security. Manager receives operational administration without billing, private-storage or global-settings control.
 - People management with available-property selection, validated account creation, CSV bulk registration, 24-hour sample logins, generated one-time passwords, editing, password reset, safe deactivation/reactivation and history-preserving deletion.
@@ -49,8 +50,8 @@ Included:
 
 Still model/account dependent:
 
-- Automatic terminal card/person commands in no-PC mode.
-- Automatic fingerprint template push: until per-model evidence is recorded in `docs/device-profiles/`, fingerprint enrollment, enable/disable and deletion stay operator tasks.
+- Automatic terminal card/person commands in no-PC mode, and remote door control (model-dependent; a refusal stays in Hardware actions).
+- Fingerprint capture and template push are implemented and capability-gated (the bridge probes the terminal before the Worker hands it that work), but the firmware that implements `CaptureFingerPrint`/`FingerPrint/SetUp` varies by model — where a terminal refuses the call, the portal says so and the enrollment stays an operator task.
 - Exact MinMoe event minor-code mapping and event payload variants.
 - Gemini enrichment, FCM delivery, large GitHub exports, and full accounting/reconciliation UI.
 - Android production signing, push configuration, and Play distribution.

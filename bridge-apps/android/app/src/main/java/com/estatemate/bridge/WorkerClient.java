@@ -143,12 +143,24 @@ public final class WorkerClient {
      */
     public Reply heartbeat(String version, String hostname, String platform, Map<String, Object> stats,
                            List<Map<String, Object>> devices) {
+        return heartbeat(version, hostname, platform, stats, devices, null);
+    }
+
+    /**
+     * @param capabilities what this bridge can apply, probed against its own
+     *                     terminals. The Worker only queues person and fingerprint
+     *                     operations for an agent that advertises them, so an older
+     *                     build keeps receiving exactly the work it can do.
+     */
+    public Reply heartbeat(String version, String hostname, String platform, Map<String, Object> stats,
+                           List<Map<String, Object>> devices, List<String> capabilities) {
         Map<String, Object> payload = new LinkedHashMap<String, Object>();
         payload.put("version", version);
         payload.put("hostname", hostname);
         payload.put("platform", platform);
         payload.put("stats", stats);
         if (devices != null) payload.put("devices", devices);
+        if (capabilities != null && !capabilities.isEmpty()) payload.put("capabilities", capabilities);
         return post("/api/isapi/v1/agents/" + agentId + "/heartbeat", Json.write(payload));
     }
 
@@ -157,11 +169,21 @@ public final class WorkerClient {
     }
 
     public Reply reportResult(String operationId, String kind, boolean applied, String errorMessage, long durationMs) {
+        return reportResult(operationId, kind, applied, errorMessage, null, durationMs);
+    }
+
+    /**
+     * @param result extra data for the Worker; only a fingerprint capture fills
+     *               it in, with the Base64 template the terminal just produced.
+     */
+    public Reply reportResult(String operationId, String kind, boolean applied, String errorMessage,
+                              Map<String, Object> result, long durationMs) {
         Map<String, Object> payload = new LinkedHashMap<String, Object>();
         payload.put("kind", kind == null ? "card" : kind);
         payload.put("status", applied ? "applied" : "failed");
         payload.put("errorMessage", applied ? null : (errorMessage == null ? "failed" : errorMessage));
         payload.put("durationMs", Long.valueOf(durationMs));
+        if (result != null && !result.isEmpty()) payload.put("result", result);
         return post("/api/isapi/v1/agents/" + agentId + "/operations/" + operationId + "/result", Json.write(payload));
     }
 

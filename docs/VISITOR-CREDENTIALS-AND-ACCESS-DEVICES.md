@@ -38,7 +38,7 @@ A denied unknown-card event is sufficient if the device uploads the card number.
 
 A fingerprint is not a card number, so it is stored as its own credential (`fingerprint_credentials`, migration `0015`) rather than a fake card in `access_cards`. Administrators and Managers add one from a person's profile or from **Access cards & fingerprints**: the finger slot (1–10), an optional "which finger" label, the employee number the terminal knows the person by, and the terminal the finger will be captured at.
 
-The template itself is created on the terminal — the person's finger has to be on the sensor — so EstateMate queues `enroll_fingerprint` as a `manual_action_required` task with an instruction and never asks the agent to upload a template. The same applies to `enable_fingerprint`, `disable_fingerprint` and `delete_fingerprint`, which the terminal must confirm. Gate events that carry no card number are attributed to the person through `employee_no`, so set that value when enrolling a dependant.
+The template itself is created on the terminal, but the read is driven from the portal: **Add fingerprint** arms the chosen terminal's reader through the bridge (`CaptureFingerPrint`), stores the returned template and sends it to the other terminals with `FingerPrint/SetUp`. A terminal that does not implement that API is reported in its own words and the credential falls back to an `enroll_fingerprint` `manual_action_required` task with an instruction. `delete_fingerprint` is likewise delivered to the terminal where the bridge advertises the capability, and stays an operator task otherwise. Gate events that carry no card number are attributed to the person through `employee_no`, so set that value when enrolling a dependant.
 
 ## Model-specific behavior
 

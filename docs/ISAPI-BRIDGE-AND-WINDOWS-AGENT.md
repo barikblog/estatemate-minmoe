@@ -14,18 +14,26 @@ Many estates already have a Windows PC (CCTV, accounting) on same LAN as devices
 The ISAPI bridge is a small Node.js agent that runs on the same LAN as Hikvision devices (Windows, Linux, macOS). It:
 
 1. Polls Cloudflare Worker for pending operations:
-   - `GET /api/isapi/v1/agents/:id/operations` — card upsert/enable/disable/delete, visitor upsert. Fingerprint operations are **not** in this list: a finger is captured on the terminal, so they are queued as `manual_action_required` operator tasks instead (migration `0015`)
+   - `GET /api/isapi/v1/agents/:id/operations` — card upsert/enable/disable/delete, visitor upsert, **person** upsert/delete, **fingerprint** template upload/delete, **fingerprint capture**, door commands
+   - The Worker hands out a kind only when the heartbeat advertises the matching capability (see *Capabilities* below). A pre-`0.3.0` bridge advertises nothing and keeps receiving cards, visitors and doors; person/fingerprint work is queued as `manual_action_required` operator tasks instead
+   - A `capture_fingerprint` item is the one that carries the request only; an `upload_fingerprint` item carries the transient Base64 template (`fingerData`) for the claiming agent alone
    - Auth: `X-EstateMate-Agent-Key: <secret>` or `Authorization: Bearer <secret>`
 2. Applies them via Hikvision ISAPI (HTTP Digest Auth) to the device:
    - `POST /ISAPI/AccessControl/CardInfo/Record?format=json` — add a card
    - `PUT /ISAPI/AccessControl/CardInfo/Modify?format=json` — when the terminal already holds that card number (a duplicate `Record` is an error, so a re-enable or re-issue falls through to `Modify`)
    - `PUT /ISAPI/AccessControl/CardInfo/Delete?format=json` — remove a card; the condition must be wrapped as `{"CardInfoDelCond":{"CardNoList":[{"cardNo":"…"}]}}`
+   - `POST /ISAPI/AccessControl/UserInfo/Record?format=json`, `PUT …/UserInfo/Modify`, `PUT …/UserInfo/SetUp` — write the person a credential belongs to (always with `doorRight` + `RightPlan`)
+   - `PUT /ISAPI/AccessControl/UserInfoDetail/Delete?format=json` (fallback `PUT …/UserInfo/Delete`) — remove the person with their cards and fingerprints
+   - `POST /ISAPI/AccessControl/FingerPrint/SetUp?format=json` — write or delete one finger template (slot 1–10)
+   - `POST /ISAPI/AccessControl/CaptureFingerPrint?format=json` — arm the terminal's own reader and read a live finger
    - `PUT /ISAPI/AccessControl/RemoteControl/door/{n}?format=json` — remote door command (model-dependent)
    - XML fallback: the same bodies with the ISAPI namespace (`xmlns="http://www.isapi.org/ver20/XMLSchema" version="2.0"`), tried **only** when the JSON URL itself is unsupported — never after a content rejection
 3. Reports result:
-   - `POST /api/isapi/v1/agents/:id/operations/:opId/result` with `{kind, status: applied|failed, errorMessage, durationMs}`
+   - `POST /api/isapi/v1/agents/:id/operations/:opId/result` with `{kind, status: applied|failed, errorMessage, durationMs, result?}` — a capture reports `result.templateData` (Base64), `result.fingerNo` and `result.quality`
 4. Heartbeats:
-   - `POST /api/isapi/v1/agents/:id/heartbeat` with version/hostname
+   - `POST /api/isapi/v1/agents/:id/heartbeat` with version/hostname and `capabilities: ['card','door','person','fingerprint']`
+5. Probes capabilities:
+   - `GET /ISAPI/AccessControl/CaptureFingerPrint/capabilities` and `GET /ISAPI/AccessControl/FingerPrintCfg/capabilities` (JPEG/person equivalents where relevant) decide what is advertised. The probe is cached for **10 minutes** and refreshed in the background — it is never awaited by the heartbeat, because a terminal holding a long-lived alertStream can block the probe and stop the heartbeat with it
 
 No SDK required — uses documented ISAPI endpoints available on most K1T, K26xx, K27xx/K28xx when accessed from LAN.
 
@@ -45,6 +53,49 @@ Recorded from the terminals these bridges were fixed against; the simulated term
 - **`tempCard` is not a valid card type.** Visitor credentials are written as `normalCard` under the visitor's issued employee number (`visitor-<credential>` only when no employee number was issued and it passes the 32-byte person-ID check). The old `tempCard` XML write was rejected by the terminals.
 - **XML bodies carry the namespace**: `<CardInfo xmlns="http://www.isapi.org/ver20/XMLSchema" version="2.0">`, likewise `<CardInfoDelCond>` and `<RemoteControlDoor>`.
 - **Failures are summarised, not truncated.** The reason is read from the `ResponseStatus` fields (`statusString` / `subStatusCode` / `errorMsg`), from JSON or XML, and both attempts are shown when a fallback was legitimately tried — real rejections first, unsupported-URL answers only if there are no rejections.
+
+### Person and fingerprint protocol the agent relies on
+
+Grouped with the card rules above and enforced by the simulated terminal in
+`isapi-bridge/agent.person-fingerprint.integration.mjs` (ten checks in `npm test`).
+
+- **Person before credential.** A card or a finger names an ISAPI `employeeNo`
+  that must already exist on the terminal. Record for an unknown person is
+  refused, so the bridge always writes the person first and only then the card or
+  template. EstateMate's canonical `employee_id` (≤32 characters, migration
+  `0018`) is that number.
+- **`doorRight` and `RightPlan` are mandatory.** A person stored without them
+  exists on the terminal and is authorised for nothing — the door does not open.
+  The bridge always sends both, with the terminal's own door numbers (door 1 when
+  the estate has not recorded any), plus `Valid` and `userType: normal`.
+- **`Record` is not idempotent.** A terminal that already holds the employee
+  number answers a rejection; the bridge falls through to `UserInfo/Modify` and
+  then `UserInfo/SetUp`, which is what makes a rename or a re-sync work.
+- **Removal cascades.** `UserInfoDetail/Delete` removes the person **and** their
+  cards, fingerprints and permissions. Firmware that does not implement it
+  (`notSupport`/`invalidOperation`) is retried once as `UserInfo/Delete`, which
+  removes the person record alone.
+- **Fingerprint templates are one slot at a time.**
+  `FingerPrint/SetUp` writes `{FingerPrintCfg:{employeeNo, fingerPrintID,
+  fingerType:'normalFP', fingerData, enableCardReader:[1]}}`; deleting uses the
+  same call with `deleteFingerPrint: true`, and firmware answers success even
+  when the slot was already empty. The template is Base64 in the body — never in
+  a URL, a log line or a portal response.
+- **Capture is armed, not polled.**
+  `CaptureFingerPrint` takes `{CaptureFingerPrintCond:{fingerNo}}` and returns the
+  template once the finger is read; while nobody touches the glass the terminal
+  answers "no fingerprint". The bridge re-arms every 5 s for up to ~100 s
+  (`ESTATEMATE_CAPTURE_RETRY_MS` / `ESTATEMATE_CAPTURE_MAX_MS`) and keeps
+  heartbeating in between, so the terminal does not decide the operator walked
+  away. A firmware that refuses the call is reported in the terminal's own words
+  and the portal keeps the manual enrolment task.
+- **Capabilities gate the work, not the willingness.**
+  `agentCan(device, capability)`: a device with no agent never takes automated
+  work; an agent advertising nothing is legacy and takes `card`/`visitor`/`door`
+  only; otherwise exactly what it advertises. Every fingerprint either reaches a
+  terminal as a template or — where the template cannot be taken — becomes an
+  `enroll_fingerprint` task naming the slot and the employee number. Nothing is
+  silently dropped.
 
 ### Event-stream protocol the agent relies on
 
@@ -89,6 +140,20 @@ which is why ISUP is not a supported transport.
 
 Indexes added for agent status, device lookups, and sync logs.
 
+Migration `0019_person_sync_and_fingerprint_capture.sql` adds the person half:
+
+- `device_operations` rebuilt once more to carry `user_id`, `household_member_id`,
+  `capture_id` and `result_json`, with the operation CHECK widened for
+  `upsert_person`, `delete_person`, `upload_fingerprint`,
+  `delete_fingerprint_device` and `capture_fingerprint`.
+- `isapi_agents.capabilities` — what each bridge advertised on its last probe.
+- `fingerprint_captures` — `pending|captured|failed|cancelled|expired`, the
+  Base64 `template_data`, `expires_at` (180 s to distribute it, 86 400 s hard
+  cap) and the person/finger/employee the capture belongs to.
+- `device_person_state` — synced/pending/missing/manual/removed, one row per
+  person and terminal, derived by `refreshDevicePersonState` from the operation
+  rows rather than asserted per operation.
+
 ## Backend endpoints
 
 ### User-authenticated (Admin/Manager)
@@ -113,8 +178,9 @@ Indexes added for agent status, device lookups, and sync logs.
 
 - `POST /api/isapi/v1/agents/:id/heartbeat` — agent heartbeat, updates last_seen_at, last_ip, version. Body may include `devices: [{ deviceId, stream: 'up'|'down', lastError? }]`; a `down` entry retires that terminal immediately (and writes one `event_stream` sync log per transition) instead of waiting for the hourly sweep. The agent sends this on every heartbeat and again while shutting down.
 - `GET /api/isapi/v1/agents/:id/devices` — list devices assigned to agent
-- `GET /api/isapi/v1/agents/:id/operations?limit=20` — poll pending operations (claims them as sent)
-- `POST /api/isapi/v1/agents/:id/operations/:opId/result` — report applied/failed
+- `GET /api/isapi/v1/agents/:id/operations?limit=20` — poll pending operations (claims them as sent). Items are `card`, `visitor`, `person`, `fingerprint` and `door` kinds; a `fingerprint` item is either `upload_fingerprint` (carrying the transient `fingerData` for this agent only), `delete_fingerprint_device` or `capture_fingerprint` (carrying `fingerNo`). Only kinds the heartbeat's `capabilities` allow are returned
+- `POST /api/isapi/v1/agents/:id/operations/:opId/result` — report applied/failed; a capture result may carry `{result:{templateData, fingerNo, quality}}`, which the Worker stores as the credential's template
+- `POST /api/isapi/v1/agents/:id/heartbeat` — (listed above) now also carries `capabilities`
 - `POST /api/isapi/v1/agents/:id/sync-logs` — manual log entry
 - `POST /api/isapi/v1/agents/:id/events` — **batched real-time event documents** captured from the device's ISAPI alertStream. Body `{ items: [{ deviceId, contentType?, document }] }`, max 50 items / 2 MB per request. Each document (JSON or XML string) goes through the same normalization pipeline as direct device posts; the whole batch is queued as one Queue message. Guarded by the `agent_event_stream_enabled` setting (`409` when disabled). Devices must be linked to the calling agent (`hikvision_devices.isapi_agent_id` or `isapi_device_configs`).
 
@@ -126,6 +192,20 @@ All machine endpoints accept:
 - Basic auth with secret as password
 
 ## Frontend UI
+
+New section **Person sync** (admin/manager/security read; sync and removal are
+admin/manager) in portal:
+
+- **Totals strip** — people, terminals, in step, waiting, manual, missing.
+- **Terminal cards** — one per terminal with the agent gate, advertised
+  capabilities and the synced/pending/manual/missing counts.
+- **People table** — every person with their state on each terminal, *Sync now*
+  (one person or the whole estate, optionally with credentials) and **Remove from
+  devices** (person + credentials, or the whole terminal copy).
+- **Fingerprint capture** is started from the person's **Cards & fingerprints**
+  panel or from the Cards page: choose the terminal, choose the finger slot, and
+  the panel reports *waiting for a finger*, *captured*, the terminal's refusal
+  text, and where the template was sent.
 
 New section **ISAPI Bridge & Windows Agent** (admin/manager only) in portal:
 
@@ -168,7 +248,9 @@ When device uses these patterns, `createDeviceOperations` and visitor creation s
 
 ## Real-time event streaming (agent 1.1.0)
 
-The agent now covers the event half of the problem as well as the command half. One persistent
+The agent now covers the event half of the problem as well as the command half (the
+capability-probed person/fingerprint half arrived with bridge `0.3.0`; the two
+releases are independent — streaming needs no capability and is always on). One persistent
 `GET /ISAPI/Event/notification/alertStream?format=json` connection is held per device; documents
 are buffered client-side and flushed as batched `POST /api/isapi/v1/agents/:id/events` requests
 (up to 50 items, or every 5 s). This is an **event-upload** path like HTTP Listening — it carries
@@ -220,7 +302,8 @@ Verify:
 
 ## Future improvements
 
-- Full Person + Card + Access Group linking for models requiring it (`/ISAPI/AccessControl/UserInfo/Record`, `/ISAPI/AccessControl/UserRight/...`)
+- Access-group / door-right *API* provisioning (`/ISAPI/AccessControl/UserRight/...`) beyond the `doorRight`/`RightPlan` fields the person body already carries
 - Face template provisioning via ISAPI
+- Card/fingerprint read-back (`FingerPrintUpload` and `CardInfo/Search`) to prove a template is really on a terminal instead of trusting the apply result
 - Bulk card sync status dashboard
 - Agent binary releases (pkg/nexe) for estates without Node.js
