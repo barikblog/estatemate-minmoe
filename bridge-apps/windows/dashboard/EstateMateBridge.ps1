@@ -356,7 +356,12 @@ function New-DashboardForm {
   $grid.AllowUserToDeleteRows = $false
   $grid.RowHeadersVisible = $false
   $grid.AutoSizeColumnsMode = 'Fill'
-  $grid.EditMode = 'OnType'
+  # 'OnType' is not a DataGridViewEditMode on any .NET Framework: the names are
+  # EditOnEnter, EditOnKeystroke, EditOnKeystrokeOrF2, EditOnF2 and
+  # EditProgrammatically. This one starts an edit when a printable key is
+  # pressed and on F2, which is what a grid of hostnames and ids wants, and it
+  # leaves the checkboxes clickable.
+  $grid.EditMode = 'EditOnKeystrokeOrF2'
   [void]$grid.Columns.Add('DeviceId', 'EstateMate device ID (UUID from the portal)')
   [void]$grid.Columns.Add('Name', 'Name')
   [void]$grid.Columns.Add('Host', 'ISAPI host')
@@ -874,8 +879,14 @@ function Invoke-SelfTest {
     $built = Get-DevicesJson
     $single = @($built.devices)[0]
     Check 'the table becomes the devices JSON `setup` expects' `
-      (@($built.devices).Count -eq 1 -and $single.isapiHost -eq '192.168.1.64' -and $single.estateMateDeviceId -eq '00000000-0000-4000-8000-000000000000') `
+      (@($built.devices).Count -eq 1 -and $single.isapiHost -eq '192.168.1.64' -and $single.estateMateDeviceId -eq '00000000-0000-4000-8000-000000000000' -and $single.eventStream -eq $true) `
       ($built | ConvertTo-Json -Depth 5 -Compress)
+    $grid.Rows[$index].Cells['Events'].Value = $false
+    $off = Get-DevicesJson
+    Check 'switching a terminal off in the table writes eventStream false' `
+      (@($off.devices)[0].eventStream -eq $false) `
+      ($off | ConvertTo-Json -Depth 5 -Compress)
+    $grid.Rows[$index].Cells['Events'].Value = $true
     $text = $built | ConvertTo-Json -Depth 5
     Check 'the devices JSON stays an array with one terminal' ($text -match '"devices"\s*:\s*\[') $text
     Check 'the devices JSON has no BOM and is valid UTF-8' (-not $text.StartsWith([char]0xFEFF)) 'the JSON starts with a byte-order mark'
