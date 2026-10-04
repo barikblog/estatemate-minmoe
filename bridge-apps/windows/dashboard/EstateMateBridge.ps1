@@ -364,7 +364,14 @@ function New-DashboardForm {
   [void]$grid.Columns.Add('User', 'ISAPI user')
   [void]$grid.Columns.Add('Password', 'ISAPI password')
   [void]$grid.Columns.Add('Protocol', 'http/https')
-  [void]$grid.Columns.Add('Events', 'Live events')
+  # A real checkbox column, not a text one: [bool]'False' is $true in
+  # PowerShell, so a typed "False" in a text cell would save as enabled.
+  $eventsColumn = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+  $eventsColumn.Name = 'Events'
+  $eventsColumn.HeaderText = 'Live events'
+  $eventsColumn.FalseValue = $false
+  $eventsColumn.TrueValue = $true
+  [void]$grid.Columns.Add($eventsColumn)
   $grid.Columns['Port'].FillWeight = 30
   $grid.Columns['Protocol'].FillWeight = 50
   $grid.Columns['Events'].FillWeight = 45
@@ -503,6 +510,10 @@ function Get-DevicesJson {
     [void][int]::TryParse([string]$row.Cells['Port'].Value, [ref]$port)
     $protocol = [string]$row.Cells['Protocol'].Value
     if ($protocol -ne 'https') { $protocol = 'http' }
+    # The column is a checkbox, so this is a real boolean; the string case is
+    # for anything that writes text into the cell ([bool]'False' is $true).
+    $live = $row.Cells['Events'].Value
+    if ($live -is [string]) { $live = ($live -eq 'True') }
     $devices += [pscustomobject]@{
       estateMateDeviceId = $id.Trim()
       name               = [string]$row.Cells['Name'].Value
@@ -512,7 +523,7 @@ function Get-DevicesJson {
       isapiPassword      = [string]$row.Cells['Password'].Value
       protocol           = $protocol
       enabled            = $true
-      eventStream        = [bool]$row.Cells['Events'].Value
+      eventStream        = [bool]$live
     }
   }
   return [pscustomobject]@{ devices = @($devices) }
