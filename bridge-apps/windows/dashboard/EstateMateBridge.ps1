@@ -888,9 +888,30 @@ function Invoke-SelfTest {
       (@($off.devices)[0].eventStream -eq $false) `
       ($off | ConvertTo-Json -Depth 5 -Compress)
     $grid.Rows[$index].Cells['Events'].Value = $true
-    $text = $built | ConvertTo-Json -Depth 5
+    $text = [string]($built | ConvertTo-Json -Depth 5)
     Check 'the devices JSON stays an array with one terminal' ($text -match '"devices"\s*:\s*\[') $text
-    Check 'the devices JSON has no BOM and is valid UTF-8' (-not $text.StartsWith([char]0xFEFF)) 'the JSON starts with a byte-order mark'
+    # What matters is the bytes on disk, not the string: JSON.parse in the bridge
+    # rejects a UTF-8 BOM, and Windows PowerShell's Set-Content writes one, which
+    # is why Write-Utf8NoBom exists. Report the first code point so a failure
+    # says what it actually saw instead of only that something was wrong.
+    $firstCode = -1
+    $firstChars = '(empty)'
+    if ($text -and $text.Length -gt 0) {
+      $firstCode = [int][char]$text[0]
+      $firstChars = $text.Substring(0, [Math]::Min(20, $text.Length))
+    }
+    Check 'the devices JSON string starts with a brace' ($firstCode -eq 0x7B) ("first code point: 0x{0:X4}; starts with: {1}" -f $firstCode, $firstChars)
+    $probeFile = Join-Path $env:TEMP ('estatemate-selftest-' + [Guid]::NewGuid().ToString('N') + '.json')
+    try {
+      Write-Utf8NoBom $probeFile $text
+      $bytes = [System.IO.File]::ReadAllBytes($probeFile)
+      $bomText = 'the file is shorter than three bytes'
+      if ($bytes.Length -ge 3) { $bomText = "first bytes: {0:X2} {1:X2} {2:X2}" -f $bytes[0], $bytes[1], $bytes[2] }
+      $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+      Check 'the devices file the dashboard writes has no byte-order mark' (-not $hasBom) $bomText
+    } finally {
+      Remove-Item -LiteralPath $probeFile -Force -ErrorAction SilentlyContinue
+    }
     $grid.Rows.Clear()
     Fill-Fields
     Check 'the table can be rebuilt from the saved state' ($grid.Rows.Count -eq @($script:Devices).Count) "rows=$($grid.Rows.Count) devices=$(@($script:Devices).Count)"
