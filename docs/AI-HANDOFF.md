@@ -73,7 +73,7 @@ honest answer for firmware that refuses the API.
   terminal and the overview grid derives each person's state from the queued,
   applied and failed rows (`refreshDevicePersonState`) rather than asserting it.
 
-### Bridge (agent `0.3.0`, i.e. the next `bridge-*` tag)
+### Bridge (agent `0.3.0`; current release tag `bridge-0.3.1`, same code)
 
 `isapi-bridge/agent.mjs` gained the person/fingerprint half of the ISAPI
 surface, all JSON-first with the XML form only when the JSON URL is unsupported:
@@ -113,6 +113,16 @@ green: MSI, installer kit, portable exe, Windows agent bundle, bridge APK and
 Android APK, 20 assets). A PC still on `bridge-0.2.8` receives card, visitor and
 door work only and shows every person/fingerprint item as a manual task; updating
 it through the dashboard's installer kit is what turns the new capture flow on.
+
+**Re-published as
+[`bridge-0.3.1`](https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.3.1)**
+(2026-10-04T10:37:23Z, tag run `37195549069` green, 20 assets, now the *Latest*
+release the portal's download links resolve to). Same agent code as
+`bridge-0.3.0` — the only commit between the tags is the handoff record of the
+0019 deploy (`4885967`, PR #43) — so the artifacts differ only in the version
+they carry and report on the heartbeat (`0.3.1`). An estate on 0.3.0 gains
+nothing by updating; an estate on 0.2.x should take 0.3.1 to turn on the
+person-sync and fingerprint-capture flow.
 
 
 ## The MSI now installs a dashboard, not a console window (2026-10-04)
