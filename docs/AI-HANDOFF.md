@@ -143,7 +143,36 @@ honest answer for firmware that refuses the API.
   terminal and the overview grid derives each person's state from the queued,
   applied and failed rows (`refreshDevicePersonState`) rather than asserting it.
 
-### Bridge (agent `0.3.0`; current release tag `bridge-0.3.1`, same code)
+### Bridge (current release tag `bridge-0.4.0`, published 2026-10-04)
+
+`bridge-0.4.0` is the first release with the **ZKTeco PUSH (ADMS) transport**:
+`isapi-bridge/zkteco-push.mjs` (codec), `isapi-bridge/zkteco-push-server.mjs`
+(listener and the operation→command bridge) and the agent wiring in
+`isapi-bridge/agent.mjs`. It is **off unless `agent-config.json` sets
+`zktecoPush.enabled`**, so a 0.3.1 estate that installs 0.4.0 changes nothing, and
+the listener defaults to loopback. Two facts a future session must not lose:
+
+- **The numeric-PIN rule.** `validateTerminalPin()` refuses any Employee ID a
+  `StringPinFunOn!=1` terminal cannot store, instead of truncating or substituting
+  it. Visitor card issuance at a numeric-only ZKTeco gate therefore fails with a
+  message, by design. A per-device numeric alias map is the follow-up and needs a
+  D1 migration plus a Worker-side change — never an agent-side guess.
+- **Node-only by intent.** The Android bridge is client-only and cannot host the
+  inbound listener, so it does not carry this transport. That knowingly breaks
+  AGENTS.md's Node/Android equivalence rule for this feature; the deviation and
+  its reason are recorded in `docs/device-profiles/ZKTECO-PUSH.md`. Do not resolve
+  it by porting the module to Kotlin.
+
+**Verification status: CI-only.** 26 protocol/agent checks plus the 21 profile
+tests pass, and the Windows bundle/MSI/exe are smoke-tested on a runner — but **no
+physical ZKTeco terminal has been driven by this code**, and the installer opens no
+firewall port for the listener yet. `docs/device-profiles/ZKTECO-PUSH.md` has the
+bench checklist; a pilot should be one gate, with the terminal's own menu kept as
+the fallback. Release: `https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.4.0`
+(PR #45, Actions run `37202731713`; Worker deploy run `37202628623`, production
+smoke test passed; no migration was pending, so `migrations/` still ends at `0019`).
+
+### Bridge (agent `0.3.0`; release tag `bridge-0.3.1`, same code)
 
 `isapi-bridge/agent.mjs` gained the person/fingerprint half of the ISAPI
 surface, all JSON-first with the XML form only when the JSON URL is unsupported:
@@ -193,6 +222,19 @@ release the portal's download links resolve to). Same agent code as
 they carry and report on the heartbeat (`0.3.1`). An estate on 0.3.0 gains
 nothing by updating; an estate on 0.2.x should take 0.3.1 to turn on the
 person-sync and fingerprint-capture flow.
+
+**[`bridge-0.4.0`](https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.4.0)**
+(2026-10-04T12:44:15Z, tag run `37202731713` green, 20 assets, **now the *Latest*
+release the portal's download links resolve to**) adds the ZKTeco PUSH (ADMS)
+transport (`44bd8b4`, PR #45, merged as `8a150df`; Worker deploy run `37202628623`,
+production smoke test passed, no migration pending — `migrations/` still ends at
+`0019`). **An estate on 0.3.1 gains nothing it will notice**: the new transport is
+inert until `agent-config.json` opts in, so the only visible change for a
+Hikvision-only estate is the version the heartbeat reports. An estate with a
+ZKTeco gate takes 0.4.0 to provision and receive events from it at all — and should
+read `docs/device-profiles/ZKTECO-PUSH.md` first, because that file records the
+numeric-PIN refusal, the operations this transport will not perform, and the fact
+that no physical ZKTeco terminal has been driven by this code yet.
 
 
 ## The MSI now installs a dashboard, not a console window (2026-10-04)
