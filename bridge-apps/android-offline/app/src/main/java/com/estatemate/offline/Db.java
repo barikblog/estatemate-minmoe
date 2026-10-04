@@ -241,7 +241,12 @@ public final class Db {
     }
 
     private static String errorJson(String message) {
-        return new JSONObject().put("error", message).toString();
+        try {
+            return new JSONObject().put("error", message).toString();
+        } catch (org.json.JSONException unreachable) {
+            // put(String, String) only fails on null keys / non-finite numbers.
+            return "{\"error\":\"" + String.valueOf(message).replace("\\", "\\\\").replace("\"", "\\\"") + "\"}";
+        }
     }
 
 }

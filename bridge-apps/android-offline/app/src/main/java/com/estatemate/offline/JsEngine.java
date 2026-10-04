@@ -106,8 +106,10 @@ public final class JsEngine {
                 }
                 return notFound();
             }
-        });
-        view.setWebChromeClient(new android.webkit.WebChromeClient() {
+
+            // onRenderProcessGone is a WebViewClient callback (API 26), not a
+            // WebChromeClient one — it lived on the wrong client before and the
+            // @Override failed the first real android.jar compile.
             @Override
             public boolean onRenderProcessGone(WebView view, android.webkit.RenderProcessGoneDetail detail) {
                 ServerLog.append("error", "engine renderer died; restarting the WebView");

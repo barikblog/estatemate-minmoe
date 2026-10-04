@@ -63,6 +63,7 @@ BUNDLE_SCRIPT = HERE / "bundle-offline-server.mjs"
 AGENT_BRIDGE_SOURCES = [
     "AlertStreamReader.java",
     "BridgeConfig.java",
+    "BridgeLog.java",
     "Device.java",
     "Digest.java",
     "IsapiClient.java",

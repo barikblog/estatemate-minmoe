@@ -60,7 +60,7 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onCreate(Bundle state) {
-        super.onCreate(savedInstanceState);
+        super.onCreate(state);
         prefs = new ServerPrefs(this);
         buildUi();
         handler.post(refreshTick);
