@@ -47,10 +47,22 @@ and was unreachable from the environment that verified the table above. Open the
 **Details** link on any red `Workers Builds: estatemate` check to confirm in one
 read.
 
-The default Preview command is `npx wrangler preview`, and Worker Previews
-create **branch-isolated** resources. This Worker binds a D1 database, two
-queues (producer + consumer, one with a dead-letter queue) and a Durable Object.
-The API token Cloudflare auto-generates for Workers Builds grants:
+Two further observations narrow it:
+
+- A green check's summary carries `Build ID`, `Script` **and `Version ID`**; a
+  red one carries only `Build ID` and `Script`. So the red builds never produce
+  a Worker version at all — they fail before publishing anything, which is why a
+  red preview has never affected production.
+- **Node version is ruled out.** PR #48 added `.node-version` = `22`, pinning the
+  build image off its Node 24.18.0 default, and that PR's own preview build
+  (`07170015`) still failed. The failure is not a Node mismatch.
+
+What is left is the difference between the two commands: production runs
+`wrangler deploy`, a preview runs the Preview command (default
+`npx wrangler preview`), and Worker Previews create **branch-isolated**
+resources. This Worker binds a D1 database, two queues (producer + consumer, one
+with a dead-letter queue) and a Durable Object. The API token Cloudflare
+auto-generates for Workers Builds grants:
 
 - Account: Account Settings (read), Workers Scripts (edit), Workers KV (edit), Workers R2 (edit)
 - Zone: Workers Routes (edit)
@@ -59,7 +71,12 @@ The API token Cloudflare auto-generates for Workers Builds grants:
 **It has no D1 scope and no Queues scope.** A production `wrangler deploy` only
 *references* existing resource IDs, so it succeeds; a preview that has to
 *create* an isolated D1 database and queues is refused. That is consistent with
-everything in the table: production green, every preview red, code-independent.
+every observation above: production green, every preview red, code-independent,
+Node-independent, and no version produced.
+
+Note that builds are happening on PR branches at all, which means **Enable
+Preview Builds is currently on** — with it off, a non-`main` push does not build
+and posts no check.
 
 The same missing D1 scope is why migrations cannot be assumed to work in a
 build — see §2.

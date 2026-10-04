@@ -53,11 +53,16 @@ command `npx wrangler preview` creates branch-isolated resources, and this
 Worker binds D1, two queues and a Durable Object — while the token Cloudflare
 auto-generates for Builds grants Workers Scripts/KV/R2/Routes and **no D1 and no
 Queues scope**. Production deploy only *references* existing IDs, so it passes;
-a preview that must *create* them is refused. That fits every row. **Not
-confirmed**: the build log sits in the dashboard, unreachable from the
-environment that wrote this. Open the Details link on any red check to settle it
-in one read. Recommendation is to turn preview builds off regardless — CI's
-credential-free `wrangler deploy --dry-run` already proves a PR bundles.
+a preview that must *create* them is refused. That fits every row. Two details
+narrow it further: a red check's summary has no `Version ID` (a green one does),
+so the failed builds never publish anything; and **Node version is ruled out** —
+this PR added `.node-version` = 22 and its own preview build `07170015` still
+failed. **Not confirmed**: the build log sits in the dashboard, unreachable from
+the environment that wrote this. Open the Details link on any red check to settle
+it in one read. Recommendation is to turn preview builds off regardless — CI's
+credential-free `wrangler deploy --dry-run` already proves a PR bundles, and
+builds are running on PR branches at all only because Enable Preview Builds is
+currently on.
 
 ### What only a human can finish
 
