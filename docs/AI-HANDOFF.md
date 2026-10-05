@@ -1,5 +1,25 @@
 # AI handoff — EstateMate
 
+## Hikvision visitor accounts are PIN-only `UserInfo` (2026-10-05)
+
+- The terminal person-editor screenshot is the Hikvision visitor provisioning
+  contract. `upsert_visitor` sends only `UserInfo`: issued employee ID, visitor
+  name, `belongGroup: "Company"`, `userType: "normal"`, finite UTC `Valid`,
+  `localUIRight: false`, and the pass PIN as `password`. PINs must be 4–8 digits.
+- No visitor `CardInfo`, fingerprint, face, door-right or right-plan request is
+  made. This removes the card-linking `badJsonContent / employeeNo` path and
+  leaves Card/Fingerprint as “Not added” in the terminal UI. Resident/dependant
+  person, card and fingerprint operations are unchanged.
+- The Worker includes the stored PIN in initial and reconciled visitor operations.
+  `revoke_visitor` deletes the `UserInfo` account, so the existing minute expiry
+  sweep automatically frees its person slot while preserving the pass record.
+- Node and Android simulations reject invalid PINs before network I/O, assert the
+  exact account fields and absence of `CardInfo`, and verify idempotent update and
+  person-account deletion. ZKTeco PUSH remains governed by its separate device
+  profile and is not an ISAPI implementation.
+- Final validation: 23 Vitest files / 241 tests, all Node bridge integrations and
+  the web build pass; the Android JVM protocol suite passes 117/117 checks.
+
 ## ZKTeco terminals can now be provisioned and can talk back (2026-10-04, bridge `0.4.0`)
 
 Requested as: **ship the new agent capability** — ZKTeco PUSH (ADMS) as a second
@@ -465,9 +485,9 @@ uploaded bundles in the repository root (`estatemate-isapi-fix.zip`,
   `bridge-apps/android/tools/ProtocolTest.java` now carry the fix-bundle implementation:
   `writeTerminalCard`/`writeCard` (Record, then Modify on `cardNoAlreadyExist`),
   `deleteTerminalCard`/`deleteCard` (`CardInfoDelCond` with lower-case `cardNo`; an
-  already-absent card counts as removed, an unsupported call does not), visitors as a JSON
-  `normalCard` under the issued employee number, ISAPI-namespaced XML used only when the JSON
-  URL itself is unsupported, success read from the `ResponseStatus` `statusCode`, and failure
+  already-absent card counts as removed, an unsupported call does not), ISAPI-namespaced XML
+  used only when the JSON URL itself is unsupported, success read from the `ResponseStatus`
+  `statusCode`, and failure
   reasons summarised from `statusString`/`subStatusCode`/`errorMsg`. The two implementations
   stay equivalent, as the project rules require.
 - **Nothing else in the bundles was newer.** The rest of `estatemate-bridge-android-fix.zip` is

@@ -973,7 +973,85 @@ async function deleteTerminalCard(device, cardNo) {
 }
 
 function alreadyGone(result) {
-  return /not ?exist|not ?found|cardNoNotExist/i.test(String(result.body || '')) && !/notSupport/i.test(String(result.body || ''));
+  return /not ?exist|not ?found|cardNoNotExist|employeeNoNotExist/i.test(String(result.body || '')) && !/notSupport/i.test(String(result.body || ''));
+}
+
+function xmlText(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
+}
+
+/**
+ * Build only the temporary terminal account shown in the device's person UI:
+ * employee ID, name, Company department, finite validity, non-administrator
+ * normal-user role, and PIN. Visitor provisioning intentionally sends no card,
+ * fingerprint, face, door-right, or right-plan record.
+ */
+function visitorPersonInfo(payload, employeeNo) {
+  const asUtc = (value, label) => {
+    const instant = new Date(String(value || ''));
+    if (!Number.isFinite(instant.getTime())) throw new Error(`visitor ${label} is not a valid date`);
+    return instant.toISOString().replace(/\.\d{3}Z$/, 'Z');
+  };
+  const beginTime = asUtc(payload.validFrom, 'validFrom');
+  const endTime = asUtc(payload.validUntil, 'validUntil');
+  if (Date.parse(endTime) <= Date.parse(beginTime)) throw new Error('visitor validUntil must be after validFrom');
+  const pin = String(payload.pin || '').trim();
+  if (!/^\d{4,8}$/.test(pin)) throw new Error('visitor PIN must contain 4 to 8 digits');
+  return {
+    employeeNo: String(employeeNo),
+    name: String(payload.visitorName || 'Visitor').trim().slice(0, 32) || 'Visitor',
+    belongGroup: 'Company',
+    userType: 'normal',
+    Valid: { enable: true, beginTime, endTime, timeType: 'UTC' },
+    localUIRight: false,
+    password: pin,
+  };
+}
+
+/**
+ * Add or update the finite visitor UserInfo account. Record is the documented
+ * add call; duplicate IDs continue through Modify, and SetUp covers firmware
+ * exposing only the combined add/edit operation. XML is used only when the JSON
+ * URL is unsupported, never to hide a content rejection.
+ */
+async function writeTerminalVisitorPerson(device, payload, employeeNo) {
+  const info = visitorPersonInfo(payload, employeeNo);
+  const body = JSON.stringify({ UserInfo: info });
+  const attempts = [];
+  let result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/UserInfo/Record?format=json', body, false);
+  attempts.push(result);
+  if (isapiOk(result)) return { ok: true, result, attempts };
+
+  if (!isapiUnsupported(result)) {
+    const modify = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/UserInfo/Modify?format=json', body, false);
+    attempts.push(modify);
+    if (isapiOk(modify)) return { ok: true, result: modify, attempts };
+  }
+
+  result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/UserInfo/SetUp?format=json', body, false);
+  attempts.push(result);
+  if (isapiOk(result)) return { ok: true, result, attempts };
+  if (!isapiUnsupported(result)) return { ok: false, result, attempts };
+  if (attempts.some((attempt) => !isapiUnsupported(attempt))) return { ok: false, result, attempts };
+
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<UserInfo ${ISAPI_XML_NS}>
+  <employeeNo>${info.employeeNo}</employeeNo>
+  <name>${xmlText(info.name)}</name>
+  <belongGroup>Company</belongGroup>
+  <userType>normal</userType>
+  <Valid><enable>true</enable><beginTime>${info.Valid.beginTime}</beginTime><endTime>${info.Valid.endTime}</endTime><timeType>UTC</timeType></Valid>
+  <localUIRight>false</localUIRight>
+  <password>${info.password}</password>
+</UserInfo>`;
+  result = await isapiRequest(device, 'POST', '/ISAPI/AccessControl/UserInfo/Record', xml, true);
+  attempts.push(result);
+  return { ok: isapiOk(result), result, attempts };
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,21 +1398,21 @@ async function applyCardOperation(device, operation) {
       log('warn', `Card delete failed on ${device.name}: ${removed.result.status} ${String(removed.result.body).slice(0, 500)}`);
       return { success: false, error: describeAttempts(removed.attempts) };
     } else if (op === 'revoke_visitor') {
-      const visitorCard = payload.credentialNumber || cardUid;
-      if (!visitorCard) return { success: false, error: 'Missing credential number' };
-      const removed = await deleteTerminalCard(device, visitorCard);
-      if (removed.ok) return { success: true };
-      return { success: false, error: `Visitor revoke ${describeAttempts(removed.attempts)}` };
-    } else if (op === 'upsert_visitor') {
-      // A visitor credential is filed as a normal card under the visitor's issued
-      // employee number. "tempCard" is not a valid cardType value on these terminals.
-      const visitorCard = payload.credentialNumber || cardUid;
-      if (!visitorCard) return { success: false, error: 'Missing credential number' };
-      const visitorEmployeeNo = employeeNo || (TERMINAL_EMPLOYEE_NO.test(`visitor-${payload.credentialNumber}`) ? `visitor-${payload.credentialNumber}` : null);
+      const credential = payload.credentialNumber || cardUid;
+      const visitorEmployeeNo = employeeNo || (credential && TERMINAL_EMPLOYEE_NO.test(`visitor-${credential}`) ? `visitor-${credential}` : null);
       if (!visitorEmployeeNo) return { success: false, error: 'operation has no valid visitor employee number' };
-      const written = await writeTerminalCard(device, visitorEmployeeNo, visitorCard);
-      if (written.ok) return { success: true };
-      return { success: false, error: `Visitor ${describeAttempts(written.attempts)}` };
+      const removed = await deleteTerminalPerson(device, { employeeNo: visitorEmployeeNo, fullRemoval: true });
+      if (removed.ok) return { success: true };
+      return { success: false, error: `Visitor account revoke ${describeAttempts(removed.attempts)}` };
+    } else if (op === 'upsert_visitor') {
+      // A visitor is a PIN-only, finite UserInfo account. Do not create CardInfo,
+      // fingerprint, or face records: those fields remain "Not added" on device.
+      const credential = payload.credentialNumber || cardUid;
+      const visitorEmployeeNo = employeeNo || (credential && TERMINAL_EMPLOYEE_NO.test(`visitor-${credential}`) ? `visitor-${credential}` : null);
+      if (!visitorEmployeeNo) return { success: false, error: 'operation has no valid visitor employee number' };
+      const person = await writeTerminalVisitorPerson(device, payload, visitorEmployeeNo);
+      if (person.ok) return { success: true };
+      return { success: false, error: `Visitor account ${describeAttempts(person.attempts)}` };
     }
 
     else if (op === 'upsert_person') {
