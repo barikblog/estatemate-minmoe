@@ -201,6 +201,19 @@ public final class BridgeService extends Service {
             }, "bridge-flusher");
             flusher.start();
 
+            if (config.remoteVerifyEnabled) {
+                // Synced before the streams open: a cold cache denies, which is the
+                // right failure mode but a useless one if it is only because we
+                // started in the wrong order.
+                syncRemoteVerification();
+                snapshotter = new Thread(new Runnable() {
+                    public void run() {
+                        remoteVerifyLoop();
+                    }
+                }, "bridge-remote-verify");
+                snapshotter.start();
+            }
+
             for (Device device : config.devices()) {
                 if (!device.enabled || !config.eventStreamEnabled || !device.eventStream) {
                     BridgeLog.append("info", "event stream disabled for " + device.name);
@@ -231,6 +244,7 @@ public final class BridgeService extends Service {
         deviceThreads.clear();
         if (supervisor != null) supervisor.interrupt();
         if (flusher != null) flusher.interrupt();
+        if (snapshotter != null) snapshotter.interrupt();
         releaseWakeLock();
         if (wasRunning) BridgeLog.append("info", "bridge stopped");
         try {
@@ -336,10 +350,140 @@ public final class BridgeService extends Service {
         }
     }
 
+    // ------------------------------------------- remote network verification --
+    //
+    // The terminal reads, this bridge decides, then answers with the door command.
+    // The credential set is held on the phone on purpose: a decision that needs a
+    // round trip to the internet is a decision that fails closed whenever the
+    // estate's uplink does, which at a gate means a crowd.
+
+    /** The estate's authorised credentials, as of the last successful sync. */
+    private final RemoteVerify.Cache credentials = new RemoteVerify.Cache();
+    /** Stops a card resting on a reader from firing command after command. */
+    private final RemoteVerify.Cooldown remoteCooldown = new RemoteVerify.Cooldown(5000);
+    /** What the portal allows, per terminal. Empty until the first sync. */
+    private final Map<String, RemoteVerify.Settings> remoteSettings = new LinkedHashMap<String, RemoteVerify.Settings>();
+    /** Per-terminal outcomes, reported on the heartbeat for the portal's widget. */
+    private final Map<String, Map<String, Object>> remoteState = new LinkedHashMap<String, Map<String, Object>>();
+    private Thread snapshotter;
+
+    /** Refreshes the terminal settings and then the credential snapshot. */
+    private void syncRemoteVerification() {
+        if (!config.remoteVerifyEnabled || worker == null) return;
+        WorkerClient.Reply linked = worker.listDevices();
+        if (linked.ok()) {
+            remoteSettings.clear();
+            for (Object item : Json.asArray(linked.json().get("items"))) {
+                Map<String, Object> row = Json.asObject(item);
+                String id = Json.string(row, "device_id", "");
+                if (!id.isEmpty()) remoteSettings.put(id, RemoteVerify.Settings.from(row));
+            }
+        }
+        boolean ok = credentials.sync(new RemoteVerify.PageSource() {
+            public RemoteVerify.Page fetch(String cursor, String since) throws Exception {
+                WorkerClient.Reply reply = worker.credentialSnapshot(since, cursor, config.snapshotPageSize);
+                if (!reply.ok()) throw new IllegalStateException(reply.message());
+                return RemoteVerify.pageFrom(reply.json());
+            }
+        }, 500);
+        if (ok) {
+            BridgeLog.append("info", "remote verification: " + credentials.size() + " credential(s) cached");
+        } else {
+            // The previous snapshot stays in force: a stale list still opens the
+            // right doors, an empty one opens none.
+            BridgeLog.append("warn", "remote verification: snapshot sync failed — the previous snapshot stays in force");
+        }
+    }
+
+    private void remoteVerifyLoop() {
+        while (running) {
+            try {
+                syncRemoteVerification();
+            } catch (Exception error) {
+                BridgeLog.append("warn", "remote verification: " + (error.getMessage() == null ? error.toString() : error.getMessage()));
+            }
+            sleep(config.snapshotIntervalSeconds * 1000L);
+        }
+    }
+
+    /**
+     * Decides one event and, when it is granted, opens the door.
+     *
+     * Returns the verdict the event should carry upstream, or null when this
+     * terminal is not being served as a reader.
+     */
+    private Map<String, Object> handleRemoteVerification(Device device, String document) {
+        if (device == null || !config.remoteVerifyEnabled) return null;
+        RemoteVerify.Settings settings = remoteSettings.get(device.estateMateDeviceId);
+        if (settings == null || !settings.enabled) return null;
+        RemoteVerify.Event event = RemoteVerify.parseEvent(document, null);
+        if (event == null || !event.hasCredential()) return null;
+
+        long startedAt = System.currentTimeMillis();
+        RemoteVerify.Decision decision = RemoteVerify.decide(credentials, event.cardNo, event.employeeNo,
+                device.estateMateDeviceId, startedAt);
+
+        Map<String, Object> verdict = new LinkedHashMap<String, Object>();
+        verdict.put("decision", decision.granted ? "granted" : "denied");
+        verdict.put("reason", decision.reason);
+        verdict.put("latencyMs", Long.valueOf(System.currentTimeMillis() - startedAt));
+        verdict.put("doorResult", "not_attempted");
+
+        if (!decision.granted) {
+            BridgeLog.append("info", "Access Denied - Remote Database Lookup Failed at " + device.name + ": "
+                    + decision.reason + " (" + (event.cardNo != null ? "card " + event.cardNo : "employee " + event.employeeNo) + ")");
+        } else if (!remoteCooldown.allow(RemoteVerify.cooldownKey(device.estateMateDeviceId, decision),
+                settings.cooldownMs, startedAt)) {
+            verdict.put("cooldownSuppressed", Boolean.TRUE);
+        } else {
+            int doorNo = event.doorNo > 0 ? event.doorNo : settings.doorNo;
+            verdict.put("doorNo", Integer.valueOf(doorNo));
+            IsapiClient.OpResult opened = isapi.openDoor(device, doorNo);
+            if (opened.success) {
+                verdict.put("doorResult", "opened");
+                BridgeLog.append("info", "remote verification: opened door " + doorNo + " at " + device.name);
+            } else {
+                verdict.put("doorResult", "refused");
+                // The terminal's own words: whether this model honours the command
+                // at all is exactly what a refusal settles.
+                BridgeLog.append("warn", "remote verification: " + device.name + " refused the door command: " + opened.error);
+            }
+        }
+
+        Map<String, Object> state = new LinkedHashMap<String, Object>();
+        state.put("enabled", Boolean.TRUE);
+        state.put("lastDecision", decision.granted ? "granted" : "denied");
+        state.put("lastReason", decision.reason);
+        state.put("lastResult", verdict.get("doorResult"));
+        state.put("lastLatencyMs", verdict.get("latencyMs"));
+        remoteState.put(device.estateMateDeviceId, state);
+        return verdict;
+    }
+
+    /** The block the portal's status widget reads. */
+    private Map<String, Object> remoteVerifyHeartbeat() {
+        Map<String, Object> perDevice = new LinkedHashMap<String, Object>();
+        for (Map.Entry<String, Map<String, Object>> entry : remoteState.entrySet()) {
+            perDevice.put(entry.getKey(), entry.getValue());
+        }
+        Map<String, Object> out = new LinkedHashMap<String, Object>();
+        out.put("enabled", Boolean.TRUE);
+        int enabled = 0;
+        for (RemoteVerify.Settings settings : remoteSettings.values()) if (settings.enabled) enabled += 1;
+        out.put("devicesEnabled", Integer.valueOf(enabled));
+        out.put("cache", credentials.stats(System.currentTimeMillis()));
+        out.put("perDevice", perDevice);
+        // An inbound LAN listener is impossible on a phone, so an Android bridge
+        // serves only terminals it can reach with an outbound alertStream.
+        out.put("listener", "unsupported-on-android");
+        return out;
+    }
+
     private void sendHeartbeat() {
         Map<String, Object> stats = BridgeRuntime.stats();
         stats.put("eventStream", Boolean.valueOf(config.eventStreamEnabled));
-        WorkerClient.Reply reply = worker.heartbeat(VERSION, android.os.Build.MODEL + " (" + android.os.Build.VERSION.RELEASE + ")", "android", stats, BridgeRuntime.streamStates(), capabilities());
+        Map<String, Object> remoteVerify = config.remoteVerifyEnabled ? remoteVerifyHeartbeat() : null;
+        WorkerClient.Reply reply = worker.heartbeat(VERSION, android.os.Build.MODEL + " (" + android.os.Build.VERSION.RELEASE + ")", "android", stats, BridgeRuntime.streamStates(), capabilities(), remoteVerify);
         if (reply.ok()) {
             BridgeRuntime.setWorkerOnline(true);
             BridgeRuntime.setWorkerStatus("online");
@@ -479,7 +623,9 @@ public final class BridgeService extends Service {
                                 // event; forwarding it would file a bogus
                                 // "videoloss" entry against the terminal.
                                 if (AlertStreamReader.isHeartbeatDocument(document)) return;
-                                BridgeRuntime.queue(device.estateMateDeviceId, document);
+                                Map<String, Object> verdict = handleRemoteVerification(device, document);
+                                if (verdict == null) BridgeRuntime.queue(device.estateMateDeviceId, document);
+                                else BridgeRuntime.queueWithVerdict(device.estateMateDeviceId, document, verdict);
                             }
                         });
                         if (stream.input != null) {

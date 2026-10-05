@@ -18,5 +18,21 @@
     "ackTimeoutSeconds": 180,
     "requireAgentKey": false,
     "agentKey": ""
+  },
+  "remoteVerify": {
+    "enabled": false,
+    "snapshotIntervalSeconds": 60,
+    "pageSize": 2000,
+    "cardNumberFormats": [
+      "exact",
+      "padded10"
+    ]
+  },
+  "lanEvents": {
+    "enabled": false,
+    "port": 8080,
+    "bindAddress": "127.0.0.1",
+    "requireTerminalKey": false,
+    "terminalKey": ""
   }
 }

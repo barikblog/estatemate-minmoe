@@ -589,6 +589,71 @@ Requested as: "publish the wizard in a GitHub release" / "create a new exe bridg
 - Rebuilt and published [EstateMate Bridge 0.2.4](https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.2.4) from `d28d03b`; tag build `36362897668` passed Node/Windows/Android bridge validation and published the Windows executable, Windows bundle and Android bridge APK with checksums.
 - Operational caveat: the release's Windows bundle is unsigned; no persistent Android release keystore was configured, so the bridge APK is debug-signed with a throwaway key and cannot update an existing differently signed install in place. Reinstalling the Android app clears its private config; obtain a fresh portal installer/secret and re-enter the terminal config if reinstall is needed. The sandbox published artifacts but did not install them on the estate's physical LAN host or test against a real terminal.
 
+## Remote Network Verification: the terminal reads, the bridge decides (2026-10-05)
+
+Requested as: support more people than a Hikvision terminal can store by turning
+it into a reader — it streams the credential it saw, EstateMate Bridge verifies
+against the estate database and sends a remote unlock.
+
+The terminal-capacity problem is real (a few thousand users, 20,000+ people), and
+the reader pattern is the right answer. Two parts of the request were **not**
+implemented as specified, and both are recorded here rather than quietly changed:
+
+- **The event does not arrive on an inbound port by default.** The agent already
+  holds an outbound `alertStream` per terminal, which delivers the same events
+  with no open port, no firewall rule, and it works on the Android bridge. That
+  is the default path. A **LAN event listener** (`isapi-bridge/lan-event-listener.mjs`)
+  was added for terminals that can only push, because the request asked for it:
+  off unless configured, bound to loopback by default, ingest-only, and it prints
+  the `netsh` firewall rule an operator needs, since the installer creates none.
+  The Android bridge cannot host one — a phone on estate Wi-Fi is not a stable
+  address for a terminal to call — which is a recorded deviation from the
+  Node/Android equivalence rule, like the ZKTeco PUSH transport.
+- **The decision is not a live database query.** The estate's users live in D1,
+  behind the public internet. A lookup per swipe would make a physical door depend
+  on the estate's uplink and on a round trip nobody can promise inside a few
+  hundred milliseconds — and it would fail *closed*, which at a gate means a
+  crowd. The bridge caches the credential set
+  (`GET /api/isapi/v1/agents/:id/credential-snapshot`, full then delta with
+  removals) and decides locally in microseconds. A dead link now degrades to "the
+  snapshot is as fresh as it was" instead of "nobody gets in".
+
+What shipped:
+
+- **Migration `0020_remote_network_verification.sql`** — per-terminal
+  `remote_verify_enabled` / `remote_verify_door_no` / `remote_verify_cooldown_ms`
+  / `remote_verify_state`, plus `remote_decision`,
+  `remote_decision_reason` and `remote_door_result` on `access_events` with an
+  index. Every column defaults to today's behaviour: no estate's gates change
+  because this migration ran.
+- **`isapi-bridge/remote-verify.mjs`** — the snapshot cache, the card-number
+  candidate handling (raw, zero-padded, byte-reversed), the decision and its
+  reasons, and the cooldown that stops a card resting on a reader from holding a
+  door open.
+- **Agent wiring** — one ingest point (`queueEvent`) serves both event paths; the
+  decision is a Map lookup and only the door command is allowed to be slow, which
+  is why the event's verdict is written before the command is even sent and the
+  upload waits for the result rather than the door.
+- **Worker** — the snapshot endpoint, the verdict travelling with the event, the
+  per-terminal state the bridge reports on its heartbeat, and an
+  Administrator-only `PATCH /api/access/devices/:id/remote-verify` (a Manager must
+  not be able to change what a door does).
+- **Portal** — a per-terminal panel with the toggle and a status widget showing
+  cache age, credential count and the last outcome.
+- **Android** — `RemoteVerify.java`, a direct port of the Node rules (same
+  protocol, same card handling, same reason strings) so a phone and a PC give the
+  same answer at the same gate.
+
+**Verification status: CI-verified, hardware-unverified.** 33 agent integration
+checks (fake Worker + fake terminal) and 8 Worker tests pass, covering paging,
+delta removal, cold-cache denial, one unlock per card with the documented
+payload, cooldown suppression, refusal reporting, and the listener's ingest-only
+behaviour. **No physical terminal has been driven by this code.** The unlock
+command remains best-effort: no device profile records a verified
+`RemoteControl/door` response, so a refusal is reported, not assumed. Prove one
+model at one gate — see `docs/REMOTE-NETWORK-VERIFICATION.md` — before relying on
+it, and record the result here and in that model's device profile.
+
 ## Employee ID (32-char rule), bulk people toolkit, visitor device-account lifecycle, and the six estate modules (2026-09-27)
 
 Requested as: cap the Employee ID at 32 characters; add bulk person

@@ -1784,6 +1784,83 @@ function AccessEvents({ user }: { user: User }) {
   </PagePanel>;
 }
 
+/**
+ * Remote Network Verification, per terminal.
+ *
+ * The toggle is Administrator-only because it changes what happens when a person
+ * stands at the gate; everyone else sees the status only. The status is whatever
+ * the bridge itself reported on its last heartbeat - how many credentials it is
+ * holding, how stale they are, and whether the door answered the last command -
+ * because none of that is knowable from the database.
+ */
+function RemoteVerification({ rows, canEdit, reload }: { rows: Row[]; canEdit: boolean; reload: () => void }) {
+  const [notice, setNotice] = useState('');
+  const [tone, setTone] = useState<'info' | 'error'>('info');
+  const [saving, setSaving] = useState('');
+  async function save(id: string, body: { enabled?: boolean; doorNo?: number; cooldownMs?: number }) {
+    setNotice(''); setSaving(String(id));
+    try {
+      const result = await api<{ warnings?: string[] }>(`/api/access/devices/${id}/remote-verify`, { method: 'PATCH', body: JSON.stringify(body) });
+      // The API answers with what enabling this actually commits an estate to.
+      // Showing it here is the difference between an informed switch-on and a
+      // support call next week about a door that did not open.
+      setTone('info');
+      setNotice((result.warnings ?? []).join(' '));
+      reload();
+    } catch (reason) {
+      setTone('error');
+      setNotice(reason instanceof Error ? reason.message : 'Could not save the remote verification setting');
+    } finally { setSaving(''); }
+  }
+  return <section className="form-card">
+    <h3>Remote Network Verification</h3>
+    <p className="presence-hint">Turn a terminal into a reader: it reports the credential it saw and <strong>EstateMate Bridge</strong> decides against its local copy of the estate, then answers with the door command. For estates with more people than the terminal can store.</p>
+    {notice && <Notice tone={tone}>{notice}</Notice>}
+    <table className="data-table compact">
+      <thead><tr><th>Terminal</th><th>Mode</th><th>Door</th><th>Cooldown (ms)</th><th>Bridge status</th></tr></thead>
+      <tbody>
+        {rows.map((row) => {
+          const id = String(row.id ?? '');
+          const enabled = Number(row.remote_verify_enabled ?? 0) === 1;
+          const state = (() => { try { return JSON.parse(String(row.remote_verify_state ?? '')) as Row; } catch { return null; } })();
+          const cache = (state?.cache ?? {}) as Row;
+          const age = typeof cache.cacheAgeSeconds === 'number' ? Number(cache.cacheAgeSeconds) : null;
+          let status = 'No bridge has reported yet';
+          let statusTone = 'muted';
+          if (enabled && state) {
+            if (state.lastResult === 'refused') { status = 'Door refused the last command — check Gate activity'; statusTone = 'error'; }
+            else if (cache.lastSyncError) { status = `Snapshot not refreshing: ${String(cache.lastSyncError)}`; statusTone = 'error'; }
+            else if (age !== null && age > 900) { status = `Snapshot ${Math.round(age / 60)} min old`; statusTone = 'warn'; }
+            else {
+              const count = typeof cache.credentialCount === 'number' ? Number(cache.credentialCount) : null;
+              status = `${count ?? 'no'} credential(s), synced ${age === null ? 'recently' : `${age}s ago`}`;
+              statusTone = 'ok';
+            }
+          } else if (enabled) {
+            status = 'On, waiting for the bridge to report';
+          }
+          return <tr key={id}>
+            <td>{String(row.name ?? '')}<br /><small>{String(row.gate_name ?? '')}</small></td>
+            <td>
+              <label className="switch">
+                <input type="checkbox" checked={enabled} disabled={!canEdit || saving === id}
+                  onChange={(event) => { void save(id, { enabled: event.currentTarget.checked }); }} />
+                <span>{enabled ? 'Reader — bridge decides' : 'Terminal decides'}</span>
+              </label>
+            </td>
+            <td><input className="narrow" type="number" min={1} max={8} defaultValue={Number(row.remote_verify_door_no ?? 1)} disabled={!canEdit || !enabled || saving === id}
+              onBlur={(event) => { const value = Number(event.currentTarget.value); if (value !== Number(row.remote_verify_door_no ?? 1)) void save(id, { doorNo: value }); }} /></td>
+            <td><input className="narrow" type="number" min={0} max={60000} step={100} defaultValue={Number(row.remote_verify_cooldown_ms ?? 1500)} disabled={!canEdit || !enabled || saving === id}
+              onBlur={(event) => { const value = Number(event.currentTarget.value); if (value !== Number(row.remote_verify_cooldown_ms ?? 1500)) void save(id, { cooldownMs: value }); }} /></td>
+            <td><span className={`chip ${statusTone}`}>{status}</span>{state?.lastDecision ? <small><br />Last: {String(state.lastDecision)}{state.lastReason ? ` (${String(state.lastReason)})` : ''}</small> : null}</td>
+          </tr>;
+        })}
+      </tbody>
+    </table>
+    {!canEdit && <p className="presence-hint">Only an Administrator can switch a terminal into reader mode.</p>}
+  </section>;
+}
+
 function Devices({ user }: { user: User }) {
   const operator=user.role==='admin'||user.role==='manager';
   const list = useList('/api/access/devices');
@@ -1821,6 +1898,7 @@ function Devices({ user }: { user: User }) {
       <label>Connection pattern<select name="connectionPattern"><option value="">Use profile recommendation (recommended)</option><option value="isapi_bridge">ISAPI bridge agent (cross-platform)</option><option value="windows_agent">Windows agent (ISAPI)</option><option value="isapi_windows_agent">ISAPI Windows agent (combined)</option><option value="manual_sync">Manual synchronization (no agent)</option></select></label>
       <button className="primary">Register</button>
     </FormCard>}
+    {Boolean(list.data?.items?.length) && <RemoteVerification rows={list.data?.items ?? []} canEdit={user.role === 'admin'} reload={list.reload} />}
     <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Device'],['id','EstateMate device ID','id'],['vendor','Vendor'],['model','Model'],['profile_key','Series profile'],['connection_pattern','Connection'],['isapi_agent_name','ISAPI agent'],['isapi_host','ISAPI host'],['last_isapi_sync_status','ISAPI sync'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['last_seen_at','Last seen','date'],['pending_operations','Manual pending'],['queued_operations','Queued ops']]} action={operator?(row)=><div className="row-actions"><button className="text" onClick={()=>edit(row)}>Edit</button><button className="text danger" onClick={()=>remove(row)}>Delete</button></div>:undefined} /></ListState>
   </PagePanel>;
 }

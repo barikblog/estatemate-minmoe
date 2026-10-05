@@ -25,6 +25,10 @@ public final class BridgeConfig {
     public final int eventFlushCount;
     public final int eventFlushSeconds;
     public final int eventBufferLimit;
+    /** Remote Network Verification is off unless this host opts in and the portal switches a terminal on. */
+    public final boolean remoteVerifyEnabled;
+    public final int snapshotIntervalSeconds;
+    public final int snapshotPageSize;
 
     private final ArrayList<Device> devices;
 
@@ -39,6 +43,9 @@ public final class BridgeConfig {
             int eventFlushCount,
             int eventFlushSeconds,
             int eventBufferLimit,
+            boolean remoteVerifyEnabled,
+            int snapshotIntervalSeconds,
+            int snapshotPageSize,
             List<Device> devices) {
         this.agentId = agentId;
         this.agentSecret = agentSecret;
@@ -50,6 +57,9 @@ public final class BridgeConfig {
         this.eventFlushCount = eventFlushCount;
         this.eventFlushSeconds = eventFlushSeconds;
         this.eventBufferLimit = eventBufferLimit;
+        this.remoteVerifyEnabled = remoteVerifyEnabled;
+        this.snapshotIntervalSeconds = snapshotIntervalSeconds;
+        this.snapshotPageSize = snapshotPageSize;
         this.devices = new ArrayList<Device>(devices);
     }
 
@@ -99,6 +109,9 @@ public final class BridgeConfig {
                 flushCount,
                 flushSeconds,
                 bufferLimit,
+                Json.bool(Json.asObject(config.get("remoteVerify")), "enabled", false),
+                Math.max(15, Json.integer(Json.asObject(config.get("remoteVerify")), "snapshotIntervalSeconds", 60)),
+                Math.min(5000, Math.max(100, Json.integer(Json.asObject(config.get("remoteVerify")), "pageSize", 2000))),
                 devices);
     }
 
@@ -196,7 +209,8 @@ public final class BridgeConfig {
             resolved.add(isUuid(id) ? device.withEstateMateDeviceId(id) : device);
         }
         return new BridgeConfig(agentId, agentSecret, workerUrl, syncIntervalSeconds, heartbeatIntervalSeconds,
-                isapiTimeoutMs, eventStreamEnabled, eventFlushCount, eventFlushSeconds, eventBufferLimit, resolved);
+                isapiTimeoutMs, eventStreamEnabled, eventFlushCount, eventFlushSeconds, eventBufferLimit,
+                remoteVerifyEnabled, snapshotIntervalSeconds, snapshotPageSize, resolved);
     }
 
     /** Terminals still without a usable id after the portal was consulted. */

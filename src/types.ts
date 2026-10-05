@@ -74,6 +74,13 @@ export interface NormalizedAccessEvent {
   deviceTimestamp: string;
   profileKey: string;
   rawSummary: string;
+  // Set only when the bridge decided this event itself, because the terminal was
+  // running as a reader. `remoteDoorResult` is the terminal's own answer to the
+  // unlock command - recorded rather than assumed, since no device profile in
+  // this repository proves the command is honoured.
+  remoteDecision?: 'granted' | 'denied' | null;
+  remoteDecisionReason?: string | null;
+  remoteDoorResult?: 'opened' | 'refused' | 'not_attempted' | null;
 }
 
 /**
