@@ -298,7 +298,9 @@ for the behaviour the agent depends on.
 - `PUT /ISAPI/AccessControl/CardInfo/Modify?format=json` — update a card the terminal already holds (a duplicate `Record` is an error, so re-enable/re-issue lands here)
 - `PUT /ISAPI/AccessControl/CardInfo/Delete?format=json` — delete a resident/dependant card; the body must be `{"CardInfoDelCond":{"CardNoList":[{"cardNo":"…"}]}}`. A bare `{"CardNoList":[{"CardNo":"…"}]}` is answered `Invalid Format / badJsonFormat`.
 - `GET /ISAPI/AccessControl/CardInfo/Record?format=json` — list cards
-- Some firmware implements only the XML form: the same URLs without `?format=json` and with the ISAPI namespace on the corresponding root element (`UserInfo`, `CardInfo`, or the delete condition). The agent tries XML **only** when the JSON URL is unsupported (404/405/501 or `notSupport`/`invalidURL`/`invalidOperation`), never after a content rejection.
+- `GET /ISAPI/System/time/Get?format=json` — read the terminal's system time (clock sync only; JSON-first with the XML URL fallback).
+- `PUT /ISAPI/System/time/Set?format=json` — set the terminal's system time to the bridge host's wall clock, body `{"time":{"date":"YYYY-MM-DD","time":"HH:MM:SS","timeType":"local"}}`.
+- Some firmware implements only the XML form: the same URLs without `?format=json` and with the ISAPI namespace on the corresponding root element (`UserInfo`, `CardInfo`, `time`, or the delete condition). The agent tries XML **only** when the JSON URL is unsupported (404/405/501 or `notSupport`/`invalidURL`/`invalidOperation`), never after a content rejection.
 - A 2xx is not proof of success: some firmware answers 200 with a `ResponseStatus` whose `statusCode` is not 1 (OK). Success is `statusCode == 1`.
 
 Test manually:
@@ -327,6 +329,49 @@ normal-user/non-administrator settings, enabled finite start/end validity, and t
 4-to-8-digit visitor PIN in `password`. No visitor `CardInfo`, fingerprint, face,
 door-right or right-plan field is sent. At expiry or manual revocation, the bridge
 deletes the `UserInfo` account so the person slot is available again.
+
+## Terminal clock sync (opt-in)
+
+A terminal enforces everything time-sensitive with its **own clock**: a visitor's
+finite pass window is checked against the terminal's hardware at the moment of the
+swipe, and gate events carry the terminal's timestamp. A terminal that drifts hours
+from the estate rejects a live visitor pass early, honours a dead one late, and
+files its gate history at the wrong moment — none of it visible from the portal,
+because nothing was asking the terminal what time it thought it was.
+
+With `"timeSync": { "enabled": true }` the bridge:
+
+1. reads each terminal's system time (`/ISAPI/System/time/Get`) at startup and
+   every `checkIntervalMinutes` (default 15, minimum 1);
+2. measures the offset against the **bridge host's clock** — the reference every
+   other decision on the estate LAN already trusts;
+3. when the offset exceeds `maxDriftMs` (default 30 000, minimum 5 000), sets the
+   terminal's clock back to the bridge's wall clock (`/ISAPI/System/time/Set`,
+   `timeType: "local"`), then re-reads to confirm and reports the confirmed drift;
+4. carries the per-terminal state on the heartbeat, where the Worker stores it on
+   the device row and the portal's **Access control devices → Terminal clocks**
+   shows the reported time, the drift, the last check and the last sync.
+
+Two operational assumptions, stated rather than hidden:
+
+- **The bridge host is the reference.** If the office PC's own time is wrong, set
+  the PC's time — this feature makes the terminals agree with the estate, it does
+  not make the estate right.
+- **The terminal's timezone must match the bridge host's.** The sync aligns wall
+  clocks. A terminal configured to a different zone shows up as a constant offset
+  in the portal and belongs re-zoned at the terminal, not "corrected" into a wrong
+  wall clock by the bridge.
+
+A failed read keeps the last good reading plus the error (a terminal that just
+went down must not erase the last known clock from the portal). Off by default:
+no `timeSync` key means no clock traffic at all, and a heartbeat without a clock
+entry leaves the stored value alone, so every existing estate behaves exactly as
+before.
+
+> **Android bridge:** the Android bridge does not run the clock check — it records
+> the deviation in `../bridge-apps/android/README.md` rather than porting a
+> background clock loop to the service. A terminal served only by an Android
+> bridge simply never reports a clock, which the portal shows as "no report yet".
 
 ## License
 

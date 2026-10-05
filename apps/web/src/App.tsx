@@ -1861,6 +1861,59 @@ function RemoteVerification({ rows, canEdit, reload }: { rows: Row[]; canEdit: b
   </section>;
 }
 
+/**
+ * Terminal clocks, per terminal.
+ *
+ * A terminal enforces everything time-sensitive with its own clock — a
+ * visitor's finite pass window is checked against the terminal's hardware,
+ * and gate events carry its timestamp. The bridge's time-sync check reports
+ * what each terminal thinks the time is and how far it is from the bridge
+ * host; when the offset passes the threshold the bridge sets the clock back.
+ * Display-only here: the switch lives in the bridge host's agent-config.json
+ * (`timeSync`), because the reference clock is the machine the bridge runs
+ * on, not anything the portal can set.
+ */
+function TerminalClock({ rows }: { rows: Row[] }) {
+  const parseClock = (row: Row): Row | null => {
+    try { const value = JSON.parse(String(row.device_clock ?? '')) as Row; return value && value.terminalTime ? value : null; } catch { return null; }
+  };
+  const formatDrift = (seconds: number): string => {
+    if (seconds < 60) return `${seconds}s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+  };
+  const withClock = rows.flatMap((row) => { const clock = parseClock(row); return clock ? [{ row, clock }] : []; });
+  if (!withClock.length) return null;
+  return <section className="form-card">
+    <h3>Terminal clocks</h3>
+    <p className="presence-hint">Each terminal enforces visitor pass windows and timestamps gate events with its <strong>own clock</strong>. The bridge reports what each terminal thinks the time is and how far it is from the bridge host; when the offset passes the threshold it sets the clock back. The switch is in the bridge host's <code>agent-config.json</code> (<code>timeSync</code>).</p>
+    <table className="data-table compact">
+      <thead><tr><th>Terminal</th><th>Terminal time</th><th>Drift</th><th>Last check</th><th>Last sync</th></tr></thead>
+      <tbody>
+        {withClock.map(({ row, clock }) => {
+          const id = String(row.id ?? '');
+          const drift = typeof clock.driftMs === 'number' ? Number(clock.driftMs) : 0;
+          const absDriftSeconds = Math.round(Math.abs(drift) / 1000);
+          let tone = 'ok';
+          if (clock.lastError) tone = 'error';
+          else if (absDriftSeconds > 300) tone = 'error';
+          else if (absDriftSeconds > 30) tone = 'warn';
+          const driftLabel = clock.lastError ? 'Unreachable'
+            : absDriftSeconds < 2 ? 'In sync'
+            : `${drift > 0 ? 'Ahead by' : 'Behind by'} ${formatDrift(absDriftSeconds)}`;
+          return <tr key={id}>
+            <td>{String(row.name ?? '')}<br /><small>{String(row.gate_name ?? '')}</small></td>
+            <td>{clock.terminalTime ? readableDate(clock.terminalTime) : '—'}</td>
+            <td><span className={`chip ${tone}`}>{driftLabel}</span>{clock.lastError ? <small><br />{String(clock.lastError)}</small> : null}</td>
+            <td>{clock.lastCheckedAt ? readableDate(clock.lastCheckedAt) : '—'}</td>
+            <td>{clock.lastSyncAt ? `${readableDate(clock.lastSyncAt)} (${Number(clock.syncs ?? 0)}×)` : 'Never'}</td>
+          </tr>;
+        })}
+      </tbody>
+    </table>
+  </section>;
+}
+
 function Devices({ user }: { user: User }) {
   const operator=user.role==='admin'||user.role==='manager';
   const list = useList('/api/access/devices');
@@ -1899,6 +1952,7 @@ function Devices({ user }: { user: User }) {
       <button className="primary">Register</button>
     </FormCard>}
     {Boolean(list.data?.items?.length) && <RemoteVerification rows={list.data?.items ?? []} canEdit={user.role === 'admin'} reload={list.reload} />}
+    {Boolean(list.data?.items?.length) && <TerminalClock rows={list.data?.items ?? []} />}
     <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Device'],['id','EstateMate device ID','id'],['vendor','Vendor'],['model','Model'],['profile_key','Series profile'],['connection_pattern','Connection'],['isapi_agent_name','ISAPI agent'],['isapi_host','ISAPI host'],['last_isapi_sync_status','ISAPI sync'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['last_seen_at','Last seen','date'],['pending_operations','Manual pending'],['queued_operations','Queued ops']]} action={operator?(row)=><div className="row-actions"><button className="text" onClick={()=>edit(row)}>Edit</button><button className="text danger" onClick={()=>remove(row)}>Delete</button></div>:undefined} /></ListState>
   </PagePanel>;
 }

@@ -109,6 +109,23 @@ const cardNumberFormats = Array.isArray(config.remoteVerify?.cardNumberFormats) 
   ? config.remoteVerify.cardNumberFormats
   : ['exact', 'padded10'];
 
+// Terminal clock sync.
+//
+// A terminal enforces everything with its own clock: a visitor pass is a
+// finite window the terminal checks against its hardware, and gate events
+// carry its timestamp. A terminal hours off the estate rejects a live pass
+// early, honours a dead one late, and none of it is visible from the database.
+// When this is on, the bridge reads each terminal's system time, measures the
+// offset against the bridge host's clock and sets the clock back when the
+// offset exceeds the threshold; the per-terminal state rides on the heartbeat.
+// Off by default, so an estate that does not opt in gets no extra ISAPI
+// traffic and exactly the bridge it had before. The bridge host's clock is the
+// reference — see the clock section below for the two assumptions that makes.
+const timeSyncConfigured = config.timeSync && typeof config.timeSync === 'object' ? config.timeSync : {};
+const timeSyncEnabled = timeSyncConfigured.enabled === true;
+const timeSyncMaxDriftMs = Math.max(5000, Number(timeSyncConfigured.maxDriftMs || 30000));
+const timeSyncCheckIntervalMs = Math.max(60 * 1000, Number(timeSyncConfigured.checkIntervalMinutes || 15) * 60 * 1000);
+
 // LAN event listener: the terminal pushes its events here instead of the bridge
 // pulling them from an alertStream. Off by default and bound to loopback, so a
 // default install opens no port at all. See lan-event-listener.mjs for why.
@@ -602,11 +619,28 @@ function setStreamState(deviceId, stream, lastError = null) {
 }
 
 function heartbeatDeviceStates() {
-  return [...streamStates.entries()].map(([deviceId, state]) => ({
-    deviceId,
-    stream: state.stream,
-    lastError: state.lastError,
-  }));
+  // Union, not intersection: a terminal whose event stream is switched off
+  // (or that is not streamed at all) still gets its clock reported, and the
+  // Worker treats stream presence and clock state as independent fields.
+  const ids = new Set([...streamStates.keys(), ...clockStates.keys()]);
+  return [...ids].map((deviceId) => {
+    const stream = streamStates.get(deviceId);
+    const clock = clockStates.get(deviceId);
+    return {
+      deviceId,
+      ...(stream ? { stream: stream.stream, lastError: stream.lastError } : {}),
+      ...(clock ? {
+        clock: {
+          terminalTime: clock.terminalTime,
+          driftMs: clock.driftMs,
+          lastCheckedAt: clock.lastCheckedAt,
+          lastSyncAt: clock.lastSyncAt,
+          syncs: clock.syncs,
+          lastError: clock.lastError,
+        },
+      } : {}),
+    };
+  });
 }
 
 function sleep(ms) {
@@ -956,6 +990,161 @@ function describeAttempts(attempts) {
 }
 
 const ISAPI_XML_NS = 'xmlns="http://www.isapi.org/ver20/XMLSchema" version="2.0"';
+
+// ---------------------------------------------------------------------------
+// Terminal clock sync
+//
+// The terminal decides every time-sensitive thing with its own clock. A
+// visitor's pass is a finite `UserInfo` window: the terminal compares the
+// swipe moment against `beginTime`/`endTime` on its own hardware. Gate events
+// carry the terminal's timestamp, and remote verification decides against the
+// bridge's clock. A terminal that drifts hours from the estate rejects a live
+// pass early, honours a dead one late, and files its history at the wrong
+// moment — none of it visible from the database, because nothing was ever
+// asking the terminal what time it thought it was.
+//
+// Two assumptions, stated because they are operational, not technical:
+//
+// * The **bridge host is the reference**. It sits on the estate LAN and is the
+//   clock every other decision on that LAN already trusts (event timestamps
+//   are checked against it, the remote-verify cache ages against it). If the
+//   office PC's time is wrong, set the PC's time — this feature makes the
+//   terminals agree with the estate, it does not make the estate right.
+// * The terminal's **timezone matches the bridge host's**. The sync aligns
+//   wall clocks. A terminal configured to a different zone shows up as a
+//   constant offset in the portal and belongs re-zoned at the terminal, not
+//   "corrected" into a wrong wall clock by the bridge.
+//
+// Off by default (see the config block at the top): no key means no clock
+// traffic at all, so every existing estate behaves exactly as before.
+// ---------------------------------------------------------------------------
+
+/** Latest per-terminal clock state, keyed by EstateMate device id. */
+const clockStates = new Map();
+
+/**
+ * Parse a system-time answer into epoch milliseconds, or null.
+ *
+ * The terminal reports a wall-clock date and time (in its own zone). It is
+ * read in the bridge host's zone: that is what makes "the gate shows the same
+ * wall clock as the office PC" the invariant, and it is the reading under
+ * which drift means what the portal says it means (see the section above).
+ */
+function parseTerminalClockTime(body, isXml) {
+  let date;
+  let time;
+  if (isXml) {
+    date = /<date>([^<]*)<\/date>/.exec(String(body || ''))?.[1];
+    time = /<time>(\d{2}:\d{2}:\d{2})<\/time>/.exec(String(body || ''))?.[1];
+  } else {
+    let parsed;
+    try { parsed = JSON.parse(String(body || '')); } catch { return null; }
+    date = parsed?.time?.date;
+    time = parsed?.time?.time;
+  }
+  const match = /^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/.exec(`${String(date || '').trim()} ${String(time || '').trim()}`);
+  if (!match) return null;
+  const ms = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5]), Number(match[6])).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/** Reads the terminal's system time. JSON first; XML only when the JSON URL is not supported. */
+async function readTerminalClock(device) {
+  const attempts = [];
+  let result = await isapiRequest(device, 'GET', '/ISAPI/System/time/Get?format=json', null, false);
+  attempts.push(result);
+  const jsonTime = parseTerminalClockTime(result.body, false);
+  if (isapiOk(result) && jsonTime !== null) return { timeMs: jsonTime };
+  if (!isapiUnsupported(result)) return { error: describeIsapiFailure(result) };
+  result = await isapiRequest(device, 'GET', '/ISAPI/System/time/Get', null, true);
+  attempts.push(result);
+  const xmlTime = parseTerminalClockTime(result.body, true);
+  if (isapiOk(result) && xmlTime !== null) return { timeMs: xmlTime };
+  return { error: describeAttempts(attempts) };
+}
+
+/**
+ * Writes the bridge host's wall clock to the terminal. JSON first; XML only
+ * when the firmware does not support the JSON URL. The body is the wall clock
+ * with `timeType: local`, matching how the terminal reports its own time.
+ */
+async function setTerminalClock(device, timeMs = Date.now()) {
+  const d = new Date(timeMs);
+  const pad = (value) => String(value).padStart(2, '0');
+  const date = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const time = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  const jsonBody = JSON.stringify({ time: { date, time, timeType: 'local' } });
+  const xmlBody = `<?xml version="1.0" encoding="UTF-8"?>\n<time ${ISAPI_XML_NS}><date>${date}</date><time>${time}</time><timeType>local</timeType></time>`;
+  const attempts = [];
+  let result = await isapiRequest(device, 'PUT', '/ISAPI/System/time/Set?format=json', jsonBody, false);
+  attempts.push(result);
+  if (isapiOk(result)) return { ok: true, result, attempts };
+  if (!isapiUnsupported(result)) return { ok: false, result, attempts };
+  result = await isapiRequest(device, 'PUT', '/ISAPI/System/time/Set', xmlBody, true);
+  attempts.push(result);
+  return { ok: isapiOk(result), result, attempts };
+}
+
+/**
+ * One terminal's clock, end to end: read, measure the offset against the
+ * bridge host, and — when the offset exceeds the threshold — set it back to
+ * the bridge's time and re-read to confirm. A failed read keeps the last good
+ * reading plus the error: a terminal that just went down must not erase the
+ * last known clock from the portal, and the error is what the operator acts
+ * on.
+ */
+async function checkTerminalClock(device) {
+  const previous = clockStates.get(device.estateMateDeviceId);
+  const state = {
+    terminalTime: previous?.terminalTime ?? null,
+    driftMs: previous?.driftMs ?? 0,
+    lastCheckedAt: new Date().toISOString(),
+    lastSyncAt: previous?.lastSyncAt ?? null,
+    syncs: previous?.syncs ?? 0,
+    lastError: null,
+  };
+  const finish = () => {
+    clockStates.set(device.estateMateDeviceId, state);
+    return state;
+  };
+  const read = await readTerminalClock(device).catch((err) => ({ error: err.message }));
+  if (read.error || read.timeMs === undefined) {
+    state.lastError = String(read.error ?? 'unreadable terminal clock').slice(0, 300);
+    return finish();
+  }
+  const driftMs = Math.round(read.timeMs - Date.now());
+  state.terminalTime = new Date(read.timeMs).toISOString();
+  state.driftMs = driftMs;
+  if (Math.abs(driftMs) <= timeSyncMaxDriftMs) return finish();
+
+  const write = await setTerminalClock(device).catch((err) => ({ ok: false, attempts: [], error: err.message }));
+  if (!write.ok) {
+    state.lastError = (write.error ? String(write.error) : describeAttempts(write.attempts || [])).slice(0, 300);
+    log('warn', `Terminal clock for ${device.name} is off by ${Math.round(driftMs / 1000)}s and could not be set: ${state.lastError}`);
+    return finish();
+  }
+  // Confirm against the terminal, not against our own write: the Set answer
+  // is not proof the clock moved.
+  const confirm = await readTerminalClock(device).catch((err) => ({ error: err.message }));
+  if (!confirm.error && confirm.timeMs !== undefined) {
+    state.terminalTime = new Date(confirm.timeMs).toISOString();
+    state.driftMs = Math.round(confirm.timeMs - Date.now());
+  }
+  state.lastSyncAt = new Date().toISOString();
+  state.syncs += 1;
+  log('info', `Terminal clock for ${device.name} was off by ${Math.round(driftMs / 1000)}s; set to the bridge's time`);
+  return finish();
+}
+
+/** Checks every ISAPI terminal this agent serves. No-op while the feature is off. */
+async function checkAllTerminalClocks() {
+  if (!timeSyncEnabled) return;
+  for (const device of devices.values()) {
+    if (shutdownRequested) return;
+    if (device.transport !== 'isapi') continue;
+    await checkTerminalClock(device);
+  }
+}
 
 /**
  * Adds a card to the terminal, or updates it when the terminal already has that
@@ -1896,6 +2085,15 @@ async function main() {
     }
   }
 
+  // The first clock check runs before the first heartbeat, so the portal sees
+  // each terminal's time from the very first report — a terminal hours off is
+  // exactly the one an operator most needs to see early.
+  if (timeSyncEnabled) {
+    await checkAllTerminalClocks();
+    const isapiDevices = [...devices.values()].filter((device) => device.transport === 'isapi').length;
+    log('info', `Terminal clock sync: on, ${isapiDevices} terminal(s) checked every ${timeSyncCheckIntervalMs / 60000} min, set when off by more than ${timeSyncMaxDriftMs / 1000}s`);
+  }
+
   await heartbeat();
   await pollAndApply();
 
@@ -1907,6 +2105,12 @@ async function main() {
 
   setInterval(heartbeat, heartbeatInterval * 1000);
   setInterval(pollAndApply, syncInterval * 1000);
+  if (timeSyncEnabled) {
+    // A clock drifts slowly; the interval exists so a terminal that loses NTP
+    // or a battery-backed RTC catches up without anyone noticing the pass
+    // window first.
+    setInterval(checkAllTerminalClocks, timeSyncCheckIntervalMs);
+  }
 
   // The snapshot is refreshed together with the terminal settings, so a terminal
   // switched into reader mode in the portal starts being served without a restart.
@@ -2007,6 +2211,16 @@ export {
   buildDigestAuthHeader,
   basicAuthHeader,
   alertStreamPath,
+  // Terminal clock sync, exported so the integration checks can drive the real
+  // read/measure/set/confirm loop against a simulated terminal.
+  clockStates,
+  timeSyncEnabled,
+  timeSyncMaxDriftMs,
+  parseTerminalClockTime,
+  readTerminalClock,
+  setTerminalClock,
+  checkTerminalClock,
+  checkAllTerminalClocks,
 };
 const isEntrypoint = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
 if (!isEntrypoint && !process.env.ESTATEMATE_AGENT_STANDBY) {

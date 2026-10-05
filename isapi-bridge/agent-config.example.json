@@ -28,6 +28,11 @@
       "padded10"
     ]
   },
+  "timeSync": {
+    "enabled": false,
+    "maxDriftMs": 30000,
+    "checkIntervalMinutes": 15
+  },
   "lanEvents": {
     "enabled": false,
     "port": 8080,

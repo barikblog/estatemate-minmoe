@@ -122,6 +122,56 @@ Recorded from the terminals and from Hikvision's *Intelligent Security API (Gene
 
 A healthy agent host can still be holding a dead terminal, which is why per-terminal stream state travels with the heartbeat: the estate PC staying up never keeps an unreachable gate looking online.
 
+## Terminal clock sync (opt-in, migration 0021)
+
+A terminal enforces everything time-sensitive with its own clock. A visitor's pass
+is a finite `UserInfo` window: the terminal compares the swipe moment against
+`beginTime`/`endTime` on its own hardware. Gate events carry the terminal's
+timestamp, and Remote Network Verification decides against the bridge's clock.
+A terminal hours off the estate therefore rejects a live visitor pass early,
+honours a dead one late, and files its history at the wrong moment — none of it
+visible from the database, because nothing was ever asking the terminal what
+time it thought it was.
+
+`"timeSync": { "enabled": true }` in `agent-config.json` (off by default) makes
+the bridge, at startup and every `checkIntervalMinutes` (default 15):
+
+1. **Read** the terminal's system time (`GET /ISAPI/System/time/Get`, JSON-first
+   with the XML URL fallback like every other write).
+2. **Measure** the offset against the bridge host's clock. The host is the
+   reference on purpose: it sits on the estate LAN and is the clock every other
+   decision on that LAN already trusts. If the host's own time is wrong, fix the
+   host — this feature aligns the terminals with the estate, it does not make
+   the estate right.
+3. **Set** the clock back (`PUT /ISAPI/System/time/Set` with
+   `timeType: "local"`) only when the offset exceeds `maxDriftMs` (default
+   30 000 ms, minimum 5 000), then **re-read to confirm** — the Set answer is
+   not proof the clock moved — and report the confirmed drift.
+4. **Report** the per-terminal state (`terminalTime`, `driftMs`,
+   `lastCheckedAt`, `lastSyncAt`, `syncs`, `lastError`) on the heartbeat.
+
+The Worker stores the state on the device row (`hikvision_devices.device_clock`,
+migration 0021) with the same scoping as every other heartbeat write: a device
+that is not linked to the reporting agent is untouched, and a heartbeat without
+a clock entry leaves the stored value alone — a bridge built before this feature
+(or with it switched off) keeps the row exactly as it was. The portal's
+**Access control devices** page shows it in the **Terminal clocks** section: the
+time the terminal thinks it is, how far that is from the bridge, the last check
+and the last sync. It is a status surface, never read back as an input to a
+decision.
+
+Two assumptions are operational, not technical, and are enforced by convention:
+the bridge host's clock is correct, and each terminal's timezone matches the
+host's. The sync aligns wall clocks; a terminal in a different timezone shows up
+as a constant offset in the portal and belongs re-zoned at the terminal. A failed
+read keeps the last good reading plus the error, so a terminal that just went
+down never erases the last known clock from the portal.
+
+**Android deviation, recorded:** the Android bridge does not run the clock check
+(see `bridge-apps/android/README.md`). A terminal served only by an Android
+bridge never reports a clock, and the portal shows "no report yet" for it — the
+same recorded-deviation treatment the LAN event listener has.
+
 ## Reaching the estate from off-site
 
 The agent needs no inbound access, but administrators and installers sometimes do.
