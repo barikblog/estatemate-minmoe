@@ -13,7 +13,7 @@
     "build:web": "npm --workspace apps/web run build",
     "typecheck": "tsc --noEmit && npm --workspace apps/web run typecheck",
     "test": "vitest run && npm run test:isapi-bridge && npm run test:cloudflared-kit",
-    "test:isapi-bridge": "node --check isapi-bridge/agent.mjs && node --check isapi-bridge/zkteco-push.mjs && node --check isapi-bridge/zkteco-push-server.mjs && node isapi-bridge/agent.integration.mjs && node isapi-bridge/agent.resolution.integration.mjs && node isapi-bridge/agent.card-operations.integration.mjs && node isapi-bridge/agent.person-fingerprint.integration.mjs && node isapi-bridge/zkteco-push.integration.mjs && node isapi-bridge/agent.zkteco-push.integration.mjs",
+    "test:isapi-bridge": "node --check isapi-bridge/agent.mjs && node --check isapi-bridge/zkteco-push.mjs && node --check isapi-bridge/zkteco-push-server.mjs && node isapi-bridge/agent.integration.mjs && node isapi-bridge/agent.resolution.integration.mjs && node isapi-bridge/agent.card-operations.integration.mjs && node isapi-bridge/agent.person-fingerprint.integration.mjs && node isapi-bridge/zkteco-push.integration.mjs && node isapi-bridge/agent.zkteco-push.integration.mjs && node isapi-bridge/agent.remote-verify.integration.mjs",
     "test:cloudflared-kit": "node --check scripts/cloudflared-remote-access.mjs && node scripts/cloudflared-remote-access.integration.mjs",
     "tunnel:plan": "node scripts/cloudflared-remote-access.mjs",
     "db:migrate:local": "wrangler d1 migrations apply estatemate-db --local",

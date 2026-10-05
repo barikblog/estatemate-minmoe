@@ -4728,6 +4728,7 @@ app.get('/api/access/devices', requireRoles('admin','manager','security'), async
     `SELECT d.id,d.name,d.vendor,d.serial_number,d.model,d.firmware,d.mac_address,d.gate_name,d.direction,d.integration_mode,${deviceEffectiveStatus('d')} AS status,d.last_seen_at,d.profile_key,d.connection_pattern,d.profile_config_json,d.capabilities_json,
       d.isapi_agent_id,d.isapi_sync_enabled,d.last_isapi_sync_at,d.last_isapi_sync_status,d.isapi_host,d.isapi_port,d.isapi_username,
       CASE WHEN d.isapi_password_ciphertext IS NULL THEN 0 ELSE 1 END AS isapi_password_configured,d.isapi_protocol,
+      d.remote_verify_enabled,d.remote_verify_door_no,d.remote_verify_cooldown_ms,d.remote_verify_state,
       d.created_at,d.updated_at,d.status AS stored_status,
       ap.id AS access_point_id,ap.name AS access_point_name,
       (SELECT COUNT(*) FROM device_operations o WHERE o.device_id=d.id AND o.status='manual_action_required') AS pending_operations,
@@ -4801,6 +4802,51 @@ app.patch('/api/access/devices/:id', requireRoles('admin','manager'), async (c) 
   ]);
   await audit(c,'update','access_device',c.req.param('id'),{ ...body,profileKey:profile.key,connectionPattern });
   return c.json({ ok:true,profile:{ key:profile.key,label:profile.label } });
+});
+
+/**
+ * Remote Network Verification, per terminal.
+ *
+ * Administrator-only on purpose, and deliberately not part of the general device
+ * edit route: this switch changes what happens when a human stands at a gate.
+ * A Manager gets operational administration, not a new way to make a door open.
+ *
+ * Switching it on does not by itself do anything - the host running the bridge
+ * also has to opt in - and the response says so, because "I turned it on and
+ * nothing happened" is otherwise the first thing anyone will report.
+ */
+app.patch('/api/access/devices/:id/remote-verify', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<{ enabled?: unknown; doorNo?: unknown; cooldownMs?: unknown }>();
+  const existing = await c.env.DB.prepare(
+    `SELECT id,name,model,isapi_agent_id,remote_verify_enabled,remote_verify_door_no,remote_verify_cooldown_ms
+       FROM hikvision_devices WHERE id=? AND deleted_at IS NULL`,
+  ).bind(c.req.param('id')).first<{ id:string; name:string; model:string|null; isapi_agent_id:string|null; remote_verify_enabled:number; remote_verify_door_no:number; remote_verify_cooldown_ms:number }>();
+  if (!existing) return jsonError(c, 404, 'Access-control device not found');
+
+  const enabled = body.enabled === undefined ? Boolean(existing.remote_verify_enabled) : Boolean(body.enabled);
+  const rawDoorNo = body.doorNo === undefined ? Number(existing.remote_verify_door_no) : Number(body.doorNo);
+  const rawCooldown = body.cooldownMs === undefined ? Number(existing.remote_verify_cooldown_ms) : Number(body.cooldownMs);
+  if (!Number.isInteger(rawDoorNo) || rawDoorNo < 1 || rawDoorNo > 8) return jsonError(c, 400, 'doorNo must be an integer between 1 and 8');
+  if (!Number.isFinite(rawCooldown) || rawCooldown < 0 || rawCooldown > 60000) return jsonError(c, 400, 'cooldownMs must be between 0 and 60000');
+
+  await c.env.DB.prepare(
+    `UPDATE hikvision_devices SET remote_verify_enabled=?,remote_verify_door_no=?,remote_verify_cooldown_ms=?,updated_at=datetime('now') WHERE id=?`,
+  ).bind(enabled ? 1 : 0, rawDoorNo, Math.round(rawCooldown), existing.id).run();
+  await audit(c, 'update', 'access_device_remote_verify', existing.id, { enabled, doorNo: rawDoorNo, cooldownMs: Math.round(rawCooldown) });
+
+  const warnings: string[] = [];
+  if (enabled && !existing.isapi_agent_id) {
+    warnings.push('No agent is linked to this terminal yet, so nothing is serving it. Link one in "Device agent" and set "remoteVerify": {"enabled": true} in the bridge host\'s agent-config.json.');
+  }
+  if (enabled) {
+    warnings.push('The terminal must be configured as a reader (it reports the credential instead of deciding), and it must be set to upload unknown-card events, or a card it does not hold produces no event at all.');
+    warnings.push('The unlock command is best-effort: no device profile in this repository records a verified RemoteControl/door response, so a refusal is reported in Gate activity rather than assumed away. Prove this model at one gate before relying on it.');
+  }
+  return c.json({
+    ok: true,
+    remoteVerify: { enabled, doorNo: rawDoorNo, cooldownMs: Math.round(rawCooldown) },
+    warnings,
+  });
 });
 
 app.delete('/api/access/devices/:id', requireRoles('admin','manager'), async (c) => {
@@ -6468,7 +6514,7 @@ async function handleIsapiAgentHeartbeat(request: Request, env: Env, agentId: st
   if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'POST' } });
   const agent = await authenticateIsapiAgent(request, env, agentId);
   if (!agent) return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Bearer realm="EstateMate ISAPI agent"' } });
-  let body: { version?: string; hostname?: string; ip?: string; stats?: unknown; devices?: unknown; capabilities?: unknown } = {};
+  let body: { version?: string; hostname?: string; ip?: string; stats?: unknown; devices?: unknown; capabilities?: unknown; remoteVerify?: unknown } = {};
   try { body = await request.json(); } catch { body = {}; }
   const ip = request.headers.get('CF-Connecting-IP') || body.ip || null;
   // What this bridge can do, as it says so itself. Only capabilities we know are
@@ -6507,6 +6553,28 @@ async function handleIsapiAgentHeartbeat(request: Request, env: Env, agentId: st
       : 'Event stream down: the agent cannot hold the terminal connection open';
     if (await markTerminalStreamDown(env, agentId, deviceId, reason)) terminalsOffline += 1;
   }
+
+  // Remote verification: the bridge reports, per terminal, what it decided and
+  // whether the door answered, plus how fresh its credential snapshot is. None of
+  // that is derivable from the database, and all of it is what an operator needs
+  // before trusting a gate to this feature - so it is stored as reported and shown
+  // as-is, never read back as an input to a decision.
+  const remoteVerify = body.remoteVerify;
+  if (remoteVerify && typeof remoteVerify === 'object') {
+    const perDevice = (remoteVerify as { perDevice?: unknown }).perDevice;
+    if (perDevice && typeof perDevice === 'object') {
+      const cache = (remoteVerify as { cache?: unknown }).cache ?? null;
+      const statements = Object.entries(perDevice as Record<string, unknown>)
+        .slice(0, 100)
+        .filter(([deviceId]) => typeof deviceId === 'string' && deviceId.trim().length > 0)
+        .map(([deviceId, state]) => env.DB.prepare(
+          // Scoped to this agent's own terminals: one estate's bridge must not
+          // write status onto another's device row.
+          `UPDATE hikvision_devices SET remote_verify_state=? WHERE id=? AND isapi_agent_id=?`,
+        ).bind(JSON.stringify({ ...(state && typeof state === 'object' ? state : {}), cache }), deviceId, agentId));
+      if (statements.length) await env.DB.batch(statements);
+    }
+  }
   return Response.json(
     { ok: true, agentId, terminalsOffline, terminalsOnline, serverTime: new Date().toISOString() },
     { headers: { 'Cache-Control': 'no-store' } },
@@ -6519,12 +6587,138 @@ async function handleIsapiAgentDevices(request: Request, env: Env, agentId: stri
   if (!agent) return new Response('Unauthorized', { status: 401 });
   const result = await env.DB.prepare(
     `SELECT cfg.device_id,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol,cfg.sync_enabled,
-       d.name AS device_name,d.model,d.gate_name,d.connection_pattern,d.status AS device_status
+       d.name AS device_name,d.model,d.gate_name,d.connection_pattern,d.status AS device_status,
+       d.remote_verify_enabled,d.remote_verify_door_no,d.remote_verify_cooldown_ms
      FROM isapi_device_configs cfg JOIN hikvision_devices d ON d.id=cfg.device_id
      WHERE cfg.agent_id=? AND cfg.sync_enabled=1 AND d.deleted_at IS NULL AND d.status!='disabled'
      ORDER BY d.gate_name,d.name`,
   ).bind(agentId).all();
   return Response.json({ agentId, serverTime: new Date().toISOString(), items: result.results }, { headers: { 'Cache-Control': 'no-store' } });
+}
+
+// ---------------------------------------------------------------------------
+// Remote Network Verification: the credential snapshot
+//
+// A terminal running as a reader cannot hold the estate, so the bridge holds it
+// instead and decides on the LAN. This endpoint is how the bridge gets the set:
+// a full snapshot on first contact, then deltas keyed on `since`.
+//
+// Two properties the whole design depends on:
+//
+// * **It paces, it does not dump.** 20,000+ credentials is a few megabytes of
+//   JSON, which is too much for one Workers response and far too much to rebuild
+//   every minute, so pages are keyed by credential value and deltas carry only
+//   what moved.
+// * **Removals are part of the protocol.** A credential revoked between two
+//   syncs must leave the bridge's cache, or a card that was suspended an hour
+//   ago keeps opening the door until the next restart. Rows are kept for history
+//   (status flips rather than deletes), which is what makes that list possible.
+// ---------------------------------------------------------------------------
+const SNAPSHOT_DEFAULT_PAGE = 2000;
+const SNAPSHOT_MAX_PAGE = 5000;
+
+type SnapshotItem = {
+  kind: 'card' | 'employee';
+  value: string;
+  personId: string | null;
+  employeeNo: string | null;
+  status: 'active';
+  validUntil: string | null;
+  updatedAt: string | null;
+};
+
+async function handleIsapiAgentCredentialSnapshot(request: Request, env: Env, agentId: string): Promise<Response> {
+  if (request.method !== 'GET') return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET' } });
+  const agent = await authenticateIsapiAgent(request, env, agentId);
+  if (!agent) return new Response('Unauthorized', { status: 401 });
+
+  const url = new URL(request.url);
+  const requestedLimit = Number(url.searchParams.get('limit') ?? SNAPSHOT_DEFAULT_PAGE);
+  const limit = Math.min(SNAPSHOT_MAX_PAGE, Math.max(100, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : SNAPSHOT_DEFAULT_PAGE));
+  const cursor = (url.searchParams.get('cursor') ?? '').trim();
+  const since = (url.searchParams.get('since') ?? '').trim();
+  const full = !cursor && !since;
+  const cursorValue = cursor ? cursor.split('|')[0] ?? '' : '';
+  const cursorKind = cursor ? cursor.split('|')[1] ?? '' : '';
+  const serverTime = new Date().toISOString();
+
+  // A credential is only usable when the card is active *and* the person is: a
+  // deactivated account or a rejected dependant must not keep opening gates just
+  // because nobody remembered to suspend each card individually.
+  const cards = await env.DB.prepare(
+    `SELECT c.card_uid AS value,c.resident_id AS person_id,
+       COALESCE(hm.employee_id,u.employee_id) AS employee_no,
+       c.expires_at AS valid_until,c.updated_at
+     FROM access_cards c
+     JOIN users u ON u.id=c.resident_id
+     LEFT JOIN household_members hm ON hm.id=c.household_member_id
+     WHERE c.status='active' AND u.status='active' AND (hm.id IS NULL OR hm.status='active')
+       AND (?1 = '' OR c.updated_at > ?1)
+       AND (?2 = '' OR c.card_uid >= ?2)
+     ORDER BY c.card_uid LIMIT ?3`,
+  ).bind(since, cursorValue, limit + 1).all<{ value: string; person_id: string | null; employee_no: string | null; valid_until: string | null; updated_at: string | null }>();
+
+  // Employee numbers are the person's terminal identity. A fingerprint, a face
+  // or a PIN carries no card number at all - only this - so an estate whose
+  // gates are used by fingerprint is served entirely by this half.
+  const employees = await env.DB.prepare(
+    `SELECT value,person_id,employee_no,valid_until,updated_at FROM (
+       SELECT u.employee_id AS value,u.id AS person_id,u.employee_id AS employee_no,
+         NULL AS valid_until,u.updated_at
+       FROM users u
+       WHERE u.employee_id IS NOT NULL AND u.status='active'
+         AND (?1 = '' OR u.updated_at > ?1)
+         AND (?2 = '' OR u.employee_id >= ?2)
+       UNION ALL
+       SELECT hm.employee_id AS value,hm.primary_resident_id AS person_id,hm.employee_id AS employee_no,
+         NULL AS valid_until,hm.updated_at
+       FROM household_members hm
+       WHERE hm.employee_id IS NOT NULL AND hm.status='active'
+         AND (?1 = '' OR hm.updated_at > ?1)
+         AND (?2 = '' OR hm.employee_id >= ?2)
+     ) ORDER BY value LIMIT ?3`,
+  ).bind(since, cursorValue, limit + 1).all<{ value: string; person_id: string | null; employee_no: string | null; valid_until: string | null; updated_at: string | null }>();
+
+  const merged: SnapshotItem[] = [
+    ...cards.results.map((row) => ({ kind: 'card' as const, value: row.value, personId: row.person_id, employeeNo: row.employee_no, status: 'active' as const, validUntil: row.valid_until, updatedAt: row.updated_at })),
+    ...employees.results.map((row) => ({ kind: 'employee' as const, value: row.value, personId: row.person_id, employeeNo: row.employee_no, status: 'active' as const, validUntil: row.valid_until, updatedAt: row.updated_at })),
+  ]
+    // Anything already sent on a previous page is dropped by position in the
+    // ordering, so paging cannot repeat or skip a credential.
+    .filter((item) => !cursor || item.value > cursorValue || (item.value === cursorValue && item.kind > cursorKind))
+    .sort((a, b) => (a.value < b.value ? -1 : a.value > b.value ? 1 : a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0));
+
+  const page = merged.slice(0, limit);
+  const nextCursor = merged.length > limit ? `${page[page.length - 1]!.value}|${page[page.length - 1]!.kind}` : null;
+
+  // Removals only mean something against a cache that already exists, so a full
+  // snapshot - which replaces the set outright - never carries them.
+  let removed: Array<{ kind: string; value: string }> = [];
+  if (!full && since) {
+    const gone = await env.DB.prepare(
+      `SELECT 'card' AS kind,c.card_uid AS value
+         FROM access_cards c WHERE c.status<>'active' AND c.updated_at > ?
+       UNION ALL
+       SELECT 'employee',u.employee_id FROM users u
+        WHERE u.employee_id IS NOT NULL AND u.status<>'active' AND u.updated_at > ?
+       UNION ALL
+       SELECT 'employee',hm.employee_id FROM household_members hm
+        WHERE hm.employee_id IS NOT NULL AND hm.status<>'active' AND hm.updated_at > ?`,
+    ).bind(since, since, since).all<{ kind: string; value: string }>();
+    removed = gone.results.filter((row) => row.value);
+  }
+
+  const version = page.reduce<string | null>((latest, item) => (item.updatedAt && (!latest || item.updatedAt > latest) ? item.updatedAt : latest), null) ?? serverTime;
+
+  return Response.json({
+    agentId,
+    version,
+    serverTime,
+    full,
+    items: page,
+    removed,
+    nextCursor,
+  }, { headers: { 'Cache-Control': 'no-store' } });
 }
 
 const AGENT_EVENT_BATCH_LIMIT = 50;
@@ -6605,7 +6799,18 @@ async function handleIsapiAgentEvents(request: Request, env: Env, agentId: strin
     if (!identity) { rejected++; continue; }
     seenDevices.add(identity.id);
     const event = await normalizeHikvisionDocument(document, identity);
-    if (event) events.push(event); else rejected++;
+    if (!event) { rejected++; continue; }
+    // The bridge decides credentials itself when a terminal runs as a reader.
+    // Its verdict travels with the event so the gate history records who decided
+    // and whether the door answered - not merely what the terminal thought.
+    const verdict = (item as { remoteVerification?: unknown }).remoteVerification;
+    if (verdict && typeof verdict === 'object') {
+      const v = verdict as { decision?: unknown; reason?: unknown; doorResult?: unknown; latencyMs?: unknown };
+      event.remoteDecision = v.decision === 'granted' || v.decision === 'denied' ? v.decision : null;
+      event.remoteDecisionReason = typeof v.reason === 'string' ? v.reason.slice(0, 120) : null;
+      event.remoteDoorResult = v.doorResult === 'opened' || v.doorResult === 'refused' || v.doorResult === 'not_attempted' ? v.doorResult : null;
+    }
+    events.push(event);
   }
 
   if (seenDevices.size) {
@@ -6902,7 +7107,7 @@ async function consumeAccessEvents(batch: MessageBatch<AccessEventQueuePayload>,
        ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,created_at DESC LIMIT 1)`;
   const statements = events.map((event) => env.DB.prepare(
     `INSERT OR IGNORE INTO access_events(
-      id,vendor_event_id,device_id,access_point_id,card_id,fingerprint_id,resident_id,household_member_id,visitor_request_id,card_uid,employee_no,person_name,credential_type,door_no,direction,result,event_type,device_timestamp,profile_key,raw_summary
+      id,vendor_event_id,device_id,access_point_id,card_id,fingerprint_id,resident_id,household_member_id,visitor_request_id,card_uid,employee_no,person_name,credential_type,door_no,direction,result,event_type,device_timestamp,profile_key,raw_summary,remote_decision,remote_decision_reason,remote_door_result
      ) VALUES (?,?,?,?,
        (SELECT id FROM access_cards WHERE card_uid=? LIMIT 1),
        (SELECT id FROM fingerprint_credentials WHERE employee_no=? AND employee_no IS NOT NULL
@@ -6911,7 +7116,7 @@ async function consumeAccessEvents(batch: MessageBatch<AccessEventQueuePayload>,
        COALESCE((SELECT household_member_id FROM access_cards WHERE card_uid=? LIMIT 1),
          (SELECT household_member_id FROM fingerprint_credentials WHERE employee_no=? AND employee_no IS NOT NULL
           ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,created_at DESC LIMIT 1)),
-       (SELECT id FROM visitor_requests WHERE credential_number=? OR pin=? LIMIT 1),?,?,?,?,?,?,?,?,?,?,?)`,
+       (SELECT id FROM visitor_requests WHERE credential_number=? OR pin=? LIMIT 1),?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
   ).bind(
     event.id,event.vendorEventId,event.deviceId,event.accessPointId,
     event.cardUid,event.employeeNo,event.cardUid,event.employeeNo,
@@ -6919,6 +7124,7 @@ async function consumeAccessEvents(batch: MessageBatch<AccessEventQueuePayload>,
     event.cardUid,event.cardUid,
     event.cardUid,event.employeeNo,event.personName,event.credentialType,event.doorNo,event.direction,event.result,
     event.eventType,event.deviceTimestamp,event.profileKey,event.rawSummary,
+    event.remoteDecision ?? null,event.remoteDecisionReason ?? null,event.remoteDoorResult ?? null,
   ));
   await env.DB.batch(statements);
   const captured = events.filter((event) => Boolean(event.cardUid)).map((event) => env.DB.prepare(
@@ -7089,6 +7295,8 @@ export default {
     if (isapiHeartbeat?.[1]) return handleIsapiAgentHeartbeat(request, env, decodeURIComponent(isapiHeartbeat[1]));
     const isapiDevices = /^\/api\/isapi\/v1\/agents\/([^/]+)\/devices$/.exec(url.pathname);
     if (isapiDevices?.[1]) return handleIsapiAgentDevices(request, env, decodeURIComponent(isapiDevices[1]));
+    const isapiSnapshot = /^\/api\/isapi\/v1\/agents\/([^/]+)\/credential-snapshot$/.exec(url.pathname);
+    if (isapiSnapshot?.[1]) return handleIsapiAgentCredentialSnapshot(request, env, decodeURIComponent(isapiSnapshot[1]));
     const isapiEvents = /^\/api\/isapi\/v1\/agents\/([^/]+)\/events$/.exec(url.pathname);
     if (isapiEvents?.[1]) return handleIsapiAgentEvents(request, env, decodeURIComponent(isapiEvents[1]));
     const isapiOpsResult = /^\/api\/isapi\/v1\/agents\/([^/]+)\/operations\/([^/]+)\/result$/.exec(url.pathname);

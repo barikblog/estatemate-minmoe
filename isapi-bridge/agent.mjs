@@ -20,6 +20,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { applyPushOperation, startZktecoPushServer } from './zkteco-push-server.mjs';
 import { pinPolicy } from './zkteco-push.mjs';
+import { CredentialCache, CooldownTracker, cooldownKey, decideCredential, parseTerminalEvent } from './remote-verify.mjs';
+import { startLanEventListener } from './lan-event-listener.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -89,6 +91,32 @@ const pushAgentKey = String((config.zktecoPush && config.zktecoPush.agentKey) ||
 // still queued. A terminal polls on RequestDelay, so this is deliberately longer
 // than one poll cycle.
 const pushAckTimeoutMs = Math.max(5000, Number((config.zktecoPush && config.zktecoPush.ackTimeoutSeconds) || 180) * 1000);
+
+// Remote Network Verification.
+//
+// Two switches, and both must be on before any door is opened by this code:
+// this host-level one (an estate PC opts in) and the per-terminal one in the
+// portal (an Administrator decides which gates are readers). The host switch
+// exists because a snapshot of the whole estate's credentials is a real thing to
+// hold on a machine, and an operator should be able to say no to it without
+// hunting through the portal.
+const remoteVerifyEnabled = Boolean(config.remoteVerify && config.remoteVerify.enabled === true);
+const snapshotInterval = Math.max(15, Number((config.remoteVerify && config.remoteVerify.snapshotIntervalSeconds) || 60));
+// 20,000 credentials page through in a handful of requests at this size; the cap
+// is what keeps one request from being bigger than the Worker's body limit.
+const snapshotPageSize = Math.min(5000, Math.max(100, Number((config.remoteVerify && config.remoteVerify.pageSize) || 2000)));
+const cardNumberFormats = Array.isArray(config.remoteVerify?.cardNumberFormats) && config.remoteVerify.cardNumberFormats.length
+  ? config.remoteVerify.cardNumberFormats
+  : ['exact', 'padded10'];
+
+// LAN event listener: the terminal pushes its events here instead of the bridge
+// pulling them from an alertStream. Off by default and bound to loopback, so a
+// default install opens no port at all. See lan-event-listener.mjs for why.
+const lanEventsEnabled = Boolean(config.lanEvents && config.lanEvents.enabled === true);
+const lanEventsPort = Number.isInteger(config.lanEvents?.port) ? config.lanEvents.port : 8080;
+const lanEventsBindAddress = String(config.lanEvents?.bindAddress || '127.0.0.1');
+const lanEventsRequireKey = Boolean(config.lanEvents?.requireTerminalKey);
+const lanEventsTerminalKey = String(config.lanEvents?.terminalKey || '').trim();
 
 if (!/^[0-9a-f-]{36}$/i.test(agentId)) {
   console.error('Invalid agentId, must be UUID');
@@ -401,6 +429,11 @@ async function heartbeat() {
         // Per-terminal liveness: 'down' retires the terminal in the portal at
         // once rather than waiting for the hourly offline sweep.
         devices: heartbeatDeviceStates(),
+        // Remote verification is the one feature where the portal has to be able
+        // to see the agent's own state - how fresh the snapshot is, how many
+        // decisions it made, whether the door actually answered - because none of
+        // that is observable from the database alone.
+        ...(remoteVerifyEnabled ? { remoteVerify: remoteVerifyHeartbeat() } : {}),
       }),
     });
     if (!res.ok) log('warn', 'Heartbeat failed', res.status, json);
@@ -697,7 +730,12 @@ function queueEvent(deviceId, document) {
     log('warn', 'Skipping missing or oversized event document for device', deviceId);
     return;
   }
-  pendingEvents.push({ deviceId, document });
+  const item = { deviceId, document };
+  // Remote verification runs here because this is the one place every event
+  // passes through, whichever way it arrived: an alertStream the bridge holds
+  // open, or a document a terminal pushed to the LAN listener.
+  beginRemoteVerification(deviceId, document, item);
+  pendingEvents.push(item);
   if (pendingEvents.length > eventBufferLimit) {
     const drop = pendingEvents.length - eventBufferLimit;
     pendingEvents.splice(0, drop);
@@ -719,6 +757,11 @@ async function flushEvents() {
   try {
     while (pendingEvents.length) {
       const items = pendingEvents.splice(0, 50);
+      // Wait for any door command these events triggered, so the history records
+      // what actually happened at the lock instead of a permanent "pending". The
+      // command was already sent the moment the decision was made - this only
+      // holds the upload, never the door.
+      await Promise.all(items.map((item) => pendingDoorCommands.get(item)).filter(Boolean));
       try {
         const { res, json } = await apiFetch(`/api/isapi/v1/agents/${agentId}/events`, {
           method: 'POST',
@@ -1338,6 +1381,34 @@ function extractFingerprintQuality(body) {
   return xml?.[1] ? Number(xml[1]) : null;
 }
 
+/**
+ * Sends one Hikvision RemoteControl door command: JSON first, XML only when the
+ * firmware does not implement the JSON URL.
+ *
+ * Best-effort by design. No device profile in docs/device-profiles/ records a
+ * verified RemoteControl/door response, so both callers - an operator pressing
+ * "open" in Access control remote, and the remote-verification path below -
+ * receive the terminal's own answer and are expected to surface a refusal rather
+ * than assume the door moved.
+ *
+ * Note the payload: `{"RemoteControlDoor":{"cmd":"open"}}` over
+ * `?format=json`, and for the XML form the namespace is
+ * `http://www.isapi.org/ver20/XMLSchema` (ISAPI_XML_NS). The bare
+ * `xmlns="http://isapi.org"` form that appears in some examples is not what the
+ * terminals in this project accept.
+ */
+async function sendDoorCommand(device, doorCmd, doorNo) {
+  const attempts = [];
+  let result = await isapiRequest(device, 'PUT', `/ISAPI/AccessControl/RemoteControl/door/${doorNo}?format=json`, JSON.stringify({ RemoteControlDoor: { cmd: doorCmd } }), false);
+  attempts.push(result);
+  if (!isapiOk(result)) {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<RemoteControlDoor ${ISAPI_XML_NS}><cmd>${doorCmd}</cmd></RemoteControlDoor>`;
+    result = await isapiRequest(device, 'PUT', `/ISAPI/AccessControl/RemoteControl/door/${doorNo}`, xml, true);
+    attempts.push(result);
+  }
+  return { ok: isapiOk(result), attempts, result };
+}
+
 async function applyCardOperation(device, operation) {
   const payload = operation.payload || {};
   const cardUid = payload.cardUid || payload.cardNo || payload.card_number;
@@ -1473,18 +1544,9 @@ async function applyCardOperation(device, operation) {
     if (doorCmd) {
       const doorNo = Number(payload.doorNo || 1);
       if (!Number.isInteger(doorNo) || doorNo < 1 || doorNo > 8) return { success: false, error: 'doorNo must be 1-8' };
-      // Best-effort Hikvision RemoteControl. Not verified per firmware in
-      // docs/device-profiles/; a rejection is reported so an operator can apply it.
-      const attempts = [];
-      let result = await isapiRequest(device, 'PUT', `/ISAPI/AccessControl/RemoteControl/door/${doorNo}?format=json`, JSON.stringify({ RemoteControlDoor: { cmd: doorCmd } }), false);
-      attempts.push(result);
-      if (!isapiOk(result)) {
-        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<RemoteControlDoor ${ISAPI_XML_NS}><cmd>${doorCmd}</cmd></RemoteControlDoor>`;
-        result = await isapiRequest(device, 'PUT', `/ISAPI/AccessControl/RemoteControl/door/${doorNo}`, xml, true);
-        attempts.push(result);
-      }
-      if (isapiOk(result)) return { success: true };
-      return { success: false, error: `Door ${describeAttempts(attempts)}` };
+      const sent = await sendDoorCommand(device, doorCmd, doorNo);
+      if (sent.ok) return { success: true };
+      return { success: false, error: `Door ${describeAttempts(sent.attempts)}` };
     }
 
     return { success: false, error: `Unknown operation ${op}` };
@@ -1546,11 +1608,235 @@ async function pollAndApply() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Remote Network Verification
+//
+// A terminal holds a few thousand people. An estate with more than that cannot
+// fit them on the device, so instead of asking the terminal to decide we let it
+// report and decide here, on the LAN, then answer with the door command above.
+//
+// The rules this section enforces, in the order they matter:
+//
+// 1. Both switches must be on - this host (`remoteVerify.enabled`) and the
+//    terminal in the portal. Neither alone opens anything.
+// 2. The decision is made against the local snapshot, never a live query, so a
+//    lost internet link makes the gate stale rather than dead.
+// 3. A cold cache denies. An agent that has not yet loaded a snapshot must not
+//    decide that a stranger is a resident.
+// 4. Every decision is recorded, including the refusals, and the door command's
+//    own answer is surfaced rather than assumed.
+// ---------------------------------------------------------------------------
+
+const credentialCache = new CredentialCache({ cardFormats: cardNumberFormats });
+const remoteCooldowns = new CooldownTracker();
+const remoteStats = {
+  decisions: 0, granted: 0, denied: 0, opened: 0, refused: 0, cooldownSuppressed: 0,
+  lastError: null, lastLatencyMs: null, lastAt: null,
+};
+/** deviceId -> what the portal shows for this terminal's last decision. */
+const remoteDeviceState = new Map();
+/** Queued event item -> the door command still running for it. */
+const pendingDoorCommands = new WeakMap();
+
+const clampDoorNo = (value) => {
+  const doorNo = Number(value);
+  return Number.isInteger(doorNo) && doorNo >= 1 && doorNo <= 8 ? doorNo : 1;
+};
+
+const remoteVerifyActive = (device) => remoteVerifyEnabled && Boolean(device?.remoteVerify?.enabled);
+/** The LAN event listener, when one is running. Never opens a port unless configured. */
+let lanEventsListener = null;
+
+/** Re-reads each terminal's remote-verification settings from the portal. */
+async function refreshRemoteVerifyConfig() {
+  if (!remoteVerifyEnabled) return;
+  try {
+    const { res, json } = await apiFetch(`/api/isapi/v1/agents/${agentId}/devices`, { method: 'GET' });
+    if (!res.ok) {
+      log('warn', `Remote verification: the Worker answered HTTP ${res.status} for terminal settings; the last known settings stay in force`);
+      return;
+    }
+    const items = Array.isArray(json.items) ? json.items : [];
+    const byId = new Map(items.map((item) => [String(item.device_id || '').trim(), item]));
+    for (const [id, device] of devices) {
+      const row = byId.get(id);
+      device.remoteVerify = row
+        ? {
+          enabled: Number(row.remote_verify_enabled) === 1,
+          doorNo: clampDoorNo(row.remote_verify_door_no),
+          cooldownMs: Number(row.remote_verify_cooldown_ms) > 0 ? Number(row.remote_verify_cooldown_ms) : 1500,
+        }
+        : { enabled: false, doorNo: 1, cooldownMs: 1500 };
+    }
+  } catch (err) {
+    log('warn', `Remote verification: terminal settings refresh failed: ${err.message}`);
+  }
+}
+
+/** One page of the credential snapshot, or a thrown error the caller keeps. */
+async function fetchSnapshotPage(cursor, since) {
+  const params = new URLSearchParams({ limit: String(snapshotPageSize) });
+  if (cursor) params.set('cursor', cursor);
+  else if (since) params.set('since', since);
+  const { res, json } = await apiFetch(`/api/isapi/v1/agents/${agentId}/credential-snapshot?${params.toString()}`, { method: 'GET' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}${json?.error ? ` ${json.error}` : ''}`);
+  return json;
+}
+
+/**
+ * Refreshes the local credential set.
+ *
+ * A failed sync keeps the previous snapshot in place on purpose: a list that is
+ * a few minutes stale still opens the right doors, whereas an empty one opens
+ * none, and a gate that stops working is worse than a gate that is catching up.
+ */
+async function syncCredentialSnapshot() {
+  if (!remoteVerifyEnabled) return null;
+  const result = await credentialCache.sync(fetchSnapshotPage);
+  if (result.ok) {
+    log('debug', `Credential snapshot: ${result.count} credential(s) in ${result.pages} page(s), version ${result.version ?? 'unknown'}`);
+  } else {
+    log('warn', `Credential snapshot sync failed: ${result.error}. Keeping the previous snapshot of ${result.count} credential(s); the next attempt asks for a full one.`);
+  }
+  return result;
+}
+
+/**
+ * Decides one event and, when it is granted, opens the door.
+ *
+ * Called from the single event ingest point, so an event that arrived over the
+ * alertStream and one that a terminal pushed to the LAN listener are treated
+ * identically. The decision itself is synchronous - a Map lookup - and only the
+ * door command is allowed to be slow, which is why the event's annotation is
+ * written before the command is even sent.
+ */
+function beginRemoteVerification(deviceId, document, item) {
+  if (!remoteVerifyEnabled) return;
+  const device = devices.get(deviceId);
+  if (!remoteVerifyActive(device)) return;
+
+  const event = parseTerminalEvent(document, '');
+  if (!event) return;
+
+  const startedAt = Date.now();
+  const decision = decideCredential(credentialCache, { cardNo: event.cardNo, employeeNo: event.employeeNo, deviceId });
+  remoteStats.decisions += 1;
+  remoteStats.lastAt = new Date().toISOString();
+  remoteStats.lastLatencyMs = Date.now() - startedAt;
+
+  const record = {
+    decision: decision.decision,
+    reason: decision.reason,
+    matchedOn: decision.matchedOn ?? null,
+    latencyMs: remoteStats.lastLatencyMs,
+    doorResult: 'not_attempted',
+    doorNo: null,
+  };
+  item.remoteVerification = record;
+
+  if (decision.decision !== 'granted') {
+    remoteStats.denied += 1;
+    // The wording the request asked for, and the reason an operator can act on.
+    log('info', `Access Denied - Remote Database Lookup Failed at ${device.name}: ${decision.reason} (${event.cardNo ? `card ${event.cardNo}` : `employee ${event.employeeNo}`})`);
+    remoteDeviceState.set(deviceId, {
+      enabled: true, lastDecision: decision.decision, lastReason: decision.reason,
+      lastResult: 'not_attempted', lastLatencyMs: record.latencyMs, lastAt: new Date().toISOString(),
+      matchedOn: decision.matchedOn ?? null,
+    });
+    return;
+  }
+
+  remoteStats.granted += 1;
+  const cooldownMs = device.remoteVerify?.cooldownMs ?? 1500;
+  const gate = remoteCooldowns.allow(cooldownKey(deviceId, decision), cooldownMs);
+  if (!gate.allowed) {
+    // The same credential moments ago. Counted in the history, but no second
+    // command: a card left resting on a reader must not hold the door open.
+    remoteStats.cooldownSuppressed += 1;
+    record.doorResult = 'not_attempted';
+    record.cooldownSuppressed = true;
+    log('debug', `Remote verification: ${decision.matchedValue} at ${device.name} is inside the ${cooldownMs}ms cooldown (${gate.waitedMs}ms since the last attempt)`);
+    remoteDeviceState.set(deviceId, {
+      enabled: true, lastDecision: decision.decision, lastReason: 'cooldown',
+      lastResult: 'not_attempted', lastLatencyMs: record.latencyMs, lastAt: new Date().toISOString(),
+      matchedOn: decision.matchedOn ?? null,
+    });
+    return;
+  }
+
+  const doorNo = clampDoorNo(event.doorNo || device.remoteVerify?.doorNo || 1);
+  record.doorNo = doorNo;
+  record.doorResult = 'pending';
+  const command = sendDoorCommand(device, 'open', doorNo)
+    .then((sent) => {
+      if (sent.ok) {
+        record.doorResult = 'opened';
+        remoteStats.opened += 1;
+        log('info', `Remote verification: opened door ${doorNo} at ${device.name} for ${decision.matchedOn} ${decision.matchedValue}`);
+      } else {
+        record.doorResult = 'refused';
+        remoteStats.refused += 1;
+        remoteStats.lastError = describeAttempts(sent.attempts);
+        // The terminal's own words, not a paraphrase: whether this model honours
+        // RemoteControl/door at all is exactly what a refusal settles.
+        log('warn', `Remote verification: ${device.name} refused the door command for ${decision.matchedValue}: ${remoteStats.lastError}`);
+      }
+      remoteDeviceState.set(deviceId, {
+        enabled: true, lastDecision: decision.decision, lastReason: decision.reason,
+        lastResult: record.doorResult, lastLatencyMs: Date.now() - startedAt, lastAt: new Date().toISOString(),
+        matchedOn: decision.matchedOn ?? null,
+      });
+    })
+    .catch((err) => {
+      record.doorResult = 'refused';
+      remoteStats.refused += 1;
+      remoteStats.lastError = String(err?.message ?? err);
+      log('warn', `Remote verification: door command failed for ${device.name}: ${remoteStats.lastError}`);
+    });
+  pendingDoorCommands.set(item, command);
+}
+
+/** Per-terminal remote-verification state for the heartbeat, keyed by device id. */
+function remoteVerifyHeartbeat() {
+  if (!remoteVerifyEnabled) return null;
+  const perDevice = {};
+  for (const [id, state] of remoteDeviceState) perDevice[id] = state;
+  const enabledDevices = [...devices.values()].filter(remoteVerifyActive).length;
+  return {
+    enabled: true,
+    devicesEnabled: enabledDevices,
+    listener: lanEventsListener ? { bound: true, ...lanEventsListener.stats } : { bound: false },
+    cache: credentialCache.stats(),
+    // A snapshot the size of the estate is worth watching: a bridge serving
+    // 20,000 credentials from a list it refreshed an hour ago is a different
+    // risk from one that refreshed ten seconds ago.
+    stale: credentialCache.ageSeconds() !== null && credentialCache.ageSeconds() > Math.max(300, snapshotInterval * 5),
+    ...remoteStats,
+    perDevice,
+  };
+}
+
 async function main() {
   log('info', `EstateMate ISAPI Bridge starting...`);
   await resolveDeviceIds();
   const streamDevices = [...devices.values()].filter((device) => device.eventStream !== false);
   log('info', `Agent: ${agentId}, Worker: ${workerUrl}, Devices: ${devices.size}, Interval: ${syncInterval}s, EventStream: ${eventStreamEnabled ? `on (${streamDevices.length} device(s))` : 'off'}`);
+
+  // Remote verification has to have its snapshot before the first event arrives:
+  // a cold cache denies everything, which is the correct failure mode but a
+  // useless one if it is only because we started in the wrong order.
+  if (remoteVerifyEnabled) {
+    await refreshRemoteVerifyConfig();
+    await syncCredentialSnapshot();
+    const readers = [...devices.values()].filter(remoteVerifyActive);
+    log('info', `Remote verification: on, ${readers.length} terminal(s) in reader mode, ${credentialCache.count} credential(s) cached, refresh every ${snapshotInterval}s`);
+    if (!readers.length) {
+      log('warn', 'Remote verification is enabled on this host but no terminal has it switched on in the portal — Access control devices → the terminal → Remote Network Verification.');
+    }
+    if (!credentialCache.ready) {
+      log('warn', 'Remote verification started without a credential snapshot. Every decision denies until the first sync succeeds; check that the Worker is reachable.');
+    }
+  }
 
   if (pushEnabled) {
     const listener = startPushListener();
@@ -1574,6 +1860,42 @@ async function main() {
     log('warn', `${disabledPushDevices.length} device(s) are on the ZKTeco PUSH transport but zktecoPush is disabled — no terminal can reach them. Set "zktecoPush": {"enabled": true, "port": ${pushPort}} in agent-config.json.`);
   }
 
+  // The LAN event listener is the alternative to pulling an alertStream: some
+  // terminals only push. It ingests events for every terminal whether or not
+  // remote verification is on, because the history is useful either way - only
+  // the decision needs the feature switched on.
+  if (lanEventsEnabled) {
+    try {
+      lanEventsListener = await startLanEventListener({
+        port: lanEventsPort,
+        bindAddress: lanEventsBindAddress,
+        requireKey: lanEventsRequireKey,
+        agentKey: lanEventsTerminalKey,
+        log,
+        resolveDevice: ({ ip, event }) => {
+          // The terminal's own reported address is the better identifier; the
+          // socket address is the fallback for firmware that omits it.
+          const candidates = [event?.deviceIp, ip]
+            .map((value) => String(value ?? '').trim().replace(/^::ffff:/, ''))
+            .filter(Boolean);
+          for (const address of candidates) {
+            const hit = [...devices.values()].find((device) => String(device.isapiHost).trim() === address);
+            if (hit) return hit;
+          }
+          return null;
+        },
+        onEvent: ({ device, raw }) => {
+          if (!device?.estateMateDeviceId) return;
+          queueEvent(device.estateMateDeviceId, raw);
+        },
+      });
+    } catch (err) {
+      // Non-fatal on purpose: a port clash or a missing firewall rule must not
+      // take down the half of the bridge that polls and streams.
+      log('error', `LAN event listener could not start on ${lanEventsBindAddress}:${lanEventsPort}: ${err?.code || err?.message}`);
+    }
+  }
+
   await heartbeat();
   await pollAndApply();
 
@@ -1585,6 +1907,15 @@ async function main() {
 
   setInterval(heartbeat, heartbeatInterval * 1000);
   setInterval(pollAndApply, syncInterval * 1000);
+
+  // The snapshot is refreshed together with the terminal settings, so a terminal
+  // switched into reader mode in the portal starts being served without a restart.
+  if (remoteVerifyEnabled) {
+    setInterval(async () => {
+      await refreshRemoteVerifyConfig();
+      await syncCredentialSnapshot();
+    }, snapshotInterval * 1000);
+  }
 
   // Graceful shutdown: stop stream loops first, then flush buffered events.
   const shutdown = () => {
@@ -1600,6 +1931,9 @@ async function main() {
     // mid-shutdown is not lost between the listener and the event buffer.
     if (pushState.listener) {
       pushState.listener.close().catch(() => undefined);
+    }
+    if (lanEventsListener) {
+      lanEventsListener.close().catch(() => undefined);
     }
     heartbeat()
       .catch(() => undefined)
@@ -1626,6 +1960,17 @@ export {
   createJsonEventScanner,
   queueEvent,
   flushEvents,
+  // Remote Network Verification. Exported so the integration checks drive the
+  // real agent - a decision that never reaches the terminal proves nothing, and
+  // these are the seams that let a fake Worker and a fake terminal observe it.
+  credentialCache,
+  remoteStats,
+  remoteDeviceState,
+  beginRemoteVerification,
+  refreshRemoteVerifyConfig,
+  syncCredentialSnapshot,
+  remoteVerifyHeartbeat,
+  sendDoorCommand,
   deviceEventLoop,
   openAlertStream,
   main,

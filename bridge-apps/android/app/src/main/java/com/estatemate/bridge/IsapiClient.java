@@ -344,6 +344,20 @@ public final class IsapiClient {
      * Applies one queued Worker operation, with the same payload shapes and the
      * same "treat an already-deleted card as applied" rule as the desktop agent.
      */
+    /**
+     * Opens one door.
+     *
+     * Best-effort, and deliberately routed through the same operation the portal
+     * queues, so there is exactly one implementation of the RemoteControl call.
+     * No device profile in this repository records a verified response, so the
+     * terminal's own answer is returned verbatim for the caller to report.
+     */
+    public OpResult openDoor(Device device, int doorNo) {
+        Map<String, Object> payload = new LinkedHashMap<String, Object>();
+        payload.put("doorNo", Integer.valueOf(doorNo));
+        return applyOperation(device, "remote_open", payload, null);
+    }
+
     public OpResult applyOperation(Device device, String operation, Map<String, Object> payload) {
         return applyOperation(device, operation, payload, null);
     }

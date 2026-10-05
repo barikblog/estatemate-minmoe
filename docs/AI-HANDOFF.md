@@ -163,7 +163,53 @@ honest answer for firmware that refuses the API.
   terminal and the overview grid derives each person's state from the queued,
   applied and failed rows (`refreshDevicePersonState`) rather than asserting it.
 
-### Bridge (current release tag `bridge-0.4.0`, published 2026-10-04)
+### Bridge (current release tag `bridge-0.4.1`, published 2026-10-05)
+
+`bridge-0.4.1` changes **how a visitor is provisioned on a Hikvision ISAPI
+terminal** — the one path every estate on 0.2.x–0.4.0 could hit. A visitor is now
+a finite **PIN-only `UserInfo` account** and nothing else: employee number, name,
+department `Company`, `userType: normal`, `localUIRight: false`, an enabled
+start/end validity window, and the pass PIN as `password` (validated as 4–8
+decimal digits; the portal always generates 6). Both the Node and the Android
+bridge stopped creating or deleting visitor `CardInfo`, fingerprint, face,
+door-right and right-plan records, and `revoke_visitor` now deletes the **person**
+(`UserInfoDetail/Delete`, with a `UserInfo/Delete` fallback) instead of a card —
+which is what actually frees the terminal slot.
+
+Why: the old flow filed the visitor as a `normalCard` `CardInfo` record and real
+terminals answered `Invalid Content` / `badJsonContent` / `employeeNo`. The
+terminal's own UI contract is a normal finite user with a PIN and no card,
+fingerprint or face (PR #49, `5ef5080`; the Worker side forwards the stored PIN
+and was deployed with the same merge, so an estate needs **both** the current
+Worker and a 0.4.1 bridge).
+
+**Verification status: CI-only — and one deliberate open question.**
+
+- CI is green across the board: the Node bridge integration
+  (`agent.card-operations.integration.mjs`), the 117-check Android JVM protocol
+  suite, 23 Vitest files / 241 tests, and the Windows bundle/MSI/exe smoke tests.
+- **No physical terminal has been provisioned by this code.** The install on the
+  estate bridge host and the PIN check at the keypad were **not performed** when
+  this tag was cut: the working sandbox had no route to the estate LAN (no
+  egress beyond the GitHub API, no SSH keys, no host address), which is exactly
+  the situation the README describes — the agent lives on the device VLAN and
+  only its outbound HTTPS ever leaves it. Tagging a release does not install it.
+- **Unanswered:** the visitor account is written with **no `doorRight` and no
+  `RightPlan`**. For residents the bridge always sends them, on the recorded basis
+  that a person stored without them "exists but is authorised for nothing — the
+  card is recorded, the door does not open." Whether a PIN-only *visitor*
+  therefore opens a door is unknown. [`docs/VERIFY-PIN-ONLY-VISITOR-ON-TERMINAL.md`](VERIFY-PIN-ONLY-VISITOR-ON-TERMINAL.md)
+  is the bench checklist a human runs at the gate; its result decides whether a
+  follow-up must send door rights for visitors too. Do not resolve a silent
+  denial by re-adding a card record.
+
+Release: <https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.4.1>
+(built from `61c8eb5`, tag run `37279687861` green, 20 assets, **now the *Latest*
+release**). Worker deploy run `37272190250` and production smoke test
+`37272261477` both passed for the same merge; no migration was pending, so
+`migrations/` still ends at `0019`.
+
+### Bridge (release tag `bridge-0.4.0`, published 2026-10-04)
 
 `bridge-0.4.0` is the first release with the **ZKTeco PUSH (ADMS) transport**:
 `isapi-bridge/zkteco-push.mjs` (codec), `isapi-bridge/zkteco-push-server.mjs`
@@ -244,9 +290,9 @@ nothing by updating; an estate on 0.2.x should take 0.3.1 to turn on the
 person-sync and fingerprint-capture flow.
 
 **[`bridge-0.4.0`](https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.4.0)**
-(2026-10-04T12:44:15Z, tag run `37202731713` green, 20 assets, **now the *Latest*
-release the portal's download links resolve to**) adds the ZKTeco PUSH (ADMS)
-transport (`44bd8b4`, PR #45, merged as `8a150df`; Worker deploy run `37202628623`,
+(2026-10-04T12:44:15Z, tag run `37202731713` green, 20 assets, *Latest* until
+0.4.1 superseded it the next day) adds the ZKTeco PUSH (ADMS) transport
+(`44bd8b4`, PR #45, merged as `8a150df`; Worker deploy run `37202628623`,
 production smoke test passed, no migration pending — `migrations/` still ends at
 `0019`). **An estate on 0.3.1 gains nothing it will notice**: the new transport is
 inert until `agent-config.json` opts in, so the only visible change for a
@@ -255,6 +301,21 @@ ZKTeco gate takes 0.4.0 to provision and receive events from it at all — and s
 read `docs/device-profiles/ZKTECO-PUSH.md` first, because that file records the
 numeric-PIN refusal, the operations this transport will not perform, and the fact
 that no physical ZKTeco terminal has been driven by this code yet.
+
+**[`bridge-0.4.1`](https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.4.1)**
+(2026-10-05T07:52:45Z, tag run `37279687861` green, 20 assets, **now the *Latest*
+release the portal's download links resolve to**) fixes Hikvision visitor
+provisioning (`5ef5080`, PR #49, merged as `61c8eb5`): a visitor is a finite
+PIN-only `UserInfo` account instead of a `normalCard` card record, in both the
+Node and the Android bridge, and `revoke_visitor` deletes that person rather than
+a card. **Every estate that issues visitor passes at a Hikvision terminal should
+take this one** — it is the difference between a pass that provisions and one the
+terminal answers with `Invalid Content`. It is CI-verified and
+**hardware-unverified**: the bridge host was not upgraded and no terminal was
+tested from the environment that cut the tag, and the visitor account carries no
+`doorRight`/`RightPlan`, so whether the PIN opens the door is an open question.
+Run [`docs/VERIFY-PIN-ONLY-VISITOR-ON-TERMINAL.md`](VERIFY-PIN-ONLY-VISITOR-ON-TERMINAL.md)
+at one gate and record the result here and in the model's device profile.
 
 
 ## The MSI now installs a dashboard, not a console window (2026-10-04)
@@ -527,6 +588,71 @@ Requested as: "publish the wizard in a GitHub release" / "create a new exe bridg
 - The Worker-side canonical `employee_id` and its 32-character bound are migration `0018`, already on production from PR #37. Bridge guard merged in PR #38 as `d28d03b`; Deploy EstateMate run `36362797902` succeeded, followed by production smoke run `36362850890` (health, portal config, sign-in shell and login response checks passed).
 - Rebuilt and published [EstateMate Bridge 0.2.4](https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.2.4) from `d28d03b`; tag build `36362897668` passed Node/Windows/Android bridge validation and published the Windows executable, Windows bundle and Android bridge APK with checksums.
 - Operational caveat: the release's Windows bundle is unsigned; no persistent Android release keystore was configured, so the bridge APK is debug-signed with a throwaway key and cannot update an existing differently signed install in place. Reinstalling the Android app clears its private config; obtain a fresh portal installer/secret and re-enter the terminal config if reinstall is needed. The sandbox published artifacts but did not install them on the estate's physical LAN host or test against a real terminal.
+
+## Remote Network Verification: the terminal reads, the bridge decides (2026-10-05)
+
+Requested as: support more people than a Hikvision terminal can store by turning
+it into a reader — it streams the credential it saw, EstateMate Bridge verifies
+against the estate database and sends a remote unlock.
+
+The terminal-capacity problem is real (a few thousand users, 20,000+ people), and
+the reader pattern is the right answer. Two parts of the request were **not**
+implemented as specified, and both are recorded here rather than quietly changed:
+
+- **The event does not arrive on an inbound port by default.** The agent already
+  holds an outbound `alertStream` per terminal, which delivers the same events
+  with no open port, no firewall rule, and it works on the Android bridge. That
+  is the default path. A **LAN event listener** (`isapi-bridge/lan-event-listener.mjs`)
+  was added for terminals that can only push, because the request asked for it:
+  off unless configured, bound to loopback by default, ingest-only, and it prints
+  the `netsh` firewall rule an operator needs, since the installer creates none.
+  The Android bridge cannot host one — a phone on estate Wi-Fi is not a stable
+  address for a terminal to call — which is a recorded deviation from the
+  Node/Android equivalence rule, like the ZKTeco PUSH transport.
+- **The decision is not a live database query.** The estate's users live in D1,
+  behind the public internet. A lookup per swipe would make a physical door depend
+  on the estate's uplink and on a round trip nobody can promise inside a few
+  hundred milliseconds — and it would fail *closed*, which at a gate means a
+  crowd. The bridge caches the credential set
+  (`GET /api/isapi/v1/agents/:id/credential-snapshot`, full then delta with
+  removals) and decides locally in microseconds. A dead link now degrades to "the
+  snapshot is as fresh as it was" instead of "nobody gets in".
+
+What shipped:
+
+- **Migration `0020_remote_network_verification.sql`** — per-terminal
+  `remote_verify_enabled` / `remote_verify_door_no` / `remote_verify_cooldown_ms`
+  / `remote_verify_state`, plus `remote_decision`,
+  `remote_decision_reason` and `remote_door_result` on `access_events` with an
+  index. Every column defaults to today's behaviour: no estate's gates change
+  because this migration ran.
+- **`isapi-bridge/remote-verify.mjs`** — the snapshot cache, the card-number
+  candidate handling (raw, zero-padded, byte-reversed), the decision and its
+  reasons, and the cooldown that stops a card resting on a reader from holding a
+  door open.
+- **Agent wiring** — one ingest point (`queueEvent`) serves both event paths; the
+  decision is a Map lookup and only the door command is allowed to be slow, which
+  is why the event's verdict is written before the command is even sent and the
+  upload waits for the result rather than the door.
+- **Worker** — the snapshot endpoint, the verdict travelling with the event, the
+  per-terminal state the bridge reports on its heartbeat, and an
+  Administrator-only `PATCH /api/access/devices/:id/remote-verify` (a Manager must
+  not be able to change what a door does).
+- **Portal** — a per-terminal panel with the toggle and a status widget showing
+  cache age, credential count and the last outcome.
+- **Android** — `RemoteVerify.java`, a direct port of the Node rules (same
+  protocol, same card handling, same reason strings) so a phone and a PC give the
+  same answer at the same gate.
+
+**Verification status: CI-verified, hardware-unverified.** 33 agent integration
+checks (fake Worker + fake terminal) and 8 Worker tests pass, covering paging,
+delta removal, cold-cache denial, one unlock per card with the documented
+payload, cooldown suppression, refusal reporting, and the listener's ingest-only
+behaviour. **No physical terminal has been driven by this code.** The unlock
+command remains best-effort: no device profile records a verified
+`RemoteControl/door` response, so a refusal is reported, not assumed. Prove one
+model at one gate — see `docs/REMOTE-NETWORK-VERIFICATION.md` — before relying on
+it, and record the result here and in that model's device profile.
 
 ## Employee ID (32-char rule), bulk people toolkit, visitor device-account lifecycle, and the six estate modules (2026-09-27)
 

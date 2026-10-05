@@ -448,3 +448,24 @@ tbody tr:hover { background: #fafcff; }
 /* Emergency directory */
 .contact-tel { color: inherit; text-decoration: none; font-weight: 700; }
 .contact-tel:hover { color: var(--blue); text-decoration: underline; }
+
+/* Remote Network Verification (per-terminal reader mode) */
+.remote-hint { color: var(--muted); font-size: 12.5px; line-height: 1.6; }
+.switch { display: inline-flex; align-items: center; gap: 8px; font-weight: 650; font-size: 13px; color: #354259; }
+.switch input { width: 17px; height: 17px; accent-color: var(--blue); }
+.chip { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 750; background: #eef2f7; color: #6b7a90; border: 1px solid #dbe3ee; white-space: nowrap; }
+.chip.ok { background: #e7f8ef; color: #167343; border-color: #c2efd5; }
+.chip.warn { background: #fff8e9; color: #85570c; border-color: #f5dfad; }
+.chip.error { background: #fff0f1; color: #9f2631; border-color: #facbd0; }
+.chip.muted { background: #eef2f7; color: #6b7a90; }
+input.narrow { width: 90px; padding: 7px 9px; }
+:root[data-theme="dark"] .chip { background: #17253a; color: #9cabbe; border-color: #30415c; }
+:root[data-theme="dark"] .chip.ok { background: #12331f; color: #7ee2a8; border-color: #2a5c3c; }
+:root[data-theme="dark"] .chip.warn { background: #33280f; color: #f0c368; border-color: #5c4a1c; }
+:root[data-theme="dark"] .chip.error { background: #35161a; color: #f4a0a8; border-color: #5f2a31; }
+:root[data-theme="dark"] .switch { color: var(--ink); }
+
+/* Denser rows for the tables embedded inside a device card, where the
+   surrounding panel already carries the heading and the padding. */
+.data-table.compact th,
+.data-table.compact td { padding: 7px 10px; font-size: 12.5px; }
