@@ -291,11 +291,14 @@ is worth trying — see
 [`../docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md`](../docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md#terminal-protocol-the-card-path-relies-on)
 for the behaviour the agent depends on.
 
-- `POST /ISAPI/AccessControl/CardInfo/Record?format=json` — add card
+- `POST /ISAPI/AccessControl/UserInfo/Record?format=json` — create the PIN-only visitor account with employee ID, name, Company department, `userType: "normal"`, enabled finite `Valid`, `localUIRight: false` and a 4-to-8-digit `password`.
+- `PUT /ISAPI/AccessControl/UserInfo/Modify?format=json` — update an existing visitor account; `UserInfo/SetUp` is the combined add/edit compatibility path.
+- `PUT /ISAPI/AccessControl/UserInfoDetail/Delete?format=json` — delete the expired/revoked visitor account (`UserInfo/Delete` fallback).
+- `POST /ISAPI/AccessControl/CardInfo/Record?format=json` — add a resident/dependant card. Visitor provisioning does not call a `CardInfo` endpoint.
 - `PUT /ISAPI/AccessControl/CardInfo/Modify?format=json` — update a card the terminal already holds (a duplicate `Record` is an error, so re-enable/re-issue lands here)
-- `PUT /ISAPI/AccessControl/CardInfo/Delete?format=json` — delete card; the body must be `{"CardInfoDelCond":{"CardNoList":[{"cardNo":"…"}]}}`. A bare `{"CardNoList":[{"CardNo":"…"}]}` is answered `Invalid Format / badJsonFormat`.
+- `PUT /ISAPI/AccessControl/CardInfo/Delete?format=json` — delete a resident/dependant card; the body must be `{"CardInfoDelCond":{"CardNoList":[{"cardNo":"…"}]}}`. A bare `{"CardNoList":[{"CardNo":"…"}]}` is answered `Invalid Format / badJsonFormat`.
 - `GET /ISAPI/AccessControl/CardInfo/Record?format=json` — list cards
-- Some firmware implements only the XML form: the same URLs without `?format=json` and with the ISAPI namespace on the root element (`<CardInfo xmlns="http://www.isapi.org/ver20/XMLSchema" version="2.0">`). The agent tries XML **only** when the JSON URL is unsupported (404/405/501 or `notSupport`/`invalidURL`/`invalidOperation`), never after a content rejection.
+- Some firmware implements only the XML form: the same URLs without `?format=json` and with the ISAPI namespace on the corresponding root element (`UserInfo`, `CardInfo`, or the delete condition). The agent tries XML **only** when the JSON URL is unsupported (404/405/501 or `notSupport`/`invalidURL`/`invalidOperation`), never after a content rejection.
 - A 2xx is not proof of success: some firmware answers 200 with a `ResponseStatus` whose `statusCode` is not 1 (OK). Success is `statusCode == 1`.
 
 Test manually:
@@ -312,8 +315,18 @@ curl -i -X PUT --digest -u admin:password \
 - **401 Unauthorized**: Check ISAPI username/password, device allows digest auth, IP not blocked.
 - **No operations**: Device not linked to agent, or connection pattern still `manual_sync`. Set it to `isapi_bridge` / `windows_agent` and link it.
 - **Operation stuck in sent**: Agent not reporting result. Check agent logs, network to Cloudflare, secret.
-- **Card not opening door**: the card is on the terminal but the *person* is not, so the employee number has no door rights. Since bridge 0.3.0 the person record is written first (`UserInfo/Record` with `doorRight`/`RightPlan`) and the portal's **Person sync** page shows which terminal still says `missing` for that person. On a terminal with no linked bridge (or a pre-0.3.0 bridge) the same page lists the work as an operator task.
+- **Visitor PIN rejected**: Verify the `UserInfo` validity window, normal-user access configured on the terminal, and the 4-to-8-digit PIN. EstateMate deliberately does not send visitor door-plan or card fields.
+- **Card not opening door**: the resident/dependant card is on the terminal but the *person* is not, so the employee number has no door rights. Since bridge 0.3.0 the person record is written first (`UserInfo/Record` with `doorRight`/`RightPlan`) and the portal's **Person sync** page shows which terminal still says `missing` for that person. On a terminal with no linked bridge (or a pre-0.3.0 bridge) the same page lists the work as an operator task.
 - **Fingerprint capture says the terminal cannot do it**: the firmware refused `CaptureFingerPrint`. Open **Hardware actions** and enrol the finger on the terminal's own menu in the slot the task names; the portal records it and sends it to the other terminals the next time a template is held.
+
+## Visitor PIN-account lifecycle
+
+The Hikvision path sends one `UserInfo` record containing only the terminal-editor
+fields: EstateMate's issued employee number, visitor name, department `Company`,
+normal-user/non-administrator settings, enabled finite start/end validity, and the
+4-to-8-digit visitor PIN in `password`. No visitor `CardInfo`, fingerprint, face,
+door-right or right-plan field is sent. At expiry or manual revocation, the bridge
+deletes the `UserInfo` account so the person slot is available again.
 
 ## License
 

@@ -2783,14 +2783,16 @@ app.post('/api/visitors', requireRoles('resident','admin','manager'), async (c) 
   ).bind(id,residentId,propertyId,body.visitorName.trim(),body.visitorPhone?.trim() ?? null,pin,qrToken,credentialNumber,credentialNumber,credentialMode,device?.id ?? null,gateScope,1,requireGateIdVerification,validFrom,validUntil).run();
   await linkProofFiles(c.env.DB,proofKeys(body.proofKeys),'visitor_request',id,requester.id);
   // The visitor account is created on the access-control estate automatically:
-  // this queues the credential on every terminal (or the one gate an officer
-  // chose) without anyone opening Hardware actions. It is released again by
-  // releaseExpiredVisitorDeviceAccounts the moment validity ends.
+  // this queues the PIN-only account on every terminal (or the one gate an
+  // officer chose) without anyone opening Hardware actions. It is released again
+  // by releaseExpiredVisitorDeviceAccounts the moment validity ends.
   const visitorEmployeeNo=credentialNumber?deviceEmployeeNo('visitor',credentialNumber):null;
   const hardwareOperationsQueued = await queueVisitorDeviceOperations(c.env.DB, id, device?.id ?? null, {
     credentialNumber,
     employeeNo: visitorEmployeeNo,
     visitorName: body.visitorName.trim(),
+    department: 'Company',
+    pin,
     validFrom,
     validUntil,
     enabled: false,
@@ -6103,9 +6105,9 @@ interface VisitorOperationRow {
 }
 
 /**
- * Queue a visitor credential for one device, or for every enabled access-control
- * device when targetDeviceId is null. Existing operations are reused so the
- * scheduled reconciliation and the manual sync endpoint are idempotent.
+ * Queue a visitor terminal account for one device, or for every enabled
+ * access-control device when targetDeviceId is null. Existing operations are
+ * reused so scheduled reconciliation and the manual sync endpoint are idempotent.
  */
 async function queueVisitorDeviceOperations(
   db: D1Database,
@@ -6167,7 +6169,7 @@ async function queueVisitorDeviceOperations(
  */
 async function syncActiveVisitorPasses(db: D1Database): Promise<{ passes: number; devices: number; queued: number }> {
   const passes = await db.prepare(
-    `SELECT id,credential_number,visitor_name,valid_from,valid_until,requires_security_approval,gate_scope,device_id
+    `SELECT id,credential_number,visitor_name,pin,valid_from,valid_until,requires_security_approval,gate_scope,device_id
      FROM visitor_requests
      WHERE status IN ('active','checked_in') AND datetime(valid_until)>datetime('now')
      ORDER BY created_at LIMIT 500`,
@@ -6175,6 +6177,7 @@ async function syncActiveVisitorPasses(db: D1Database): Promise<{ passes: number
     id: string;
     credential_number: string | null;
     visitor_name: string;
+    pin: string;
     valid_from: string;
     valid_until: string;
     requires_security_approval: number;
@@ -6193,6 +6196,8 @@ async function syncActiveVisitorPasses(db: D1Database): Promise<{ passes: number
       // it can never exceed the 32 characters ISAPI allows.
       employeeNo: deviceEmployeeNo('visitor', pass.credential_number),
       visitorName: pass.visitor_name,
+      department: 'Company',
+      pin: pass.pin,
       validFrom: pass.valid_from,
       validUntil: pass.valid_until,
       enabled: false,
@@ -6222,10 +6227,10 @@ interface VisitorPassForRemoval {
 }
 
 /**
- * Queue the removal of one visitor credential from every access-control device.
+ * Queue the removal of one visitor account from every access-control device.
  *
- * Terminals have a limited number of person/card slots, so a visitor pass may
- * only occupy one while it is valid. Removal is queued for *all* enabled devices
+ * Terminals have a limited number of person slots, so a visitor pass may only
+ * occupy one while it is valid. Removal is queued for *all* enabled devices
  * rather than only the ones the pass was sent to: an every-gate pass reached all
  * of them, and an operator may have linked another terminal since it was issued.
  * Existing revocations are reused, so the sweep is safe to run every minute and
@@ -6837,9 +6842,9 @@ async function handleIsapiAgentOperationResult(request: Request, env: Env, agent
     } catch (error) { console.error('Fingerprint capture result failed', operationId, error); }
   }
 
-  // The agent deleted the visitor credential from this terminal. Once it has done
-  // so on every terminal the pass was sent to, the pass is recorded as removed and
-  // its device slot is free again — while the pass record itself stays in the app.
+  // Refresh after every applied visitor-account operation. Once revocation has
+  // deleted the account from every terminal, the pass is recorded as removed and
+  // its person slot is free again — while the pass record itself stays in the app.
   if (visitorOperation && body.status === 'applied') {
     try {
       const owner = await env.DB.prepare(

@@ -23,6 +23,7 @@ import assert from 'node:assert/strict';
 // Simulated terminal: Basic-auth challenge, card records keyed by card number.
 // ---------------------------------------------------------------------------
 const cards = new Map();
+const persons = new Map();
 const requests = [];
 const refusedEmployeeNumbers = new Set(['900000008']);
 const deviceServer = createServer((req, res) => {
@@ -46,6 +47,36 @@ const deviceServer = createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ statusCode: 1, statusString: 'OK', subStatusCode: 'ok' }));
     };
+
+    if (req.url.startsWith('/ISAPI/AccessControl/UserInfo/Record')) {
+      if (!json) return reject('badXmlContent', 'unsupported on this firmware');
+      const info = JSON.parse(body).UserInfo || {};
+      if (!info.employeeNo || !info.Valid || info.userType !== 'normal' || info.belongGroup !== 'Company'
+        || info.localUIRight !== false || !/^\d{4,8}$/.test(String(info.password || ''))
+        || 'doorRight' in info || 'RightPlan' in info || 'gender' in info) {
+        return reject('badJsonContent', 'UserInfo');
+      }
+      if (persons.has(info.employeeNo)) return reject('employeeNoAlreadyExist', 'employeeNo');
+      persons.set(info.employeeNo, info);
+      return ok();
+    }
+    if (req.url.startsWith('/ISAPI/AccessControl/UserInfo/Modify') || req.url.startsWith('/ISAPI/AccessControl/UserInfo/SetUp')) {
+      const info = JSON.parse(body).UserInfo || {};
+      if (!persons.has(info.employeeNo)) return reject('employeeNoNotExist', 'employeeNo');
+      persons.set(info.employeeNo, info);
+      return ok();
+    }
+    if (req.url.startsWith('/ISAPI/AccessControl/UserInfoDetail/Delete')) {
+      const list = JSON.parse(body).UserInfoDetail?.EmployeeNoList || [];
+      for (const entry of list) persons.delete(entry.employeeNo);
+      return ok();
+    }
+    if (req.url.startsWith('/ISAPI/AccessControl/UserInfo/Delete')) {
+      const list = JSON.parse(body).UserInfoDelCond?.EmployeeNoList || [];
+      for (const entry of list) persons.delete(entry.employeeNo);
+      return ok();
+    }
+
     // Like the real terminals: card writes and deletes are JSON only, and a
     // delete condition that is not {CardInfoDelCond:{CardNoList:[{cardNo}]}} is
     // "Invalid Format / badJsonFormat".
@@ -174,20 +205,71 @@ try {
     assert.equal(cards.has('10000001'), false, 'the card must be gone from the terminal');
     const again = await apply('delete_card', { cardUid: '10000001' });
     assert.deepEqual(again, { success: true });
-    const revoke = await apply('revoke_visitor', { credentialNumber: '77123456' });
-    assert.deepEqual(revoke, { success: true });
     console.log('card delete uses CardInfoDelCond OK');
   }
 
-  // 3d. A visitor credential is written as a JSON normalCard, never XML/tempCard.
+  // 3d. A visitor is sent only as the finite PIN account shown by the terminal's
+  // person editor. No CardInfo or fingerprint is created, so employeeNo cannot
+  // fail while trying to link a card the user did not request.
   {
+    const invalidBefore = requests.length;
+    const invalidPin = await apply('upsert_visitor', {
+      credentialNumber: '55443322', employeeNo: 'VIS55443322', visitorName: 'Grace Visitor',
+      pin: '123', validFrom: '2026-10-05T08:00:00.000Z', validUntil: '2026-10-05T18:00:00.000Z',
+    });
+    assert.equal(invalidPin.success, false);
+    assert.match(invalidPin.error, /PIN must contain 4 to 8 digits/);
+    assert.equal(requests.length, invalidBefore, 'invalid PIN must fail before contacting the terminal');
+
     const before = requests.length;
-    const result = await apply('upsert_visitor', { credentialNumber: '55443322', employeeNo: 'VIS55443322' });
+    const visitorPayload = {
+      credentialNumber: '55443322',
+      employeeNo: 'VIS55443322',
+      visitorName: 'Grace Visitor',
+      department: 'Untrusted operation value',
+      pin: '482731',
+      validFrom: '2026-10-05T08:00:00.000Z',
+      validUntil: '2026-10-05T18:00:00.000Z',
+    };
+    const result = await apply('upsert_visitor', visitorPayload);
     assert.deepEqual(result, { success: true });
-    assert.equal(cards.get('55443322'), 'VIS55443322');
-    const sent = requests.slice(before);
-    assert.equal(sent.every((request) => request.url.includes('format=json') && !request.body.includes('tempCard')), true);
-    console.log('visitor credential written as JSON normalCard OK');
+    const person = persons.get('VIS55443322');
+    assert.deepEqual(person, {
+      employeeNo: 'VIS55443322',
+      name: 'Grace Visitor',
+      belongGroup: 'Company',
+      userType: 'normal',
+      Valid: {
+        enable: true,
+        beginTime: '2026-10-05T08:00:00Z',
+        endTime: '2026-10-05T18:00:00Z',
+        timeType: 'UTC',
+      },
+      localUIRight: false,
+      password: '482731',
+    });
+    assert.equal(cards.has('55443322'), false, 'visitor provisioning must not create CardInfo');
+    assert.deepEqual(requests.slice(before).map((request) => request.url), [
+      '/ISAPI/AccessControl/UserInfo/Record?format=json',
+    ]);
+
+    const retryBefore = requests.length;
+    const retried = await apply('upsert_visitor', visitorPayload);
+    assert.deepEqual(retried, { success: true }, 'a retried operation must update the existing account');
+    assert.deepEqual(requests.slice(retryBefore).map((request) => request.url), [
+      '/ISAPI/AccessControl/UserInfo/Record?format=json',
+      '/ISAPI/AccessControl/UserInfo/Modify?format=json',
+    ]);
+    assert.deepEqual(persons.get('VIS55443322'), person, 'the idempotent update must preserve the exact PIN-only account');
+
+    const revokeBefore = requests.length;
+    const revoked = await apply('revoke_visitor', { credentialNumber: '55443322', employeeNo: 'VIS55443322' });
+    assert.deepEqual(revoked, { success: true });
+    assert.deepEqual(requests.slice(revokeBefore).map((request) => request.url), [
+      '/ISAPI/AccessControl/UserInfoDetail/Delete?format=json',
+    ]);
+    assert.equal(persons.has('VIS55443322'), false, 'expiry/revocation must free the visitor person slot');
+    console.log('visitor PIN-only UserInfo and automatic account deletion OK');
   }
 
   // 4. The summariser reads JSON and XML ResponseStatus documents and falls back

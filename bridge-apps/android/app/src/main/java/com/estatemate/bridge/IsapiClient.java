@@ -381,18 +381,20 @@ public final class IsapiClient {
 
             if (op.equals("revoke_visitor")) {
                 String credential = firstNonEmpty(Json.string(payload, "credentialNumber", null), cardUid);
-                if (credential == null) return new OpResult(false, "Missing credential number");
-                return deleteCard(device, credential, "Visitor revoke ");
+                String visitorEmployeeNo = employeeNo != null ? employeeNo
+                        : credential == null ? null : terminalEmployeeNo("visitor-" + credential);
+                if (visitorEmployeeNo == null) return new OpResult(false, "operation has no valid visitor employee number");
+                return deletePerson(device, visitorEmployeeNo, true);
             }
 
             if (op.equals("upsert_visitor")) {
                 String credential = firstNonEmpty(Json.string(payload, "credentialNumber", null), cardUid);
-                if (credential == null) return new OpResult(false, "Missing credential number");
-                // Filed as a normal card under the visitor's issued employee number;
-                // "tempCard" is not a valid cardType on these terminals.
-                String visitorEmployeeNo = employeeNo != null ? employeeNo : terminalEmployeeNo("visitor-" + credential);
+                String visitorEmployeeNo = employeeNo != null ? employeeNo
+                        : credential == null ? null : terminalEmployeeNo("visitor-" + credential);
                 if (visitorEmployeeNo == null) return new OpResult(false, "operation has no valid visitor employee number");
-                return writeCard(device, visitorEmployeeNo, credential, "Visitor ");
+                // A visitor is only a finite PIN-enabled UserInfo account. Card,
+                // fingerprint, and face fields remain "Not added" on the device.
+                return writeVisitorPerson(device, visitorEmployeeNo, payload);
             }
 
             if (op.equals("upsert_person")) {
@@ -479,7 +481,7 @@ public final class IsapiClient {
     /** The card is already absent from the terminal (and the call is otherwise supported). */
     static boolean alreadyGone(Response response) {
         String body = response.body == null ? "" : response.body;
-        return java.util.regex.Pattern.compile("not ?exist|not ?found|cardNoNotExist", java.util.regex.Pattern.CASE_INSENSITIVE)
+        return java.util.regex.Pattern.compile("not ?exist|not ?found|cardNoNotExist|employeeNoNotExist", java.util.regex.Pattern.CASE_INSENSITIVE)
                 .matcher(body).find()
                 && !java.util.regex.Pattern.compile("notSupport", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(body).find();
     }
@@ -556,6 +558,70 @@ public final class IsapiClient {
         Response legacy = request(device, "PUT", "/ISAPI/AccessControl/CardInfo/Delete", xml, true);
         if (accepted(legacy) || alreadyGone(legacy)) return new OpResult(true, null);
         return new OpResult(false, errorPrefix + describeAttempts(response, legacy));
+    }
+
+    /** Adds or updates the finite PIN-only visitor account shown in the terminal UI. */
+    private OpResult writeVisitorPerson(Device device, String employeeNo, Map<String, Object> payload) throws IOException {
+        String fromText = Json.string(payload, "validFrom", null);
+        String untilText = Json.string(payload, "validUntil", null);
+        java.util.Date from = parseVisitorTime(fromText);
+        java.util.Date until = parseVisitorTime(untilText);
+        if (from == null) return new OpResult(false, "visitor validFrom is not a valid UTC date");
+        if (until == null) return new OpResult(false, "visitor validUntil is not a valid UTC date");
+        if (!until.after(from)) return new OpResult(false, "visitor validUntil must be after validFrom");
+        String pin = Json.string(payload, "pin", "");
+        pin = pin == null ? "" : pin.trim();
+        if (!java.util.regex.Pattern.matches("\\d{4,8}", pin)) return new OpResult(false, "visitor PIN must contain 4 to 8 digits");
+        String name = Json.string(payload, "visitorName", "Visitor");
+        name = name == null || name.trim().isEmpty() ? "Visitor" : name.trim();
+        if (name.length() > 32) name = name.substring(0, 32);
+
+        java.text.SimpleDateFormat terminalTime = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US);
+        terminalTime.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+        Map<String, Object> valid = new LinkedHashMap<String, Object>();
+        valid.put("enable", Boolean.TRUE);
+        valid.put("beginTime", terminalTime.format(from));
+        valid.put("endTime", terminalTime.format(until));
+        valid.put("timeType", "UTC");
+        Map<String, Object> info = new LinkedHashMap<String, Object>();
+        info.put("employeeNo", employeeNo);
+        info.put("name", name);
+        info.put("belongGroup", "Company");
+        info.put("userType", "normal");
+        info.put("Valid", valid);
+        info.put("localUIRight", Boolean.FALSE);
+        info.put("password", pin);
+        Map<String, Object> jsonBody = new LinkedHashMap<String, Object>();
+        jsonBody.put("UserInfo", info);
+        String body = Json.write(jsonBody);
+
+        Response record = request(device, "POST", "/ISAPI/AccessControl/UserInfo/Record?format=json", body, false);
+        if (accepted(record)) return new OpResult(true, null);
+        Response modify = null;
+        if (!unsupported(record)) {
+            modify = request(device, "PUT", "/ISAPI/AccessControl/UserInfo/Modify?format=json", body, false);
+            if (accepted(modify)) return new OpResult(true, null);
+        }
+
+        Response setUp = request(device, "PUT", "/ISAPI/AccessControl/UserInfo/SetUp?format=json", body, false);
+        if (accepted(setUp)) return new OpResult(true, null);
+        if (!unsupported(setUp)) {
+            return modify == null
+                    ? new OpResult(false, "Visitor account " + describeAttempts(record, setUp))
+                    : new OpResult(false, "Visitor account " + describeAttempts(record, modify, setUp));
+        }
+        // XML is for unsupported JSON URLs only, never a content rejection.
+        if (modify != null) return new OpResult(false, "Visitor account " + describeAttempts(record, modify, setUp));
+
+        String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<UserInfo " + XML_NS + ">\n"
+                + "  <employeeNo>" + employeeNo + "</employeeNo>\n  <name>" + xmlText(name) + "</name>\n"
+                + "  <belongGroup>Company</belongGroup>\n  <userType>normal</userType>\n"
+                + "  <Valid><enable>true</enable><beginTime>" + valid.get("beginTime") + "</beginTime>"
+                + "<endTime>" + valid.get("endTime") + "</endTime><timeType>UTC</timeType></Valid>\n"
+                + "  <localUIRight>false</localUIRight>\n  <password>" + pin + "</password>\n</UserInfo>";
+        Response legacy = request(device, "POST", "/ISAPI/AccessControl/UserInfo/Record", xml, true);
+        if (accepted(legacy)) return new OpResult(true, null);
+        return new OpResult(false, "Visitor account " + describeAttempts(record, legacy));
     }
 
     /**
@@ -865,6 +931,29 @@ public final class IsapiClient {
                 .matcher(text);
         if (json.find() && !json.group(1).trim().isEmpty()) return json.group(1).trim();
         return tag(text, name);
+    }
+
+    private static java.util.Date parseVisitorTime(String value) {
+        if (value == null) return null;
+        String[] patterns = { "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", "yyyy-MM-dd'T'HH:mm:ss'Z'" };
+        for (String pattern : patterns) {
+            java.text.SimpleDateFormat format = new java.text.SimpleDateFormat(pattern, java.util.Locale.US);
+            format.setLenient(false);
+            format.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+            java.text.ParsePosition position = new java.text.ParsePosition(0);
+            java.util.Date parsed = format.parse(value, position);
+            if (parsed != null && position.getIndex() == value.length()) return parsed;
+        }
+        return null;
+    }
+
+    private static String xmlText(String value) {
+        return (value == null ? "" : value)
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;")
+                .replace("'", "&apos;");
     }
 
     /**

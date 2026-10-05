@@ -19,11 +19,11 @@ The ISAPI bridge is a small Node.js agent that runs on the same LAN as Hikvision
    - A `capture_fingerprint` item is the one that carries the request only; an `upload_fingerprint` item carries the transient Base64 template (`fingerData`) for the claiming agent alone
    - Auth: `X-EstateMate-Agent-Key: <secret>` or `Authorization: Bearer <secret>`
 2. Applies them via Hikvision ISAPI (HTTP Digest Auth) to the device:
-   - `POST /ISAPI/AccessControl/CardInfo/Record?format=json` — add a card
+   - `POST /ISAPI/AccessControl/CardInfo/Record?format=json` — add a resident/dependant card; visitors do not use `CardInfo`
    - `PUT /ISAPI/AccessControl/CardInfo/Modify?format=json` — when the terminal already holds that card number (a duplicate `Record` is an error, so a re-enable or re-issue falls through to `Modify`)
-   - `PUT /ISAPI/AccessControl/CardInfo/Delete?format=json` — remove a card; the condition must be wrapped as `{"CardInfoDelCond":{"CardNoList":[{"cardNo":"…"}]}}`
-   - `POST /ISAPI/AccessControl/UserInfo/Record?format=json`, `PUT …/UserInfo/Modify`, `PUT …/UserInfo/SetUp` — write the person a credential belongs to (always with `doorRight` + `RightPlan`)
-   - `PUT /ISAPI/AccessControl/UserInfoDetail/Delete?format=json` (fallback `PUT …/UserInfo/Delete`) — remove the person with their cards and fingerprints
+   - `PUT /ISAPI/AccessControl/CardInfo/Delete?format=json` — remove a resident/dependant card; the condition must be wrapped as `{"CardInfoDelCond":{"CardNoList":[{"cardNo":"…"}]}}`
+   - `POST /ISAPI/AccessControl/UserInfo/Record?format=json`, `PUT …/UserInfo/Modify`, `PUT …/UserInfo/SetUp` — write a permanent resident/dependant person with `doorRight` + `RightPlan`, or a finite PIN-only visitor account containing only the terminal-editor fields
+   - `PUT /ISAPI/AccessControl/UserInfoDetail/Delete?format=json` (fallback `PUT …/UserInfo/Delete`) — remove the person account; visitor expiry uses this without any separate card deletion
    - `POST /ISAPI/AccessControl/FingerPrint/SetUp?format=json` — write or delete one finger template (slot 1–10)
    - `POST /ISAPI/AccessControl/CaptureFingerPrint?format=json` — arm the terminal's own reader and read a live finger
    - `PUT /ISAPI/AccessControl/RemoteControl/door/{n}?format=json` — remote door command (model-dependent)
@@ -49,9 +49,10 @@ Recorded from the terminals these bridges were fixed against; the simulated term
 - **A 2xx is not proof.** Some firmware answers HTTP 200 with a `ResponseStatus` whose `statusCode` is not `1` (OK). That is a failure; success is `statusCode == 1` in the body when a body carries one.
 - **Duplicate cards are an error.** `POST CardInfo/Record` for a card number the terminal already holds answers `cardNoAlreadyExist`. The bridge treats that as "update in place" and issues `PUT CardInfo/Modify` with the same `CardInfo` body, which is what makes a re-enabled or re-issued card work. If `Modify` answers `cardNoNotExist`, the card is genuinely absent and `Record`'s own reason is reported.
 - **Delete conditions are wrapped.** `PUT CardInfo/Delete` accepts `{"CardInfoDelCond":{"CardNoList":[{"cardNo":"…"}]}}` — lower-case `cardNo` inside `CardInfoDelCond`. The bare `{"CardNoList":[{"CardNo":"…"}]}` shape answers `Invalid Format / badJsonFormat` and deletes nothing.
-- **Already-absent cards count as removed.** `cardNoNotExist` / `not exist` / `not found` on a delete is success (idempotent), but a terminal that does not implement the call at all (`notSupport`) is **not** — that is a real failure an operator must see.
-- **`tempCard` is not a valid card type.** Visitor credentials are written as `normalCard` under the visitor's issued employee number (`visitor-<credential>` only when no employee number was issued and it passes the 32-byte person-ID check). The old `tempCard` XML write was rejected by the terminals.
-- **XML bodies carry the namespace**: `<CardInfo xmlns="http://www.isapi.org/ver20/XMLSchema" version="2.0">`, likewise `<CardInfoDelCond>` and `<RemoteControlDoor>`.
+- **Already-absent records count as removed.** `cardNoNotExist`, `employeeNoNotExist`, `not exist` or `not found` on the corresponding delete is success (idempotent), but a terminal that does not implement the call at all (`notSupport`) is **not** — that is a real failure an operator must see.
+- **Visitors are PIN-only `UserInfo` accounts.** Both Hikvision bridges send only issued employee number, name, `belongGroup: "Company"`, `userType: "normal"`, enabled UTC validity, `localUIRight: false`, and the 4-to-8-digit PIN as `password`. They send no `CardInfo`, fingerprint, face, `doorRight` or `RightPlan`, so the terminal UI keeps Card/Fingerprint as “Not added.” Revocation deletes the person account.
+- **PIN length fails closed.** Any PIN other than exactly 4–8 decimal digits is rejected before a terminal request. The Worker places the pass's stored PIN in initial and reconciled operations.
+- **XML bodies carry the namespace**: `<CardInfo xmlns="http://www.isapi.org/ver20/XMLSchema" version="2.0">`, likewise `<UserInfo>`, delete conditions and `<RemoteControlDoor>`.
 - **Failures are summarised, not truncated.** The reason is read from the `ResponseStatus` fields (`statusString` / `subStatusCode` / `errorMsg`), from JSON or XML, and both attempts are shown when a fallback was legitimately tried — real rejections first, unsupported-URL answers only if there are no rejections.
 
 ### Person and fingerprint protocol the agent relies on
@@ -59,15 +60,17 @@ Recorded from the terminals these bridges were fixed against; the simulated term
 Grouped with the card rules above and enforced by the simulated terminal in
 `isapi-bridge/agent.person-fingerprint.integration.mjs` (ten checks in `npm test`).
 
-- **Person before credential.** A card or a finger names an ISAPI `employeeNo`
-  that must already exist on the terminal. Record for an unknown person is
-  refused, so the bridge always writes the person first and only then the card or
-  template. EstateMate's canonical `employee_id` (≤32 characters, migration
-  `0018`) is that number.
-- **`doorRight` and `RightPlan` are mandatory.** A person stored without them
-  exists on the terminal and is authorised for nothing — the door does not open.
-  The bridge always sends both, with the terminal's own door numbers (door 1 when
-  the estate has not recorded any), plus `Valid` and `userType: normal`.
+- **Permanent person before credential.** A resident/dependant card or finger names
+  an ISAPI `employeeNo` that must already exist on the terminal. Record for an
+  unknown person is refused, so the bridge writes that permanent person first and
+  only then the card or template. EstateMate's canonical `employee_id` (≤32
+  characters, migration `0018`) is that number. Visitors are the PIN-only account
+  exception above and have no card or fingerprint operation.
+- **`doorRight` and `RightPlan` are mandatory for permanent people.** A permanent
+  person stored without them exists on the terminal and is authorised for
+  nothing. The resident/dependant path therefore sends both, with the terminal's
+  door numbers (door 1 by default), plus `Valid` and `userType: normal`. The
+  visitor payload deliberately mirrors its finite account editor and omits them.
 - **`Record` is not idempotent.** A terminal that already holds the employee
   number answers a rejection; the bridge falls through to `UserInfo/Modify` and
   then `UserInfo/SetUp`, which is what makes a rename or a re-sync work.

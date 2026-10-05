@@ -240,16 +240,58 @@ public final class ProtocolTest {
         Map<String, Object> visitor = new LinkedHashMap<String, Object>();
         visitor.put("credentialNumber", "VIS-7");
         visitor.put("employeeNo", "VIS-7");
+        visitor.put("visitorName", "Grace Visitor");
+        visitor.put("department", "Untrusted operation value");
+        visitor.put("pin", "482731");
+        visitor.put("validFrom", "2026-10-05T08:00:00.000Z");
+        visitor.put("validUntil", "2026-10-05T18:00:00.000Z");
+
+        Map<String, Object> badPin = new LinkedHashMap<String, Object>(visitor);
+        badPin.put("pin", "123");
+        int invalidPinStart = fake.requestOrder.size();
+        IsapiClient.OpResult invalidPin = client.applyOperation(device, "upsert_visitor", badPin);
+        check("visitor PIN must contain 4 to 8 digits", !invalidPin.success && invalidPin.error.contains("4 to 8 digits")
+                && fake.requestOrder.size() == invalidPinStart, String.valueOf(invalidPin.error));
+
+        int visitorRequestStart = fake.requestOrder.size();
         IsapiClient.OpResult visitorResult = client.applyOperation(device, "upsert_visitor", visitor);
         check("upsert_visitor succeeds", visitorResult.success, String.valueOf(visitorResult.error));
-        check("upsert_visitor posts a JSON normalCard, not tempCard", fake.visitorRecords.size() == 1 && fake.visitorRecords.get(0).contains("normalCard")
-                && !fake.visitorRecords.get(0).contains("tempCard"), fake.visitorRecords.toString());
+        check("upsert_visitor sends only the finite normal-user PIN account",
+                fake.visitorPersonRecords.size() == 1 && fake.visitorPersonRecords.get(0).contains("\"name\":\"Grace Visitor\"")
+                        && fake.visitorPersonRecords.get(0).contains("\"belongGroup\":\"Company\"")
+                        && fake.visitorPersonRecords.get(0).contains("\"userType\":\"normal\"")
+                        && fake.visitorPersonRecords.get(0).contains("\"enable\":true")
+                        && fake.visitorPersonRecords.get(0).contains("\"localUIRight\":false")
+                        && fake.visitorPersonRecords.get(0).contains("\"password\":\"482731\"")
+                        && !fake.visitorPersonRecords.get(0).contains("doorRight")
+                        && !fake.visitorPersonRecords.get(0).contains("RightPlan")
+                        && !fake.visitorPersonRecords.get(0).contains("gender")
+                        && !fake.visitorPersonRecords.get(0).contains("CardInfo")
+                        && !fake.visitorPersonRecords.get(0).contains("fingerprint")
+                        && !fake.visitorPersonRecords.get(0).contains("face"), fake.visitorPersonRecords.toString());
+        check("upsert_visitor makes one UserInfo request and no CardInfo request",
+                fake.requestOrder.subList(visitorRequestStart, fake.requestOrder.size()).equals(java.util.Arrays.asList(
+                        "/ISAPI/AccessControl/UserInfo/Record")) && fake.visitorRecords.isEmpty(), fake.requestOrder.toString());
+
+        int visitorRetryStart = fake.requestOrder.size();
+        IsapiClient.OpResult visitorRetry = client.applyOperation(device, "upsert_visitor", visitor);
+        check("a retried visitor upsert updates only the existing account", visitorRetry.success
+                && fake.requestOrder.subList(visitorRetryStart, fake.requestOrder.size()).equals(java.util.Arrays.asList(
+                        "/ISAPI/AccessControl/UserInfo/Record", "/ISAPI/AccessControl/UserInfo/Modify"))
+                && fake.visitorPersonRecords.size() == 2
+                && fake.visitorPersonRecords.get(1).equals(fake.visitorPersonRecords.get(0)), String.valueOf(visitorRetry.error));
 
         Map<String, Object> revoke = new LinkedHashMap<String, Object>();
         revoke.put("credentialNumber", "VIS-7");
+        revoke.put("employeeNo", "VIS-7");
+        int visitorRevokeStart = fake.requestOrder.size();
         IsapiClient.OpResult revokeResult = client.applyOperation(device, "revoke_visitor", revoke);
         check("revoke_visitor succeeds", revokeResult.success, String.valueOf(revokeResult.error));
-        check("revoke_visitor deletes the visitor card", fake.deleteRequests.size() == 2 && fake.deleteRequests.get(1).contains("VIS-7"), fake.deleteRequests.toString());
+        check("revoke_visitor deletes only the visitor person and frees its slot",
+                fake.requestOrder.subList(visitorRevokeStart, fake.requestOrder.size()).equals(java.util.Arrays.asList(
+                        "/ISAPI/AccessControl/UserInfoDetail/Delete"))
+                        && fake.deleteRequests.size() == 1 && fake.visitorPersonDeletes.size() == 1
+                        && !fake.heldPeople.contains("VIS-7"), fake.visitorPersonDeletes.toString());
 
         Map<String, Object> door = new LinkedHashMap<String, Object>();
         door.put("doorNo", Integer.valueOf(2));
@@ -606,11 +648,15 @@ public final class ProtocolTest {
         boolean staleNonceOnce;
         int staleNonceChallenges;
         final java.util.Set<String> heldCards = new java.util.HashSet<String>();
+        final java.util.Set<String> heldPeople = new java.util.HashSet<String>();
+        final List<String> requestOrder = new ArrayList<String>();
         final List<String> modifyRequests = new ArrayList<String>();
         final List<String> cardRecords = new ArrayList<String>();
         final List<String> xmlCardRecords = new ArrayList<String>();
         final List<String> deleteRequests = new ArrayList<String>();
         final List<String> visitorRecords = new ArrayList<String>();
+        final List<String> visitorPersonRecords = new ArrayList<String>();
+        final List<String> visitorPersonDeletes = new ArrayList<String>();
         final List<String> doorRequests = new ArrayList<String>();
         final List<String> personRecords = new ArrayList<String>();
         final List<String> personModifies = new ArrayList<String>();
@@ -673,6 +719,7 @@ public final class ProtocolTest {
                 return;
             }
 
+            device.requestOrder.add(path);
             if (path.equals("/ISAPI/System/deviceInfo")) {
                 respond(exchange, 200, "{\"DeviceInfo\":{\"deviceName\":\"Fake MinMoe\",\"model\":\"DS-K1T341AMF\","
                         + "\"firmwareVersion\":\"V3.4.0\",\"serialNumber\":\"PROTO1\"}}");
@@ -743,10 +790,28 @@ public final class ProtocolTest {
                     respond(exchange, 404, "{\"statusCode\":4,\"statusString\":\"Invalid Operation\",\"subStatusCode\":\"notSupport\"}");
                     return;
                 }
-                // The terminal stores a person only when the record carries door
-                // rights: without doorRight/RightPlan the person exists and is
-                // authorised for nothing, which is exactly the failure field
-                // integrators report.
+                java.util.regex.Matcher personNo = java.util.regex.Pattern.compile("\"employeeNo\":\"([^\"]*)\"").matcher(body);
+                String employeeNo = personNo.find() ? personNo.group(1) : "";
+                if (employeeNo.startsWith("VIS-")) {
+                    if (!body.contains("\"userType\":\"normal\"") || !body.contains("\"Valid\"")
+                            || !body.contains("\"belongGroup\":\"Company\"")
+                            || !java.util.regex.Pattern.compile("\"password\":\"\\d{4,8}\"").matcher(body).find()
+                            || !body.contains("\"localUIRight\":false") || body.contains("\"doorRight\"")
+                            || body.contains("\"RightPlan\"") || body.contains("\"CardInfo\"")) {
+                        respond(exchange, 400, "{\"statusCode\":6,\"statusString\":\"Invalid Content\",\"subStatusCode\":\"badJsonContent\",\"errorMsg\":\"UserInfo\"}");
+                        return;
+                    }
+                    if (device.heldPeople.contains(employeeNo)) {
+                        respond(exchange, 400, "{\"statusCode\":6,\"statusString\":\"Invalid Content\",\"subStatusCode\":\"employeeNoAlreadyExist\",\"errorMsg\":\"employeeNo\"}");
+                        return;
+                    }
+                    device.heldPeople.add(employeeNo);
+                    device.visitorPersonRecords.add(body);
+                    respond(exchange, 200, "{\"statusCode\":1,\"statusString\":\"OK\"}");
+                    return;
+                }
+                // Permanent resident/dependant people need door rights. Visitors
+                // use the finite PIN-only branch above and deliberately do not.
                 if (!body.contains("doorRight") || !body.contains("RightPlan")) {
                     respond(exchange, 400, "{\"statusCode\":6,\"statusString\":\"Invalid Content\",\"subStatusCode\":\"badParameters\",\"errorMsg\":\"doorRight\"}");
                     return;
@@ -756,17 +821,41 @@ public final class ProtocolTest {
                 return;
             }
             if (path.equals("/ISAPI/AccessControl/UserInfo/Modify") || path.equals("/ISAPI/AccessControl/UserInfo/SetUp")) {
-                device.personModifies.add(exchange.getRequestMethod() + " " + path + " " + body);
+                java.util.regex.Matcher personNo = java.util.regex.Pattern.compile("\"employeeNo\":\"([^\"]*)\"").matcher(body);
+                String employeeNo = personNo.find() ? personNo.group(1) : "";
+                if (employeeNo.startsWith("VIS-")) {
+                    if (!device.heldPeople.contains(employeeNo)) {
+                        respond(exchange, 400, "{\"statusCode\":6,\"statusString\":\"Invalid Content\",\"subStatusCode\":\"employeeNoNotExist\",\"errorMsg\":\"employeeNo\"}");
+                        return;
+                    }
+                    device.visitorPersonRecords.add(body);
+                } else {
+                    device.personModifies.add(exchange.getRequestMethod() + " " + path + " " + body);
+                }
                 respond(exchange, 200, "{\"statusCode\":1,\"statusString\":\"OK\"}");
                 return;
             }
             if (path.equals("/ISAPI/AccessControl/UserInfoDetail/Delete")) {
-                device.personDetailDeletes.add(body);
+                java.util.regex.Matcher personNo = java.util.regex.Pattern.compile("\"employeeNo\":\"([^\"]*)\"").matcher(body);
+                String employeeNo = personNo.find() ? personNo.group(1) : "";
+                if (employeeNo.startsWith("VIS-")) {
+                    device.heldPeople.remove(employeeNo);
+                    device.visitorPersonDeletes.add(body);
+                } else {
+                    device.personDetailDeletes.add(body);
+                }
                 respond(exchange, 200, "{\"statusCode\":1,\"statusString\":\"OK\"}");
                 return;
             }
             if (path.equals("/ISAPI/AccessControl/UserInfo/Delete")) {
-                device.personDeletes.add(body);
+                java.util.regex.Matcher personNo = java.util.regex.Pattern.compile("\"employeeNo\":\"([^\"]*)\"").matcher(body);
+                String employeeNo = personNo.find() ? personNo.group(1) : "";
+                if (employeeNo.startsWith("VIS-")) {
+                    device.heldPeople.remove(employeeNo);
+                    device.visitorPersonDeletes.add(body);
+                } else {
+                    device.personDeletes.add(body);
+                }
                 respond(exchange, 200, "{\"statusCode\":1,\"statusString\":\"OK\"}");
                 return;
             }

@@ -79,6 +79,35 @@ describe('visitor device-account lifecycle', () => {
     // centrally so it can never exceed the 32 characters ISAPI allows.
     expect(String(payload.employeeNo)).toBe(`visitor-${String(pass.credentialNumber)}`);
     expect(String(payload.employeeNo).length).toBeLessThanOrEqual(32);
+    expect(payload.department).toBe('Company');
+    expect(payload.pin).toBe(pass.pin);
+    expect(String(payload.pin)).toMatch(/^\d{4,8}$/);
+  });
+
+  it('reconciliation restores the stored PIN and Company department to a failed account operation', async () => {
+    addDevice();
+    const now = Date.now();
+    const pass = await issuePass(new Date(now - 60_000), new Date(now + 60 * 60_000));
+    // Model an operation created by the previous bridge contract: it failed with
+    // no PIN in its payload. Reconciliation must rebuild it from the pass row.
+    database.run(`UPDATE visitor_requests SET pin='004217' WHERE id=?`, String(pass.id));
+    database.run(
+      `UPDATE visitor_device_operations SET status='failed',payload_json='{"credentialNumber":"legacy"}' WHERE visitor_request_id=? AND operation='upsert_visitor'`,
+      String(pass.id),
+    );
+
+    const sync = await call(env, 'POST', '/api/visitors/sync-active', { token: adminToken });
+    expect(sync.status).toBe(200);
+    expect(sync.json.queued).toBe(1);
+    const operation = database.one(
+      `SELECT status,payload_json FROM visitor_device_operations WHERE visitor_request_id=? AND operation='upsert_visitor'`,
+      String(pass.id),
+    );
+    expect(operation?.status).toBe('manual_action_required');
+    const payload = JSON.parse(String(operation?.payload_json)) as Record<string, unknown>;
+    expect(payload.department).toBe('Company');
+    expect(payload.pin).toBe('004217');
+    expect(payload.employeeNo).toBe(`visitor-${String(pass.credentialNumber)}`);
   });
 
   it('marks a pass with no terminals as none and reports that from the creation call', async () => {
