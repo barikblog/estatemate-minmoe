@@ -221,7 +221,6 @@ describe('Remote Network Verification', () => {
     await worker.queue(
       { messages: sends.map((send) => ({ body: send.body })), ackAll: () => undefined, retryAll: () => undefined } as never,
       env,
-      { waitUntil: async () => undefined } as unknown as ExecutionContext,
     );
 
     const row = db.one(`SELECT remote_decision,remote_decision_reason,remote_door_result FROM access_events WHERE device_id=?`, deviceId) as {

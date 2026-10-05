@@ -165,6 +165,10 @@ copyRepo('isapi-bridge/agent.mjs', 'agent-core.mjs');
 // next module added to the core from being shipped the same way.
 copyRepo('isapi-bridge/zkteco-push.mjs', 'zkteco-push.mjs');
 copyRepo('isapi-bridge/zkteco-push-server.mjs', 'zkteco-push-server.mjs');
+// Resolved by relative path from agent-core.mjs: omit one and the installed
+// bridge exits at import time on every machine that runs this bundle.
+copyRepo('isapi-bridge/remote-verify.mjs', 'remote-verify.mjs');
+copyRepo('isapi-bridge/lan-event-listener.mjs', 'lan-event-listener.mjs');
 copyRepo('windows-agent/agent.mjs', 'agent.mjs');
 copyRepo('windows-agent/install-windows.mjs', 'install-windows.mjs');
 copyRepo('windows-agent/agent-config.example.json', 'agent-config.example.json');
