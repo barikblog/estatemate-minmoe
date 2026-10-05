@@ -644,6 +644,14 @@ What shipped:
   protocol, same card handling, same reason strings) so a phone and a PC give the
   same answer at the same gate.
 
+**Deployed 2026-10-05.** PR #50 merged as `23191f9`; run `37297232360` applied
+migration `0020` to production D1 and then deployed the Worker, and the
+post-deploy smoke run `37297353055` came back green (API health, portal config
+served from D1, login endpoint answering JSON). **Production behaviour is
+unchanged by this deploy**: every new column defaults to the previous behaviour
+and both switches ship off, so no terminal becomes a reader until an operator
+says so at that terminal.
+
 **Verification status: CI-verified, hardware-unverified.** 33 agent integration
 checks (fake Worker + fake terminal) and 8 Worker tests pass, covering paging,
 delta removal, cold-cache denial, one unlock per card with the documented
