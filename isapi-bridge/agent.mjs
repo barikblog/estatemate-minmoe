@@ -899,12 +899,23 @@ async function deviceEventLoop(device) {
 // invents one: it used to fall back to the resident's user id (36 characters —
 // terminals refuse person IDs over 32 bytes) or to a literal "1", which attached
 // a re-enabled card to whoever terminal person 1 was and still reported success.
-// Only values a terminal accepts and that are safe inside the XML body pass.
-const TERMINAL_EMPLOYEE_NO = /^[A-Za-z0-9_-]{1,32}$/;
+// Only values a terminal accepts pass: letters and digits, at most 32.
+//
+// Deletion is the one exception. Estates provisioned before the charset rule
+// may hold terminal person records under the old shape (letters, digits and
+// `._-/`, e.g. a `visitor-<credential>` visitor account), and a terminal that
+// stored them still needs them addressed to free the slot. Delete paths accept
+// that legacy shape; every write path refuses it, so nothing new is ever filed
+// under an identity a strict terminal cannot store.
+const TERMINAL_EMPLOYEE_NO = /^[A-Za-z0-9]{1,32}$/;
+const LEGACY_TERMINAL_EMPLOYEE_NO = /^[A-Za-z0-9._/-]{1,32}$/;
+const VISITOR_EMPLOYEE_NO = /^visitor-?\d/;
 
-function terminalEmployeeNo(payload) {
+function terminalEmployeeNo(payload, options = {}) {
   const value = String(payload.employeeNo ?? '').trim();
-  return TERMINAL_EMPLOYEE_NO.test(value) ? value : null;
+  if (TERMINAL_EMPLOYEE_NO.test(value)) return value;
+  if (options.allowLegacy && LEGACY_TERMINAL_EMPLOYEE_NO.test(value)) return value;
+  return null;
 }
 
 /**
@@ -1659,7 +1670,8 @@ async function applyCardOperation(device, operation) {
       return { success: false, error: describeAttempts(removed.attempts) };
     } else if (op === 'revoke_visitor') {
       const credential = payload.credentialNumber || cardUid;
-      const visitorEmployeeNo = employeeNo || (credential && TERMINAL_EMPLOYEE_NO.test(`visitor-${credential}`) ? `visitor-${credential}` : null);
+      const legacyEmployeeNo = terminalEmployeeNo(payload, { allowLegacy: true });
+      const visitorEmployeeNo = legacyEmployeeNo || (credential && TERMINAL_EMPLOYEE_NO.test(`visitor${credential}`) ? `visitor${credential}` : null);
       if (!visitorEmployeeNo) return { success: false, error: 'operation has no valid visitor employee number' };
       const removed = await deleteTerminalPerson(device, { employeeNo: visitorEmployeeNo, fullRemoval: true });
       if (removed.ok) return { success: true };
@@ -1668,7 +1680,7 @@ async function applyCardOperation(device, operation) {
       // A visitor is a PIN-only, finite UserInfo account. Do not create CardInfo,
       // fingerprint, or face records: those fields remain "Not added" on device.
       const credential = payload.credentialNumber || cardUid;
-      const visitorEmployeeNo = employeeNo || (credential && TERMINAL_EMPLOYEE_NO.test(`visitor-${credential}`) ? `visitor-${credential}` : null);
+      const visitorEmployeeNo = employeeNo || (credential && TERMINAL_EMPLOYEE_NO.test(`visitor${credential}`) ? `visitor${credential}` : null);
       if (!visitorEmployeeNo) return { success: false, error: 'operation has no valid visitor employee number' };
       const person = await writeTerminalVisitorPerson(device, payload, visitorEmployeeNo);
       if (person.ok) return { success: true };
@@ -1677,7 +1689,7 @@ async function applyCardOperation(device, operation) {
 
     else if (op === 'upsert_person') {
       if (!employeeNo) return { success: false, error: 'operation has no valid EstateMate employee number' };
-      const written = await writeTerminalPerson(device, { ...payload, employeeNo, userType: payload.userType || (String(employeeNo).startsWith('visitor-') ? 'visitor' : 'normal') });
+      const written = await writeTerminalPerson(device, { ...payload, employeeNo, userType: payload.userType || (VISITOR_EMPLOYEE_NO.test(employeeNo) ? 'visitor' : 'normal') });
       if (written.ok) {
         log('info', `Person ${employeeNo} upsert OK on ${device.name}: ${written.result.status}`);
         return { success: true };
@@ -1685,10 +1697,11 @@ async function applyCardOperation(device, operation) {
       log('warn', `Person upsert failed on ${device.name}: ${written.result.status} ${String(written.result.body).slice(0, 500)}`);
       return { success: false, error: describeAttempts(written.attempts) };
     } else if (op === 'delete_person') {
-      if (!employeeNo) return { success: false, error: 'operation has no valid EstateMate employee number' };
-      const removed = await deleteTerminalPerson(device, { ...payload, employeeNo });
+      const legacyEmployeeNo = terminalEmployeeNo(payload, { allowLegacy: true });
+      if (!legacyEmployeeNo) return { success: false, error: 'operation has no valid EstateMate employee number' };
+      const removed = await deleteTerminalPerson(device, { ...payload, employeeNo: legacyEmployeeNo });
       if (removed.ok) {
-        log('info', `Person ${employeeNo} removed from ${device.name} via ${removed.mode}`);
+        log('info', `Person ${legacyEmployeeNo} removed from ${device.name} via ${removed.mode}`);
         return { success: true };
       }
       log('warn', `Person delete failed on ${device.name}: ${removed.result.status} ${String(removed.result.body).slice(0, 500)}`);

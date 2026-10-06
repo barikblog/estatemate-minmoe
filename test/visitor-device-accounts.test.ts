@@ -89,7 +89,7 @@ describe('visitor device-account lifecycle', () => {
     const payload = JSON.parse(String(operation?.payload_json)) as Record<string, unknown>;
     // The employee number the terminal will know the visitor by — composed
     // centrally so it can never exceed the 32 characters ISAPI allows.
-    expect(String(payload.employeeNo)).toBe(`visitor-${String(pass.credentialNumber)}`);
+    expect(String(payload.employeeNo)).toBe(`visitor${String(pass.credentialNumber)}`);
     expect(String(payload.employeeNo).length).toBeLessThanOrEqual(32);
     expect(payload.department).toBe('Company');
     expect(payload.pin).toBe(pass.pin);
@@ -147,7 +147,7 @@ describe('visitor device-account lifecycle', () => {
     const payload = JSON.parse(String(operation?.payload_json)) as Record<string, unknown>;
     expect(payload.department).toBe('Company');
     expect(payload.pin).toBe('004217');
-    expect(payload.employeeNo).toBe(`visitor-${String(pass.credentialNumber)}`);
+    expect(payload.employeeNo).toBe(`visitor${String(pass.credentialNumber)}`);
   });
 
   it('marks a pass with no terminals as none and reports that from the creation call', async () => {

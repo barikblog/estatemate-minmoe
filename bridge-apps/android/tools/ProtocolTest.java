@@ -225,11 +225,11 @@ public final class ProtocolTest {
 
         Map<String, Object> payload = new LinkedHashMap<String, Object>();
         payload.put("cardUid", "99887766");
-        payload.put("employeeNo", "RES-9");
+        payload.put("employeeNo", "RES9");
         IsapiClient.OpResult upsert = client.applyOperation(device, "upsert_card", payload);
         check("upsert_card succeeds", upsert.success, String.valueOf(upsert.error));
         check("upsert_card posts the JSON card record",
-                fake.cardRecords.size() == 1 && fake.cardRecords.get(0).contains("\"cardNo\":\"99887766\"") && fake.cardRecords.get(0).contains("\"employeeNo\":\"RES-9\""),
+                fake.cardRecords.size() == 1 && fake.cardRecords.get(0).contains("\"cardNo\":\"99887766\"") && fake.cardRecords.get(0).contains("\"employeeNo\":\"RES9\""),
                 fake.cardRecords.toString());
 
         IsapiClient.OpResult delete = client.applyOperation(device, "delete_card", payload);
@@ -238,8 +238,8 @@ public final class ProtocolTest {
                 && fake.deleteRequests.get(0).contains("\"CardInfoDelCond\"") && fake.deleteRequests.get(0).contains("\"cardNo\":\"99887766\""), fake.deleteRequests.toString());
 
         Map<String, Object> visitor = new LinkedHashMap<String, Object>();
-        visitor.put("credentialNumber", "VIS-7");
-        visitor.put("employeeNo", "VIS-7");
+        visitor.put("credentialNumber", "VIS7");
+        visitor.put("employeeNo", "VIS7");
         visitor.put("visitorName", "Grace Visitor");
         visitor.put("department", "Untrusted operation value");
         visitor.put("pin", "482731");
@@ -282,8 +282,8 @@ public final class ProtocolTest {
                 && fake.visitorPersonRecords.get(1).equals(fake.visitorPersonRecords.get(0)), String.valueOf(visitorRetry.error));
 
         Map<String, Object> revoke = new LinkedHashMap<String, Object>();
-        revoke.put("credentialNumber", "VIS-7");
-        revoke.put("employeeNo", "VIS-7");
+        revoke.put("credentialNumber", "VIS7");
+        revoke.put("employeeNo", "VIS7");
         int visitorRevokeStart = fake.requestOrder.size();
         IsapiClient.OpResult revokeResult = client.applyOperation(device, "revoke_visitor", revoke);
         check("revoke_visitor succeeds", revokeResult.success, String.valueOf(revokeResult.error));
@@ -291,7 +291,7 @@ public final class ProtocolTest {
                 fake.requestOrder.subList(visitorRevokeStart, fake.requestOrder.size()).equals(java.util.Arrays.asList(
                         "/ISAPI/AccessControl/UserInfoDetail/Delete"))
                         && fake.deleteRequests.size() == 1 && fake.visitorPersonDeletes.size() == 1
-                        && !fake.heldPeople.contains("VIS-7"), fake.visitorPersonDeletes.toString());
+                        && !fake.heldPeople.contains("VIS7"), fake.visitorPersonDeletes.toString());
 
         Map<String, Object> door = new LinkedHashMap<String, Object>();
         door.put("doorNo", Integer.valueOf(2));
@@ -317,6 +317,12 @@ public final class ProtocolTest {
         unsafe.put("employeeNo", "</employeeNo><cardNo>1");
         IsapiClient.OpResult unsafeResult = client.applyOperation(device, "upsert_card", unsafe);
         check("an employee number a terminal cannot take is refused", !unsafeResult.success, String.valueOf(unsafeResult.error));
+        check("letters and digits are the only charset a terminal takes",
+                IsapiClient.terminalEmployeeNo("RES9") != null
+                        && IsapiClient.terminalEmployeeNo("RES-9") == null
+                        && IsapiClient.terminalEmployeeNo("visitor123456789012") != null
+                        && IsapiClient.terminalEmployeeNo("visitor-7", true) != null
+                        && IsapiClient.terminalEmployeeNo("visitor-7") == null);
         check("nothing reaches the terminal without a valid employee number",
                 fake.cardRecords.size() + fake.xmlCardRecords.size() == recordsBefore, fake.cardRecords.toString());
         String rejection = IsapiClient.describeFailure(400,
@@ -332,7 +338,7 @@ public final class ProtocolTest {
         fake.rejectContent = true;
         Map<String, Object> contentPayload = new LinkedHashMap<String, Object>();
         contentPayload.put("cardUid", "33334444");
-        contentPayload.put("employeeNo", "RES-33");
+        contentPayload.put("employeeNo", "RES33");
         IsapiClient.OpResult contentResult = client.applyOperation(device, "upsert_card", contentPayload);
         check("a content rejection is reported with its reason",
                 !contentResult.success && contentResult.error != null && contentResult.error.contains("badParameters"), String.valueOf(contentResult.error));
@@ -342,7 +348,7 @@ public final class ProtocolTest {
         // A card the terminal already holds is updated in place.
         Map<String, Object> heldPayload = new LinkedHashMap<String, Object>();
         heldPayload.put("cardUid", "77776666");
-        heldPayload.put("employeeNo", "RES-77");
+        heldPayload.put("employeeNo", "RES77");
         IsapiClient.OpResult firstWrite = client.applyOperation(device, "upsert_card", heldPayload);
         IsapiClient.OpResult again = client.applyOperation(device, "enable_card", heldPayload);
         check("re-enabling a card the terminal holds succeeds via Modify",
@@ -352,7 +358,7 @@ public final class ProtocolTest {
         fake.rejectJsonCards = true;
         Map<String, Object> fallbackPayload = new LinkedHashMap<String, Object>();
         fallbackPayload.put("cardUid", "11112222");
-        fallbackPayload.put("employeeNo", "RES-11");
+        fallbackPayload.put("employeeNo", "RES11");
         IsapiClient.OpResult fallback = client.applyOperation(device, "upsert_card", fallbackPayload);
         check("a firmware that rejects JSON falls back to XML", fallback.success && !fake.xmlCardRecords.isEmpty(), String.valueOf(fallback.error));
         fake.rejectJsonCards = false;
@@ -383,7 +389,7 @@ public final class ProtocolTest {
         // authorised for nothing. The bridge writes the person first, with
         // doorRight and RightPlan, and only then the card.
         Map<String, Object> personPayload = new LinkedHashMap<String, Object>();
-        personPayload.put("employeeNo", "RES-9");
+        personPayload.put("employeeNo", "RES9");
         personPayload.put("name", "Ada Nwosu");
         IsapiClient.OpResult person = client.applyOperation(device, "upsert_person", personPayload);
         check("upsert_person succeeds", person.success, String.valueOf(person.error));
@@ -398,7 +404,7 @@ public final class ProtocolTest {
         doors.add(Integer.valueOf(1));
         doors.add(Integer.valueOf(3));
         Map<String, Object> multiDoor = new LinkedHashMap<String, Object>();
-        multiDoor.put("employeeNo", "RES-10");
+        multiDoor.put("employeeNo", "RES10");
         multiDoor.put("name", "Bola Ade");
         multiDoor.put("doorNumbers", doors);
         IsapiClient.OpResult multi = client.applyOperation(device, "upsert_person", multiDoor);
@@ -408,7 +414,7 @@ public final class ProtocolTest {
 
         // A rename is an edit: Record refuses the duplicate, Modify applies it.
         Map<String, Object> rename = new LinkedHashMap<String, Object>();
-        rename.put("employeeNo", "RES-9");
+        rename.put("employeeNo", "RES9");
         rename.put("name", "Ada Nwosu-Bello");
         fake.rejectPersonJson = true; // the terminal answers Record with notSupport
         IsapiClient.OpResult edited = client.applyOperation(device, "upsert_person", rename);
@@ -419,13 +425,13 @@ public final class ProtocolTest {
         IsapiClient.OpResult removedPerson = client.applyOperation(device, "delete_person", personPayload);
         check("delete_person succeeds", removedPerson.success, String.valueOf(removedPerson.error));
         check("delete_person removes the person with their cards and fingerprints",
-                fake.personDetailDeletes.size() == 1 && fake.personDetailDeletes.get(0).contains("RES-9")
+                fake.personDetailDeletes.size() == 1 && fake.personDetailDeletes.get(0).contains("RES9")
                         && fake.personDetailDeletes.get(0).contains("EmployeeNoList"),
                 fake.personDetailDeletes.toString());
 
         // ---------------------------------------------------- fingerprints --
         Map<String, Object> fingerprint = new LinkedHashMap<String, Object>();
-        fingerprint.put("employeeNo", "RES-9");
+        fingerprint.put("employeeNo", "RES9");
         fingerprint.put("fingerNo", Integer.valueOf(2));
         IsapiClient.OpResult noTemplate = client.applyOperation(device, "upload_fingerprint", fingerprint, null);
         check("an upload without a template is refused, not silently sent",
@@ -438,11 +444,11 @@ public final class ProtocolTest {
                         && fake.fingerprintWrites.get(0).contains("\"fingerData\":\"QkFTRTY0VEVNUExBVEU=\"")
                         && fake.fingerprintWrites.get(0).contains("\"enableCardReader\":[1]"),
                 String.valueOf(written.error) + fake.fingerprintWrites.toString());
-        check("the terminal now holds the template", fake.heldFingerprints.contains("RES-9:2"), fake.heldFingerprints.toString());
+        check("the terminal now holds the template", fake.heldFingerprints.contains("RES9:2"), fake.heldFingerprints.toString());
 
         IsapiClient.OpResult deleted = client.applyOperation(device, "delete_fingerprint_device", fingerprint);
         check("delete_fingerprint_device deletes the slot",
-                deleted.success && !fake.heldFingerprints.contains("RES-9:2"), String.valueOf(deleted.error));
+                deleted.success && !fake.heldFingerprints.contains("RES9:2"), String.valueOf(deleted.error));
         check("the delete sets deleteFingerPrint",
                 fake.fingerprintWrites.get(1).contains("\"deleteFingerPrint\":true"), fake.fingerprintWrites.get(1));
 
@@ -451,7 +457,7 @@ public final class ProtocolTest {
         fake.captureTemplate = "QU5PVEhFUlRFTVBMQVRF";
         Map<String, Object> captureDep = new LinkedHashMap<String, Object>();
         captureDep.put("fingerNo", Integer.valueOf(3));
-        captureDep.put("employeeNo", "RES-9");
+        captureDep.put("employeeNo", "RES9");
         IsapiClient.OpResult captured = client.applyOperation(device, "capture_fingerprint", captureDep, null);
         check("capture_fingerprint returns the template to the caller",
                 captured.success && captured.result != null && "QU5PVEhFUlRFTVBMQVRF".equals(captured.result.get("templateData")),
@@ -749,7 +755,7 @@ public final class ProtocolTest {
                         return;
                     }
                     device.heldCards.add(held);
-                    if (body.contains("\"employeeNo\":\"VIS-")) device.visitorRecords.add(body);
+                    if (body.contains("\"employeeNo\":\"VIS")) device.visitorRecords.add(body);
                     else device.cardRecords.add(body);
                 }
                 respond(exchange, 200, "{\"statusCode\":1,\"statusString\":\"OK\"}");
@@ -792,7 +798,7 @@ public final class ProtocolTest {
                 }
                 java.util.regex.Matcher personNo = java.util.regex.Pattern.compile("\"employeeNo\":\"([^\"]*)\"").matcher(body);
                 String employeeNo = personNo.find() ? personNo.group(1) : "";
-                if (employeeNo.startsWith("VIS-")) {
+                if (employeeNo.startsWith("VIS")) {
                     if (!body.contains("\"userType\":\"normal\"") || !body.contains("\"Valid\"")
                             || !body.contains("\"belongGroup\":\"Company\"")
                             || !java.util.regex.Pattern.compile("\"password\":\"\\d{4,8}\"").matcher(body).find()
@@ -823,7 +829,7 @@ public final class ProtocolTest {
             if (path.equals("/ISAPI/AccessControl/UserInfo/Modify") || path.equals("/ISAPI/AccessControl/UserInfo/SetUp")) {
                 java.util.regex.Matcher personNo = java.util.regex.Pattern.compile("\"employeeNo\":\"([^\"]*)\"").matcher(body);
                 String employeeNo = personNo.find() ? personNo.group(1) : "";
-                if (employeeNo.startsWith("VIS-")) {
+                if (employeeNo.startsWith("VIS")) {
                     if (!device.heldPeople.contains(employeeNo)) {
                         respond(exchange, 400, "{\"statusCode\":6,\"statusString\":\"Invalid Content\",\"subStatusCode\":\"employeeNoNotExist\",\"errorMsg\":\"employeeNo\"}");
                         return;
@@ -838,7 +844,7 @@ public final class ProtocolTest {
             if (path.equals("/ISAPI/AccessControl/UserInfoDetail/Delete")) {
                 java.util.regex.Matcher personNo = java.util.regex.Pattern.compile("\"employeeNo\":\"([^\"]*)\"").matcher(body);
                 String employeeNo = personNo.find() ? personNo.group(1) : "";
-                if (employeeNo.startsWith("VIS-")) {
+                if (employeeNo.startsWith("VIS")) {
                     device.heldPeople.remove(employeeNo);
                     device.visitorPersonDeletes.add(body);
                 } else {
@@ -850,7 +856,7 @@ public final class ProtocolTest {
             if (path.equals("/ISAPI/AccessControl/UserInfo/Delete")) {
                 java.util.regex.Matcher personNo = java.util.regex.Pattern.compile("\"employeeNo\":\"([^\"]*)\"").matcher(body);
                 String employeeNo = personNo.find() ? personNo.group(1) : "";
-                if (employeeNo.startsWith("VIS-")) {
+                if (employeeNo.startsWith("VIS")) {
                     device.heldPeople.remove(employeeNo);
                     device.visitorPersonDeletes.add(body);
                 } else {
@@ -948,7 +954,7 @@ public final class ProtocolTest {
             }
             if (path.endsWith("/operations")) {
                 respond(exchange, 200, "{\"ok\":true,\"items\":[{\"id\":\"op-1\",\"kind\":\"card\",\"operation\":\"upsert_card\","
-                        + "\"deviceId\":\"" + DEVICE_ID + "\",\"payload\":{\"cardUid\":\"1234\",\"employeeNo\":\"RES-1\"}}]}");
+                        + "\"deviceId\":\"" + DEVICE_ID + "\",\"payload\":{\"cardUid\":\"1234\",\"employeeNo\":\"RES1\"}}]}");
                 return;
             }
             if (path.endsWith("/result")) {

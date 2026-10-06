@@ -255,7 +255,7 @@ describe('Person synchronisation and fingerprint capture', () => {
 
   it('removes a person from a terminal with their cards, fingerprints and permissions', async () => {
     const gateA = await createAgentFor('Gate A', ['card', 'person', 'fingerprint', 'door']);
-    db.run(`UPDATE users SET employee_id='EMP-7' WHERE id=?`, estate.residentId);
+    db.run(`UPDATE users SET employee_id='EMP7' WHERE id=?`, estate.residentId);
 
     const removed = await call(env, 'POST', '/api/device-sync/remove', {
       token: adminToken,
@@ -267,7 +267,7 @@ describe('Person synchronisation and fingerprint capture', () => {
     expect(op?.status).toBe('pending');
     const payload = JSON.parse(String(op!.payload_json)) as Record<string, unknown>;
     expect(payload.fullRemoval).toBe(true);
-    expect(payload.employeeNo).toBe('EMP-7');
+    expect(payload.employeeNo).toBe('EMP7');
     expect(payload.reason).toBe('tenancy ended');
 
     const reported = await agentRequest(gateA.agentId, gateA.secret, 'POST', `/operations/${String(db.one(`SELECT id FROM device_operations WHERE operation='delete_person'`)!.id)}/result`, { kind: 'person', status: 'applied', durationMs: 800 });
@@ -278,7 +278,7 @@ describe('Person synchronisation and fingerprint capture', () => {
 
   it('an edit re-states the person on the terminals that already hold them', async () => {
     const gateA = await createAgentFor('Gate A', ['card', 'person', 'door']);
-    db.run(`UPDATE users SET employee_id='EMP-11' WHERE id=?`, estate.residentId);
+    db.run(`UPDATE users SET employee_id='EMP11' WHERE id=?`, estate.residentId);
     addCard();
 
     // First sync puts the person on the terminal and records that it is there.

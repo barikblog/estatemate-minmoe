@@ -205,9 +205,9 @@ try {
   // 1. The person body the guide requires, and the door rights that make the
   //    difference between a person who exists and a person who can get in.
   {
-    const written = await apply('upsert_person', { employeeNo: 'EMP-100', name: 'Ada Nwosu', doorNumbers: [1, 3] });
+    const written = await apply('upsert_person', { employeeNo: 'EMP100', name: 'Ada Nwosu', doorNumbers: [1, 3] });
     assert.deepEqual(written, { success: true });
-    const person = persons.get('EMP-100');
+    const person = persons.get('EMP100');
     assert.equal(person.name, 'Ada Nwosu');
     assert.equal(person.doorRight, '1,3');
     assert.equal(person.RightPlan.length, 2);
@@ -223,32 +223,32 @@ try {
   //    it does not is refused by the terminal, which is exactly why the person is
   //    written first.
   {
-    const card = await apply('upsert_card', { cardUid: '77889900', employeeNo: 'EMP-101' });
+    const card = await apply('upsert_card', { cardUid: '77889900', employeeNo: 'EMP101' });
     assert.equal(card.success, false, 'a card cannot be filed against a person the terminal has never seen');
     assert.match(card.error, /employeeNoNotExist/);
-    const personFirst = await apply('upsert_person', { employeeNo: 'EMP-101', name: 'Bola Ade', doorNumbers: [1] });
+    const personFirst = await apply('upsert_person', { employeeNo: 'EMP101', name: 'Bola Ade', doorNumbers: [1] });
     assert.deepEqual(personFirst, { success: true });
-    const cardAgain = await apply('upsert_card', { cardUid: '77889900', employeeNo: 'EMP-101' });
+    const cardAgain = await apply('upsert_card', { cardUid: '77889900', employeeNo: 'EMP101' });
     assert.deepEqual(cardAgain, { success: true });
-    assert.equal(cards.get('77889900'), 'EMP-101');
+    assert.equal(cards.get('77889900'), 'EMP101');
     console.log('card requires its person first OK');
   }
 
   // 3. An edit: a terminal that already holds the employee number refuses Record,
   //    and the agent edits in place.
   {
-    const edit = await apply('upsert_person', { employeeNo: 'EMP-100', name: 'Ada Nwosu-Bello', doorNumbers: [1, 3] });
+    const edit = await apply('upsert_person', { employeeNo: 'EMP100', name: 'Ada Nwosu-Bello', doorNumbers: [1, 3] });
     assert.deepEqual(edit, { success: true });
-    assert.equal(persons.get('EMP-100').name, 'Ada Nwosu-Bello');
+    assert.equal(persons.get('EMP100').name, 'Ada Nwosu-Bello');
     assert.equal(urls('/ISAPI/AccessControl/UserInfo/Modify').length, 1, 'the edit must go through Modify');
     console.log('a rename is an edit on the terminal OK');
   }
 
   // 4. Removal takes everything with it.
   {
-    const removed = await apply('delete_person', { employeeNo: 'EMP-101', fullRemoval: true });
+    const removed = await apply('delete_person', { employeeNo: 'EMP101', fullRemoval: true });
     assert.deepEqual(removed, { success: true });
-    assert.equal(persons.has('EMP-101'), false);
+    assert.equal(persons.has('EMP101'), false);
     assert.equal(cards.has('77889900'), false, 'the person\u2019s cards go with them');
     assert.equal(urls('/ISAPI/AccessControl/UserInfoDetail/Delete').length, 1);
     console.log('full removal takes the person, their cards and their fingerprints OK');
@@ -258,9 +258,9 @@ try {
   //    reported failure.
   {
     supportDetailDelete = false;
-    const narrower = await apply('delete_person', { employeeNo: 'EMP-100', fullRemoval: true });
+    const narrower = await apply('delete_person', { employeeNo: 'EMP100', fullRemoval: true });
     assert.deepEqual(narrower, { success: true });
-    assert.equal(persons.has('EMP-100'), false);
+    assert.equal(persons.has('EMP100'), false);
     assert.equal(urls('/ISAPI/AccessControl/UserInfo/Delete').length, 1);
     supportDetailDelete = true;
     console.log('fallback to UserInfo/Delete OK');
@@ -268,20 +268,20 @@ try {
 
   // 6. A template read on one terminal is written to another.
   {
-    await apply('upsert_person', { employeeNo: 'EMP-200', name: 'Chika Eze', doorNumbers: [1] });
-    const written = await apply('upload_fingerprint', { employeeNo: 'EMP-200', fingerNo: 2 }, template);
+    await apply('upsert_person', { employeeNo: 'EMP200', name: 'Chika Eze', doorNumbers: [1] });
+    const written = await apply('upload_fingerprint', { employeeNo: 'EMP200', fingerNo: 2 }, template);
     assert.deepEqual(written, { success: true });
-    assert.equal(fingerprints.get('EMP-200:2'), template);
+    assert.equal(fingerprints.get('EMP200:2'), template);
     const sent = JSON.parse(urls('/ISAPI/AccessControl/FingerPrint/SetUp')[0].body).FingerPrintCfg;
     assert.deepEqual(sent.enableCardReader, [1]);
     assert.equal(sent.fingerType, 'normalFP');
     assert.equal(sent.checkEmployeeNo, true);
-    const noTemplate = await apply('upload_fingerprint', { employeeNo: 'EMP-200', fingerNo: 3 }, null);
+    const noTemplate = await apply('upload_fingerprint', { employeeNo: 'EMP200', fingerNo: 3 }, null);
     assert.equal(noTemplate.success, false);
     assert.match(noTemplate.error, /expired/, 'a template that is gone must say so, not write nothing quietly');
-    const deleted = await apply('delete_fingerprint_device', { employeeNo: 'EMP-200', fingerNo: 2 });
+    const deleted = await apply('delete_fingerprint_device', { employeeNo: 'EMP200', fingerNo: 2 });
     assert.deepEqual(deleted, { success: true });
-    assert.equal(fingerprints.has('EMP-200:2'), false);
+    assert.equal(fingerprints.has('EMP200:2'), false);
     console.log('fingerprint upload and slot delete OK');
   }
 
@@ -290,7 +290,7 @@ try {
   {
     captureArmings = 0;
     captureFailsUntil = 2;
-    const captured = await apply('capture_fingerprint', { employeeNo: 'EMP-200', fingerNo: 5 });
+    const captured = await apply('capture_fingerprint', { employeeNo: 'EMP200', fingerNo: 5 });
     assert.equal(captured.success, true, String(captured.error));
     assert.equal(captured.result.templateData, template);
     assert.equal(captured.result.fingerNo, 5);
@@ -302,11 +302,11 @@ try {
   // 8. A terminal that does not document the URL is reported as such.
   {
     supportCapture = false;
-    const refused = await apply('capture_fingerprint', { employeeNo: 'EMP-200', fingerNo: 6 });
+    const refused = await apply('capture_fingerprint', { employeeNo: 'EMP200', fingerNo: 6 });
     assert.equal(refused.success, false);
     assert.match(refused.error, /does not (document|accept) fingerprint collection/);
     supportFingerprint = false;
-    const noWrite = await apply('upload_fingerprint', { employeeNo: 'EMP-200', fingerNo: 6 }, template);
+    const noWrite = await apply('upload_fingerprint', { employeeNo: 'EMP200', fingerNo: 6 }, template);
     assert.equal(noWrite.success, false);
     assert.match(noWrite.error, /notSupport/);
     supportCapture = true;

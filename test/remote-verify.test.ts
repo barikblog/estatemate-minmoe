@@ -47,14 +47,14 @@ describe('Remote Network Verification', () => {
     const estate = seedEstate(db);
     adminToken = await tokenFor(env, estate.adminId, 'admin', 'Ada Admin');
     managerToken = await tokenFor(env, estate.managerId, 'manager', 'Musa Manager');
-    db.run(`UPDATE users SET employee_id='EMP-RITA' WHERE id='user-resident'`);
+    db.run(`UPDATE users SET employee_id='EMPRITA' WHERE id='user-resident'`);
     // A second resident who is deactivated: their card must never reach a bridge.
     db.run(`INSERT INTO users(id,name,email,password_hash,role,status) VALUES ('user-gone','Gone Resident','gone@example.com','pbkdf2-sha256$100000$x$y','resident','inactive')`);
     // One active dependant and one whose approval was refused.
     db.run(`INSERT INTO household_members(id,property_id,primary_resident_id,name,relationship,status,employee_id,requested_by)
-            VALUES ('member-ben','property-1','user-resident','Ben Dependant','child','active','EMP-BEN','user-resident')`);
+            VALUES ('member-ben','property-1','user-resident','Ben Dependant','child','active','EMPBEN','user-resident')`);
     db.run(`INSERT INTO household_members(id,property_id,primary_resident_id,name,relationship,status,employee_id,requested_by)
-            VALUES ('member-refused','property-1','user-resident','Refused Dependant','child','rejected','EMP-REFUSED','user-resident')`);
+            VALUES ('member-refused','property-1','user-resident','Refused Dependant','child','rejected','EMPREFUSED','user-resident')`);
   });
 
   async function createDeviceAndAgent(): Promise<{ deviceId: string; agentId: string; agentSecret: string }> {
@@ -123,12 +123,12 @@ describe('Remote Network Verification', () => {
     // fingerprint or PIN event would arrive with. No duplicates, nothing excluded.
     expect(seen.length).toBe(253);
     expect(new Set(seen).size).toBe(253);
-    expect(seen).toContain('employee:EMP-BEN');
-    expect(seen).toContain('employee:EMP-RITA');
+    expect(seen).toContain('employee:EMPBEN');
+    expect(seen).toContain('employee:EMPRITA');
     expect(seen).not.toContain('card:CARD-SUSPENDED');
     expect(seen).not.toContain('card:CARD-INACTIVE-USER');
     expect(seen).not.toContain('card:CARD-REFUSED');
-    expect(seen).not.toContain('employee:EMP-REFUSED');
+    expect(seen).not.toContain('employee:EMPREFUSED');
   });
 
   it('tells a bridge which credentials were revoked since its last sync', async () => {
@@ -149,7 +149,7 @@ describe('Remote Network Verification', () => {
     // refused dependant - who was never valid in the first place, but must still
     // be named so a bridge holding them drops them. This is the mechanism that
     // stops a revoked credential from opening a door all day.
-    expect(removed).toEqual(['card:CARD-1', 'employee:EMP-REFUSED', 'employee:EMP-RITA']);
+    expect(removed).toEqual(['card:CARD-1', 'employee:EMPREFUSED', 'employee:EMPRITA']);
     expect(delta.json.full).toBe(false);
   });
 

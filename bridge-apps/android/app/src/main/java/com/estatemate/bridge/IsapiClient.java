@@ -23,12 +23,20 @@ public final class IsapiClient {
     private static final int MAX_BODY = 512 * 1024;
 
     /**
-     * What a terminal accepts as a person ID and what is safe inside the XML body.
-     * EstateMate issues every employee number (nine digits) and sends it with each
-     * card operation; the bridge never invents one.
+     * What a terminal accepts as a person ID: letters and digits, at most 32.
+     * EstateMate issues every employee number and sends it with each card
+     * operation; the bridge never invents one.
+     *
+     * Deletion is the one exception. Estates provisioned before the charset rule
+     * may hold terminal person records under the old shape (letters, digits and
+     * {@code ._-/}, e.g. a {@code visitor-<credential>} visitor account), and a
+     * terminal that stored them still needs them addressed to free the slot.
+     * Delete paths accept that legacy shape; every write path refuses it.
      */
     private static final java.util.regex.Pattern TERMINAL_EMPLOYEE_NO =
-            java.util.regex.Pattern.compile("[A-Za-z0-9_-]{1,32}");
+            java.util.regex.Pattern.compile("[A-Za-z0-9]{1,32}");
+    private static final java.util.regex.Pattern LEGACY_TERMINAL_EMPLOYEE_NO =
+            java.util.regex.Pattern.compile("[A-Za-z0-9._/-]{1,32}");
 
     private final int timeoutMs;
 
@@ -395,8 +403,9 @@ public final class IsapiClient {
 
             if (op.equals("revoke_visitor")) {
                 String credential = firstNonEmpty(Json.string(payload, "credentialNumber", null), cardUid);
-                String visitorEmployeeNo = employeeNo != null ? employeeNo
-                        : credential == null ? null : terminalEmployeeNo("visitor-" + credential);
+                String legacyEmployeeNo = terminalEmployeeNo(Json.string(payload, "employeeNo", null), true);
+                String visitorEmployeeNo = legacyEmployeeNo != null ? legacyEmployeeNo
+                        : credential == null ? null : terminalEmployeeNo("visitor" + credential);
                 if (visitorEmployeeNo == null) return new OpResult(false, "operation has no valid visitor employee number");
                 return deletePerson(device, visitorEmployeeNo, true);
             }
@@ -404,7 +413,7 @@ public final class IsapiClient {
             if (op.equals("upsert_visitor")) {
                 String credential = firstNonEmpty(Json.string(payload, "credentialNumber", null), cardUid);
                 String visitorEmployeeNo = employeeNo != null ? employeeNo
-                        : credential == null ? null : terminalEmployeeNo("visitor-" + credential);
+                        : credential == null ? null : terminalEmployeeNo("visitor" + credential);
                 if (visitorEmployeeNo == null) return new OpResult(false, "operation has no valid visitor employee number");
                 // A visitor is only a finite PIN-enabled UserInfo account. Card,
                 // fingerprint, and face fields remain "Not added" on the device.
@@ -417,8 +426,9 @@ public final class IsapiClient {
             }
 
             if (op.equals("delete_person")) {
-                if (employeeNo == null) return new OpResult(false, "operation has no valid EstateMate employee number");
-                return deletePerson(device, employeeNo, !Boolean.FALSE.equals(payload.get("fullRemoval")));
+                String legacyEmployeeNo = terminalEmployeeNo(Json.string(payload, "employeeNo", null), true);
+                if (legacyEmployeeNo == null) return new OpResult(false, "operation has no valid EstateMate employee number");
+                return deletePerson(device, legacyEmployeeNo, !Boolean.FALSE.equals(payload.get("fullRemoval")));
             }
 
             if (op.equals("upload_fingerprint")) {
@@ -975,9 +985,15 @@ public final class IsapiClient {
      * payload, or null when it is missing or not a value a terminal accepts.
      */
     static String terminalEmployeeNo(String value) {
+        return terminalEmployeeNo(value, false);
+    }
+
+    static String terminalEmployeeNo(String value, boolean allowLegacy) {
         if (value == null) return null;
         String trimmed = value.trim();
-        return TERMINAL_EMPLOYEE_NO.matcher(trimmed).matches() ? trimmed : null;
+        if (TERMINAL_EMPLOYEE_NO.matcher(trimmed).matches()) return trimmed;
+        if (allowLegacy && LEGACY_TERMINAL_EMPLOYEE_NO.matcher(trimmed).matches()) return trimmed;
+        return null;
     }
 
     private static String doorCommand(String operation) {
