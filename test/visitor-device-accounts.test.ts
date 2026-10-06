@@ -88,9 +88,9 @@ describe('visitor device-account lifecycle', () => {
     expect(operation?.operation).toBe('upsert_visitor');
     const payload = JSON.parse(String(operation?.payload_json)) as Record<string, unknown>;
     // The employee number the terminal will know the visitor by — composed
-    // centrally so it can never exceed the 32 characters ISAPI allows.
+    // centrally so it stays within EstateMate's 30-character Employee ID limit.
     expect(String(payload.employeeNo)).toBe(`visitor${String(pass.credentialNumber)}`);
-    expect(String(payload.employeeNo).length).toBeLessThanOrEqual(32);
+    expect(String(payload.employeeNo).length).toBeLessThanOrEqual(30);
     expect(payload.department).toBe('Company');
     expect(payload.pin).toBe(pass.pin);
     expect(String(payload.pin)).toMatch(/^\d{4,8}$/);

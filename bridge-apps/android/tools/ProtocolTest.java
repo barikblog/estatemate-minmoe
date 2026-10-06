@@ -232,6 +232,30 @@ public final class ProtocolTest {
                 fake.cardRecords.size() == 1 && fake.cardRecords.get(0).contains("\"cardNo\":\"99887766\"") && fake.cardRecords.get(0).contains("\"employeeNo\":\"RES9\""),
                 fake.cardRecords.toString());
 
+        int invalidCardWritesBefore = fake.cardRecords.size() + fake.xmlCardRecords.size();
+        for (String invalidNumber : new String[] { "CARD123", "12-34", "12 34", "１２３" }) {
+            Map<String, Object> invalidCard = new LinkedHashMap<String, Object>();
+            invalidCard.put("cardUid", invalidNumber);
+            invalidCard.put("employeeNo", "RES9");
+            IsapiClient.OpResult refusedCard = client.applyOperation(device, "upsert_card", invalidCard);
+            check("a non-decimal card number is refused", !refusedCard.success && refusedCard.error.contains("digits only"), String.valueOf(refusedCard.error));
+        }
+        Map<String, Object> numericCard = new LinkedHashMap<String, Object>();
+        numericCard.put("cardUid", Integer.valueOf(12345));
+        numericCard.put("employeeNo", "RES9");
+        IsapiClient.OpResult numericCardResult = client.applyOperation(device, "upsert_card", numericCard);
+        check("a numeric JSON card number is refused to protect leading zeroes",
+                !numericCardResult.success && numericCardResult.error.contains("text so leading zeroes"), String.valueOf(numericCardResult.error));
+        check("invalid card values never reach the terminal",
+                fake.cardRecords.size() + fake.xmlCardRecords.size() == invalidCardWritesBefore, fake.cardRecords.toString());
+
+        Map<String, Object> leadingZeroCard = new LinkedHashMap<String, Object>();
+        leadingZeroCard.put("cardUid", "00001234");
+        leadingZeroCard.put("employeeNo", "RES9");
+        IsapiClient.OpResult leadingZeroResult = client.applyOperation(device, "upsert_card", leadingZeroCard);
+        check("card-number leading zeroes are preserved", leadingZeroResult.success
+                && fake.cardRecords.get(fake.cardRecords.size() - 1).contains("\"cardNo\":\"00001234\""), fake.cardRecords.toString());
+
         IsapiClient.OpResult delete = client.applyOperation(device, "delete_card", payload);
         check("delete_card succeeds", delete.success, String.valueOf(delete.error));
         check("delete_card uses PUT with the CardInfoDelCond shape", fake.deleteRequests.size() == 1 && fake.deleteRequests.get(0).contains("99887766")

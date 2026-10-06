@@ -66,7 +66,7 @@ describe('Person synchronisation and fingerprint capture', () => {
     return { status: response.status, json: await response.json() as Record<string, unknown> };
   }
 
-  function addCard(residentId = estate.residentId, cardUid = 'CARD0001') {
+  function addCard(residentId = estate.residentId, cardUid = '10000001') {
     db.run(`INSERT INTO access_cards(id,resident_id,card_uid,status) VALUES (?,?,?,'active')`, `card-${cardUid}`, residentId, cardUid);
     return `card-${cardUid}`;
   }
@@ -223,10 +223,10 @@ describe('Person synchronisation and fingerprint capture', () => {
 
   it('walks the one-finger Hardware-actions task for a named terminal end to end', async () => {
     // The exact shape of an operator's task: one person, one finger, one terminal
-    // whose bridge cannot write a template, an employee number at the 32-character
-    // ISAPI limit, and "mark this action applied" once the finger is on the glass.
+    // whose bridge cannot write a template, an employee number at the 30-character
+    // EstateMate limit, and "mark this action applied" once the finger is on the glass.
     const { deviceId } = await createAgentFor('GATE1 Pedestrian', ['card', 'person', 'door']);
-    db.run(`UPDATE users SET employee_id='f6c76d98707443349e5a9662623b92ff', name='rig' WHERE id=?`, estate.residentId);
+    db.run(`UPDATE users SET employee_id='f6c76d98707443349e5a9662623b92', name='rig' WHERE id=?`, estate.residentId);
 
     const recorded = await call(env, 'POST', '/api/access/fingerprints', {
       token: adminToken,
@@ -234,7 +234,7 @@ describe('Person synchronisation and fingerprint capture', () => {
     });
     expect(recorded.status).toBe(201);
     expect(recorded.json.hardwareSync).toBe('manual_action_required');
-    expect(recorded.json.employeeNo).toBe('f6c76d98707443349e5a9662623b92ff');
+    expect(recorded.json.employeeNo).toBe('f6c76d98707443349e5a9662623b92');
 
     const task = db.one(`SELECT id,operation,status,manual_instruction FROM device_operations WHERE fingerprint_id=?`, String(recorded.json.id));
     expect(task?.operation).toBe('enroll_fingerprint');
@@ -243,7 +243,7 @@ describe('Person synchronisation and fingerprint capture', () => {
     expect(instruction).toContain('rig');
     expect(instruction).toContain('GATE1 Pedestrian');
     expect(instruction).toContain('finger slot 1');
-    expect(instruction).toContain('f6c76d98707443349e5a9662623b92ff');
+    expect(instruction).toContain('f6c76d98707443349e5a9662623b92');
     expect(instruction).toMatch(/mark this action applied/i);
 
     // The operator enrols the finger on the terminal and marks the task applied,

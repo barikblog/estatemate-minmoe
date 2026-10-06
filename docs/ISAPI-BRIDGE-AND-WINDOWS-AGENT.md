@@ -39,7 +39,13 @@ No SDK required — uses documented ISAPI endpoints available on most K1T, K26xx
 
 ### Card identity guard
 
-Card upsert and re-enable operations must carry the holder's canonical EstateMate `employee_id`, which is bounded to 32 characters by migration `0018` and the terminal's ISAPI limit. Both the Node and Android bridge validate it before making a terminal request. A missing or unsafe value fails closed; the bridge never substitutes the resident's 36-character UUID or a guessed `1` (which could attach the card to another terminal person). ISAPI `ResponseStatus` fields are included in failure diagnostics so a terminal rejection such as `Invalid Content / badParameters / employeeNo` remains actionable. Regression coverage is in `isapi-bridge/agent.card-operations.integration.mjs` and the Android `ProtocolTest`.
+Card upsert and re-enable operations carry the holder's canonical EstateMate `employee_id`. New or changed IDs are limited to 30 alphanumeric characters by the Worker and migration `0024`; the terminal wire limit remains 32. Both bridges validate the supplied value before making a terminal request and retain compatibility for historical 31–32-character IDs already stored on hardware. A missing or unsafe value fails closed; the bridge never substitutes the resident's 36-character UUID or a guessed `1` (which could attach the card to another terminal person). ISAPI `ResponseStatus` fields are included in failure diagnostics so a terminal rejection such as `Invalid Content / badParameters / employeeNo` remains actionable. Regression coverage is in `isapi-bridge/agent.card-operations.integration.mjs` and the Android `ProtocolTest`.
+
+### Card-number rule
+
+Physical card numbers are text containing ASCII digits only; they are never parsed as integers or normalized, so leading zeroes survive. The manual form, scan completion, CSV import, API and database triggers enforce this on new cards, and both bridge implementations refuse nondigit card upserts/re-enables before sending an ISAPI write. Card labels remain free text. Deletion stays permissive so legacy nondigit card records can still be removed; a visitor is a PIN-only `UserInfo` account and is not a physical card.
+
+When an operation fails, both bridges include the operation's failure reason in their local log as well as reporting it to the Worker. Non-card operations such as `upsert_visitor` log `card=n/a` rather than looking like a missing card.
 
 ### Terminal protocol the card path relies on
 
@@ -63,8 +69,7 @@ Grouped with the card rules above and enforced by the simulated terminal in
 - **Permanent person before credential.** A resident/dependant card or finger names
   an ISAPI `employeeNo` that must already exist on the terminal. Record for an
   unknown person is refused, so the bridge writes that permanent person first and
-  only then the card or template. EstateMate's canonical `employee_id` (≤32
-  characters, migration `0018`) is that number. Visitors are the PIN-only account
+  only then the card or template. EstateMate's canonical `employee_id` (new values ≤30 characters, migration `0024`) is that number. Historical values may remain up to the terminal's 32-character limit. Visitors are the PIN-only account
   exception above and have no card or fingerprint operation.
 - **`doorRight` and `RightPlan` are mandatory for permanent people.** A permanent
   person stored without them exists on the terminal and is authorised for

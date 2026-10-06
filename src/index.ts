@@ -19,6 +19,7 @@ import {
   type SyncResult,
 } from './device-sync';
 import { EMPLOYEE_ID_MAX, deviceEmployeeNo, employeeIdFromUuid, readEmployeeId } from './employee-id';
+import { cardNumberValidationError, isDigitsOnlyCardNumber } from './card-number';
 import { AccessLiveFeed } from './live-feed';
 import { evaluateVisitorPass } from './visitor-pass';
 import { normalizeHikvisionDocument } from './hikvision';
@@ -90,7 +91,7 @@ function agentEffectiveStatus(alias: string): string {
   return `CASE WHEN ${alias}.status='online' AND COALESCE(${alias}.last_seen_at,'1970-01-01 00:00:00') < datetime('now','-${AGENT_OFFLINE_MINUTES} minutes') THEN 'offline' ELSE ${alias}.status END`;
 }
 
-function jsonError(c: AppContext, status: 400 | 401 | 403 | 404 | 409 | 413 | 500 | 503, message: string) {
+function jsonError(c: AppContext, status: 400 | 401 | 403 | 404 | 409 | 413 | 422 | 500 | 503, message: string) {
   return c.json({ error: message }, status);
 }
 
@@ -403,7 +404,7 @@ async function employeeIdInUse(
   return Boolean(dependant);
 }
 
-/** A fresh, unused 32-character Employee ID. */
+/** A fresh, unused 30-character Employee ID. */
 async function newEmployeeId(db: D1Database): Promise<string> {
   for (let attempt = 0; attempt < 10; attempt += 1) {
     const candidate = employeeIdFromUuid(crypto.randomUUID());
@@ -431,8 +432,8 @@ async function resolveNewEmployeeId(
     }
     return { value: reading.value, error: null, conflict: false };
   }
-  // The person's own UUID without hyphens is exactly 32 characters and is
-  // already unique in practice; fall back to a generated value on a collision.
+  // The person's UUID supplies a stable 30-character suffix; fall back to a
+  // newly generated value on a collision.
   const natural = employeeIdFromUuid(personId);
   if (natural && !(await employeeIdInUse(db, natural))) return { value: natural, error: null, conflict: false };
   return { value: await newEmployeeId(db), error: null, conflict: false };
@@ -574,7 +575,7 @@ app.post('/api/auth/bootstrap', async (c) => {
   if (!name || !email || !body.password) return jsonError(c, 400, 'name, email and password are required');
   const id = crypto.randomUUID();
   // Even the first seeded administrator gets a terminal identity at birth, so
-  // every person record carries a valid 32-character Employee ID from day one.
+  // every person record carries a valid 30-character Employee ID from day one.
   await c.env.DB.prepare(
     `INSERT INTO users(id, name, email, password_hash, role, employee_id) VALUES (?, ?, ?, ?, 'admin', ?)`,
   ).bind(id, name, email, await hashPassword(body.password), employeeIdFromUuid(id)).run();
@@ -1067,7 +1068,7 @@ app.post('/api/household-members', requireRoles('resident','admin','manager'), a
   const direct = isEstateOperator(user.role);
   // A dependant is a person on the terminal too: they hold cards and
   // fingerprints of their own, so they get an Employee ID at creation, capped at
-  // 32 characters like every other person's.
+  // 30 characters like every other person's.
   const employeeId=await resolveNewEmployeeId(c.env.DB,id,body.employeeId);
   if (employeeId.error) return jsonError(c,employeeId.conflict?409:400,employeeId.error);
   await c.env.DB.prepare(
@@ -1466,7 +1467,7 @@ app.post('/api/users', requireRoles('admin','manager'), async (c) => {
   const id = crypto.randomUUID();const persistedRole=storedRole(body.role);
   // Every person gets a terminal identity at creation so a card or fingerprint
   // can be pushed immediately. An administrator may supply their own; it is
-  // capped at 32 characters because that is what the terminal will store.
+  // capped at 30 characters, below the terminal's 32-character wire limit.
   const employeeId=await resolveNewEmployeeId(c.env.DB,id,body.employeeId);
   if (employeeId.error) return jsonError(c,employeeId.conflict?409:400,employeeId.error);
   const statements = [c.env.DB.prepare(
@@ -1727,8 +1728,8 @@ async function findPerson(db: D1Database, key: PersonKey): Promise<PersonRef | n
  * Required columns: `person_type,name`. Accounts also need `email` and `role`;
  * dependants need `relationship` and either `primary_resident_email` or
  * `primary_resident_employee_id` so the household they join is unambiguous.
- * `employee_id` is optional everywhere and is rejected if longer than 32
- * characters, because that is all a terminal will store.
+ * `employee_id` is optional everywhere and is rejected if longer than 30
+ * characters, EstateMate's limit below the terminal's 32-character wire cap.
  */
 app.post('/api/people/bulk-upload', requireRoles('admin','manager'), async (c) => {
   const prepared = await prepareCsvImport(c, PEOPLE_BULK_MAX_ROWS, ['person_type','name'], 'people.csv', 'people-imports');
@@ -2360,14 +2361,14 @@ app.patch('/api/payments/:id/review', requireRoles('cashier', 'admin'), async (c
   return c.json({ ok: true });
 });
 
-async function prepareCsvImport(c:AppContext,maxRows:number,required:string[],defaultFilename:string,category:string):Promise<Response|{ table:CsvTable;jobId:string;filename:string;storageKey:string }> {
+async function prepareCsvImport(c:AppContext,maxRows:number,required:string[],defaultFilename:string,category:string,options:{ preserveCellWhitespace?:boolean }={}):Promise<Response|{ table:CsvTable;jobId:string;filename:string;storageKey:string }> {
   const length=Number(c.req.header('Content-Length') ?? 0);
   if (length>CSV_BODY_LIMIT) return jsonError(c,413,'CSV exceeds the 2 MB upload limit');
   const text=await c.req.text();
   if (!text || new TextEncoder().encode(text).byteLength>CSV_BODY_LIMIT) return jsonError(c,413,'CSV must be between 1 byte and 2 MB');
   let table:CsvTable;
   try {
-    table=parseCsv(text,maxRows);requireHeaders(table,required);
+    table=parseCsv(text,maxRows,{ trimValues:!options.preserveCellWhitespace });requireHeaders(table,required);
     if (!table.rows.length) throw new Error('CSV must contain at least one data row');
   } catch(error) { return jsonError(c,400,error instanceof Error?error.message:'Invalid CSV'); }
   const jobId=crypto.randomUUID();const filename=(c.req.header('X-Filename') ?? defaultFilename).slice(0,200);
@@ -2571,19 +2572,20 @@ app.post('/api/imports/tenancies', requireRoles('admin','manager'), async (c) =>
 });
 
 app.post('/api/imports/cards', requireRoles('admin','manager'), async (c) => {
-  const prepared=await prepareCsvImport(c,500,['resident_email','card_uid'],'access-cards.csv','operations-imports');
+  const prepared=await prepareCsvImport(c,500,['resident_email','card_uid'],'access-cards.csv','operations-imports',{ preserveCellWhitespace:true });
   if (prepared instanceof Response) return prepared;
   const errors:Array<{ row:number;error:string }>=[];let successful=0;const seen=new Set<string>();
   for (const [index,row] of prepared.table.rows.entries()) {
     try {
-      const email=row.resident_email?.trim().toLowerCase();const cardUid=row.card_uid?.trim();const status=(row.status?.trim().toLowerCase() || 'active');
-      if(!email || !cardUid)throw new Error('resident_email and card_uid are required');
-      const key=cardUid.toLowerCase();if(seen.has(key))throw new Error('duplicate card_uid in this CSV');seen.add(key);
+      const email=row.resident_email?.trim().toLowerCase();const cardUid=row.card_uid ?? '';const status=(row.status?.trim().toLowerCase() || 'active');
+      if(!email)throw new Error('resident_email is required');
+      const cardNumberError=cardNumberValidationError(cardUid);if(cardNumberError)throw new Error(cardNumberError);
+      const key=cardUid;if(seen.has(key))throw new Error('duplicate card_uid in this CSV');seen.add(key);
       if(!['active','expired','suspended','revoked'].includes(status))throw new Error('invalid card status');
       const resident=await c.env.DB.prepare(`SELECT id FROM users WHERE lower(email)=? AND role='resident' AND status='active'`).bind(email).first<{ id:string }>();
       if(!resident)throw new Error('active resident account was not found');
       const existing=await c.env.DB.prepare(`SELECT id FROM access_cards WHERE lower(card_uid)=?`).bind(key).first();if(existing)throw new Error('card_uid already exists');
-      const expiresAt=row.expires_at?validDate(row.expires_at,'expires_at'):null;const id=crypto.randomUUID();
+      const expiresValue=row.expires_at?.trim() ?? '';const expiresAt=expiresValue?validDate(expiresValue,'expires_at'):null;const id=crypto.randomUUID();
       await c.env.DB.prepare(`INSERT INTO access_cards(id,resident_id,card_uid,card_label,status,expires_at) VALUES (?,?,?,?,?,?)`).bind(id,resident.id,cardUid,row.card_label?.trim() || null,status,expiresAt).run();
       if(status==='active')await createDeviceOperations(c.env,id,'upsert_card',{ cardUid,residentId:resident.id,label:row.card_label?.trim() || null,expiresAt,enabled:true });
       successful+=1;
@@ -3972,6 +3974,8 @@ app.get('/api/access/card-scan-sessions/:id', requireRoles('admin','manager'), a
 app.post('/api/access/card-scan-sessions/:id/complete', requireRoles('admin','manager'), async (c) => {
   const session=await c.env.DB.prepare(`SELECT * FROM credential_scan_sessions WHERE id=? AND requested_by=? AND purpose='card_enrollment' AND status='captured'`).bind(c.req.param('id'),c.get('user').id).first<Record<string,string|null>>();
   if (!session?.captured_credential || !session.resident_id) return jsonError(c,409,'No card credential has been captured yet');
+  const capturedCardError=cardNumberValidationError(session.captured_credential);
+  if (capturedCardError) return jsonError(c,422,'Captured card number may contain digits only. Cancel this scan and use a physical card with a numeric number.');
   const cardId=crypto.randomUUID();
   await c.env.DB.batch([
     c.env.DB.prepare(`INSERT INTO access_cards(id,resident_id,household_member_id,card_uid,card_label) VALUES (?,?,?,?,?)`).bind(cardId,session.resident_id,session.household_member_id,session.captured_credential,session.card_label),
@@ -4145,8 +4149,8 @@ app.post('/api/access/fingerprints', requireRoles('admin','manager'), async (c) 
   let personName = '';
   let personKind: PersonKind = 'account';
   let personId = '';
-  // An operator may still type the number the terminal already knows, but it has
-  // to fit: ISAPI employeeNo/employeeNoString stops at 32 characters.
+  // An operator may still type a terminal identity, but new values follow the
+  // 30-character EstateMate limit (the ISAPI wire field itself allows 32).
   const suppliedEmployeeNo = readEmployeeId(body.employeeNo);
   if (suppliedEmployeeNo.error) return jsonError(c, 400, suppliedEmployeeNo.error);
   let employeeNo = suppliedEmployeeNo.value;
@@ -4618,7 +4622,10 @@ app.post('/api/access/fingerprints/:id/remove-from-device', requireRoles('admin'
 
 app.post('/api/access/cards', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{ residentId?: string; householdMemberId?: string; cardUid?: string; cardLabel?: string }>();
-  if ((!body.residentId && !body.householdMemberId) || !body.cardUid?.trim()) return jsonError(c, 400, 'residentId or householdMemberId, and cardUid are required');
+  if (!body.residentId && !body.householdMemberId) return jsonError(c,400,'residentId or householdMemberId is required');
+  const cardNumberError=cardNumberValidationError(body.cardUid);
+  if (cardNumberError) return jsonError(c,400,cardNumberError);
+  const cardUid=body.cardUid as string;
   let residentId = body.residentId;
   let householdMemberId: string|null = null;
   let label = body.cardLabel?.trim() ?? null;
@@ -4633,7 +4640,7 @@ app.post('/api/access/cards', requireRoles('admin','manager'), async (c) => {
     if (!resident) return jsonError(c,404,'Active resident not found');
   }
   const id = crypto.randomUUID();
-  await c.env.DB.prepare(`INSERT INTO access_cards(id,resident_id,household_member_id,card_uid,card_label) VALUES (?,?,?,?,?)`).bind(id,residentId,householdMemberId,body.cardUid.trim(),label).run();
+  await c.env.DB.prepare(`INSERT INTO access_cards(id,resident_id,household_member_id,card_uid,card_label) VALUES (?,?,?,?,?)`).bind(id,residentId,householdMemberId,cardUid,label).run();
   // Send the card to the terminal together with the person's Employee ID, so the
   // device stores one identity for the human and both their card and their
   // fingerprint resolve to it. Without this the terminal invents its own number
@@ -4644,8 +4651,8 @@ app.post('/api/access/cards', requireRoles('admin','manager'), async (c) => {
   // written but cannot open anything. The agent feed orders upsert_person before
   // the credential operations queued in the same second.
   const personSync = await autoSyncPerson(c.env, householdMemberId ? 'dependant' : 'account', householdMemberId ?? String(residentId), 'card issued', { includeCredentials: true });
-  await createDeviceOperations(c.env,id,'upsert_card',{ cardUid:body.cardUid.trim(),residentId,householdMemberId,employeeNo:cardEmployeeNo,enabled:true });
-  await audit(c, 'issue', 'access_card', id, { ...body, residentId, householdMemberId, employeeNo: cardEmployeeNo, personSync: personSync.queued + personSync.manual });
+  await createDeviceOperations(c.env,id,'upsert_card',{ cardUid,residentId,householdMemberId,employeeNo:cardEmployeeNo,enabled:true });
+  await audit(c, 'issue', 'access_card', id, { ...body, cardUid, residentId, householdMemberId, employeeNo: cardEmployeeNo, personSync: personSync.queued + personSync.manual });
   return c.json({ id, employeeNo: cardEmployeeNo, personSync: describeSync(personSync), hardwareSync: personSync.manual ? 'manual_action_required' : 'queued' }, 201);
 });
 
@@ -4654,6 +4661,9 @@ app.patch('/api/access/cards/:id', requireRoles('admin','manager'), async (c) =>
   if (!body.status || !['active','expired','suspended','revoked'].includes(body.status)) return jsonError(c, 400, 'Invalid status');
   const card = await c.env.DB.prepare(`SELECT id,card_uid,status,resident_id FROM access_cards WHERE id=?`).bind(c.req.param('id')).first<Record<string,string>>();
   if (!card) return jsonError(c, 404, 'Card not found');
+  if (body.status==='active' && !isDigitsOnlyCardNumber(card.card_uid)) {
+    return jsonError(c,409,'This legacy card number contains non-digits and cannot be re-enabled. Issue a new card with a digits-only number.');
+  }
   await c.env.DB.batch([
     c.env.DB.prepare(`UPDATE access_cards SET status=?,deactivated_at=CASE WHEN ?='active' THEN NULL ELSE datetime('now') END,deactivated_reason=?,auto_expired=0,updated_at=datetime('now') WHERE id=?`).bind(body.status, body.status, body.reason ?? null, card.id),
     c.env.DB.prepare(`INSERT INTO card_status_changes(id,card_id,old_status,new_status,reason,changed_by) VALUES (?,?,?,?,?,?)`).bind(crypto.randomUUID(), card.id, card.status, body.status, body.reason ?? 'manual admin action', c.get('user').id),
@@ -6243,8 +6253,8 @@ async function syncActiveVisitorPasses(db: D1Database): Promise<{ passes: number
     if (!pass.credential_number) continue;
     queued += await queueVisitorDeviceOperations(db, pass.id, pass.gate_scope === 'gate' ? pass.device_id : null, {
       credentialNumber: pass.credential_number,
-      // The number the terminal will know this visitor by. Composed centrally so
-      // it can never exceed the 32 characters ISAPI allows.
+      // The number the terminal will know this visitor by. Composed centrally
+      // so it stays within EstateMate's 30-character Employee ID limit.
       employeeNo: deviceEmployeeNo('visitor', pass.credential_number),
       visitorName: pass.visitor_name,
       department: 'Company',

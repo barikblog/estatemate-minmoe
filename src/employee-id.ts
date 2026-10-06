@@ -2,10 +2,9 @@
  * Employee ID rules.
  *
  * A MinMoe/ISAPI terminal identifies a person by `employeeNo` (numeric) or
- * `employeeNoString`. Both are bounded at **32 characters**, and a longer value
- * is refused by the device — silently on some firmware, which is the worst
- * failure mode because the person simply never opens the gate and nothing in
- * EstateMate explains why.
+ * `employeeNoString` (alphanumeric). The terminal accepts up to 32 characters;
+ * EstateMate deliberately sets a stricter 30-character business limit so
+ * people can use consistent IDs across every supported device.
  *
  * EstateMate therefore treats the Employee ID as a first-class property of a
  * *person* (an account or a household dependant), not of each credential: one
@@ -13,18 +12,15 @@
  * That is also what makes a cardless gate event attributable — the terminal
  * reports the employee number, and the number resolves to exactly one person.
  *
- * The 32-character cap and the letters-and-digits-only charset are enforced
- * three times, deliberately:
- *   1. here, at the API boundary, with a message an operator can act on;
- *   2. in the schema (`CHECK (length(employee_id) BETWEEN 1 AND 32)`, from
- *      migration 0018);
- *   3. by trigger on `users.employee_id`, `household_members.employee_id` and
- *      `fingerprint_credentials.employee_no` (migration 0022), whose columns
- *      predate the charset rule and cannot be given a CHECK retroactively.
+ * The 30-character policy and letters-and-digits-only charset are enforced at
+ * the API boundary and by triggers for new or changed database values. The
+ * original schema permits 32 characters because that is the terminal limit;
+ * migration 0024 adds the stricter application limit without rewriting
+ * historical 32-character IDs that may already be programmed into terminals.
  */
 
-/** Hard cap imposed by the ISAPI employeeNo/employeeNoString field. */
-export const EMPLOYEE_ID_MAX = 32;
+/** EstateMate's maximum Employee ID length (the terminal itself accepts 32). */
+export const EMPLOYEE_ID_MAX = 30;
 
 /**
  * Allowed characters. Letters and digits only: that is what the terminals
@@ -69,16 +65,16 @@ export function readEmployeeId(value: unknown): EmployeeIdReading {
 }
 
 /**
- * The default Employee ID for a person: their EstateMate UUID without hyphens,
- * which is exactly 32 hex characters. Returning null (rather than an over-long
- * value) is the point — the old code defaulted a fingerprint's employee number
- * to the raw 36-character UUID, which no terminal could store.
+ * The default Employee ID for a person: the last 30 hex characters of their
+ * EstateMate UUID without hyphens. The UUID contributes 120 bits of identity,
+ * while staying inside the app's 30-character policy. Returning null for
+ * malformed IDs avoids inventing an identifier from arbitrary text.
  */
 export function employeeIdFromUuid(id: string): string | null {
   const compact = String(id ?? '').trim().replaceAll('-', '').toLowerCase();
-  if (!compact || compact.length > EMPLOYEE_ID_MAX) return null;
+  if (!compact || compact.length > 36) return null;
   if (!EMPLOYEE_ID_PATTERN.test(compact)) return null;
-  return compact;
+  return compact.slice(-EMPLOYEE_ID_MAX);
 }
 
 /**

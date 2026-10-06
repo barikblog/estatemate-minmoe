@@ -114,12 +114,12 @@ maximum length and whether letters can be used in personnel ID"*. A model manual
 sharper still: *"By default, the device supports 1 to 14 digits of User ID."* Note
 that last clause — **14 digits is common, and 32 is not a promise**. Where a
 terminal reports a width (`MaxPinWidth`/`PIN2Width`), that width wins over
-EstateMate's 32-character cap.
+EstateMate's 30-character Employee ID cap (the terminal wire limit is 32).
 
-**Why this is not a detail.** EstateMate's Employee ID is `1–32` characters of
-`[A-Za-z0-9]` (`src/employee-id.ts`) and **defaults to the person's UUID minus
-hyphens — 32 hex characters, i.e. full of letters**. That shape is built for
-Hikvision ISAPI, where it is exactly right. Handed to a `StringPinFunOn=0`
+**Why this is not a detail.** EstateMate's Employee ID is `1–30` characters of
+`[A-Za-z0-9]` (`src/employee-id.ts`) and **defaults to the last 30 hex characters
+of the person's UUID**. That shape is built for Hikvision ISAPI, where it is
+exactly right. Handed to a `StringPinFunOn=0`
 terminal it is a value the device cannot store. The three tempting responses are
 all wrong:
 

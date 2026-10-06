@@ -534,11 +534,17 @@ public final class BridgeService extends Service {
             IsapiClient.OpResult result = isapi.applyOperation(device, name, Json.asObject(operation.get("payload")), fingerData);
             long duration = System.currentTimeMillis() - started;
             WorkerClient.Reply reported = worker.reportResult(operationId, kind, result.success, result.error, result.result, duration);
+            String failure = result.success ? "" : result.error == null || result.error.isEmpty()
+                    ? "operation failed without an error detail"
+                    : result.error.replace('\n', ' ').replace('\r', ' ');
+            if (failure.length() > 500) failure = failure.substring(0, 500);
             if (reported.ok()) {
                 BridgeLog.append(result.success ? "info" : "warn",
-                        (result.success ? "applied" : "failed") + " " + name + " for " + device.name + " in " + duration + " ms");
+                        (result.success ? "applied" : "failed") + " " + name + " for " + device.name + " in " + duration + " ms"
+                                + (result.success ? "" : ": " + failure));
             } else {
-                BridgeLog.append("warn", "could not report " + operationId + ": " + reported.message());
+                BridgeLog.append("warn", "could not report " + operationId + ": " + reported.message()
+                        + (result.success ? "" : "; operation failure: " + failure));
             }
             sleep(500);
         }

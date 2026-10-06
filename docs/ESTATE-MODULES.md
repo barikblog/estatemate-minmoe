@@ -27,7 +27,7 @@ pending, domestic staff & caregivers, with-logins.
 - Approve / reject / deactivate from the roster (existing household routes);
   deactivated dependants keep their record — only the credentials stop.
 - New dependants: Tenancy & household (single) or **People → Bulk tools** (CSV).
-- Every dependant gets their own 32-char Employee ID at creation — see
+- Every dependant gets their own 30-char Employee ID at creation — see
   [EMPLOYEE-ID-AND-BULK-PEOPLE.md](EMPLOYEE-ID-AND-BULK-PEOPLE.md).
 
 ## Staff management (`GET /api/staff`, `…/api/staff/shifts`)
@@ -102,7 +102,7 @@ and operators can list who has read it (name, role, when).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `employee_id_max_length` | `32` | Documented constant for migrations and operators (enforced in code + schema) |
+| `employee_id_max_length` | `30` | Current application limit for new or changed IDs; historical terminal IDs may be up to 32 |
 | `visitor_device_account_policy` | `automatic` | The expiry-release policy in force |
 | `visitor_device_account_sweep_minutes` | `1` | How often the cron releases slots |
 | `facility_booking_max_days_ahead` | `90` | How far ahead bookings open |

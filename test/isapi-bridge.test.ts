@@ -142,10 +142,10 @@ describe('Hikvision ISAPI bridge and Windows agent', () => {
     const resident = db.one(`SELECT id FROM users WHERE email='resident@example.com'`);
     const residentId = (resident as { id: string }).id;
     const cardId = 'card-001';
-    db.run(`INSERT INTO access_cards(id,resident_id,card_uid,status) VALUES (?,'${residentId}','CARD123456','active')`, cardId);
+    db.run(`INSERT INTO access_cards(id,resident_id,card_uid,status) VALUES (?,'${residentId}','10000001','active')`, cardId);
 
     const opId = 'op-001';
-    db.run(`INSERT INTO device_operations(id,device_id,card_id,operation,payload_json,status) VALUES (?,'${deviceId}','${cardId}','upsert_card','{\"cardUid\":\"CARD123456\"}','pending')`, opId);
+    db.run(`INSERT INTO device_operations(id,device_id,card_id,operation,payload_json,status) VALUES (?,'${deviceId}','${cardId}','upsert_card','{\"cardUid\":\"10000001\"}','pending')`, opId);
 
     const { default: worker } = await import('../src/index');
     const hbRequest = new Request(`https://estatemate.test/api/isapi/v1/agents/${agentId}/heartbeat`, {

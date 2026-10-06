@@ -909,6 +909,7 @@ async function deviceEventLoop(device) {
 // under an identity a strict terminal cannot store.
 const TERMINAL_EMPLOYEE_NO = /^[A-Za-z0-9]{1,32}$/;
 const LEGACY_TERMINAL_EMPLOYEE_NO = /^[A-Za-z0-9._/-]{1,32}$/;
+const CARD_NUMBER = /^[0-9]+$/;
 const VISITOR_EMPLOYEE_NO = /^visitor-?\d/;
 
 function terminalEmployeeNo(payload, options = {}) {
@@ -1614,6 +1615,21 @@ async function applyCardOperation(device, operation) {
   const cardUid = payload.cardUid || payload.cardNo || payload.card_number;
   const employeeNo = terminalEmployeeNo(payload);
   const op = operation.operation;
+  const isCardOperation = ['upsert_card', 'enable_card', 'disable_card', 'delete_card'].includes(op);
+
+  // New card writes use decimal card numbers only. Keep deletion permissive so
+  // legacy non-decimal records can still be removed from a terminal.
+  if (isCardOperation) {
+    if (cardUid === undefined || cardUid === null || cardUid === '') {
+      return { success: false, error: 'operation has no card number' };
+    }
+    if (typeof cardUid !== 'string') {
+      return { success: false, error: 'card number must be text so leading zeroes are preserved' };
+    }
+    if ((op === 'upsert_card' || op === 'enable_card') && !CARD_NUMBER.test(cardUid)) {
+      return { success: false, error: 'card number may contain digits only' };
+    }
+  }
 
   // A ZKTeco terminal on the PUSH transport is not an ISAPI device: the same
   // operation vocabulary is delivered as a queued command the terminal picks up
@@ -1644,7 +1660,8 @@ async function applyCardOperation(device, operation) {
     });
   }
 
-  log('info', `Applying ${op} for device ${device.name} (${device.estateMateDeviceId}) card=${cardUid} opId=${operation.id}`);
+  const cardLog = isCardOperation ? (cardUid ? 'present' : 'missing') : 'n/a';
+  log('info', `Applying ${op} for device ${device.name} (${device.estateMateDeviceId}) card=${cardLog} opId=${operation.id}`);
 
   try {
     if (op === 'upsert_card' || op === 'enable_card') {
@@ -1796,8 +1813,9 @@ async function pollAndApply() {
             result: result.result || null,
           }),
         });
-        if (!rRes.ok) log('warn', `Result report failed for ${op.id}:`, rRes.status, rJson);
-        else log('info', `Reported ${result.success ? 'applied' : 'failed'} for ${op.id} in ${duration}ms`);
+        const failure = result.success ? '' : String(result.error || 'operation failed without an error detail').replace(/[\r\n]+/g, ' ').slice(0, 500);
+        if (!rRes.ok) log('warn', `Result report failed for ${op.id}${failure ? `; operation failure: ${failure}` : ''}:`, rRes.status, rJson);
+        else log(result.success ? 'info' : 'warn', `Reported ${result.success ? 'applied' : 'failed'} for ${op.id} in ${duration}ms${failure ? `: ${failure}` : ''}`);
       } catch (err) {
         log('error', `Failed to report result for ${op.id}:`, err.message);
       }
@@ -2188,6 +2206,7 @@ export {
   syncCredentialSnapshot,
   remoteVerifyHeartbeat,
   sendDoorCommand,
+  pollAndApply,
   deviceEventLoop,
   openAlertStream,
   main,

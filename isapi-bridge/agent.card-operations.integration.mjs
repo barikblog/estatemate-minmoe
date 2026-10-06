@@ -120,6 +120,30 @@ const deviceServer = createServer((req, res) => {
 await new Promise((resolve) => deviceServer.listen(0, '127.0.0.1', resolve));
 const devicePort = deviceServer.address().port;
 
+// Fake the Worker's operation queue so this integration also checks that a
+// failed visitor write includes its failure reason in the local agent log.
+const queuedWorkerOperations = [];
+const reportedWorkerResults = [];
+const workerServer = createServer((req, res) => {
+  let body = '';
+  req.on('data', (chunk) => { body += chunk; });
+  req.on('end', () => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    if (req.method === 'GET' && req.url.includes('/operations?limit=20')) {
+      res.end(JSON.stringify({ items: queuedWorkerOperations.splice(0) }));
+      return;
+    }
+    if (req.method === 'POST' && req.url.includes('/result')) {
+      reportedWorkerResults.push(JSON.parse(body));
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    res.end(JSON.stringify({ ok: true }));
+  });
+});
+await new Promise((resolve) => workerServer.listen(0, '127.0.0.1', resolve));
+const workerPort = workerServer.address().port;
+
 // ---------------------------------------------------------------------------
 // Agent configuration, then import the agent in standby (config is read at import).
 // ---------------------------------------------------------------------------
@@ -130,9 +154,9 @@ const deviceId = '22222222-2222-4222-8222-222222222222';
 writeFileSync(configPath, JSON.stringify({
   agentId: '00000000-0000-4000-a000-000000000010',
   agentSecret: 'integration-test-secret-123456',
-  workerUrl: 'http://127.0.0.1:9',
+  workerUrl: `http://127.0.0.1:${workerPort}`,
   eventStream: false,
-  logLevel: 'error',
+  logLevel: 'info',
 }));
 writeFileSync(devicesPath, JSON.stringify({
   devices: [{ estateMateDeviceId: deviceId, name: 'Card Terminal', isapiHost: '127.0.0.1', isapiPort: devicePort, isapiUsername: 'admin', isapiPassword: 'device-password', protocol: 'http' }],
@@ -154,6 +178,28 @@ try {
     assert.equal(cards.get('10000001'), '842317765', 'the card must be filed under the issued employee number');
     assert.equal(cardWrites().length, 1, 'one JSON card record, no retries');
     console.log('issued employee number written verbatim OK');
+  }
+
+  // 1b. Card numbers are opaque text digits, not strings to normalize. Invalid
+  //     values and numeric JSON values are refused before contacting the terminal.
+  {
+    const before = requests.length;
+    for (const cardUid of ['CARD12345', '123-45', '123 45']) {
+      const result = await apply('upsert_card', { cardUid, employeeNo: '842317765' });
+      assert.equal(result.success, false);
+      assert.match(result.error, /card number may contain digits only/);
+    }
+    const numericUpsert = await apply('upsert_card', { cardUid: 12345, employeeNo: '842317765' });
+    assert.equal(numericUpsert.success, false);
+    assert.match(numericUpsert.error, /text so leading zeroes are preserved/);
+    const enabled = await apply('enable_card', { cardUid: 'CARD12345', employeeNo: '842317765' });
+    assert.equal(enabled.success, false);
+    assert.match(enabled.error, /card number may contain digits only/);
+    const numericDelete = await apply('delete_card', { cardUid: 12345 });
+    assert.equal(numericDelete.success, false);
+    assert.match(numericDelete.error, /text so leading zeroes are preserved/);
+    assert.equal(requests.length, before, 'an invalid card number must not reach the terminal');
+    console.log('non-decimal and non-string card numbers refused before write OK');
   }
 
   // 2. No employee number: refused before the terminal is contacted — including
@@ -295,6 +341,35 @@ try {
     console.log('legacy visitor revocation and stale-upsert rename OK');
   }
 
+  // 3f. Failure reports carry the same reason into the local bridge log, and a
+  //     PIN-only visitor is labelled as a non-card operation.
+  {
+    queuedWorkerOperations.push({
+      id: 'op-visitor-failure-log',
+      deviceId,
+      kind: 'visitor',
+      operation: 'upsert_visitor',
+      payload: {
+        credentialNumber: '55443322', employeeNo: 'VIS55443322', visitorName: 'Grace Visitor',
+        pin: '123', validFrom: '2026-10-05T08:00:00.000Z', validUntil: '2026-10-05T18:00:00.000Z',
+      },
+    });
+    const lines = [];
+    const originalLog = console.log;
+    console.log = (...args) => lines.push(args.map(String).join(' '));
+    try {
+      await agent.pollAndApply();
+    } finally {
+      console.log = originalLog;
+    }
+    assert.equal(reportedWorkerResults.length, 1);
+    assert.equal(reportedWorkerResults[0].errorMessage, 'visitor PIN must contain 4 to 8 digits');
+    assert.ok(lines.some((line) => line.includes('card=n/a')), 'visitor provisioning must not look like a missing physical card');
+    assert.ok(lines.some((line) => line.includes('op-visitor-failure-log') && line.includes('visitor PIN must contain 4 to 8 digits')),
+      'the local failure log must include the Worker result reason');
+    console.log('failed operation reason and PIN-only visitor log are actionable OK');
+  }
+
   // 4. The summariser reads JSON and XML ResponseStatus documents and falls back
   //    to a slice of anything else.
   {
@@ -372,5 +447,6 @@ try {
   process.exit(0);
 } finally {
   deviceServer.close();
+  workerServer.close();
   rmSync(dir, { recursive: true, force: true });
 }

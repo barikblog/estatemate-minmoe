@@ -1,5 +1,29 @@
 # AI handoff — EstateMate
 
+## Digit-only card numbers and 30-character Employee IDs (2026-10-07)
+
+This section supersedes the older 32-character application-policy notes below.
+The terminal wire limit remains 32; EstateMate's limit for new or changed IDs is
+30 characters.
+
+- Physical card numbers are ASCII digits only and remain text, so leading zeroes
+  are preserved. Reject whitespace and punctuation instead of trimming or
+  normalising them. Card labels remain free text. Existing nondigit card values
+  may be viewed and deleted, but cannot be newly issued or re-enabled.
+- PIN-only visitor provisioning is separate from physical-card handling. A
+  visitor upsert without a physical card correctly logs `card=n/a`.
+- New or changed Employee IDs are alphanumeric and at most 30 characters. New
+  defaults use the last 30 hex characters of the person's UUID. Existing 31–32
+  character IDs remain unchanged for hardware compatibility until explicitly
+  replaced; legacy IDs remain accepted on device-delete paths.
+- Migrations `0023_access_card_numbers_digits_only.sql` and
+  `0024_employee_id_max_30.sql` enforce these rules in D1. The Node and Android
+  bridges validate card numbers and retain local operation-failure reasons even
+  when reporting a result to the Worker fails.
+- Coverage includes `src/card-number.test.ts`,
+  `test/access-card-numbers.test.ts`, Node bridge integration tests and Android
+  `ProtocolTest`. Android protocol tests still require a JDK/Android SDK.
+
 ## Employee IDs are letters and digits only (2026-10-06)
 
 - A terminal accepts nothing else as an employeeNo/employeeNoString, so the
