@@ -59,7 +59,16 @@ if [ -n "$leaks" ]; then
   printf '%s\n' "$leaks"
 fi
 
-# 4. Informational: CI has no JDK/Android SDK, so Kotlin is never compiled here.
+# 4. Workers Builds invokes `wrangler preview` for branch builds. Wrangler's
+# production dry-run does not require this property, so guard both the live and
+# starter configs against silently losing the Preview configuration.
+for config in wrangler.jsonc wrangler.template.jsonc; do
+  if ! grep -Eq '^[[:space:]]*"previews"[[:space:]]*:' "$config"; then
+    fail "$config must define a top-level previews block for Cloudflare Worker Preview builds."
+  fi
+done
+
+# 5. Informational: CI has no JDK/Android SDK, so Kotlin is never compiled here.
 if [ -n "$(git diff --name-only "$base" HEAD -- apps/android)" ]; then
   printf '::notice::apps/android changed, but neither CI nor this script has a JDK/Android SDK: Kotlin was NOT compiled. Build apps/android locally before merging.\n'
 fi

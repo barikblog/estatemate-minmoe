@@ -53,5 +53,23 @@
     "ALLOWED_ORIGINS": "",
     "HIKVISION_MODE": "per-device",
     "FILE_STORAGE_MODE": "github-private-configurable"
+  },
+  // Cloudflare Workers Builds runs `wrangler preview` for non-production
+  // branches. Preview settings are isolated and do not inherit production
+  // bindings. Keep this safe by omitting D1 and Queue bindings until dedicated
+  // staging resources exist; never point a PR Preview at estate production data.
+  "previews": {
+    "vars": {
+      "APP_NAME": "EstateMate Preview",
+      "ALLOWED_ORIGINS": "",
+      "HIKVISION_MODE": "per-device",
+      "FILE_STORAGE_MODE": "disabled"
+    },
+    // Each Worker Preview receives an isolated namespace for this binding.
+    "durable_objects": {
+      "bindings": [
+        { "name": "LIVE_FEED", "class_name": "AccessLiveFeed" }
+      ]
+    }
   }
 }

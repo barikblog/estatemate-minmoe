@@ -113,6 +113,12 @@ The workflow builds, tests, applies D1 migrations, and deploys after a push to `
 
 A separate `CI` workflow (`.github/workflows/ci.yml`) runs on every pull request targeting `main` and on manual dispatch. It needs no secrets: typecheck, Vitest plus the ISUP integration test, the portal build, the full migration chain against an empty SQLite database, `scripts/ci-checks.sh` (clean diff, append-only migrations, no committed credentials) and `wrangler deploy --dry-run`, which bundles the Worker and resolves D1, Queue, Durable Object and asset bindings offline. Deployments remain gated by `npm run build` inside the deploy workflow, so CI shortens the feedback loop rather than adding a new authority.
 
+## Pull request Worker Previews
+
+Cloudflare Workers Builds runs `npx wrangler preview` for non-production branches. Both `wrangler.jsonc` and the starter `wrangler.template.jsonc` therefore include a `previews` block. Preview variables are explicitly set, and the Durable Object binding is redeclared so each Preview gets isolated state.
+
+The Preview intentionally has **no D1 or Queue binding** until separate staging resources are provisioned. Wrangler does not inherit production bindings into Previews; do not copy the production D1 ID or queue name into this block just to make the preview look complete. As configured, Preview deployment/build validation is safe from production data and side effects, but API routes that require D1 or the access-events queue are not functional. To enable those routes, create dedicated staging D1/Queue resources, bind them under `previews`, apply the migrations to staging, and configure Preview secrets separately with Wrangler's `preview base-config secret` commands. Production migrations and deployment remain owned by the `main`-branch GitHub Actions workflow above.
+
 ## Rollback
 
 List deployments and roll back the Worker code with Wrangler or the dashboard. D1 migrations are forward-only; take an export before destructive schema changes.
