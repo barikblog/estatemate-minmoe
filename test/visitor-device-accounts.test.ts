@@ -33,6 +33,18 @@ describe('visitor device-account lifecycle', () => {
     );
   }
 
+  /** Links a live agent to a device, the way the portal does. */
+  async function linkAgentToDevice(deviceId: string): Promise<void> {
+    const agentRes = await call(env, 'POST', '/api/isapi/agents', { token: adminToken, body: { name: 'Gate Agent', platform: 'linux' } });
+    expect(agentRes.status).toBe(201);
+    const { id: agentId } = agentRes.json as { id: string };
+    const linkRes = await call(env, 'POST', '/api/isapi/device-configs', {
+      token: adminToken,
+      body: { deviceId, agentId, isapiHost: '192.168.1.101', isapiPort: 80, isapiUsername: 'admin', isapiPassword: 'device-password', protocol: 'http', syncEnabled: true },
+    });
+    expect(linkRes.status).toBe(200);
+  }
+
   async function issuePass(from: Date, until: Date): Promise<Record<string, unknown>> {
     const response = await call(env, 'POST', '/api/visitors', {
       token: residentToken,
@@ -82,6 +94,34 @@ describe('visitor device-account lifecycle', () => {
     expect(payload.department).toBe('Company');
     expect(payload.pin).toBe(pass.pin);
     expect(String(payload.pin)).toMatch(/^\d{4,8}$/);
+  });
+
+  it('queues the upsert as a Hardware actions task, not pending, when no live agent is linked to the device', async () => {
+    // An agent-capable pattern with no linked agent: nothing will ever poll
+    // this operation, so it must not masquerade as a queued command that an
+    // agent is about to pick up.
+    addDevice('device-1', 'isapi_bridge');
+    const now = Date.now();
+    await issuePass(new Date(now - 60_000), new Date(now + 60 * 60_000));
+
+    const operation = database.one(
+      `SELECT operation,status FROM visitor_device_operations WHERE operation='upsert_visitor'`,
+    );
+    expect(operation?.operation).toBe('upsert_visitor');
+    expect(operation?.status).toBe('manual_action_required');
+  });
+
+  it('queues the upsert as pending when a live agent is linked to the device', async () => {
+    addDevice('device-1', 'isapi_bridge');
+    await linkAgentToDevice('device-1');
+    const now = Date.now();
+    await issuePass(new Date(now - 60_000), new Date(now + 60 * 60_000));
+
+    const operation = database.one(
+      `SELECT operation,status FROM visitor_device_operations WHERE operation='upsert_visitor'`,
+    );
+    expect(operation?.operation).toBe('upsert_visitor');
+    expect(operation?.status).toBe('pending');
   });
 
   it('reconciliation restores the stored PIN and Company department to a failed account operation', async () => {

@@ -51,6 +51,14 @@ The response tells the resident plainly that the account is created now and
 deleted from all devices automatically when validity ends, while the record is
 kept.
 
+The upsert follows the same delivery rule as the revocation: a device whose
+connection pattern is agent-capable gets the operation as `pending` **only when
+a live agent is actually linked to it**. A terminal that is agent-capable on
+paper but has no linked agent gets a `manual_action_required` Hardware-actions
+task instead — otherwise the operation would sit as `pending` forever, a command
+nothing will ever pick up, while the pass's state still recorded the slot as
+held.
+
 ## How deletion happens
 
 `releaseExpiredVisitorDeviceAccounts(env)`:

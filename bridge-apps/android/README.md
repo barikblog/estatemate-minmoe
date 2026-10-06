@@ -85,6 +85,18 @@ receives under the tag `EstateMateBridge`.
   instead of leaving it on `pending` until the first card is swiped;
 * reconnects with a 5 s → 60 s backoff and keeps running across reboots.
 
+**Node/Android deviation — terminal clock sync:** the Windows/Node bridge's
+optional `"timeSync"` check (read the terminal's system time, compare it to the
+host, set it back past a threshold, report it on the heartbeat) is **not
+ported** to this APK. The Android bridge reports no `clock` field, and the
+Worker leaves `hikvision_devices.device_clock` alone when a heartbeat carries
+none, so a terminal served only by an Android bridge simply shows no clock
+report in the portal. This is recorded here rather than fixed by porting a
+background clock loop into the service — the same treatment the LAN event
+listener and ZKTeco PUSH have. If an estate needs terminal clock correction and
+runs only Android bridges, it should set each terminal's time and timezone in
+the terminal's own setup menu.
+
 The app is deliberately plain Java against the platform APIs only (no Kotlin, no
 AndroidX, no native code, no Gradle). That is what makes the APK reproducible
 without Android Studio, and it keeps the APK at a few tens of kilobytes.

@@ -1,5 +1,44 @@
 # AI handoff — EstateMate
 
+## Terminal clock sync, and the visitor upsert delivery fix (2026-10-05)
+
+- A terminal enforces every time-sensitive decision with its own clock: a
+  visitor's finite pass window is checked against the terminal's hardware, and
+  gate events carry its timestamp. `"timeSync": { "enabled": true }` in
+  `agent-config.json` (off by default) makes the Node bridge read each
+  terminal's system time at startup and every `checkIntervalMinutes` (default
+  15), measure the offset against the bridge host's clock, and set the clock
+  back — JSON-first, XML fallback, re-read to confirm — only past
+  `maxDriftMs` (default 30 s, minimum 5 s). The per-terminal state
+  (`terminalTime`, `driftMs`, `lastCheckedAt`, `lastSyncAt`, `syncs`,
+  `lastError`) rides on the heartbeat, is stored in the new
+  `hikvision_devices.device_clock` column (migration `0021_terminal_clock_sync.sql`)
+  scoped to the reporting agent's own terminals, and is shown in the portal's
+  **Access control devices → Terminal clocks** section. It is a status surface,
+  never an input to a decision.
+- The reference clock is the **bridge host** on purpose: it is the clock every
+  other decision on the estate LAN already trusts. The documented assumptions
+  are that the host's time is correct and that each terminal's timezone matches
+  the host's (the sync aligns wall clocks; a differently-zoned terminal shows
+  as a constant offset and belongs re-zoned at the terminal). A failed read
+  keeps the last good reading plus the error, and a heartbeat without a clock
+  entry leaves the stored value alone, so old bridges and opted-out estates
+  change nothing.
+- **Android deviation, recorded:** the Android bridge does not run the clock
+  check (see `bridge-apps/android/README.md`), the same treatment the LAN event
+  listener and ZKTeco PUSH have.
+- **Visitor upsert delivery fix:** `queueVisitorDeviceOperations` marked an
+  upsert `pending` whenever the device's connection pattern was agent-capable,
+  without checking that a live agent was actually linked to the device — so on
+  an unlinked terminal the command waited forever while the pass still recorded
+  its slot as held. The upsert now uses the same `visitorOperationDelivery`
+  rule as the revocation path: `pending` only with a linked, sync-enabled
+  agent; `manual_action_required` otherwise. Locked down by two new tests in
+  `test/visitor-device-accounts.test.ts`; the storage contract is locked down
+  by `test/device-clock.test.ts` and the bridge loop by
+  `isapi-bridge/agent.time-sync.integration.mjs` (now part of
+  `npm run test:isapi-bridge`).
+
 ## Hikvision visitor accounts are PIN-only `UserInfo` (2026-10-05)
 
 - The terminal person-editor screenshot is the Hikvision visitor provisioning

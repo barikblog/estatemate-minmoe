@@ -4728,7 +4728,7 @@ app.get('/api/access/devices', requireRoles('admin','manager','security'), async
     `SELECT d.id,d.name,d.vendor,d.serial_number,d.model,d.firmware,d.mac_address,d.gate_name,d.direction,d.integration_mode,${deviceEffectiveStatus('d')} AS status,d.last_seen_at,d.profile_key,d.connection_pattern,d.profile_config_json,d.capabilities_json,
       d.isapi_agent_id,d.isapi_sync_enabled,d.last_isapi_sync_at,d.last_isapi_sync_status,d.isapi_host,d.isapi_port,d.isapi_username,
       CASE WHEN d.isapi_password_ciphertext IS NULL THEN 0 ELSE 1 END AS isapi_password_configured,d.isapi_protocol,
-      d.remote_verify_enabled,d.remote_verify_door_no,d.remote_verify_cooldown_ms,d.remote_verify_state,
+      d.remote_verify_enabled,d.remote_verify_door_no,d.remote_verify_cooldown_ms,d.remote_verify_state,d.device_clock,
       d.created_at,d.updated_at,d.status AS stored_status,
       ap.id AS access_point_id,ap.name AS access_point_name,
       (SELECT COUNT(*) FROM device_operations o WHERE o.device_id=d.id AND o.status='manual_action_required') AS pending_operations,
@@ -6175,7 +6175,12 @@ async function queueVisitorDeviceOperations(
   let queued = 0;
 
   for (const device of devices.results) {
-    const status = isPendingPattern(device.connection_pattern) ? 'pending' : 'manual_action_required';
+    // Same delivery rule as the revocation path: `pending` only when a live
+    // agent is actually linked to the terminal. A device whose connection
+    // pattern is agent-capable but that has no linked config would otherwise
+    // hold this upsert as `pending` forever — a command nothing will ever
+    // pick up — while the pass still records itself as provisioned.
+    const status = await visitorOperationDelivery(db, device);
     const current = byDevice.get(device.id);
     if (!current) {
       statements.push(db.prepare(
@@ -6510,6 +6515,40 @@ async function markTerminalStreamUp(env: Env, agentId: string, deviceId: string)
   return true;
 }
 
+/**
+ * What the bridge's time-sync check reports about a terminal's clock, reduced
+ * to the fields the portal shows. It is stored as reported — a status surface,
+ * never read back as an input to a decision (the same rule as
+ * `remote_verify_state`) — so this validates shape only, and an entry that
+ * cannot be trusted to display is dropped rather than stored.
+ */
+function normalizeDeviceClock(value: unknown): {
+  terminalTime: string;
+  driftMs: number;
+  lastCheckedAt: string | null;
+  lastSyncAt: string | null;
+  syncs: number;
+  lastError: string | null;
+} | null {
+  if (!value || typeof value !== 'object') return null;
+  const item = value as Record<string, unknown>;
+  const asIso = (value: number): string => new Date(value).toISOString();
+  const terminalTimeMs = typeof item.terminalTime === 'string' && item.terminalTime.trim() ? Date.parse(item.terminalTime) : Number.NaN;
+  const driftMs = typeof item.driftMs === 'number' ? item.driftMs : Number.NaN;
+  if (Number.isNaN(terminalTimeMs) || Number.isNaN(driftMs) || !Number.isFinite(driftMs)) return null;
+  const optionalInstant = (value: unknown): string | null =>
+    typeof value === 'string' && value.trim() && !Number.isNaN(Date.parse(value)) ? asIso(Date.parse(value)) : null;
+  const syncs = typeof item.syncs === 'number' && Number.isInteger(item.syncs) && item.syncs >= 0 ? item.syncs : 0;
+  return {
+    terminalTime: asIso(terminalTimeMs),
+    driftMs: Math.round(driftMs),
+    lastCheckedAt: optionalInstant(item.lastCheckedAt),
+    lastSyncAt: optionalInstant(item.lastSyncAt),
+    syncs,
+    lastError: typeof item.lastError === 'string' && item.lastError.trim() ? item.lastError.trim().slice(0, 300) : null,
+  };
+}
+
 async function handleIsapiAgentHeartbeat(request: Request, env: Env, agentId: string): Promise<Response> {
   if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'POST' } });
   const agent = await authenticateIsapiAgent(request, env, agentId);
@@ -6540,18 +6579,34 @@ async function handleIsapiAgentHeartbeat(request: Request, env: Env, agentId: st
   const reported = Array.isArray(body.devices) ? body.devices as Array<Record<string, unknown>> : [];
   let terminalsOffline = 0;
   let terminalsOnline = 0;
+  let terminalClocks = 0;
   for (const entry of reported.slice(0, 100)) {
     const deviceId = typeof entry?.deviceId === 'string' ? entry.deviceId.trim() : '';
+    if (!deviceId) continue;
+    // Stream presence and clock state are independent: a terminal whose event
+    // stream is off or down still gets its clock reported, and a device that
+    // reports only a clock is not a presence update.
     const stream = typeof entry?.stream === 'string' ? entry.stream.trim().toLowerCase() : '';
-    if (!deviceId || (stream !== 'up' && stream !== 'down')) continue;
     if (stream === 'up') {
       if (await markTerminalStreamUp(env, agentId, deviceId)) terminalsOnline += 1;
-      continue;
+    } else if (stream === 'down') {
+      const reason = typeof entry?.lastError === 'string' && entry.lastError.trim()
+        ? `Event stream down: ${entry.lastError.trim()}`
+        : 'Event stream down: the agent cannot hold the terminal connection open';
+      if (await markTerminalStreamDown(env, agentId, deviceId, reason)) terminalsOffline += 1;
     }
-    const reason = typeof entry?.lastError === 'string' && entry.lastError.trim()
-      ? `Event stream down: ${entry.lastError.trim()}`
-      : 'Event stream down: the agent cannot hold the terminal connection open';
-    if (await markTerminalStreamDown(env, agentId, deviceId, reason)) terminalsOffline += 1;
+    // The bridge host's time-sync check, per terminal. Scoped to this agent's
+    // own terminals, like everything else the heartbeat writes: one estate's
+    // bridge must not report onto another's device row. A heartbeat without a
+    // clock entry leaves the stored value alone — a bridge built before time
+    // sync (or with it switched off) keeps the row exactly as it was.
+    const clock = normalizeDeviceClock(entry?.clock);
+    if (clock) {
+      const saved = await env.DB.prepare(
+        `UPDATE hikvision_devices SET device_clock=? WHERE id=? AND isapi_agent_id=?`,
+      ).bind(JSON.stringify(clock), deviceId, agentId).run();
+      if (Number(saved.meta.changes ?? 0) > 0) terminalClocks += 1;
+    }
   }
 
   // Remote verification: the bridge reports, per terminal, what it decided and
@@ -6576,7 +6631,7 @@ async function handleIsapiAgentHeartbeat(request: Request, env: Env, agentId: st
     }
   }
   return Response.json(
-    { ok: true, agentId, terminalsOffline, terminalsOnline, serverTime: new Date().toISOString() },
+    { ok: true, agentId, terminalsOffline, terminalsOnline, terminalClocks, serverTime: new Date().toISOString() },
     { headers: { 'Cache-Control': 'no-store' } },
   );
 }
