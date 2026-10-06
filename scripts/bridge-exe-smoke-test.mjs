@@ -139,7 +139,7 @@ function startFakeWorker(state) {
               kind: 'card',
               operation: 'upsert_card',
               deviceId: state.deviceId,
-              payload: { cardUid: '4455667788', employeeNo: 'RES-42' },
+              payload: { cardUid: '4455667788', employeeNo: 'RES42' },
             },
           ],
         });
@@ -231,7 +231,7 @@ function startFakeDevice(state) {
         response.writeHead(200, { 'Content-Type': 'multipart/mixed; boundary=smokeboundary' });
         response.write('--smokeboundary\r\nContent-Type: application/json\r\n\r\n');
         response.write(
-          '{"EventNotificationAlert":{"eventType":"AccessControllerEvent","cardNo":"4455667788","employeeNoString":"RES-42","majorEventType":5}}\r\n',
+          '{"EventNotificationAlert":{"eventType":"AccessControllerEvent","cardNo":"4455667788","employeeNoString":"RES42","majorEventType":5}}\r\n',
         );
         response.write('--smokeboundary\r\nContent-Type: application/json\r\n\r\n');
         response.write('{"EventNotificationAlert":{"eventType":"AccessControllerEvent","cardNo":"9988776655","majorEventType":5}}\r\n');
@@ -639,7 +639,7 @@ async function main() {
     check('run applied the queued card operation over ISAPI', applied, `cardRecords=${state.cardRecords.length}`);
     check(
       'the card record carried the card UID and employee number',
-      state.cardRecords.some((body) => body.includes('4455667788') && body.includes('RES-42')),
+      state.cardRecords.some((body) => body.includes('4455667788') && body.includes('RES42')),
       state.cardRecords.join(' | ').slice(0, 300),
     );
     const reported = await waitFor(() => state.results.length >= 1, { label: 'the operation result report' });
