@@ -9,11 +9,12 @@ describe('employee ID rules', () => {
     expect(readEmployeeId('x'.repeat(33)).error).toMatch(/32 characters/);
   });
 
-  it('rejects characters that would corrupt an ISAPI XML body or a CSV cell', () => {
-    for (const bad of ['a b', 'a&b', 'a<b', 'a>b', 'a"b', 'a,b', "a'b", 'a;b']) {
+  it('allows letters and digits only — the terminal accepts nothing else', () => {
+    for (const bad of ['a b', 'a&b', 'a<b', 'a>b', 'a"b', 'a,b', "a'b", 'a;b', 'EMP-001', 'est/2024/042', 'UNIT.A-01', 'emp_9']) {
       expect(readEmployeeId(bad).error, `expected rejection: ${bad}`).toBeTruthy();
     }
-    for (const good of ['EMP-001', 'est/2024/042', 'UNIT.A-01', 'emp_9', '1001']) {
+    expect(readEmployeeId('EMP-001').error).toMatch(/letters and numbers/);
+    for (const good of ['EMP001', 'est2024042', 'UNITA01', 'emp9', '1001']) {
       expect(readEmployeeId(good).error, `expected acceptance: ${good}`).toBeNull();
     }
   });
@@ -37,7 +38,7 @@ describe('employee ID rules', () => {
   });
 
   it('composes a device employee number that never exceeds the cap', () => {
-    expect(deviceEmployeeNo('visitor', '999999999999')).toBe('visitor-999999999999');
+    expect(deviceEmployeeNo('visitor', '999999999999')).toBe('visitor999999999999');
     const cramped = deviceEmployeeNo('fingerprint', 'a'.repeat(70));
     expect(cramped.length).toBe(32);
     // The unique part survives; the prefix is what gets shortened.

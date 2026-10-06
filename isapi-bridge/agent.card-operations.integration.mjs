@@ -166,6 +166,8 @@ try {
       ['upsert_card', { cardUid: '10000003', employeeNo: '434ad149-1d4d-4756-8a21-cbc369c012e2' }],
       ['upsert_card', { cardUid: '10000004', employeeNo: '</employeeNo><cardNo>1' }],
       ['upsert_card', { cardUid: '10000005', employeeNo: '   ' }],
+      ['upsert_card', { cardUid: '10000007', employeeNo: 'EMP-7' }],
+      ['upsert_card', { cardUid: '10000008', employeeNo: 'est/2024/042' }],
     ]) {
       const result = await apply(operation, payload);
       assert.equal(result.success, false, `${operation} ${JSON.stringify(payload)} must be refused`);
@@ -272,6 +274,27 @@ try {
     console.log('visitor PIN-only UserInfo and automatic account deletion OK');
   }
 
+  // 3e. A visitor account filed before the charset rule (hyphenated
+  // `visitor-<credential>`) is still revocable, and a stale upsert carrying
+  // the old name is created under the new one instead of failing.
+  {
+    persons.set('visitor-66554433', { employeeNo: 'visitor-66554433', name: 'Old Visitor' });
+    const revoked = await apply('revoke_visitor', { credentialNumber: '66554433', employeeNo: 'visitor-66554433' });
+    assert.deepEqual(revoked, { success: true });
+    assert.equal(persons.has('visitor-66554433'), false, 'the legacy visitor slot must be freed');
+
+    const stale = await apply('upsert_visitor', {
+      credentialNumber: '66554433', employeeNo: 'visitor-66554433', visitorName: 'Old Visitor',
+      pin: '482731', validFrom: '2026-10-05T08:00:00.000Z', validUntil: '2026-10-05T18:00:00.000Z',
+    });
+    assert.deepEqual(stale, { success: true });
+    assert.equal(persons.has('visitor66554433'), true, 'a stale upsert lands under the charset-safe name');
+    assert.equal(persons.has('visitor-66554433'), false, 'nothing new is filed under the legacy name');
+    const cleanup = await apply('revoke_visitor', { credentialNumber: '66554433', employeeNo: 'visitor66554433' });
+    assert.deepEqual(cleanup, { success: true });
+    console.log('legacy visitor revocation and stale-upsert rename OK');
+  }
+
   // 4. The summariser reads JSON and XML ResponseStatus documents and falls back
   //    to a slice of anything else.
   {
@@ -282,6 +305,12 @@ try {
     assert.equal(agent.describeIsapiFailure({ status: 500, body: 'gateway exploded' }), 'ISAPI 500: gateway exploded');
     assert.equal(agent.terminalEmployeeNo({ employeeNo: ' 842317765 ' }), '842317765');
     assert.equal(agent.terminalEmployeeNo({ employeeNo: 'x'.repeat(33) }), null);
+    assert.equal(agent.terminalEmployeeNo({ employeeNo: 'EMP-7' }), null);
+    assert.equal(agent.terminalEmployeeNo({ employeeNo: 'visitor55443322' }), 'visitor55443322');
+    // The pre-charset visitor shape is deletable but never writable: a strict
+    // terminal cannot store it, and nothing new may be filed under it.
+    assert.equal(agent.terminalEmployeeNo({ employeeNo: 'visitor-55443322' }), null);
+    assert.equal(agent.terminalEmployeeNo({ employeeNo: 'visitor-55443322' }, { allowLegacy: true }), 'visitor-55443322');
 
     // A refused credential is reported with the terminal's own lock state and
     // remaining attempts (XML_ResponseStatus_AuthenticationFailed) — the guide

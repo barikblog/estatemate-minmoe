@@ -220,7 +220,7 @@ sync again.
 | Revoke **one card** while keeping the person | **No.** The protocol has no card-only delete; the person delete would strip their fingerprints and face too, so the task stays queued with that explanation |
 | Fingerprint capture / template delivery | **No** — the terminal's own reader and menu remain the way |
 | Remote open/close | **No** — `CONTROL BOARD` is documented but unproven here, and EstateMate does not ship an unproven gate command |
-| Visitor slots with a `visitor-…` Employee ID | **No**, on a numeric-PIN terminal — same rule as above |
+| Visitor slots with a `visitor…` Employee ID | **No**, on a numeric-PIN terminal — same rule as above |
 
 ### Security
 

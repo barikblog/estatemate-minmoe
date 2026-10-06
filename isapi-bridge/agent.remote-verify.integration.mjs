@@ -86,8 +86,8 @@ const published = {
   deviceReads: 0,
 };
 let snapshotPages = [
-  { items: [{ kind: 'card', value: '0001234567', personId: 'p1', employeeNo: 'EMP-1', status: 'active', validUntil: null }] },
-  { items: [{ kind: 'card', value: '0007654321', personId: 'p2', employeeNo: 'EMP-2', status: 'active', validUntil: null }] },
+  { items: [{ kind: 'card', value: '0001234567', personId: 'p1', employeeNo: 'EMP1', status: 'active', validUntil: null }] },
+  { items: [{ kind: 'card', value: '0007654321', personId: 'p2', employeeNo: 'EMP2', status: 'active', validUntil: null }] },
 ];
 let remoteVerifyEnabled = true;
 

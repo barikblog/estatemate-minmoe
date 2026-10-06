@@ -109,7 +109,7 @@ function decodeRegistryValue(value) {
  *
  * This is the whole reason ZKTeco support is not a one-line adapter over the
  * Hikvision path. EstateMate's Employee ID is deliberately terminal-safe for
- * ISAPI — `[A-Za-z0-9._-/]{1,32}`, and by default a person's UUID without its
+ * ISAPI — `[A-Za-z0-9]{1,32}`, and by default a person's UUID without its
  * hyphens, which is 32 *hex* characters and so full of letters. A Hex string is
  * exactly what a `StringPinFunOn=0` terminal cannot hold. Silently truncating or
  * rewriting it would file the resident under a number that resolves to somebody

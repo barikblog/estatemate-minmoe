@@ -1,5 +1,37 @@
 # AI handoff — EstateMate
 
+## Employee IDs are letters and digits only (2026-10-06)
+
+- A terminal accepts nothing else as an employeeNo/employeeNoString, so the
+  previous charset (letters, digits and `._-/`) could issue identities a
+  strict terminal silently refuses. `src/employee-id.ts` now validates
+  `^[A-Za-z0-9]+$` (still max 32), the portal input/pattern and bulk CSV
+  templates use separator-free examples (`EMP0001`), and both bridges enforce
+  the same pattern before any ISAPI write — Node (`isapi-bridge/agent.mjs`)
+  and Android (`IsapiClient.java`) changed together.
+- `deviceEmployeeNo()` no longer joins with a hyphen: a visitor account is
+  `visitor<credential number>` (19 chars for a 12-digit credential). The
+  Node `upsert_person` visitor-type inference matches `visitor` with or
+  without the legacy hyphen.
+- Delete paths are the deliberate exception: both bridges accept the legacy
+  `[A-Za-z0-9._/-]{1,32}` shape for `delete_person`/`revoke_visitor`, so a
+  slot filed before the rule (e.g. `visitor-<credential>`) stays removable.
+  Write paths refuse it. A stale pending upsert carrying the old visitor name
+  is created under the new name instead of failing.
+- Migration `0022_employee_id_alphanumeric_only.sql` strips the old
+  separators from stored `users`/`household_members` IDs (collisions keep 24
+  chars and gain 8 of their own id), re-points unusable fingerprint values at
+  the person's own identity, and adds charset triggers on all three columns.
+  History (`access_events`), the person-state cache and queued payloads are
+  untouched. Estates that used separators should run **Resynchronise
+  everyone** after deploying.
+- Coverage: `src/employee-id.test.ts`, `test/employee-id-people.test.ts`
+  (including a DB-level separator rejection), `test/visitor-device-accounts.test.ts`,
+  `isapi-bridge/agent.card-operations.integration.mjs` (§3e: legacy revoke +
+  stale-upsert rename), and Android `ProtocolTest` (charset + legacy-delete
+  checks). Fixtures using `EMP-…`/`RES-…`/`VIS-…` IDs were rewritten without
+  separators across all suites.
+
 ## Terminal clock sync, and the visitor upsert delivery fix (2026-10-05)
 
 - A terminal enforces every time-sensitive decision with its own clock: a

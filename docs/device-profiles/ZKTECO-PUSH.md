@@ -117,7 +117,7 @@ terminal reports a width (`MaxPinWidth`/`PIN2Width`), that width wins over
 EstateMate's 32-character cap.
 
 **Why this is not a detail.** EstateMate's Employee ID is `1–32` characters of
-`[A-Za-z0-9._-/]` (`src/employee-id.ts`) and **defaults to the person's UUID minus
+`[A-Za-z0-9]` (`src/employee-id.ts`) and **defaults to the person's UUID minus
 hyphens — 32 hex characters, i.e. full of letters**. That shape is built for
 Hikvision ISAPI, where it is exactly right. Handed to a `StringPinFunOn=0`
 terminal it is a value the device cannot store. The three tempting responses are
@@ -144,7 +144,7 @@ then works unchanged: the ATTLOG `PIN` equals the person's Employee ID, exactly 
 `employee_no` does on the Hikvision path.
 
 **Accepted consequence, recorded so nobody re-litigates it:** visitor credentials
-composed as `visitor-<n>` (`deviceEmployeeNo('visitor', …)`) are **never storable**
+composed as `visitor<n>` (`deviceEmployeeNo('visitor', …)`) are **never storable**
 on a numeric-only terminal, so visitor card issuance to a ZKTeco gate fails with the
 message above rather than half-working. The follow-up is a per-device numeric alias
 map, which needs a D1 migration and a Worker-side change — not an agent-side

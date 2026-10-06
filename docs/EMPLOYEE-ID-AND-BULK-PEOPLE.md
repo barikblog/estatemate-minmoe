@@ -21,24 +21,33 @@ Three facts follow from that:
 
 ## The rule
 
-> An Employee ID may never exceed **32 characters**.
+> An Employee ID is **letters and digits only** and may never exceed **32
+> characters** — that is what a terminal accepts as an
+> employeeNo/employeeNoString.
 
 Enforced four times, deliberately:
 
 - **Portal validation** (`src/employee-id.ts`): rejected with a sentence an
-  operator can act on (`Employee ID must not exceed 32 characters`).
+  operator can act on (`Employee ID may only contain letters and numbers`,
+  `Employee ID must not exceed 32 characters`).
 - **Schema CHECK** on `users.employee_id` and `household_members.employee_id`
-  (`length(employee_id) BETWEEN 1 AND 32`).
-- **Triggers** on `fingerprint_credentials.employee_no` (a predating column that
-  cannot take a CHECK retroactively), refusing over-long inserts and updates.
+  (`length(employee_id) BETWEEN 1 AND 32`), from migration 0018.
+- **Triggers** on `users.employee_id`, `household_members.employee_id` and
+  `fingerprint_credentials.employee_no` (migration 0022), refusing any
+  non-alphanumeric or over-long insert or update to those columns.
 - **API**: every route that accepts or composes an employee number — person
   create/edit, fingerprint issue, card issue, visitor provisioning — validates
   and/or composes with the cap (`deviceEmployeeNo()` shrinks the *prefix*, never
-  the unique identifier).
+  the unique identifier) and the charset.
 
-Allowed characters: letters, digits and `. _ - /`. Spaces, `&`, `<`, `>`, quotes
-and commas are rejected rather than rewritten, because an identifier that
-arrives mangled on the terminal is worse than one the portal refused.
+Separators (`. _ - /`), spaces, `&`, `<`, `>`, quotes and commas are rejected
+rather than rewritten, because an identifier that arrives mangled on the
+terminal is worse than one the portal refused. Estates provisioned before
+migration 0022 had stored values normalised by stripping those separators
+(collisions gain 8 characters of the person's own id); run **Resynchronise
+everyone** after deploying so the terminals store the new identities. A
+terminal that stored the old shape still frees the slot on removal, because the
+bridges accept the legacy shape on delete paths only.
 
 ## Who gets one, and how
 
@@ -71,7 +80,7 @@ One CSV, archived against an import job (`people_upload`). Columns:
 | `name` | required |
 | `email` | required for accounts |
 | `role` | required for accounts |
-| `employee_id` | optional, max 32 chars |
+| `employee_id` | optional, letters and digits, max 32 chars |
 | `unit_number` | optional, residents only (vacant unit) |
 | `status` | `active` (default) or `inactive` |
 | `relationship` | required for dependants |

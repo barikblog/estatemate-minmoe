@@ -34,13 +34,20 @@ describe('employee ID on people', () => {
   });
 
   it('keeps an administrator-supplied Employee ID and rejects over-long and duplicates', async () => {
-    const supplied = 'EST/2024/0042';
+    const supplied = 'EST20240042';
     const created = await call(env, 'POST', '/api/users', {
       token: adminToken,
       body: { name: 'Supplied Id Person', email: 'supplied@example.com', password: 'temporary-password-1', role: 'resident', employeeId: supplied },
     });
     expect(created.status).toBe(201);
     expect(created.json.employeeId).toBe(supplied);
+
+    const separated = await call(env, 'POST', '/api/users', {
+      token: adminToken,
+      body: { name: 'Separated Id', email: 'separated@example.com', password: 'temporary-password-1', role: 'resident', employeeId: 'EST-2024-0042' },
+    });
+    expect(separated.status).toBe(400);
+    expect(String(separated.json.error ?? separated.text)).toMatch(/letters and numbers/);
 
     const tooLong = await call(env, 'POST', '/api/users', {
       token: adminToken,
@@ -59,21 +66,21 @@ describe('employee ID on people', () => {
   it('lets an operator change the Employee ID and blocks a clash with a dependant', async () => {
     database.run(
       `INSERT INTO household_members(id,property_id,primary_resident_id,name,relationship,status,requested_by,employee_id)
-       VALUES ('member-staff','property-1','user-resident','Ada Staff','domestic_staff','active','user-resident','HOUSE-77')`,
+       VALUES ('member-staff','property-1','user-resident','Ada Staff','domestic_staff','active','user-resident','HOUSE77')`,
     );
     const clash = await call(env, 'PATCH', `/api/users/${estate.residentId}`, {
       token: adminToken,
-      body: { employeeId: 'house-77' },
+      body: { employeeId: 'house77' },
     });
     expect(clash.status).toBe(409);
     expect(String(clash.json.error)).toMatch(/already assigned/);
 
     const ok = await call(env, 'PATCH', `/api/users/${estate.residentId}`, {
       token: adminToken,
-      body: { employeeId: 'EST-OWNER-01' },
+      body: { employeeId: 'ESTOWNER01' },
     });
     expect(ok.status).toBe(200);
-    expect(ok.json.employeeId).toBe('EST-OWNER-01');
+    expect(ok.json.employeeId).toBe('ESTOWNER01');
   });
 
   it('assigns dependants their own Employee ID at creation', async () => {
@@ -121,17 +128,20 @@ describe('employee ID on people', () => {
     expect(operation?.payload_json && JSON.parse(String(operation.payload_json)).employeeNo).toBe(employeeId);
   });
 
-  it('enforces the 32-character rule at the database level too', () => {
+  it('enforces the charset and 32-character rule at the database level too', () => {
     expect(() => database.run(
       `UPDATE users SET employee_id=? WHERE id=?`, 'z'.repeat(33), estate.residentId,
-    )).toThrow(/CHECK/i);
+    )).toThrow(/letters and numbers/);
+    expect(() => database.run(
+      `UPDATE users SET employee_id='BAD-ID' WHERE id=?`, estate.residentId,
+    )).toThrow(/letters and numbers/);
     database.run(
       `INSERT INTO household_members(id,property_id,primary_resident_id,name,relationship,status,requested_by)
        VALUES ('member-trigger','property-1','user-resident','Trigger Person','other','active','user-resident')`,
     );
     database.run(
       `INSERT INTO fingerprint_credentials(id,resident_id,household_member_id,employee_no,finger_no)
-       VALUES ('finger-ok','user-resident','member-trigger','ok-1',1)`,
+       VALUES ('finger-ok','user-resident','member-trigger','ok1',1)`,
     );
     expect(() => database.run(
       `INSERT INTO fingerprint_credentials(id,resident_id,household_member_id,employee_no,finger_no)

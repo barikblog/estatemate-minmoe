@@ -30,10 +30,10 @@ describe('estate modules', () => {
   it('serves the cross-household dependant roster with each dependant’s access picture', async () => {
     database.run(
       `INSERT INTO household_members(id,property_id,primary_resident_id,name,relationship,status,requested_by,employee_id)
-       VALUES ('hm-1','property-1','user-resident','Nanny One','domestic_staff','active','user-resident','HM-0001')`,
+       VALUES ('hm-1','property-1','user-resident','Nanny One','domestic_staff','active','user-resident','HM0001')`,
     );
     database.run(`INSERT INTO access_cards(id,resident_id,household_member_id,card_uid,status) VALUES ('c-hm','user-resident','hm-1','121212','active')`);
-    database.run(`INSERT INTO fingerprint_credentials(id,resident_id,household_member_id,employee_no,finger_no,status) VALUES ('f-hm','user-resident','hm-1','HM-0001',3,'active')`);
+    database.run(`INSERT INTO fingerprint_credentials(id,resident_id,household_member_id,employee_no,finger_no,status) VALUES ('f-hm','user-resident','hm-1','HM0001',3,'active')`);
 
     const roster = await call(env, 'GET', '/api/dependants?status=active', { token: adminToken });
     expect(roster.status).toBe(200);
@@ -42,7 +42,7 @@ describe('estate modules', () => {
     expect(items[0]!.name).toBe('Nanny One');
     expect(items[0]!.active_cards).toBe(1);
     expect(items[0]!.active_fingerprints).toBe(1);
-    expect(items[0]!.employee_id).toBe('HM-0001');
+    expect(items[0]!.employee_id).toBe('HM0001');
     const summary = roster.json.summary as Record<string, number>;
     expect(summary.domestic_staff).toBe(1);
 

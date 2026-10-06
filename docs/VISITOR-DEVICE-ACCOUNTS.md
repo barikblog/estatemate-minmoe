@@ -36,7 +36,7 @@ record separately**:
 
 When a pass is created, every enabled terminal (or the one gate an officer
 chose) gets the upsert with the composed employee number
-(`visitor-<credential number>`, always ≤ 32 characters, since the terminal's
+(`visitor<credential number>`, letters and digits only and always ≤ 32 characters, since the terminal's
 employeeNo/employeeNoString field is bounded at 32). On Hikvision ISAPI
 terminals, that upsert creates or updates **one PIN-only `UserInfo` account**:
 

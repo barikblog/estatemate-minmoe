@@ -136,7 +136,7 @@ Run this with a real pass, at one gate, with the terminal in front of you.
 ### 4b. What the terminal now holds
 
 On the terminal's own menu (or its web client), find the person record for
-employee number **`visitor-<credential number>`** and confirm:
+employee number **`visitor<credential number>`** (passes issued before the alphanumeric-only rule show the legacy `visitor-<credential number>` shape) and confirm:
 
 - [ ] name = the visitor's name;
 - [ ] department = `Company`;

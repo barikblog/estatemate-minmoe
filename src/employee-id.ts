@@ -13,24 +13,27 @@
  * That is also what makes a cardless gate event attributable — the terminal
  * reports the employee number, and the number resolves to exactly one person.
  *
- * The 32-character cap is enforced three times, deliberately:
+ * The 32-character cap and the letters-and-digits-only charset are enforced
+ * three times, deliberately:
  *   1. here, at the API boundary, with a message an operator can act on;
- *   2. in the schema (`CHECK (length(employee_id) BETWEEN 1 AND 32)`);
- *   3. by trigger on `fingerprint_credentials.employee_no`, whose column
- *      predates the rule and cannot be given a CHECK retroactively.
+ *   2. in the schema (`CHECK (length(employee_id) BETWEEN 1 AND 32)`, from
+ *      migration 0018);
+ *   3. by trigger on `users.employee_id`, `household_members.employee_id` and
+ *      `fingerprint_credentials.employee_no` (migration 0022), whose columns
+ *      predate the charset rule and cannot be given a CHECK retroactively.
  */
 
 /** Hard cap imposed by the ISAPI employeeNo/employeeNoString field. */
 export const EMPLOYEE_ID_MAX = 32;
 
 /**
- * Allowed characters. Kept to what survives an ISAPI XML body and a CSV cell
- * without escaping surprises: letters, digits and `._-/`. Spaces, `&`, `<`, `>`,
- * quotes and commas are rejected rather than silently rewritten, because a
- * terminal that stores a different string than the portal shows is a support
- * call nobody can diagnose.
+ * Allowed characters. Letters and digits only: that is what the terminals
+ * accept as an employeeNo/employeeNoString. Separators (`. _ - /`), spaces,
+ * `&`, `<`, `>`, quotes and commas are rejected rather than silently
+ * rewritten, because a terminal that stores a different string than the portal
+ * shows is a support call nobody can diagnose.
  */
-const EMPLOYEE_ID_PATTERN = /^[A-Za-z0-9._\-/]+$/;
+const EMPLOYEE_ID_PATTERN = /^[A-Za-z0-9]+$/;
 
 export interface EmployeeIdReading {
   /** Trimmed value to store, or null when the field was omitted or blank. */
@@ -59,7 +62,7 @@ export function readEmployeeId(value: unknown): EmployeeIdReading {
   if (!EMPLOYEE_ID_PATTERN.test(text)) {
     return {
       value: null,
-      error: 'Employee ID may only contain letters, numbers and . _ - /',
+      error: 'Employee ID may only contain letters and numbers',
     };
   }
   return { value: text, error: null };
@@ -80,16 +83,17 @@ export function employeeIdFromUuid(id: string): string | null {
 
 /**
  * Compose a device-side employee number for something that is not a person
- * record — today, a visitor credential — without ever exceeding the cap.
+ * record — today, a visitor credential — without ever exceeding the cap and
+ * using letters and digits only, like every other terminal identity.
  *
  * The identifier is the part that distinguishes one record from another, so it
  * is preserved and the *prefix* is shortened instead. Truncating the tail would
  * collapse distinct visitors onto one terminal identity.
  */
 export function deviceEmployeeNo(prefix: string, identifier: string): string {
-  const composed = `${prefix}-${identifier}`;
+  const composed = `${prefix}${identifier}`;
   if (composed.length <= EMPLOYEE_ID_MAX) return composed;
-  const room = EMPLOYEE_ID_MAX - identifier.length - 1;
-  if (room >= 1) return `${prefix.slice(0, room)}-${identifier}`;
+  const room = EMPLOYEE_ID_MAX - identifier.length;
+  if (room >= 1) return `${prefix.slice(0, room)}${identifier}`;
   return identifier.slice(-EMPLOYEE_ID_MAX);
 }

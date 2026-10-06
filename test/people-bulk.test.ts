@@ -45,8 +45,8 @@ describe('bulk people operations', () => {
   it('uploads accounts and dependants from one CSV and returns passwords once', async () => {
     const text = csv([
       ['person_type','name','email','phone','role','employee_id','unit_number','relationship','primary_resident_email'],
-      ['account','Bulk One','bulk1@example.com','','resident','BULK-001','C-02','',''],
-      ['account','Bulk Two','bulk2@example.com','','security','BULK-002','','',''],
+      ['account','Bulk One','bulk1@example.com','','resident','BULK001','C-02','',''],
+      ['account','Bulk Two','bulk2@example.com','','security','BULK002','','',''],
       ['dependant','Bulk Dependant','','','','','','spouse','RESIDENT@EXAMPLE.COM'],
     ]);
     const upload = await postCsv(env, '/api/people/bulk-upload', text, adminToken);
@@ -56,7 +56,7 @@ describe('bulk people operations', () => {
     const credentials = upload.json.credentials as Array<{ name:string;email:string;employeeId:string;temporaryPassword:string }>;
     expect(credentials).toHaveLength(2);
     expect(credentials[0]!.temporaryPassword).toMatch(/^EM-/);
-    expect(credentials[0]!.employeeId).toBe('BULK-001');
+    expect(credentials[0]!.employeeId).toBe('BULK001');
 
     const bulk = database.one(`SELECT id FROM users WHERE email='bulk1@example.com'`);
     expect(bulk).toBeTruthy();
@@ -71,8 +71,8 @@ describe('bulk people operations', () => {
   it('reports bad rows instead of half-applying the CSV', async () => {
     const text = csv([
       ['person_type','name','email','role','employee_id','relationship'],
-      ['account','Good Person','good@example.com','resident','GOOD-1',''],
-      ['account','Bad Email','not-an-email','resident','BAD-1',''],
+      ['account','Good Person','good@example.com','resident','GOOD1',''],
+      ['account','Bad Email','not-an-email','resident','BAD1',''],
       ['account','Too Long','long@example.com','resident','x'.repeat(33),''],
       ['dependant','Orphan Dependant','','','','spouse'],
     ]);
@@ -106,25 +106,25 @@ describe('bulk people operations', () => {
   });
 
   it('edits people in bulk including the Employee ID, matched by it', async () => {
-    database.run(`UPDATE users SET employee_id='EDIT-01' WHERE id=?`, estate.residentId);
+    database.run(`UPDATE users SET employee_id='EDIT01' WHERE id=?`, estate.residentId);
     const text = csv([
       ['employee_id','name','phone','new_employee_id'],
-      ['EDIT-01','Renamed Resident','+2349000000000','EDIT-99'],
+      ['EDIT01','Renamed Resident','+2349000000000','EDIT99'],
     ]);
     const edit = await postCsv(env, '/api/people/bulk-edit', text, adminToken);
     expect(edit.status).toBe(200);
     const row = database.one(`SELECT name,phone,employee_id FROM users WHERE id=?`, estate.residentId);
     expect(row?.name).toBe('Renamed Resident');
-    expect(row?.employee_id).toBe('EDIT-99');
+    expect(row?.employee_id).toBe('EDIT99');
     expect(String(edit.json.notice)).toMatch(/Resynchronise/);
   });
 
   it('refuses a bulk edit that would duplicate an Employee ID', async () => {
-    database.run(`UPDATE users SET employee_id='A-1' WHERE id=?`, estate.residentId);
-    database.run(`UPDATE users SET employee_id='B-2' WHERE id=?`, estate.cashierId);
+    database.run(`UPDATE users SET employee_id='A1' WHERE id=?`, estate.residentId);
+    database.run(`UPDATE users SET employee_id='B2' WHERE id=?`, estate.cashierId);
     const text = csv([
       ['employee_id','new_employee_id'],
-      ['A-1','b-2'],
+      ['A1','b2'],
     ]);
     const edit = await postCsv(env, '/api/people/bulk-edit', text, adminToken);
     expect(edit.status).toBe(207);
@@ -132,13 +132,13 @@ describe('bulk people operations', () => {
   });
 
   it('deletes people in bulk, preserving history and suspending credentials', async () => {
-    database.run(`UPDATE users SET employee_id='DEL-01' WHERE id=?`, estate.residentId);
+    database.run(`UPDATE users SET employee_id='DEL01' WHERE id=?`, estate.residentId);
     database.run(`UPDATE users SET property_id=NULL WHERE id=?`, estate.residentId);
     database.run(`UPDATE property_ownerships SET status='revoked' WHERE property_id=? AND resident_id=?`, estate.propertyId, estate.residentId);
     database.run(`INSERT INTO access_cards(id,resident_id,card_uid,status) VALUES ('card-del','user-resident','777888','active')`);
     const response = await call(env, 'POST', '/api/people/bulk-delete', {
       token: adminToken,
-      body: { confirm: 'DELETE_PEOPLE', employeeIds: ['DEL-01'] },
+      body: { confirm: 'DELETE_PEOPLE', employeeIds: ['DEL01'] },
     });
     expect(response.status).toBe(200);
     expect(response.json.successfulRows).toBe(1);
@@ -155,10 +155,10 @@ describe('bulk people operations', () => {
       body: { employeeIds: ['anybody'] },
     });
     expect(noConfirm.status).toBe(400);
-    database.run(`UPDATE users SET employee_id='DEL-ADMIN' WHERE id=?`, estate.adminId);
+    database.run(`UPDATE users SET employee_id='DELADMIN' WHERE id=?`, estate.adminId);
     const selfDelete = await call(env, 'POST', '/api/people/bulk-delete', {
       token: adminToken,
-      body: { confirm: 'DELETE_PEOPLE', employeeIds: ['DEL-ADMIN'] },
+      body: { confirm: 'DELETE_PEOPLE', employeeIds: ['DELADMIN'] },
     });
     expect(selfDelete.status).toBe(207);
     expect(String((selfDelete.json.errors as Array<{ error:string }>)[0]!.error)).toMatch(/your own account/i);
@@ -171,7 +171,7 @@ describe('bulk people operations', () => {
               ('device-b','Side Gate','Hikvision','Side','exit','access_terminal_8xx','manual','online')`,
     );
     database.run(`INSERT INTO access_cards(id,resident_id,card_uid,status) VALUES ('card-resync','user-resident','555666','active')`);
-    database.run(`INSERT INTO fingerprint_credentials(id,resident_id,employee_no,finger_no,status) VALUES ('fp-resync','user-resident','EMP-1',1,'active')`);
+    database.run(`INSERT INTO fingerprint_credentials(id,resident_id,employee_no,finger_no,status) VALUES ('fp-resync','user-resident','EMP1',1,'active')`);
 
     const first = await call(env, 'POST', '/api/people/bulk-resync', {
       token: adminToken,
