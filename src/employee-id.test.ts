@@ -2,14 +2,14 @@ import { describe, expect, it } from 'vitest';
 import { EMPLOYEE_ID_MAX, deviceEmployeeNo, employeeIdFromUuid, readEmployeeId } from './employee-id';
 
 describe('employee ID rules', () => {
-  it('caps every identifier at 32 characters', () => {
-    expect(EMPLOYEE_ID_MAX).toBe(32);
-    expect(readEmployeeId('x'.repeat(32)).error).toBeNull();
-    expect(readEmployeeId('x'.repeat(33)).value).toBeNull();
-    expect(readEmployeeId('x'.repeat(33)).error).toMatch(/32 characters/);
+  it('caps every new identifier at 30 characters', () => {
+    expect(EMPLOYEE_ID_MAX).toBe(30);
+    expect(readEmployeeId('x'.repeat(30)).error).toBeNull();
+    expect(readEmployeeId('x'.repeat(31)).value).toBeNull();
+    expect(readEmployeeId('x'.repeat(31)).error).toMatch(/30 characters/);
   });
 
-  it('allows letters and digits only — the terminal accepts nothing else', () => {
+  it('allows letters and digits only', () => {
     for (const bad of ['a b', 'a&b', 'a<b', 'a>b', 'a"b', 'a,b', "a'b", 'a;b', 'EMP-001', 'est/2024/042', 'UNIT.A-01', 'emp_9']) {
       expect(readEmployeeId(bad).error, `expected rejection: ${bad}`).toBeTruthy();
     }
@@ -25,13 +25,13 @@ describe('employee ID rules', () => {
     }
   });
 
-  it('derives a valid default from a UUID exactly once 32 characters long', () => {
+  it('derives a 30-character default from a UUID while retaining 120 bits', () => {
     const fromUuid = employeeIdFromUuid('550e8400-e29b-41d4-a716-446655440000');
-    expect(fromUuid).toBe('550e8400e29b41d4a716446655440000');
-    expect(fromUuid).toHaveLength(32);
+    expect(fromUuid).toBe('0e8400e29b41d4a716446655440000');
+    expect(fromUuid).toHaveLength(30);
   });
 
-  it('refuses values over 32 characters instead of truncating silently', () => {
+  it('refuses malformed UUID-derived identifiers instead of inventing one', () => {
     expect(employeeIdFromUuid('x'.repeat(40))).toBeNull();
     expect(employeeIdFromUuid('not a uuid with spaces')).toBeNull();
     expect(employeeIdFromUuid('')).toBeNull();
@@ -40,16 +40,15 @@ describe('employee ID rules', () => {
   it('composes a device employee number that never exceeds the cap', () => {
     expect(deviceEmployeeNo('visitor', '999999999999')).toBe('visitor999999999999');
     const cramped = deviceEmployeeNo('fingerprint', 'a'.repeat(70));
-    expect(cramped.length).toBe(32);
+    expect(cramped.length).toBe(30);
     // The unique part survives; the prefix is what gets shortened.
-    expect(cramped.endsWith('a'.repeat(31))).toBe(true);
+    expect(cramped.endsWith('a'.repeat(30))).toBe(true);
   });
 
-  it('preserves the identifier when the prefix alone overflows', () => {
-    // 40-char identifier already over the cap: keep its tail, which is unique.
+  it('preserves the identifier tail when the prefix and identifier overflow', () => {
     const identifier = '9'.repeat(40);
     const composed = deviceEmployeeNo('visitor', identifier);
-    expect(composed.length).toBe(32);
-    expect(composed).toBe(identifier.slice(-32));
+    expect(composed.length).toBe(30);
+    expect(composed).toBe(identifier.slice(-30));
   });
 });

@@ -85,7 +85,7 @@ describe('Remote Network Verification', () => {
 
   it('refuses the credential snapshot without the agent secret', async () => {
     const { agentId } = await createDeviceAndAgent();
-    addCard('CARD-1');
+    addCard('10000001');
     const res = await agentRequest(env, 'GET', `/api/isapi/v1/agents/${agentId}/credential-snapshot`, '');
     expect(res.status).toBe(401);
   });
@@ -95,13 +95,13 @@ describe('Remote Network Verification', () => {
     // A realistic estate, not a token two rows: 250 cards is the smallest set
     // that proves paging happens, because the endpoint refuses pages smaller
     // than 100 (a 20,000-credential estate must not arrive one row at a time).
-    for (let i = 0; i < 250; i += 1) addCard(`CARD-${String(i).padStart(3, '0')}`);
-    addCard('CARD-BEN', { householdMemberId: 'member-ben' });
+    for (let i = 0; i < 250; i += 1) addCard(String(10000000 + i));
+    addCard('10000250', { householdMemberId: 'member-ben' });
     // Excluded: a suspended card, a deactivated resident's card, a refused
     // dependant's card. A bridge must never be able to open a door for any of them.
-    addCard('CARD-SUSPENDED', { status: 'suspended' });
-    addCard('CARD-INACTIVE-USER', { residentId: 'user-gone' });
-    addCard('CARD-REFUSED', { householdMemberId: 'member-refused' });
+    addCard('10000251', { status: 'suspended' });
+    addCard('10000252', { residentId: 'user-gone' });
+    addCard('10000253', { householdMemberId: 'member-refused' });
 
     const seen: string[] = [];
     let cursor = '';
@@ -125,21 +125,21 @@ describe('Remote Network Verification', () => {
     expect(new Set(seen).size).toBe(253);
     expect(seen).toContain('employee:EMPBEN');
     expect(seen).toContain('employee:EMPRITA');
-    expect(seen).not.toContain('card:CARD-SUSPENDED');
-    expect(seen).not.toContain('card:CARD-INACTIVE-USER');
-    expect(seen).not.toContain('card:CARD-REFUSED');
+    expect(seen).not.toContain('card:10000251');
+    expect(seen).not.toContain('card:10000252');
+    expect(seen).not.toContain('card:10000253');
     expect(seen).not.toContain('employee:EMPREFUSED');
   });
 
   it('tells a bridge which credentials were revoked since its last sync', async () => {
     const { agentId, agentSecret } = await createDeviceAndAgent();
-    addCard('CARD-1');
-    addCard('CARD-3');
+    addCard('10000001');
+    addCard('10000303');
     // Prime the cache: a delta only means anything against something already held.
     const first = await agentRequest(env, 'GET', `/api/isapi/v1/agents/${agentId}/credential-snapshot`, agentSecret);
     expect(first.status).toBe(200);
 
-    db.run(`UPDATE access_cards SET status='suspended',updated_at=datetime('now','+1 minute') WHERE card_uid='CARD-1'`);
+    db.run(`UPDATE access_cards SET status='suspended',updated_at=datetime('now','+1 minute') WHERE card_uid='10000001'`);
     db.run(`UPDATE users SET status='inactive',updated_at=datetime('now','+1 minute') WHERE id='user-resident'`);
 
     const delta = await agentRequest(env, 'GET', `/api/isapi/v1/agents/${agentId}/credential-snapshot?since=1970-01-01T00:00:00.000Z`, agentSecret);
@@ -149,7 +149,7 @@ describe('Remote Network Verification', () => {
     // refused dependant - who was never valid in the first place, but must still
     // be named so a bridge holding them drops them. This is the mechanism that
     // stops a revoked credential from opening a door all day.
-    expect(removed).toEqual(['card:CARD-1', 'employee:EMPREFUSED', 'employee:EMPRITA']);
+    expect(removed).toEqual(['card:10000001', 'employee:EMPREFUSED', 'employee:EMPRITA']);
     expect(delta.json.full).toBe(false);
   });
 
@@ -205,7 +205,7 @@ describe('Remote Network Verification', () => {
         ipAddress: '192.168.1.101',
         eventType: 'AccessControllerEvent',
         dateTime: '2026-10-05T10:15:30+01:00',
-        AccessControllerEvent: { cardNo: 'CARD-1', employeeNoString: '', name: 'Rita Resident', doorNo: 1 },
+        AccessControllerEvent: { cardNo: '10000001', employeeNoString: '', name: 'Rita Resident', doorNo: 1 },
       },
     });
     const res = await agentRequest(env, 'POST', `/api/isapi/v1/agents/${agentId}/events`, agentSecret, {

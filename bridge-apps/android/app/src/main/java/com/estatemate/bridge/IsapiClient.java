@@ -37,6 +37,8 @@ public final class IsapiClient {
             java.util.regex.Pattern.compile("[A-Za-z0-9]{1,32}");
     private static final java.util.regex.Pattern LEGACY_TERMINAL_EMPLOYEE_NO =
             java.util.regex.Pattern.compile("[A-Za-z0-9._/-]{1,32}");
+    private static final java.util.regex.Pattern CARD_NUMBER =
+            java.util.regex.Pattern.compile("[0-9]+");
 
     private final int timeoutMs;
 
@@ -377,15 +379,23 @@ public final class IsapiClient {
      */
     public OpResult applyOperation(Device device, String operation, Map<String, Object> payload, String resultData) {
         String op = operation == null ? "" : operation;
-        String cardUid = firstNonEmpty(
-                Json.string(payload, "cardUid", null),
-                Json.string(payload, "cardNo", null),
-                Json.string(payload, "card_number", null));
+        Object rawCardUid = payload.get("cardUid");
+        if (rawCardUid == null || rawCardUid instanceof String && ((String) rawCardUid).isEmpty()) rawCardUid = payload.get("cardNo");
+        if (rawCardUid == null || rawCardUid instanceof String && ((String) rawCardUid).isEmpty()) rawCardUid = payload.get("card_number");
+        String cardUid = rawCardUid instanceof String ? (String) rawCardUid : null;
         // No fallback: the resident id is 36 characters (terminals refuse person IDs
         // over 32 bytes) and a literal "1" attached a re-enabled card to whoever
         // terminal person 1 was, while still reporting success.
         String employeeNo = terminalEmployeeNo(Json.string(payload, "employeeNo", null));
-        BridgeLog.append("info", "applying " + op + " on " + device.name + " card=" + cardUid);
+        boolean cardOperation = op.equals("upsert_card") || op.equals("enable_card") || op.equals("disable_card") || op.equals("delete_card");
+        BridgeLog.append("info", "applying " + op + " on " + device.name + " card=" + (cardOperation ? (cardUid == null || cardUid.isEmpty() ? "missing" : "present") : "n/a"));
+        if (cardOperation && rawCardUid != null && !(rawCardUid instanceof String)) {
+            return new OpResult(false, "card number must be text so leading zeroes are preserved");
+        }
+        if (op.equals("upsert_card") || op.equals("enable_card")) {
+            if (cardUid == null || cardUid.isEmpty()) return new OpResult(false, "operation has no card number");
+            if (!CARD_NUMBER.matcher(cardUid).matches()) return new OpResult(false, "card number may contain digits only");
+        }
 
         try {
             if (op.equals("upsert_card") || op.equals("enable_card")) {
@@ -397,7 +407,7 @@ public final class IsapiClient {
             }
 
             if (op.equals("disable_card") || op.equals("delete_card")) {
-                if (cardUid == null) return new OpResult(false, "operation has no card number");
+                if (cardUid == null || cardUid.isEmpty()) return new OpResult(false, "operation has no card number");
                 return deleteCard(device, cardUid, "");
             }
 

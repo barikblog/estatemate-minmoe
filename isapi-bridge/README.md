@@ -190,8 +190,8 @@ because that is how a resident ends up with a card on the wrong door. Write
 A ZKTeco terminal identifies a person by **User ID** (`PIN`). Most firmware stores
 *digits only*: the terminal declares whether it can hold a string User ID at
 registration, in the parameter `StringPinFunOn` (§7.4: "Specify whether to support
-the string-type user ID"). EstateMate's Employee ID, by contrast, defaults to a
-UUID without its hyphens — 32 hex characters, i.e. **full of letters**.
+the string-type user ID"). EstateMate's Employee ID, by contrast, defaults to the last 30 hex characters
+of the person's UUID, i.e. it can still contain **letters**.
 
 So for a numeric-only terminal the bridge **refuses the write** and says why,
 naming the fix:

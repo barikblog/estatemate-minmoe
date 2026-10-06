@@ -3,7 +3,9 @@ export interface CsvTable {
   rows: Record<string, string>[];
 }
 
-export function parseCsv(input: string, maxRows = 5_000): CsvTable {
+export function parseCsv(input: string, maxRows = 5_000, options: { trimValues?: boolean } = {}): CsvTable {
+  const preserveCellWhitespace = options.trimValues === false;
+  const cellValue = (value: string) => preserveCellWhitespace ? value : value.trim();
   const text = input.replace(/^\uFEFF/, '');
   const matrix: string[][] = [];
   let row: string[] = [];
@@ -17,16 +19,16 @@ export function parseCsv(input: string, maxRows = 5_000): CsvTable {
       else if (char === '"') quoted = false;
       else field += char;
     } else if (char === '"') quoted = true;
-    else if (char === ',') { row.push(field.trim()); field = ''; }
+    else if (char === ',') { row.push(cellValue(field)); field = ''; }
     else if (char === '\n') {
-      row.push(field.trim()); field = '';
+      row.push(cellValue(field)); field = '';
       if (row.some((value) => value !== '')) matrix.push(row);
       row = [];
       if (matrix.length > maxRows + 1) throw new Error(`CSV exceeds the ${maxRows.toLocaleString()} row limit`);
     } else if (char !== '\r') field += char;
   }
   if (quoted) throw new Error('CSV contains an unterminated quoted field');
-  row.push(field.trim());
+  row.push(cellValue(field));
   if (row.some((value) => value !== '')) matrix.push(row);
   if (!matrix.length) throw new Error('CSV is empty');
   if (matrix.length - 1 > maxRows) throw new Error(`CSV exceeds the ${maxRows.toLocaleString()} row limit`);
@@ -35,7 +37,7 @@ export function parseCsv(input: string, maxRows = 5_000): CsvTable {
   if (headers.some((header) => !header)) throw new Error('CSV contains an empty header');
   if (new Set(headers).size !== headers.length) throw new Error('CSV contains duplicate headers');
 
-  const rows = matrix.slice(1).map((values) => Object.fromEntries(headers.map((header, index) => [header, values[index]?.trim() ?? ''])));
+  const rows = matrix.slice(1).map((values) => Object.fromEntries(headers.map((header, index) => [header, values[index] ?? ''])));
   return { headers, rows };
 }
 

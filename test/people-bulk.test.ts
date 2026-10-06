@@ -64,7 +64,7 @@ describe('bulk people operations', () => {
     const dependant = database.one(`SELECT * FROM household_members WHERE name='Bulk Dependant'`);
     expect(dependant?.primary_resident_id).toBe(estate.residentId);
     expect(dependant?.status).toBe('active');
-    expect(String(dependant?.employee_id)).toHaveLength(32);
+    expect(String(dependant?.employee_id)).toHaveLength(30);
     expect(database.one(`SELECT kind,status FROM import_jobs WHERE id=?`, String(upload.json.id))?.kind).toBe('people_upload');
   });
 
@@ -73,7 +73,7 @@ describe('bulk people operations', () => {
       ['person_type','name','email','role','employee_id','relationship'],
       ['account','Good Person','good@example.com','resident','GOOD1',''],
       ['account','Bad Email','not-an-email','resident','BAD1',''],
-      ['account','Too Long','long@example.com','resident','x'.repeat(33),''],
+      ['account','Too Long','long@example.com','resident','x'.repeat(31),''],
       ['dependant','Orphan Dependant','','','','spouse'],
     ]);
     const upload = await postCsv(env, '/api/people/bulk-upload', text, adminToken);
@@ -82,7 +82,7 @@ describe('bulk people operations', () => {
     expect(upload.json.errorRows).toBe(3);
     const errors = upload.json.errors as Array<{ row:number;error:string }>;
     expect(errors.some((entry) => entry.error.includes('valid email'))).toBe(true);
-    expect(errors.some((entry) => entry.error.includes('32 characters'))).toBe(true);
+    expect(errors.some((entry) => entry.error.includes('30 characters'))).toBe(true);
     expect(errors.some((entry) => entry.error.includes('primary_resident'))).toBe(true);
   });
 

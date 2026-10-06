@@ -63,7 +63,7 @@ export const RETURN_MEANINGS = {
   '-1004': 'this table or feature is not available on this model',
 };
 
-/** EstateMate's own cap, from `src/employee-id.ts`: a terminal cannot store more. */
+/** ZKTeco's reported/default User ID ceiling; EstateMate's new-ID policy is 30. */
 export const PIN_MAX = 32;
 
 /* ------------------------------------------------------------------------- *
