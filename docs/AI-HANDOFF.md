@@ -202,7 +202,48 @@ honest answer for firmware that refuses the API.
   terminal and the overview grid derives each person's state from the queued,
   applied and failed rows (`refreshDevicePersonState`) rather than asserting it.
 
-### Bridge (current release tag `bridge-0.4.1`, published 2026-10-05)
+### Bridge (current release tag `bridge-0.4.2`, published 2026-10-06)
+
+`bridge-0.4.2` is the first release containing the **Remote Network
+Verification agent modules** and **terminal clock sync**.
+
+- **Remote Network Verification** (`fb2133d`, `7dd24e8`) ships the two new
+  modules inside every bridge bundle: `isapi-bridge/remote-verify.mjs`
+  (credential snapshot cache + decision + cooldown) and
+  `isapi-bridge/lan-event-listener.mjs` (the ingest-only LAN listener for
+  terminals that can only push). The Worker side and its migration (0020) were
+  deployed earlier, so this is the release that makes reader mode actually
+  runnable: `"remoteVerify": { "enabled": true }` on the host plus the
+  per-terminal Administrator switch. Still **off unless opted in twice**.
+  The Android APK gains `RemoteVerify.java`; the LAN listener remains a
+  recorded Node-only deviation.
+- **Terminal clock sync** (`8942273`, PR #52, merged as `804b0fd`):
+  `"timeSync": { "enabled": true }` in `agent-config.json` (off by default)
+  makes the Node bridge read each terminal's system time, compare it to the
+  bridge host's clock and set it back past `maxDriftMs` (default 30 s),
+  re-reading to confirm. The state is reported on the heartbeat, stored in
+  `hikvision_devices.device_clock` (migration `0021`, deployed with the same
+  Worker deploy) and shown in the portal's **Terminal clocks** section.
+  A terminal enforces visitor pass windows with its own clock, which is what
+  this keeps honest. The Android bridge does not run it — recorded in
+  `bridge-apps/android/README.md` like the listener.
+- **Visitor upsert delivery fix** (Worker side, `8942273`): an agent-capable
+  device is `pending` only when a live agent is actually linked to it,
+  matching the revocation path — an unlinked terminal now gets a Hardware
+  actions task instead of a command that waits forever.
+
+**Verification status: CI-only.** Tag run `37446412350` green (lint, exe,
+bundle, MSI, both APKs, publish), 20 assets, unsigned unless signing secrets
+are present (see the release's `SIGNING.txt`). No physical terminal has been
+driven by this build, and no estate bridge host has been upgraded from the
+environment that cut the tag. Estates on 0.4.1 that install 0.4.2 change
+nothing by default — both new features are opt-in, and the visitor delivery
+fix is Worker-side. Release:
+`https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.4.2`
+(PR #52, tag run `37446412350`; Worker deploy run `37446365489` applied
+migration `0021`, so `migrations/` now ends at `0021`).
+
+### Bridge (release tag `bridge-0.4.1`, published 2026-10-05)
 
 `bridge-0.4.1` changes **how a visitor is provisioned on a Hikvision ISAPI
 terminal** — the one path every estate on 0.2.x–0.4.0 could hit. A visitor is now
@@ -340,6 +381,17 @@ ZKTeco gate takes 0.4.0 to provision and receive events from it at all — and s
 read `docs/device-profiles/ZKTECO-PUSH.md` first, because that file records the
 numeric-PIN refusal, the operations this transport will not perform, and the fact
 that no physical ZKTeco terminal has been driven by this code yet.
+
+**[`bridge-0.4.2`](https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.4.2)**
+(2026-10-06T10:02:35Z, tag run `37446412350` green, 20 assets, **now the *Latest*
+release the portal's download links resolve to**) ships the Remote Network
+Verification agent modules (`fb2133d`, `7dd24e8`) for the first time, plus the
+opt-in terminal clock sync (`8942273`, PR #52, merged as `804b0fd`; Worker
+deploy run `37446365489` applied migration `0021`). **Every estate that wants
+reader-mode gates must take this one** — the Worker half has been live since
+the 0020 deploy, but no released bridge bundle could run it before this tag.
+CI-verified and **hardware-unverified**: no estate host was upgraded and no
+terminal driven from the environment that cut the tag.
 
 **[`bridge-0.4.1`](https://github.com/barikblog/estatemate-minmoe/releases/tag/bridge-0.4.1)**
 (2026-10-05T07:52:45Z, tag run `37279687861` green, 20 assets, **now the *Latest*
