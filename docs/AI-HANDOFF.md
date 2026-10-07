@@ -22,7 +22,21 @@ The terminal wire limit remains 32; EstateMate's limit for new or changed IDs is
   when reporting a result to the Worker fails.
 - Coverage includes `src/card-number.test.ts`,
   `test/access-card-numbers.test.ts`, Node bridge integration tests and Android
-  `ProtocolTest`. Android protocol tests still require a JDK/Android SDK.
+  `ProtocolTest`. Java was unavailable locally, but Android protocol tests and
+  APK builds passed in the tagged bridge workflow.
+
+### Deployment and publish outcome
+
+- PR #57 merged as `a4257bd`. Production deploy workflow `37548849227`
+  succeeded, including the D1 migrations `0023`/`0024` and Worker/web deployment.
+- Production smoke check `GET /api/health` returned `ok: true` for EstateMate
+  at `https://estatemate.estatemate.workers.dev` after deployment.
+- Bridge release workflow `37549066883` passed all validation, Windows bundle,
+  executable/MSI installer and Android APK jobs. `bridge-0.4.4` is the latest
+  published release, with checksums and the Windows/Android install artifacts.
+- The original terminal rejection cannot be diagnosed further because its
+  supplied log omitted the terminal `ResponseStatus`; the updated bridge keeps
+  that failure reason in its local log even if Worker reporting fails.
 
 ## Employee IDs are letters and digits only (2026-10-06)
 
