@@ -8,7 +8,7 @@ type Section =
   // Overview
   | 'dashboard'
   // Access control
-  | 'cards' | 'events' | 'devices' | 'remote' | 'isapi' | 'operations'
+  | 'cards' | 'events' | 'devices' | 'remote' | 'sync' | 'isapi' | 'operations'
   // People & households
   | 'residents' | 'residency' | 'dependants' | 'staff'
   // Property & estate
@@ -72,6 +72,7 @@ const navGroups: NavGroup[] = [
     { id: 'events', label: 'Gate activity', roles: ['admin','manager','security','resident'] },
     { id: 'devices', label: 'Terminals & devices', roles: ['admin','manager','security'] },
     { id: 'remote', label: 'Remote door control', roles: ['admin'] },
+    { id: 'sync', label: 'Person sync', roles: ['admin','manager'] },
     { id: 'isapi', label: 'Device agent', roles: ['admin','manager'] },
     { id: 'operations', label: 'Hardware actions', roles: ['admin','manager'] },
   ]},
@@ -437,6 +438,7 @@ function SectionView({ section, user, config, gate, onNavigate }: { section: Sec
     case 'events': return <AccessEvents user={user} />;
     case 'devices': return <Devices user={user} />;
     case 'remote': return <RemoteAccess onNavigate={onNavigate} />;
+    case 'sync': return <PersonSync />;
     case 'isapi': return <IsapiBridge user={user} />;
     case 'operations': return <Operations />;
     case 'settings': return <Settings />;
@@ -624,15 +626,17 @@ function People({ user }: { user: User }) {
 
 function UserAccountForm({ actorRole,user,properties,onDone,onCancel }: { actorRole:User['role'];user?:Row;properties:Row[];onDone:(message:string)=>void;onCancel?:()=>void }) {
   const [message,setMessage]=useState('');const [role,setRole]=useState(String(user?.role ?? 'resident'));
+  const existingEmployeeId=String(user?.employee_id ?? '');const hasLegacyEmployeeId=existingEmployeeId.length>30;
   async function submit(event:FormEvent<HTMLFormElement>) {
     event.preventDefault();setMessage('');const values=Object.fromEntries(new FormData(event.currentTarget));
+    if(user&&values.employeeId===existingEmployeeId)delete values.employeeId;
     if(!values.propertyId)delete values.propertyId;
     try { await api(user?`/api/users/${user.id}`:'/api/users',{ method:user?'PATCH':'POST',body:JSON.stringify(values) });onDone(user?'Account details updated.':'Account created successfully.'); }
     catch(reason){setMessage(reason instanceof Error?reason.message:'Could not save account');}
   }
   return <FormCard title={user?`Edit ${String(user.name)}`:'New account'} onSubmit={submit} message={message}>
     <label>Name<input name="name" defaultValue={String(user?.name ?? '')} required /></label><label>Email<input name="email" type="email" defaultValue={String(user?.email ?? '')} required /></label><label>Phone<input name="phone" defaultValue={String(user?.phone ?? '')} /></label>
-    <label>Employee ID<input name="employeeId" defaultValue={String(user?.employee_id ?? '')} maxLength={32} pattern="[A-Za-z0-9._/\-]{1,32}" placeholder="Auto-generated" /><small>The person's identity on access-control devices. Max 32 characters; left blank, EstateMate generates one.</small></label>
+    <label>Employee ID<input name="employeeId" defaultValue={existingEmployeeId} maxLength={hasLegacyEmployeeId?existingEmployeeId.length:30} pattern={hasLegacyEmployeeId?'[A-Za-z0-9]{1,32}':'[A-Za-z0-9]{1,30}'} placeholder="Auto-generated" /><small>{hasLegacyEmployeeId?'This existing ID is over the new 30-character limit and will be kept unless replaced. New IDs must use letters and numbers only, up to 30 characters.':'Letters and numbers only, up to 30 characters. Leave blank on a new account and EstateMate generates an ID.'}</small></label>
     <label>Role<select name="role" value={role} onChange={(event)=>setRole(event.target.value)}><option value="resident">Resident</option><option value="security">Security</option><option value="cashier">Cashier</option>{actorRole==='admin'&&<><option value="manager">Manager</option><option value="admin">Administrator</option></>}</select></label>
     {user&&<label>Status<select name="status" defaultValue={String(user.status ?? 'active')}><option value="active">Active</option><option value="inactive">Inactive</option></select></label>}
     {role==='resident'&&<label>{user?'Assign another available property (optional)':'Available property (optional)'}<select name="propertyId"><option value="">No property assignment</option>{properties.map((property)=><option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)} — {String(property.address)}</option>)}</select><small>Only properties without an approved owner are listed. Existing ownership is not replaced.</small></label>}
@@ -652,8 +656,8 @@ function PeopleBulkTools({ onDone }: { onDone:()=>void }) {
   const [otherResult,setOtherResult]=useState('');const [busy,setBusy]=useState(false);
   const [deleteIds,setDeleteIds]=useState('');const [resyncIds,setResyncIds]=useState('');
   const [credentials,setCredentials]=useState<Array<{ name:string;email:string;employeeId:string;temporaryPassword:string }>>([]);
-  const uploadTemplate='person_type,name,email,phone,role,employee_id,unit_number,relationship,primary_resident_email\naccount,Ada Resident,ada@example.com,+2348000000000,resident,EMP-0001,A-01,,\naccount,Gate Officer,security@example.com,+2348000000001,security,EMP-0002,,,\ndependant,Nanny One,,+2348000000002,,EMP-0003,,domestic_staff,ada@example.com\n';
-  const editTemplate='employee_id,name,phone,new_employee_id,status\nEMP-0001,Ada Resident,+2348000000099,,active\nEMP-0003,,+2348000000100,DEP-2024,,inactive\n';
+  const uploadTemplate='person_type,name,email,phone,role,employee_id,unit_number,relationship,primary_resident_email\naccount,Ada Resident,ada@example.com,+2348000000000,resident,EMP0001,A-01,,\naccount,Gate Officer,security@example.com,+2348000000001,security,EMP0002,,,\ndependant,Nanny One,,+2348000000002,,EMP0003,,domestic_staff,ada@example.com\n';
+  const editTemplate='employee_id,name,phone,new_employee_id,status\nEMP0001,Ada Resident,+2348000000099,,active\nEMP0003,,+2348000000100,DEP2024,,inactive\n';
   function download(name:string,text:string){const url=URL.createObjectURL(new Blob([text],{type:'text/csv'}));const link=document.createElement('a');link.href=url;link.download=name;link.click();URL.revokeObjectURL(url);}
   function downloadCredentials(){const quote=(value:string)=>`"${value.replaceAll('"','""')}"`;download('estatemate-bulk-people-credentials.csv',`name,email,employee_id,temporary_password\n${credentials.map((item)=>[item.name,item.email,item.employeeId,item.temporaryPassword].map(quote).join(',')).join('\n')}\n`);}
   function parseIds(raw:string):string[]{return [...new Set(raw.split(/[\s,;]+/).map((value)=>value.trim()).filter(Boolean))];}
@@ -694,17 +698,17 @@ function PeopleBulkTools({ onDone }: { onDone:()=>void }) {
     finally{setBusy(false);}
   }
   return <section className="import-grid">
-    <form className="form-card import-card" onSubmit={(event)=>submitCsv(event,'/api/people/bulk-upload',setUploadResult)}><h3>Bulk upload people</h3><p>Accounts and dependants in one CSV. Accounts need email and role; dependants need a relationship and the main resident’s email or Employee ID. Employee IDs are optional but max 32 characters. Temporary passwords are returned once.</p><input name="file" type="file" accept=".csv,text/csv" required /><div className="row-actions"><button type="button" className="secondary" onClick={()=>download('people-upload-template.csv',uploadTemplate)}>Download template</button><button className="primary" disabled={busy}>{busy?'Uploading…':'Upload people'}</button>{credentials.length>0&&<button type="button" className="secondary" onClick={downloadCredentials}>Download credentials</button>}</div>{uploadResult&&<Notice tone={/error|failed|First error/i.test(uploadResult)?'warning':'success'}>{uploadResult}</Notice>}</form>
+    <form className="form-card import-card" onSubmit={(event)=>submitCsv(event,'/api/people/bulk-upload',setUploadResult)}><h3>Bulk upload people</h3><p>Accounts and dependants in one CSV. Accounts need email and role; dependants need a relationship and the main resident’s email or Employee ID. Employee IDs are optional but max 30 characters. Temporary passwords are returned once.</p><input name="file" type="file" accept=".csv,text/csv" required /><div className="row-actions"><button type="button" className="secondary" onClick={()=>download('people-upload-template.csv',uploadTemplate)}>Download template</button><button className="primary" disabled={busy}>{busy?'Uploading…':'Upload people'}</button>{credentials.length>0&&<button type="button" className="secondary" onClick={downloadCredentials}>Download credentials</button>}</div>{uploadResult&&<Notice tone={/error|failed|First error/i.test(uploadResult)?'warning':'success'}>{uploadResult}</Notice>}</form>
     <form className="form-card import-card" onSubmit={(event)=>submitCsv(event,'/api/people/bulk-edit',setEditResult)}><h3>Bulk edit people</h3><p>Match each row by employee_id (email is a fallback). Only the columns you fill change. new_employee_id re-points a terminal identity — resynchronise afterwards so hardware agrees.</p><input name="file" type="file" accept=".csv,text/csv" required /><div className="row-actions"><button type="button" className="secondary" onClick={()=>download('people-edit-template.csv',editTemplate)}>Download template</button><button className="primary" disabled={busy}>{busy?'Saving…':'Apply edits'}</button></div>{editResult&&<Notice tone={/error|failed|First error/i.test(editResult)?'warning':'success'}>{editResult}</Notice>}</form>
-    <div className="form-card import-card"><h3>Bulk delete</h3><p>Paste Employee IDs, one per line. Safe soft delete: gate access stops on every device and billing, access-event and audit history is preserved.</p><textarea rows={4} value={deleteIds} onChange={(event)=>setDeleteIds(event.target.value)} placeholder={'EMP-0001\nEMP-0002'} /><div className="row-actions"><button className="primary danger" onClick={bulkDelete} disabled={busy}>{busy?'Deleting…':'Delete these people'}</button></div></div>
-    <div className="form-card import-card"><h3>Resynchronise into all access controls</h3><p>Re-push every credential of the selected people — or of everyone holding a credential — to every terminal. Active cards are refreshed with the current Employee ID; inactive ones are disabled; fingerprints are queued as operator tasks.</p><textarea rows={3} value={resyncIds} onChange={(event)=>setResyncIds(event.target.value)} placeholder={'Optional: EMP-0001 EMP-0002'} /><div className="row-actions"><button className="primary" onClick={()=>bulkResync('people')} disabled={busy}>{busy?'Working…':'Resynchronise listed'}</button><button className="secondary" onClick={()=>bulkResync('all')} disabled={busy}>Resynchronise everyone</button></div></div>
+    <div className="form-card import-card"><h3>Bulk delete</h3><p>Paste Employee IDs, one per line. Safe soft delete: gate access stops on every device and billing, access-event and audit history is preserved.</p><textarea rows={4} value={deleteIds} onChange={(event)=>setDeleteIds(event.target.value)} placeholder={'EMP0001\nEMP0002'} /><div className="row-actions"><button className="primary danger" onClick={bulkDelete} disabled={busy}>{busy?'Deleting…':'Delete these people'}</button></div></div>
+    <div className="form-card import-card"><h3>Resynchronise into all access controls</h3><p>Re-push every credential of the selected people — or of everyone holding a credential — to every terminal. Active cards are refreshed with the current Employee ID; inactive ones are disabled; fingerprints are queued as operator tasks.</p><textarea rows={3} value={resyncIds} onChange={(event)=>setResyncIds(event.target.value)} placeholder={'Optional: EMP0001 EMP0002'} /><div className="row-actions"><button className="primary" onClick={()=>bulkResync('people')} disabled={busy}>{busy?'Working…':'Resynchronise listed'}</button><button className="secondary" onClick={()=>bulkResync('all')} disabled={busy}>Resynchronise everyone</button></div></div>
     {otherResult&&<div className="span-2"><Notice tone={/failed|skipped|error/i.test(otherResult)?'warning':'success'}>{otherResult}</Notice></div>}
   </section>;
 }
 
 function UsersCsvImporter({ onDone }: { onDone:()=>void }) {
   const [result,setResult]=useState('');const [busy,setBusy]=useState(false);const [credentials,setCredentials]=useState<Array<{ name:string;email:string;temporaryPassword:string }>>([]);
-  const template='name,email,phone,role,unit_number,status,employee_id\nAda Resident,ada@example.com,+2348000000000,resident,A-01,active,EMP-0001\nGate Officer,security@example.com,+2348000000001,security,,active,\n';
+  const template='name,email,phone,role,unit_number,status,employee_id\nAda Resident,ada@example.com,+2348000000000,resident,A-01,active,EMP0001\nGate Officer,security@example.com,+2348000000001,security,,active,\n';
   function download(name:string,text:string) { const url=URL.createObjectURL(new Blob([text],{ type:'text/csv' }));const link=document.createElement('a');link.href=url;link.download=name;link.click();URL.revokeObjectURL(url); }
   function downloadCredentials() { const quote=(value:string)=>`"${value.replaceAll('"','""')}"`;download('estatemate-new-user-credentials.csv',`name,email,temporary_password\n${credentials.map((item)=>[item.name,item.email,item.temporaryPassword].map(quote).join(',')).join('\n')}\n`); }
   async function upload(event:FormEvent<HTMLFormElement>) {
@@ -915,7 +919,7 @@ const operationImportDefinitions={
   properties:{ label:'Properties',description:'Create streets, units, blocks and zones before assigning residents.',template:'unit_number,address,street,block,zone\nA-01,1 Palm Avenue,Palm Avenue,Block A,North\n' },
   ownerships:{ label:'Property ownerships',description:'Assign existing available properties to existing active resident accounts.',template:'resident_email,unit_number\nresident@example.com,A-01\n' },
   tenancies:{ label:'Tenancies',description:'Import current or historical main tenancies and bill responsibility.',template:'tenant_email,unit_number,start_date,end_date,billing_responsibility,status,can_manage_visitors,can_manage_maintenance,note\ntenant@example.com,A-01,2026-01-01,2026-12-31,tenant,active,true,true,Opening balance migration\n' },
-  cards:{ label:'Access cards',description:'Register known card numbers for active residents and queue hardware synchronization.',template:'resident_email,card_uid,card_label,status,expires_at\nresident@example.com,10000001,Main card,active,2027-12-31\n' },
+  cards:{ label:'Access cards',description:'Register digits-only card numbers (keep leading zeroes) for active residents and queue hardware synchronization.',template:'resident_email,card_uid,card_label,status,expires_at\nresident@example.com,10000001,Main card,active,2027-12-31\n' },
 } as const;
 
 function ImportCentre() {
@@ -1570,6 +1574,7 @@ function PersonCredentials({ residentId, householdMemberId, personName, devices,
   const list = useList(`/api/access/credentials?limit=50&${query}`);
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
+  const [captureId, setCaptureId] = useState('');
 
   async function addCard(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setMessage('');
@@ -1577,7 +1582,7 @@ function PersonCredentials({ residentId, householdMemberId, personName, devices,
     try {
       await api('/api/access/cards', { method: 'POST', body: JSON.stringify({
         ...(residentId ? { residentId } : { householdMemberId }),
-        cardUid: String(form.get('cardUid') ?? '').trim(),
+        cardUid: String(form.get('cardUid') ?? ''),
         cardLabel: String(form.get('cardLabel') ?? '').trim() || undefined,
       }) });
       setMessage(`Card added to ${personName}. Hardware synchronization is queued for every linked terminal.`);
@@ -1589,13 +1594,28 @@ function PersonCredentials({ residentId, householdMemberId, personName, devices,
   async function addFingerprint(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setMessage('');
     const form = new FormData(event.currentTarget);
+    const deviceId = String(form.get('deviceId') ?? '').trim();
+    const shared = {
+      fingerNo: Number(form.get('fingerNo')),
+      fingerLabel: String(form.get('fingerLabel') ?? '').trim() || undefined,
+      employeeNo: String(form.get('employeeNo') ?? '').trim() || undefined,
+      deviceId: deviceId || undefined,
+    };
     try {
+      if (deviceId) {
+        // A terminal is chosen: arm its reader and read the finger for real.
+        const started = await api<{ captureId:string; instruction:string }>('/api/access/fingerprints/capture', { method: 'POST', body: JSON.stringify({
+          ...(residentId ? { residentId, personId: residentId, personKind: 'account' } : { householdMemberId, personId: householdMemberId, personKind: 'dependant' }),
+          ...shared,
+        }) });
+        setCaptureId(String(started.captureId));
+        setMessage(started.instruction);
+        event.currentTarget.reset();
+        return;
+      }
       const result = await api<{ queuedActions:number }>('/api/access/fingerprints', { method: 'POST', body: JSON.stringify({
         ...(residentId ? { residentId } : { householdMemberId }),
-        fingerNo: Number(form.get('fingerNo')),
-        fingerLabel: String(form.get('fingerLabel') ?? '').trim() || undefined,
-        employeeNo: String(form.get('employeeNo') ?? '').trim() || undefined,
-        deviceId: String(form.get('deviceId') ?? '').trim() || undefined,
+        ...shared,
       }) });
       setMessage(`Fingerprint recorded for ${personName}. ${result.queuedActions} terminal task(s) queued — enroll the finger on the terminal, then mark each action applied under Hardware actions.`);
       event.currentTarget.reset(); list.reload(); onChanged?.();
@@ -1618,22 +1638,28 @@ function PersonCredentials({ residentId, householdMemberId, personName, devices,
   return <section className="panel person-credentials">
     <div className="panel-title"><div><p className="eyebrow">ACCESS</p><h3>{personName} — cards &amp; fingerprints</h3></div><button className="secondary sm" onClick={() => list.reload()}>Refresh</button></div>
     {message && <Notice tone={/Could not|failed/i.test(message) ? 'error' : 'success'}>{message}</Notice>}
-    <p className="presence-hint">A card is written to a terminal by a linked agent. A fingerprint is captured on the terminal itself — EstateMate records the slot and queues the task, and an operator confirms it under <strong>Hardware actions</strong>.</p>
+    <p className="presence-hint">A card is written to a terminal by a linked agent. For a fingerprint, EstateMate arms the reader on the terminal you choose: the person presses a finger, and the template is written to every other terminal automatically. Choose <em>Not recorded yet</em> to record the slot only and enrol it on the terminal by hand.</p>
+    {captureId && <FingerprintCapture captureId={captureId} onFinished={(status, value) => {
+      setMessage(status === 'captured'
+        ? `Fingerprint read from ${personName} and sent to the other terminals.`
+        : String(value.error ?? 'The fingerprint could not be read — the manual enrolment task is in Hardware actions.'));
+      if (status === 'captured') { list.reload(); onChanged?.(); }
+    }} onCancel={() => setCaptureId('')} />}
     <ListState list={list}><DataTable rows={rows} columns={[['credential_type','Type'],['credential_reference','Card / finger'],['credential_label','Label'],['finger_no','Slot'],['employee_no','Employee no'],['enrolled_device_name','Enrolled at'],['status','Status'],['pending_operations','Open tasks'],['updated_at','Updated','date']]} action={(row) => <div className="row-actions">{String(row.status) === 'active'
       ? <button className="text danger" onClick={() => change(row.credential_type, row.id, 'suspended')}>Suspend</button>
       : <button className="text" onClick={() => change(row.credential_type, row.id, 'active')}>Activate</button>}</div>} /></ListState>
     <div className="credential-forms">
       <FormCard title={`Add an access card for ${personName}`} onSubmit={addCard}>
-        <label>Card UID / number<input name="cardUid" required placeholder="Printed card number" /></label>
+        <label>Card UID / number<input name="cardUid" required inputMode="numeric" pattern="[0-9]+" title="Enter digits only; leading zeroes are preserved." placeholder="Printed card number" /><small>Digits only. Leading zeroes are preserved.</small></label>
         <label>Label<input name="cardLabel" placeholder="Main card" /></label>
         <button className="primary" disabled={busy}>Add card</button>
       </FormCard>
       <FormCard title={`Add a fingerprint for ${personName}`} onSubmit={addFingerprint}>
         <label>Finger slot<select name="fingerNo" defaultValue="1">{[1,2,3,4,5,6,7,8,9,10].map((value) => <option key={value} value={value}>Finger {value}</option>)}</select><small>The slot the terminal stores this finger under (1–10).</small></label>
         <label>Which finger<input name="fingerLabel" placeholder="Right index" /></label>
-        <label>Employee number<input name="employeeNo" placeholder={residentId ? 'Defaults to the EstateMate person ID' : 'Required for this dependant'} /><small>The terminal identifies the person by this number, so a fingerprint event can be matched to them. A dependant has no default.</small></label>
-        <label>Capture at<select name="deviceId"><option value="">Not recorded yet</option>{devices.map((device) => <option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.gate_name)}</option>)}</select></label>
-        <button className="primary" disabled={busy}>Record fingerprint</button>
+        <label>Employee number<input name="employeeNo" maxLength={30} pattern="[A-Za-z0-9]{1,30}" title="Letters and numbers only; maximum 30 characters." placeholder={residentId ? 'Defaults to the EstateMate person ID' : 'Required for this dependant'} /><small>Letters and numbers only, up to 30 characters. The terminal uses this to attribute fingerprint events.</small></label>
+        <label>Capture at<select name="deviceId"><option value="">Not recorded yet — enrol on the terminal myself</option>{devices.map((device) => <option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.gate_name)}</option>)}</select><small>Choose a terminal to arm its reader now and read the finger; the template then goes to the other terminals.</small></label>
+        <button className="primary" disabled={busy}>{busy ? 'Working…' : 'Read the fingerprint'}</button>
       </FormCard>
     </div>
   </section>;
@@ -1648,6 +1674,8 @@ function Cards({ user }: { user: User }) {
   const [credentialKind,setCredentialKind]=useState<'card'|'fingerprint'>('card');
   const [mode,setMode]=useState<'device'|'manual'>('device');
   const [scanSession,setScanSession]=useState<Row|null>(null);
+  const [captureId,setCaptureId]=useState('');
+  const [fingerMode,setFingerMode]=useState<'capture'|'manual'>('capture');
   const [picked,setPicked]=useState<PickedPerson|null>(null);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setMessage('');
@@ -1660,7 +1688,7 @@ function Cards({ user }: { user: User }) {
         const session=await api<Row>('/api/access/card-scan-sessions',{ method:'POST',body:JSON.stringify({ deviceId:form.get('deviceId'),...person,cardLabel:String(form.get('cardLabel') ?? '').trim() || undefined }) });
         setScanSession(session);setMessage(`Waiting for ${picked.name} to tap or scan a card at the selected access-control device.`);
       } else {
-        await api('/api/access/cards', { method: 'POST', body: JSON.stringify({ ...person, cardUid:String(form.get('cardUid') ?? '').trim(), cardLabel:String(form.get('cardLabel') ?? '').trim() || undefined }) });
+        await api('/api/access/cards', { method: 'POST', body: JSON.stringify({ ...person, cardUid:String(form.get('cardUid') ?? ''), cardLabel:String(form.get('cardLabel') ?? '').trim() || undefined }) });
         setShow(false);setPicked(null);setMessage(`Card issued to ${picked.name} and hardware actions queued.`);list.reload();
       }
     } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Failed'); }
@@ -1686,13 +1714,29 @@ function Cards({ user }: { user: User }) {
     if (!picked) { setMessage('Choose the person this fingerprint belongs to.'); return; }
     const form = new FormData(event.currentTarget);
     const person = picked.kind === 'resident' ? { residentId: picked.id } : { householdMemberId: picked.id };
+    const deviceId = String(form.get('deviceId') ?? '').trim();
     try {
+      if (fingerMode === 'capture') {
+        if (!deviceId) { setMessage('Choose the terminal whose reader will take the fingerprint.'); return; }
+        const started = await api<Row>('/api/access/fingerprints/capture', { method: 'POST', body: JSON.stringify({
+          ...person,
+          personKind: picked.kind === 'resident' ? 'account' : 'dependant',
+          personId: picked.id,
+          fingerNo: Number(form.get('fingerNo')),
+          fingerLabel: String(form.get('fingerLabel') ?? '').trim() || undefined,
+          deviceId,
+        }) });
+        setShow(false); setPicked(null);
+        setCaptureId(String(started.captureId));
+        setMessage(String(started.instruction ?? 'The terminal reader is armed.'));
+        return;
+      }
       const result = await api<Row>('/api/access/fingerprints', { method: 'POST', body: JSON.stringify({
         ...person,
         fingerNo: Number(form.get('fingerNo')),
         fingerLabel: String(form.get('fingerLabel') ?? '').trim() || undefined,
         employeeNo: String(form.get('employeeNo') ?? '').trim() || undefined,
-        deviceId: String(form.get('deviceId') ?? '').trim() || undefined,
+        deviceId: deviceId || undefined,
       }) });
       setShow(false); setPicked(null);
       setMessage(String(result.instruction ?? `Fingerprint recorded for ${picked.name}.`) + ' Mark it applied under Hardware actions once the finger is enrolled.');
@@ -1708,8 +1752,14 @@ function Cards({ user }: { user: User }) {
   const actions = operator ? (row: Row) => <div className="row-actions">{row.status === 'active' ? <button className="text danger" onClick={() => change(row, 'suspended')}>Suspend</button> : <button className="text" onClick={() => change(row, 'active')}>Activate</button>}{String(row.credential_type) === 'fingerprint' && <button className="text danger" onClick={() => removeFingerprint(row)}>Delete</button>}</div> : undefined;
   return <PagePanel title="Access cards & fingerprints" subtitle="Cards are written to a terminal by an agent; fingerprints are captured on the terminal and confirmed here" action={operator ? <button className="primary" onClick={() => { setShow(!show); setPicked(null); setMessage(''); }}>Issue card or fingerprint</button> : null}>
     {message && <Notice tone={message.includes('issued')?'success':message.includes('Waiting')?'info':'error'}>{message}</Notice>}
-    {show && <FormCard title="Issue a card or record a fingerprint" onSubmit={credentialKind==='card'?submit:submitFingerprint}><label>Credential type<select value={credentialKind} onChange={(event)=>setCredentialKind(event.target.value as 'card'|'fingerprint')}><option value="card">Access card</option><option value="fingerprint">Fingerprint</option></select></label>{credentialKind==='card'?<><label>Enrollment method<select value={mode} onChange={(event)=>setMode(event.target.value as 'device'|'manual')}><option value="device">Tap/scan at selected device (recommended)</option><option value="manual">Enter card UID manually</option></select></label>{mode==='device'&&<label>Access-control device<select name="deviceId" required><option value="">Select device</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.model||device.vendor)} — {String(device.gate_name)}</option>)}</select></label>}<PersonPicker picked={picked} onPick={setPicked} />{mode==='manual'&&<label>Card UID / number<input name="cardUid" required /></label>}<label>Label<input name="cardLabel" placeholder="Optional card label" /></label><button className="primary">{mode==='device'?'Start scan':'Issue card'}</button></>:<><p className="form-note">A fingerprint is captured on the terminal, not through the browser: pick the person and the slot, then enroll the finger on the terminal and confirm the queued task under <strong>Hardware actions</strong>.</p><PersonPicker picked={picked} onPick={setPicked} /><label>Finger slot<select name="fingerNo" defaultValue="1">{[1,2,3,4,5,6,7,8,9,10].map((value)=><option key={value} value={value}>Finger {value}</option>)}</select></label><label>Which finger<input name="fingerLabel" placeholder="Right index" /></label><label>Employee number<input name="employeeNo" placeholder="Defaults to the EstateMate person ID" /><small>Required when the person chosen is a dependant.</small></label><label>Capture at<select name="deviceId"><option value="">Not recorded yet</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.gate_name)}</option>)}</select></label><button className="primary">Record fingerprint</button></>}</FormCard>}
+    {show && <FormCard title="Issue a card or record a fingerprint" onSubmit={credentialKind==='card'?submit:submitFingerprint}><label>Credential type<select value={credentialKind} onChange={(event)=>setCredentialKind(event.target.value as 'card'|'fingerprint')}><option value="card">Access card</option><option value="fingerprint">Fingerprint</option></select></label>{credentialKind==='card'?<><label>Enrollment method<select value={mode} onChange={(event)=>setMode(event.target.value as 'device'|'manual')}><option value="device">Tap/scan at selected device (recommended)</option><option value="manual">Enter card UID manually</option></select></label>{mode==='device'&&<label>Access-control device<select name="deviceId" required><option value="">Select device</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.model||device.vendor)} — {String(device.gate_name)}</option>)}</select></label>}<PersonPicker picked={picked} onPick={setPicked} />{mode==='manual'&&<label>Card UID / number<input name="cardUid" required inputMode="numeric" pattern="[0-9]+" title="Enter digits only; leading zeroes are preserved." /><small>Digits only. Leading zeroes are preserved.</small></label>}<label>Label<input name="cardLabel" placeholder="Optional card label" /></label><button className="primary">{mode==='device'?'Start scan':'Issue card'}</button></>:<><p className="form-note">EstateMate arms the reader on the terminal you choose: the person presses a finger on the glass, the terminal hands back the template, and it is written to every other terminal automatically. Nothing is typed on the terminal, and the template is kept only until every gate has it. If the terminal’s firmware cannot do it, EstateMate says so and queues the manual enrolment instead.</p><PersonPicker picked={picked} onPick={setPicked} /><label>Enrollment<select value={fingerMode} onChange={(event)=>setFingerMode(event.target.value as 'capture'|'manual')}><option value="capture">Scan the finger at a selected terminal (recommended)</option><option value="manual">Record the slot only — enrol on the terminal myself</option></select></label><label>Finger slot<select name="fingerNo" defaultValue="1">{[1,2,3,4,5,6,7,8,9,10].map((value)=><option key={value} value={value}>Finger {value}</option>)}</select></label><label>Which finger<input name="fingerLabel" placeholder="Right index" /></label>{fingerMode==='manual'&&<label>Employee number<input name="employeeNo" placeholder="Defaults to the EstateMate person ID" /><small>Required when the person chosen is a dependant.</small></label>}<label>Capture at<select name="deviceId" required={fingerMode==='capture'}><option value="">{fingerMode==='capture'?'Select the terminal the person is standing at':'Not recorded yet'}</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.gate_name)}</option>)}</select><small>{fingerMode==='capture'?'The reader of this terminal is armed for the next three minutes.':''}</small></label><button className="primary">{fingerMode==='capture'?'Scan fingerprint':'Record fingerprint'}</button></>}</FormCard>}
     {scanSession&&<section className={`enrollment-session ${String(scanSession.status)}`}><p className="eyebrow">DEVICE CARD ENROLLMENT</p><h3>{scanSession.status==='captured'?'Card detected':'Waiting for a card…'}</h3>{Boolean(scanSession.captured_credential)&&<strong className="credential-number">{String(scanSession.captured_credential)}</strong>}<p>Present the card at the selected device. EstateMate captures the next card credential event, including a denied unknown-card event.</p><div className="row-actions">{scanSession.status==='captured'&&<button className="primary" onClick={completeScan}>Confirm and issue card</button>}<button className="secondary" onClick={cancelScan}>Cancel</button></div></section>}
+    {captureId && <FingerprintCapture captureId={captureId} onFinished={(status, value) => {
+      setMessage(status === 'captured'
+        ? `Fingerprint read from ${String(value.personName ?? 'the person')} and sent to the other terminals.`
+        : String(value.error ?? 'The fingerprint could not be read — record the slot and enrol it on the terminal instead.'));
+      if (status === 'captured') list.reload();
+    }} onCancel={() => setCaptureId('')} />}
     <ListState list={list}><DataTable exportTitle="Access Credentials" rows={list.data?.items ?? []} columns={[['credential_type','Type'],['resident_name','Main resident'],['household_member_name','Holder'],['unit_number','Unit'],['credential_reference','Card / finger'],['finger_no','Slot'],['credential_label','Label'],['enrolled_device_name','Enrolled at'],['employee_no','Employee no'],['status','Status'],['deactivated_reason','Reason'],['pending_operations','Open tasks'],['updated_at','Updated','date']]} action={actions} /></ListState>
   </PagePanel>;
 }
@@ -1734,6 +1784,136 @@ function AccessEvents({ user }: { user: User }) {
     {live.length > 0 && <section className="live-strip"><p className="eyebrow">JUST RECEIVED</p>{live.map((event, index) => <div className="live-event" key={`${String(event.vendorEventId)}-${index}`}><span className={`result-dot ${event.result}`} /><strong>{String(event.personName ?? event.cardUid ?? 'Unknown credential')}</strong><span>{String(event.result)}</span><small>{readableDate(event.deviceTimestamp)}</small></div>)}</section>}
     <ListState list={list}><DataTable exportTitle="Gate Events" rows={list.data?.items ?? []} columns={[['result','Result'],['visitor_name','Visitor'],['household_member_name','Household member'],['person_name','Device person'],['resident_name','Main resident'],['employee_no','Employee no.'],['credential_type','Method'],['card_uid','Card'],['device_name','Device'],['access_point_name','Access point'],['door_no','Door'],['direction','Direction'],['device_timestamp','Time','date']]} /></ListState>
   </PagePanel>;
+}
+
+/**
+ * Remote Network Verification, per terminal.
+ *
+ * The toggle is Administrator-only because it changes what happens when a person
+ * stands at the gate; everyone else sees the status only. The status is whatever
+ * the bridge itself reported on its last heartbeat - how many credentials it is
+ * holding, how stale they are, and whether the door answered the last command -
+ * because none of that is knowable from the database.
+ */
+function RemoteVerification({ rows, canEdit, reload }: { rows: Row[]; canEdit: boolean; reload: () => void }) {
+  const [notice, setNotice] = useState('');
+  const [tone, setTone] = useState<'info' | 'error'>('info');
+  const [saving, setSaving] = useState('');
+  async function save(id: string, body: { enabled?: boolean; doorNo?: number; cooldownMs?: number }) {
+    setNotice(''); setSaving(String(id));
+    try {
+      const result = await api<{ warnings?: string[] }>(`/api/access/devices/${id}/remote-verify`, { method: 'PATCH', body: JSON.stringify(body) });
+      // The API answers with what enabling this actually commits an estate to.
+      // Showing it here is the difference between an informed switch-on and a
+      // support call next week about a door that did not open.
+      setTone('info');
+      setNotice((result.warnings ?? []).join(' '));
+      reload();
+    } catch (reason) {
+      setTone('error');
+      setNotice(reason instanceof Error ? reason.message : 'Could not save the remote verification setting');
+    } finally { setSaving(''); }
+  }
+  return <section className="form-card">
+    <h3>Remote Network Verification</h3>
+    <p className="presence-hint">Turn a terminal into a reader: it reports the credential it saw and <strong>EstateMate Bridge</strong> decides against its local copy of the estate, then answers with the door command. For estates with more people than the terminal can store.</p>
+    {notice && <Notice tone={tone}>{notice}</Notice>}
+    <table className="data-table compact">
+      <thead><tr><th>Terminal</th><th>Mode</th><th>Door</th><th>Cooldown (ms)</th><th>Bridge status</th></tr></thead>
+      <tbody>
+        {rows.map((row) => {
+          const id = String(row.id ?? '');
+          const enabled = Number(row.remote_verify_enabled ?? 0) === 1;
+          const state = (() => { try { return JSON.parse(String(row.remote_verify_state ?? '')) as Row; } catch { return null; } })();
+          const cache = (state?.cache ?? {}) as Row;
+          const age = typeof cache.cacheAgeSeconds === 'number' ? Number(cache.cacheAgeSeconds) : null;
+          let status = 'No bridge has reported yet';
+          let statusTone = 'muted';
+          if (enabled && state) {
+            if (state.lastResult === 'refused') { status = 'Door refused the last command — check Gate activity'; statusTone = 'error'; }
+            else if (cache.lastSyncError) { status = `Snapshot not refreshing: ${String(cache.lastSyncError)}`; statusTone = 'error'; }
+            else if (age !== null && age > 900) { status = `Snapshot ${Math.round(age / 60)} min old`; statusTone = 'warn'; }
+            else {
+              const count = typeof cache.credentialCount === 'number' ? Number(cache.credentialCount) : null;
+              status = `${count ?? 'no'} credential(s), synced ${age === null ? 'recently' : `${age}s ago`}`;
+              statusTone = 'ok';
+            }
+          } else if (enabled) {
+            status = 'On, waiting for the bridge to report';
+          }
+          return <tr key={id}>
+            <td>{String(row.name ?? '')}<br /><small>{String(row.gate_name ?? '')}</small></td>
+            <td>
+              <label className="switch">
+                <input type="checkbox" checked={enabled} disabled={!canEdit || saving === id}
+                  onChange={(event) => { void save(id, { enabled: event.currentTarget.checked }); }} />
+                <span>{enabled ? 'Reader — bridge decides' : 'Terminal decides'}</span>
+              </label>
+            </td>
+            <td><input className="narrow" type="number" min={1} max={8} defaultValue={Number(row.remote_verify_door_no ?? 1)} disabled={!canEdit || !enabled || saving === id}
+              onBlur={(event) => { const value = Number(event.currentTarget.value); if (value !== Number(row.remote_verify_door_no ?? 1)) void save(id, { doorNo: value }); }} /></td>
+            <td><input className="narrow" type="number" min={0} max={60000} step={100} defaultValue={Number(row.remote_verify_cooldown_ms ?? 1500)} disabled={!canEdit || !enabled || saving === id}
+              onBlur={(event) => { const value = Number(event.currentTarget.value); if (value !== Number(row.remote_verify_cooldown_ms ?? 1500)) void save(id, { cooldownMs: value }); }} /></td>
+            <td><span className={`chip ${statusTone}`}>{status}</span>{state?.lastDecision ? <small><br />Last: {String(state.lastDecision)}{state.lastReason ? ` (${String(state.lastReason)})` : ''}</small> : null}</td>
+          </tr>;
+        })}
+      </tbody>
+    </table>
+    {!canEdit && <p className="presence-hint">Only an Administrator can switch a terminal into reader mode.</p>}
+  </section>;
+}
+
+/**
+ * Terminal clocks, per terminal.
+ *
+ * A terminal enforces everything time-sensitive with its own clock — a
+ * visitor's finite pass window is checked against the terminal's hardware,
+ * and gate events carry its timestamp. The bridge's time-sync check reports
+ * what each terminal thinks the time is and how far it is from the bridge
+ * host; when the offset passes the threshold the bridge sets the clock back.
+ * Display-only here: the switch lives in the bridge host's agent-config.json
+ * (`timeSync`), because the reference clock is the machine the bridge runs
+ * on, not anything the portal can set.
+ */
+function TerminalClock({ rows }: { rows: Row[] }) {
+  const parseClock = (row: Row): Row | null => {
+    try { const value = JSON.parse(String(row.device_clock ?? '')) as Row; return value && value.terminalTime ? value : null; } catch { return null; }
+  };
+  const formatDrift = (seconds: number): string => {
+    if (seconds < 60) return `${seconds}s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+  };
+  const withClock = rows.flatMap((row) => { const clock = parseClock(row); return clock ? [{ row, clock }] : []; });
+  if (!withClock.length) return null;
+  return <section className="form-card">
+    <h3>Terminal clocks</h3>
+    <p className="presence-hint">Each terminal enforces visitor pass windows and timestamps gate events with its <strong>own clock</strong>. The bridge reports what each terminal thinks the time is and how far it is from the bridge host; when the offset passes the threshold it sets the clock back. The switch is in the bridge host's <code>agent-config.json</code> (<code>timeSync</code>).</p>
+    <table className="data-table compact">
+      <thead><tr><th>Terminal</th><th>Terminal time</th><th>Drift</th><th>Last check</th><th>Last sync</th></tr></thead>
+      <tbody>
+        {withClock.map(({ row, clock }) => {
+          const id = String(row.id ?? '');
+          const drift = typeof clock.driftMs === 'number' ? Number(clock.driftMs) : 0;
+          const absDriftSeconds = Math.round(Math.abs(drift) / 1000);
+          let tone = 'ok';
+          if (clock.lastError) tone = 'error';
+          else if (absDriftSeconds > 300) tone = 'error';
+          else if (absDriftSeconds > 30) tone = 'warn';
+          const driftLabel = clock.lastError ? 'Unreachable'
+            : absDriftSeconds < 2 ? 'In sync'
+            : `${drift > 0 ? 'Ahead by' : 'Behind by'} ${formatDrift(absDriftSeconds)}`;
+          return <tr key={id}>
+            <td>{String(row.name ?? '')}<br /><small>{String(row.gate_name ?? '')}</small></td>
+            <td>{clock.terminalTime ? readableDate(clock.terminalTime) : '—'}</td>
+            <td><span className={`chip ${tone}`}>{driftLabel}</span>{clock.lastError ? <small><br />{String(clock.lastError)}</small> : null}</td>
+            <td>{clock.lastCheckedAt ? readableDate(clock.lastCheckedAt) : '—'}</td>
+            <td>{clock.lastSyncAt ? `${readableDate(clock.lastSyncAt)} (${Number(clock.syncs ?? 0)}×)` : 'Never'}</td>
+          </tr>;
+        })}
+      </tbody>
+    </table>
+  </section>;
 }
 
 function Devices({ user }: { user: User }) {
@@ -1773,6 +1953,8 @@ function Devices({ user }: { user: User }) {
       <label>Connection pattern<select name="connectionPattern"><option value="">Use profile recommendation (recommended)</option><option value="isapi_bridge">ISAPI bridge agent (cross-platform)</option><option value="windows_agent">Windows agent (ISAPI)</option><option value="isapi_windows_agent">ISAPI Windows agent (combined)</option><option value="manual_sync">Manual synchronization (no agent)</option></select></label>
       <button className="primary">Register</button>
     </FormCard>}
+    {Boolean(list.data?.items?.length) && <RemoteVerification rows={list.data?.items ?? []} canEdit={user.role === 'admin'} reload={list.reload} />}
+    {Boolean(list.data?.items?.length) && <TerminalClock rows={list.data?.items ?? []} />}
     <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['name','Device'],['id','EstateMate device ID','id'],['vendor','Vendor'],['model','Model'],['profile_key','Series profile'],['connection_pattern','Connection'],['isapi_agent_name','ISAPI agent'],['isapi_host','ISAPI host'],['last_isapi_sync_status','ISAPI sync'],['gate_name','Gate'],['direction','Direction'],['status','Status'],['last_seen_at','Last seen','date'],['pending_operations','Manual pending'],['queued_operations','Queued ops']]} action={operator?(row)=><div className="row-actions"><button className="text" onClick={()=>edit(row)}>Edit</button><button className="text danger" onClick={()=>remove(row)}>Delete</button></div>:undefined} /></ListState>
   </PagePanel>;
 }
@@ -2095,6 +2277,79 @@ function RemoteAccess({ onNavigate }: { onNavigate?: (section: Section) => void 
   </PagePanel>;
 }
 
+/**
+ * The person × terminal grid, and the two actions an estate actually needs.
+ *
+ * A terminal only lets somebody through when the *person* exists on it with door
+ * rights — a card recorded for an employee number no terminal has seen as a
+ * person is stored and does not open anything. That is why "synchronise" writes
+ * the person first and the credentials after, why it is automatic whenever a
+ * credential is issued or a name changes, and why this page exists at all: it is
+ * the only place that can honestly say which terminal is still missing whom.
+ */
+function PersonSync() {
+  const [copyNotice, copy] = useCopy();
+  const overview = useAsync<{
+    devices: Array<Row>; people: Array<Row>; totals: { people:number; terminals:number; synced:number; pending:number; manual:number; missing:number };
+  }>(() => api('/api/device-sync'), []);
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState('');
+
+  async function syncAll() {
+    if (!confirm('Push every person holding a credential (and their cards and fingerprints) to every terminal now? Repeated presses reuse work that is already queued.')) return;
+    setBusy('all'); setMessage('');
+    try {
+      const result = await api<{ people:number;devices:number;queued:number;manual:number;skipped:number;notice:string }>('/api/device-sync/people', { method: 'POST', body: JSON.stringify({ scope: 'all' }) });
+      setMessage(result.notice ?? `${result.people} person(s) synchronised.`);
+      overview.reload();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Synchronisation failed'); }
+    finally { setBusy(''); }
+  }
+
+  async function syncPerson(person: Row) {
+    setBusy(String(person.id)); setMessage('');
+    try {
+      const result = await api<{ notice:string }>('/api/device-sync/people', { method: 'POST', body: JSON.stringify({ scope: 'people', people: [{ personKind: person.kind, id: person.id }] }) });
+      setMessage(result.notice ?? 'Synchronised.'); overview.reload();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Synchronisation failed'); }
+    finally { setBusy(''); }
+  }
+
+  async function removeFromDevices(person: Row) {
+    if (!confirm(`Remove ${String(person.name)} from every terminal, with their cards, fingerprints and door permissions? The portal history stays.`)) return;
+    setBusy(String(person.id)); setMessage('');
+    try {
+      const result = await api<{ notice:string }>('/api/device-sync/remove', { method: 'POST', body: JSON.stringify({ personKind: person.kind, id: person.id }) });
+      setMessage(result.notice ?? 'Removal queued.'); overview.reload();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Removal failed'); }
+    finally { setBusy(''); }
+  }
+
+  const totals = overview.data?.totals;
+  const devices = overview.data?.devices ?? [];
+  return <PagePanel title="Person sync" subtitle="Keep every person, card and fingerprint in step with every access-control terminal" action={<div className="row-actions"><button className="secondary" onClick={overview.reload}>Refresh</button><button className="primary" onClick={syncAll} disabled={busy === 'all'}>{busy === 'all' ? 'Synchronising…' : 'Synchronise everyone'}</button></div>}>
+    {copyNotice && <Notice tone="info">{copyNotice}</Notice>}
+    {message && <Notice tone={/failed|error|without an employee/i.test(message) ? 'warning' : 'success'}>{message}</Notice>}
+    <Notice tone="info">EstateMate writes the <strong>person record</strong> to a terminal before the card, because a card filed against a person the terminal has never seen is stored but cannot open the door. Edits to a name or Employee ID, and every new card or fingerprint, are pushed automatically. A terminal with no bridge is listed here as a task for an operator instead of a silent failure.</Notice>
+    {totals && <div className="stat-row"><div className="stat-card"><span className="eyebrow">PEOPLE</span><strong>{totals.people}</strong></div><div className="stat-card"><span className="eyebrow">TERMINALS</span><strong>{totals.terminals}</strong></div><div className="stat-card"><span className="eyebrow">IN STEP</span><strong>{totals.synced}</strong></div><div className="stat-card"><span className="eyebrow">PENDING</span><strong>{totals.pending}</strong></div><div className="stat-card"><span className="eyebrow">NEEDS AN OPERATOR</span><strong>{totals.manual}</strong></div><div className="stat-card"><span className="eyebrow">NOT YET SENT</span><strong>{totals.missing}</strong></div></div>}
+    <h3>Terminals</h3>
+    {devices.length === 0 ? <p className="presence-hint">No access-control device is configured yet. Add one under <strong>Terminals &amp; devices</strong> and connect it to a bridge.</p> : <div className="device-sync-grid">{devices.map((device) => <article key={String(device.id)} className="form-card sync-card">
+      <strong>{String(device.name)}</strong>
+      <small>{String(device.gate_name || '')} · doors {Array.isArray(device.doorNumbers) ? (device.doorNumbers as number[]).join(', ') : '1'}</small>
+      {device.hasAgent
+        ? <small className="capabilities">Bridge can write: {(Array.isArray(device.agentCapabilities) && (device.agentCapabilities as string[]).length ? (device.agentCapabilities as string[]) : ['card','door']).join(', ')}</small>
+        : <small className="capabilities warning">No bridge linked — every change here is a task for an operator.</small>}
+      <span className="sync-counts">{String(device.synced)} in step · {String(device.pending)} pending · {String(device.manual)} manual · {String(device.missing)} not sent</span>
+    </article>)}</div>}
+    <h3>People</h3>
+    <ListState list={overview as unknown as ReturnType<typeof useList>}><DataTable rows={overview.data?.people ?? []} columns={[['name','Person'],['employeeNo','Employee no'],['status','Status'],['cards','Cards'],['fingerprints','Fingers']]} action={(row) => <div className="row-actions">
+      <button className="text" onClick={() => syncPerson(row)} disabled={busy === String(row.id)}>{busy === String(row.id) ? 'Working…' : 'Sync now'}</button>
+      <button className="text danger" onClick={() => removeFromDevices(row)} disabled={busy === String(row.id)}>Remove from devices</button>
+    </div>} /></ListState>
+    {overview.data?.people?.length === 0 && <p className="presence-hint">Nobody holds a card or fingerprint yet. Issue one under <strong>Cards &amp; fingerprints</strong> and it will be written to every terminal automatically.</p>}
+  </PagePanel>;
+}
+
 function Operations() {
   const [copyNotice, copy] = useCopy();
   const list = useList('/api/access/operations?limit=100');
@@ -2335,6 +2590,70 @@ function EvidenceButton({ entityType,entityId,count }: { entityType:string;entit
   return <><button className="text" onClick={open}>Proof ({total})</button>{(files||error)&&<div className="modal-backdrop" role="dialog" aria-modal="true"><section className="notice-modal evidence-modal"><p className="eyebrow">SUPPORTING EVIDENCE</p><h2>Uploaded proof</h2>{error&&<Notice tone="error">{error}</Notice>}{files?.map((file)=><a className="evidence-link" key={String(file.storage_key)} href={`/api/files/${encodeURIComponent(String(file.storage_key))}`}>{String(file.original_name)} <small>{Math.ceil(Number(file.size_bytes)/1024)} KB</small></a>)}{files?.length===0&&<p>No accessible files were found.</p>}<button className="secondary wide" onClick={()=>{setFiles(null);setError('');}}>Close</button></section></div>}</>;
 }
 
+/**
+ * Watches one fingerprint capture until the reader answers.
+ *
+ * The operator is standing at a terminal with a person in front of them, so the
+ * page has to say what is happening second by second: the reader is armed, the
+ * finger has been read, the template is on its way to the other terminals. When
+ * the firmware cannot do it, the same panel says so and names the fallback
+ * instead of showing an unexplained failure.
+ */
+function FingerprintCapture({ captureId, onFinished, onCancel }: {
+  captureId: string;
+  onFinished: (status: 'captured'|'failed'|'cancelled'|'expired', capture: Row) => void;
+  onCancel: () => void;
+}) {
+  const [capture, setCapture] = useState<Row | null>(null);
+  const [stopped, setStopped] = useState(false);
+  // A read finger is finished, but the template is still travelling to the other
+  // terminals; keep watching for a short while so the operator sees where it
+  // landed instead of a last frame that says "sending".
+  const settlePolls = useRef(0);
+  useEffect(() => {
+    if (stopped) return;
+    let active = true;
+    const tick = () => {
+      api<Row>(`/api/access/fingerprints/captures/${captureId}`).then((value) => {
+        if (!active) return;
+        setCapture(value);
+        const status = String(value.status);
+        if (status === 'captured') {
+          const uploads = (value.uploads as Array<Row> | undefined) ?? [];
+          const settling = uploads.some((row) => row.status === 'pending' || row.status === 'sent');
+          if (settling && settlePolls.current < 15) { settlePolls.current += 1; return; }
+        }
+        if (status !== 'pending') {
+          setStopped(true);
+          onFinished(status as 'captured'|'failed'|'cancelled'|'expired', value);
+        }
+      }).catch(() => undefined);
+    };
+    tick();
+    const timer = window.setInterval(tick, 2000);
+    return () => { active = false; window.clearInterval(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [captureId, stopped]);
+  async function cancel() {
+    setStopped(true);
+    try { await api(`/api/access/fingerprints/captures/${captureId}/cancel`, { method: 'POST' }); } catch { /* the capture may already be finished */ }
+    onCancel();
+  }
+  const status = String(capture?.status ?? 'pending');
+  const uploads = (capture?.uploads as Array<Row> | undefined) ?? [];
+  return <section className={`enrollment-session ${status === 'captured' ? 'captured' : status === 'pending' ? '' : 'failed'}`}>
+    <p className="eyebrow">FINGERPRINT CAPTURE</p>
+    <h3>{status === 'pending' ? `Waiting for ${String(capture?.personName ?? 'the person')} to touch the reader…` : status === 'captured' ? 'Fingerprint read' : status === 'failed' ? 'Capture failed' : 'Capture stopped'}</h3>
+    <p>{status === 'pending'
+      ? <>The terminal’s own reader is armed. Ask <strong>{String(capture?.personName ?? 'the person')}</strong> to place finger <strong>{String(capture?.fingerNo ?? '')}</strong> on the glass. Nothing is typed on the terminal.</>
+      : status === 'captured'
+        ? <>{String(capture?.personName ?? 'The person')}’s template was read and is being written to the other terminals: {uploads.length ? uploads.map((row) => String(row.device_name)).join(', ') : 'no other terminal needs it'}.</>
+        : String(capture?.error ?? 'The terminal did not return a fingerprint.')}</p>
+    {uploads.length > 0 && <ul className="capture-uploads">{uploads.map((row, index) => <li key={index}>{String(row.device_name)} — {row.status === 'applied' ? 'written' : row.status === 'pending' || row.status === 'sent' ? 'sending' : row.status === 'manual_action_required' ? 'needs an operator on the terminal' : `failed: ${String(row.error_message ?? 'unknown reason')}`}</li>)}</ul>}
+    <div className="row-actions">{status === 'pending' && <button className="secondary" onClick={cancel}>Stop waiting</button>}{status !== 'pending' && <button className="secondary" onClick={onCancel}>Close</button>}</div>
+  </section>;
+}
+
 function useList(url: string) {
   return useAsync<ListResponse<Row>>(() => api(url), [url]);
 }
@@ -2419,7 +2738,7 @@ function initials(name: string): string { return name.split(/\s+/).slice(0,2).ma
 function navIcon(section: Section): string {
   return ({
     dashboard: '◫',
-    cards: '▤', events: '⌁', devices: '▣', remote: '◎', isapi: '⧉', operations: '↻',
+    cards: '▤', events: '⌁', devices: '▣', remote: '◎', isapi: '⧉', operations: '↻', sync: '⇄',
     residents: '●', residency: '♙', dependants: '♟', staff: '✦',
     properties: '⌂', bills: '₦', maintenance: '◇', bookings: '▦', notices: '!', emergency: '✚',
     visitors: '↔',

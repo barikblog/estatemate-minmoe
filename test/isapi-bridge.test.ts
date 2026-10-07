@@ -142,10 +142,10 @@ describe('Hikvision ISAPI bridge and Windows agent', () => {
     const resident = db.one(`SELECT id FROM users WHERE email='resident@example.com'`);
     const residentId = (resident as { id: string }).id;
     const cardId = 'card-001';
-    db.run(`INSERT INTO access_cards(id,resident_id,card_uid,status) VALUES (?,'${residentId}','CARD123456','active')`, cardId);
+    db.run(`INSERT INTO access_cards(id,resident_id,card_uid,status) VALUES (?,'${residentId}','10000001','active')`, cardId);
 
     const opId = 'op-001';
-    db.run(`INSERT INTO device_operations(id,device_id,card_id,operation,payload_json,status) VALUES (?,'${deviceId}','${cardId}','upsert_card','{\"cardUid\":\"CARD123456\"}','pending')`, opId);
+    db.run(`INSERT INTO device_operations(id,device_id,card_id,operation,payload_json,status) VALUES (?,'${deviceId}','${cardId}','upsert_card','{\"cardUid\":\"10000001\"}','pending')`, opId);
 
     const { default: worker } = await import('../src/index');
     const hbRequest = new Request(`https://estatemate.test/api/isapi/v1/agents/${agentId}/heartbeat`, {
@@ -192,7 +192,7 @@ describe('Hikvision ISAPI bridge and Windows agent', () => {
     expect(profile.supportedConnections).toContain('isapi_windows_agent');
   });
 
-  it('device creation with isapi_bridge sets pending not manual', async () => {
+  it('device creation with isapi_bridge and a linked agent sets pending not manual', async () => {
     const deviceRes = await call(env, 'POST', '/api/access/devices', {
       token: adminToken,
       body: {
@@ -205,6 +205,18 @@ describe('Hikvision ISAPI bridge and Windows agent', () => {
     });
     expect(deviceRes.status).toBe(201);
     const deviceId = (deviceRes.json as { id: string }).id;
+
+    // `pending` is only promised when a live agent is actually linked to the
+    // device — that is what picks the command up. The unlinked case is locked
+    // down in test/visitor-device-accounts.test.ts.
+    const agentRes = await call(env, 'POST', '/api/isapi/agents', { token: adminToken, body: { name: 'ISAPI Agent', platform: 'windows' } });
+    expect(agentRes.status).toBe(201);
+    const agentId = (agentRes.json as { id: string }).id;
+    const linkRes = await call(env, 'POST', '/api/isapi/device-configs', {
+      token: adminToken,
+      body: { deviceId, agentId, isapiHost: '192.168.1.100', isapiPort: 80, isapiUsername: 'admin', isapiPassword: 'test-password-123', protocol: 'http', syncEnabled: true },
+    });
+    expect(linkRes.status).toBe(200);
 
     const resident = db.one(`SELECT id FROM users WHERE email='resident@example.com'`) as { id: string } | undefined;
     const residentId = resident!.id;
@@ -252,6 +264,18 @@ describe('Hikvision ISAPI bridge and Windows agent', () => {
       });
       expect(device.status).toBe(201);
     }
+    // The isapi_bridge terminal is linked to a live agent, so its operation is
+    // the one the agent will pick up; the manual_sync terminal stays an
+    // operator task. (An agent-capable terminal with no linked agent is also a
+    // manual task — locked down in test/visitor-device-accounts.test.ts.)
+    const mainGate = db.one(`SELECT id FROM hikvision_devices WHERE name='Main gate'`) as { id: string } | undefined;
+    const agentRes = await call(env, 'POST', '/api/isapi/agents', { token: adminToken, body: { name: 'Main Gate Agent', platform: 'windows' } });
+    expect(agentRes.status).toBe(201);
+    const linkRes = await call(env, 'POST', '/api/isapi/device-configs', {
+      token: adminToken,
+      body: { deviceId: mainGate!.id, agentId: (agentRes.json as { id: string }).id, isapiHost: '192.168.1.100', isapiPort: 80, isapiUsername: 'admin', isapiPassword: 'test-password-123', protocol: 'http', syncEnabled: true },
+    });
+    expect(linkRes.status).toBe(200);
 
     const sync = await call(env, 'POST', '/api/visitors/sync-active', { token: adminToken });
     expect(sync.status).toBe(200);

@@ -33,6 +33,18 @@ describe('visitor device-account lifecycle', () => {
     );
   }
 
+  /** Links a live agent to a device, the way the portal does. */
+  async function linkAgentToDevice(deviceId: string): Promise<void> {
+    const agentRes = await call(env, 'POST', '/api/isapi/agents', { token: adminToken, body: { name: 'Gate Agent', platform: 'linux' } });
+    expect(agentRes.status).toBe(201);
+    const { id: agentId } = agentRes.json as { id: string };
+    const linkRes = await call(env, 'POST', '/api/isapi/device-configs', {
+      token: adminToken,
+      body: { deviceId, agentId, isapiHost: '192.168.1.101', isapiPort: 80, isapiUsername: 'admin', isapiPassword: 'device-password', protocol: 'http', syncEnabled: true },
+    });
+    expect(linkRes.status).toBe(200);
+  }
+
   async function issuePass(from: Date, until: Date): Promise<Record<string, unknown>> {
     const response = await call(env, 'POST', '/api/visitors', {
       token: residentToken,
@@ -76,9 +88,66 @@ describe('visitor device-account lifecycle', () => {
     expect(operation?.operation).toBe('upsert_visitor');
     const payload = JSON.parse(String(operation?.payload_json)) as Record<string, unknown>;
     // The employee number the terminal will know the visitor by — composed
-    // centrally so it can never exceed the 32 characters ISAPI allows.
-    expect(String(payload.employeeNo)).toBe(`visitor-${String(pass.credentialNumber)}`);
-    expect(String(payload.employeeNo).length).toBeLessThanOrEqual(32);
+    // centrally so it stays within EstateMate's 30-character Employee ID limit.
+    expect(String(payload.employeeNo)).toBe(`visitor${String(pass.credentialNumber)}`);
+    expect(String(payload.employeeNo).length).toBeLessThanOrEqual(30);
+    expect(payload.department).toBe('Company');
+    expect(payload.pin).toBe(pass.pin);
+    expect(String(payload.pin)).toMatch(/^\d{4,8}$/);
+  });
+
+  it('queues the upsert as a Hardware actions task, not pending, when no live agent is linked to the device', async () => {
+    // An agent-capable pattern with no linked agent: nothing will ever poll
+    // this operation, so it must not masquerade as a queued command that an
+    // agent is about to pick up.
+    addDevice('device-1', 'isapi_bridge');
+    const now = Date.now();
+    await issuePass(new Date(now - 60_000), new Date(now + 60 * 60_000));
+
+    const operation = database.one(
+      `SELECT operation,status FROM visitor_device_operations WHERE operation='upsert_visitor'`,
+    );
+    expect(operation?.operation).toBe('upsert_visitor');
+    expect(operation?.status).toBe('manual_action_required');
+  });
+
+  it('queues the upsert as pending when a live agent is linked to the device', async () => {
+    addDevice('device-1', 'isapi_bridge');
+    await linkAgentToDevice('device-1');
+    const now = Date.now();
+    await issuePass(new Date(now - 60_000), new Date(now + 60 * 60_000));
+
+    const operation = database.one(
+      `SELECT operation,status FROM visitor_device_operations WHERE operation='upsert_visitor'`,
+    );
+    expect(operation?.operation).toBe('upsert_visitor');
+    expect(operation?.status).toBe('pending');
+  });
+
+  it('reconciliation restores the stored PIN and Company department to a failed account operation', async () => {
+    addDevice();
+    const now = Date.now();
+    const pass = await issuePass(new Date(now - 60_000), new Date(now + 60 * 60_000));
+    // Model an operation created by the previous bridge contract: it failed with
+    // no PIN in its payload. Reconciliation must rebuild it from the pass row.
+    database.run(`UPDATE visitor_requests SET pin='004217' WHERE id=?`, String(pass.id));
+    database.run(
+      `UPDATE visitor_device_operations SET status='failed',payload_json='{"credentialNumber":"legacy"}' WHERE visitor_request_id=? AND operation='upsert_visitor'`,
+      String(pass.id),
+    );
+
+    const sync = await call(env, 'POST', '/api/visitors/sync-active', { token: adminToken });
+    expect(sync.status).toBe(200);
+    expect(sync.json.queued).toBe(1);
+    const operation = database.one(
+      `SELECT status,payload_json FROM visitor_device_operations WHERE visitor_request_id=? AND operation='upsert_visitor'`,
+      String(pass.id),
+    );
+    expect(operation?.status).toBe('manual_action_required');
+    const payload = JSON.parse(String(operation?.payload_json)) as Record<string, unknown>;
+    expect(payload.department).toBe('Company');
+    expect(payload.pin).toBe('004217');
+    expect(payload.employeeNo).toBe(`visitor${String(pass.credentialNumber)}`);
   });
 
   it('marks a pass with no terminals as none and reports that from the creation call', async () => {

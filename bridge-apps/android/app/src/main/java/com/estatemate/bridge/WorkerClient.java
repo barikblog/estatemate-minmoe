@@ -143,13 +143,61 @@ public final class WorkerClient {
      */
     public Reply heartbeat(String version, String hostname, String platform, Map<String, Object> stats,
                            List<Map<String, Object>> devices) {
+        return heartbeat(version, hostname, platform, stats, devices, null);
+    }
+
+    /**
+     * @param capabilities what this bridge can apply, probed against its own
+     *                     terminals. The Worker only queues person and fingerprint
+     *                     operations for an agent that advertises them, so an older
+     *                     build keeps receiving exactly the work it can do.
+     */
+    public Reply heartbeat(String version, String hostname, String platform, Map<String, Object> stats,
+                           List<Map<String, Object>> devices, List<String> capabilities) {
         Map<String, Object> payload = new LinkedHashMap<String, Object>();
         payload.put("version", version);
         payload.put("hostname", hostname);
         payload.put("platform", platform);
         payload.put("stats", stats);
         if (devices != null) payload.put("devices", devices);
+        if (capabilities != null && !capabilities.isEmpty()) payload.put("capabilities", capabilities);
         return post("/api/isapi/v1/agents/" + agentId + "/heartbeat", Json.write(payload));
+    }
+
+    /**
+     * One page of the credential snapshot behind Remote Network Verification.
+     * `since` asks for a delta against a previous sync; `cursor` continues a
+     * page. Both null means "everything, from the start".
+     */
+    public Reply credentialSnapshot(String since, String cursor, int limit) {
+        StringBuilder path = new StringBuilder("/api/isapi/v1/agents/" + agentId + "/credential-snapshot?limit=" + Math.max(100, limit));
+        if (cursor != null && !cursor.isEmpty()) path.append("&cursor=").append(encode(cursor));
+        else if (since != null && !since.isEmpty()) path.append("&since=").append(encode(since));
+        return get(path.toString());
+    }
+
+    public Reply heartbeat(String version, String hostname, String platform, Map<String, Object> stats,
+                           List<Map<String, Object>> devices, List<String> capabilities, Map<String, Object> remoteVerify) {
+        Map<String, Object> payload = new LinkedHashMap<String, Object>();
+        payload.put("version", version);
+        payload.put("hostname", hostname);
+        payload.put("platform", platform);
+        payload.put("stats", stats);
+        if (devices != null) payload.put("devices", devices);
+        if (capabilities != null && !capabilities.isEmpty()) payload.put("capabilities", capabilities);
+        // What the bridge reports about its own half of remote verification:
+        // snapshot freshness, decision counts and per-terminal outcomes. The
+        // Worker stores it as reported; it is a status surface, never an input.
+        if (remoteVerify != null) payload.put("remoteVerify", remoteVerify);
+        return post("/api/isapi/v1/agents/" + agentId + "/heartbeat", Json.write(payload));
+    }
+
+    private static String encode(String value) {
+        try {
+            return java.net.URLEncoder.encode(value, "UTF-8");
+        } catch (java.io.UnsupportedEncodingException error) {
+            return value;
+        }
     }
 
     public Reply operations(int limit) {
@@ -157,11 +205,21 @@ public final class WorkerClient {
     }
 
     public Reply reportResult(String operationId, String kind, boolean applied, String errorMessage, long durationMs) {
+        return reportResult(operationId, kind, applied, errorMessage, null, durationMs);
+    }
+
+    /**
+     * @param result extra data for the Worker; only a fingerprint capture fills
+     *               it in, with the Base64 template the terminal just produced.
+     */
+    public Reply reportResult(String operationId, String kind, boolean applied, String errorMessage,
+                              Map<String, Object> result, long durationMs) {
         Map<String, Object> payload = new LinkedHashMap<String, Object>();
         payload.put("kind", kind == null ? "card" : kind);
         payload.put("status", applied ? "applied" : "failed");
         payload.put("errorMessage", applied ? null : (errorMessage == null ? "failed" : errorMessage));
         payload.put("durationMs", Long.valueOf(durationMs));
+        if (result != null && !result.isEmpty()) payload.put("result", result);
         return post("/api/isapi/v1/agents/" + agentId + "/operations/" + operationId + "/result", Json.write(payload));
     }
 

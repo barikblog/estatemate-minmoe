@@ -8,7 +8,9 @@ block scalar:
 
   * a here-string whose closing delimiter is indented (YAML indentation makes
     `"@` / `'@` land off column 0, which PowerShell rejects)
-  * an unterminated here-string
+  * an unterminated here-string or block comment
+  * a `<# ... #>` header comment mistaken for code (its prose would otherwise
+    count as statements and brackets, and make `param()` look misplaced)
   * unbalanced braces or parentheses
   * `param()` appearing after a real statement (only top-of-script is legal)
   * unresolved `${{ }}` Actions expressions left inside a `run` body
@@ -85,10 +87,17 @@ def lint(text: str, label: str, extra_errors=None):
     lines = text.replace('\r\n', '\n').split('\n')
 
     here_delim = None
+    block_comment = False
     seen_stmt = False
     code_lines = []
 
     for lineno, raw in enumerate(lines, 1):
+        if block_comment:
+            # Inside <# ... #>: prose, not statements. Skip it whole.
+            if '#>' in raw:
+                block_comment = False
+            continue
+
         if here_delim is not None:
             # Closing delimiter must be at column 0, optionally followed by
             # punctuation/parameters but never preceded by whitespace.
@@ -104,6 +113,12 @@ def lint(text: str, label: str, extra_errors=None):
 
         m = HERE_OPEN.search(raw)
         stripped = raw.strip()
+        if stripped.startswith('<#'):
+            # A block comment: one line, or many until the closing #>.
+            if '#>' not in stripped:
+                block_comment = True
+            continue
+
         if m and not stripped.startswith('#'):
             here_delim = HERE_CLOSE_SQ if m.group(0).startswith("@'") else HERE_CLOSE_DQ
             continue
@@ -135,6 +150,8 @@ def lint(text: str, label: str, extra_errors=None):
 
     if here_delim is not None:
         errors.append(f"unterminated here-string opened with {here_delim[::-1]!r}")
+    if block_comment:
+        errors.append("unterminated block comment: opened with '<#' and no '#>'")
 
     code = '\n'.join(code_lines)
     for opener, closer in (('{', '}'), ('(', ')'), ('[', ']')):

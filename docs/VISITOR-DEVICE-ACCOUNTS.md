@@ -4,7 +4,7 @@ Introduced in migration `0018_employee_id_bulk_people_visitor_device_lifecycle_m
 
 ## The problem
 
-Access-control terminals hold a **limited number of person/card slots**. A
+Access-control terminals hold a **limited number of person slots**. A
 visitor is not a resident: their account must exist on the terminal only while
 its pass can actually open a gate — and the slot has to be freed when validity
 ends so the terminal doesn't silently fill up with dead visitors.
@@ -36,10 +36,29 @@ record separately**:
 
 When a pass is created, every enabled terminal (or the one gate an officer
 chose) gets the upsert with the composed employee number
-(`visitor-<credential number>`, always ≤ 32 characters, since the terminal's
-employeeNo/employeeNoString field is bounded at 32). The response tells the
-resident plainly that the account is created now and deleted from all devices
-automatically when validity ends, while the record is kept.
+(`visitor<credential number>`, letters and digits only, at most 30 characters
+under EstateMate's current Employee ID policy; the terminal wire field allows
+32). On Hikvision ISAPI terminals, that upsert creates or updates **one PIN-only
+`UserInfo` account**:
+
+- issued employee number and visitor name;
+- department `Company`;
+- enabled finite start/end validity, not a long-term account;
+- `userType: "normal"` and `localUIRight: false`;
+- the stored pass PIN as `password`, validated as 4–8 decimal digits.
+
+No visitor `CardInfo`, fingerprint, face, door-right or right-plan data is sent.
+The response tells the resident plainly that the account is created now and
+deleted from all devices automatically when validity ends, while the record is
+kept.
+
+The upsert follows the same delivery rule as the revocation: a device whose
+connection pattern is agent-capable gets the operation as `pending` **only when
+a live agent is actually linked to it**. A terminal that is agent-capable on
+paper but has no linked agent gets a `manual_action_required` Hardware-actions
+task instead — otherwise the operation would sit as `pending` forever, a command
+nothing will ever pick up, while the pass's state still recorded the slot as
+held.
 
 ## How deletion happens
 
@@ -53,8 +72,10 @@ automatically when validity ends, while the record is kept.
    pass explicitly).
 2. **Queues `revoke_visitor` for every enabled terminal**, not just the ones the
    pass was sent to: an every-gate pass reached all of them, and an operator may
-   have linked another terminal since. Existing revocations are reused and only
-   failed ones retried, so the sweep is safe to run constantly.
+   have linked another terminal since. On Hikvision, the operation deletes the
+   `UserInfo` account and frees its person slot; it does not issue a `CardInfo`
+   delete. Existing revocations are reused and only failed ones retried, so the
+   sweep is safe to run constantly.
 3. Terminals linked to a live agent get it as `pending`; the rest become
    **Hardware actions** for an operator, exactly like every other manual device
    task on this platform.

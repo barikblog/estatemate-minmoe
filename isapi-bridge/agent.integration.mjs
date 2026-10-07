@@ -49,8 +49,12 @@ const deviceServer = createServer((req, res) => {
     return;
   }
   res.writeHead(200, { 'Content-Type': 'multipart/mixed; boundary=streambnd' });
+  // A keep-alive heartbeat (eventType "videoloss" + eventState "inactive" per the
+  // ISAPI guide) rides the stream between events and must never be forwarded.
+  res.write('--streambnd\r\nContent-Type: application/json\r\n\r\n{"EventNotificationAlert":{"eventType":"videoloss","eventState":"inactive","activePostCount":1}}\r\n');
   res.write('--streambnd\r\nContent-Type: application/json\r\n\r\n{"EventNotificationAlert":{"eventType":"AccessControllerEvent","cardNo":"1111"}}\r\n');
   setTimeout(() => {
+    res.write('--streambnd\r\nContent-Type: application/json\r\n\r\n{"EventNotificationAlert":{"eventType":"heartBeat","eventState":"active","activePostCount":2}}\r\n');
     res.write('--streambnd\r\nContent-Type: application/json\r\n\r\n{"EventNotificationAlert":{"eventType":"AccessControllerEvent","cardNo":"2222"}}\r\n');
     res.end('--streambnd--\r\n');
   }, 300);
@@ -110,6 +114,15 @@ try {
     assert.equal(documents[2], '<EventNotificationAlert><eventType>x</eventType></EventNotificationAlert>');
     console.log('multipart parser OK');
 
+    // The stream's keep-alive heartbeat is not a gate event: the guide defines it
+    // as "videoloss"/"inactive" (subscription heartbeat: "heartBeat"/"active").
+    // A real video-loss alarm is "videoloss"/"active" and stays a document.
+    assert.equal(agent.isStreamHeartbeat('{"EventNotificationAlert":{"eventType":"videoloss","eventState":"inactive"}}'), true);
+    assert.equal(agent.isStreamHeartbeat('<EventNotificationAlert><eventType>heartBeat</eventType><eventState>active</eventState></EventNotificationAlert>'), true);
+    assert.equal(agent.isStreamHeartbeat('{"EventNotificationAlert":{"eventType":"videoloss","eventState":"active"}}'), false);
+    assert.equal(agent.isStreamHeartbeat('{"EventNotificationAlert":{"eventType":"AccessControllerEvent","cardNo":"1111"}}'), false);
+    console.log('heartbeat filter OK');
+
     const jsonDocuments = [];
     const jsonFeed = agent.createJsonEventScanner((document) => jsonDocuments.push(document));
     const jsonWhole = '{"first":1}  {"nested":{"text":"}{"},"deep":[1,2,{"x":"}"}]} {"last":3}';
@@ -134,6 +147,7 @@ try {
   assert.equal(items[0].deviceId, '11111111-1111-4111-8111-111111111111');
   assert.ok(items[0].document.includes('"cardNo":"1111"'), 'first document mismatch');
   assert.ok(items[1].document.includes('"cardNo":"2222"'), 'second document mismatch');
+  assert.equal(items.filter((item) => agent.isStreamHeartbeat(item.document)).length, 0, 'a keep-alive heartbeat must never be forwarded as an event');
   assert.equal(agent.pendingEvents.length, 0, 'buffer should be empty after flush');
   console.log('streaming end-to-end OK:', receivedFlushes.length, 'flush request(s)');
 

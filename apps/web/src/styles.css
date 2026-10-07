@@ -102,6 +102,19 @@ input:focus, select:focus, textarea:focus { border-color: var(--blue); box-shado
 .hero-orb::after { inset: 90px; background: rgba(255,255,255,.08); }
 .hero-orb span { position: relative; z-index: 2; font-size: 33px; font-weight: 900; letter-spacing: -.08em; }
 .stat-grid { display: grid; grid-template-columns: repeat(5, minmax(150px, 1fr)); gap: 13px; margin: 20px 0; }
+/* Person sync: the same card language as the dashboard, one tile per terminal
+   plus a strip of counters. */
+.stat-row { display: grid; grid-template-columns: repeat(6, minmax(110px, 1fr)); gap: 10px; margin: 16px 0; }
+.stat-row .stat-card { min-height: 92px; padding: 14px 16px; }
+.stat-row .stat-card strong { font-size: 22px; margin: 6px 0 0; }
+.device-sync-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin: 12px 0 22px; }
+.sync-card { display: flex; flex-direction: column; gap: 6px; }
+.sync-card small { color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+.sync-card small.capabilities { color: #2f6f4f; }
+.sync-card small.capabilities.warning { color: #a5520f; }
+.sync-card .sync-counts { margin-top: auto; font-size: 11.5px; font-weight: 700; color: #385675; }
+.enrollment-session.failed { border-color: #d9534f; }
+:root[data-theme="dark"] .sync-card .sync-counts { color: #b7c4d6; }
 .stat-card, .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 15px; box-shadow: 0 8px 28px rgba(25,55,105,.05); }
 .stat-card { padding: 20px; min-height: 142px; display: flex; flex-direction: column; }
 .stat-card p { color: var(--muted); font-size: 12px; font-weight: 700; }
@@ -196,6 +209,7 @@ tbody tr:hover { background: #fafcff; }
 .visitor-preview, .enrollment-session { margin: 18px 0; padding: 22px; border: 1px solid #bfd6f7; border-left: 5px solid var(--blue); border-radius: var(--radius); background: #f4f8ff; }.visitor-preview.invalid { border-color: #f0b7bc; border-left-color: var(--red); background: #fff5f6; }.visitor-preview dl { display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; }.visitor-preview dl div { padding: 12px; background: rgba(255,255,255,.65); border-radius: 9px; }.visitor-preview dt { color: var(--muted); font-size: 10px; text-transform: uppercase; font-weight: 800; }.visitor-preview dd { margin: 5px 0 0; font-size: 13px; font-weight: 700; }
 .visitor-pass-modal { width: min(620px,100%); }.visitor-pass { text-align: center; padding: 24px; border: 2px solid #14213d; border-radius: 16px; background: white; }.visitor-pass h2 { font-size: 30px; margin-bottom: 10px; }.pass-qr { width: min(280px,80%); display: block; margin: 16px auto 8px; image-rendering: pixelated; }.pass-barcode { width: 100%; max-width: 430px; height: auto; }.credential-number { display: block; font-size: 24px; letter-spacing: .16em; margin-top: 4px; }.visitor-pass > small { color: #68748a; }.pass-pin { margin: 12px auto 0; padding: 8px 12px; width: fit-content; border-radius: 8px; background: #eef4fc; letter-spacing: .08em; }.pass-dates { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 18px 0; font-size: 11px; }.pass-dates span { padding: 10px; background: #f1f5fa; border-radius: 8px; }.pass-policy { margin: 0; color: #5d687a; font-size: 11px; line-height: 1.55; }.no-print { margin-top: 16px; justify-content: center; }
 .enrollment-session.captured { border-left-color: var(--green); }.enrollment-session .credential-number { margin: 12px 0; }
+.enrollment-session .capture-uploads { margin: 12px 0 0; padding-left: 18px; color: var(--muted); font-size: 12px; line-height: 1.7; }
 :root[data-theme="dark"] .visitor-preview, :root[data-theme="dark"] .enrollment-session { background: #17253a; }.visitor-preview.invalid { color: #14213d; }
 /* ---------------- New grouped navigation + module surfaces ---------------- */
 .quick-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin: 22px 0; }
@@ -255,7 +269,7 @@ tbody tr:hover { background: #fafcff; }
 }
 @media (max-width: 560px) {
   .auth-shell { padding: 0; }.form-panel { border-radius: 0; min-height: 100vh; }.content { padding: 12px; }.panel, .hero-card { border-radius: 13px; }.page-panel { min-height: calc(100vh - 110px); }.panel-title { align-items: flex-start; }.panel-title .primary { padding: 9px; font-size: 11px; }
-  .stat-grid { grid-template-columns: repeat(2, 1fr); gap: 9px; }.stat-card { padding: 14px; min-height: 120px; }.stat-card strong { font-size: 23px; }.hero-card { padding: 28px 22px; }.hero-orb { right: -160px; }
+  .stat-grid, .stat-row { grid-template-columns: repeat(2, 1fr); gap: 9px; }.stat-card { padding: 14px; min-height: 120px; }.stat-card strong { font-size: 23px; }.hero-card { padding: 28px 22px; }.hero-orb { right: -160px; }
   .form-grid,.people-filters,.credential-forms { grid-template-columns: 1fr; }.span-2 { grid-column: span 1; }.visitor-preview dl,.pass-dates { grid-template-columns: 1fr; }.street-picker { grid-template-columns: 1fr; }.live-event { grid-template-columns: 10px 1fr 65px; }.live-event small { display: none; }
   .quick-grid { grid-template-columns: 1fr; gap: 10px; }
   .quick-tiles { grid-template-columns: repeat(3, 1fr); gap: 6px; }
@@ -434,3 +448,24 @@ tbody tr:hover { background: #fafcff; }
 /* Emergency directory */
 .contact-tel { color: inherit; text-decoration: none; font-weight: 700; }
 .contact-tel:hover { color: var(--blue); text-decoration: underline; }
+
+/* Remote Network Verification (per-terminal reader mode) */
+.remote-hint { color: var(--muted); font-size: 12.5px; line-height: 1.6; }
+.switch { display: inline-flex; align-items: center; gap: 8px; font-weight: 650; font-size: 13px; color: #354259; }
+.switch input { width: 17px; height: 17px; accent-color: var(--blue); }
+.chip { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 750; background: #eef2f7; color: #6b7a90; border: 1px solid #dbe3ee; white-space: nowrap; }
+.chip.ok { background: #e7f8ef; color: #167343; border-color: #c2efd5; }
+.chip.warn { background: #fff8e9; color: #85570c; border-color: #f5dfad; }
+.chip.error { background: #fff0f1; color: #9f2631; border-color: #facbd0; }
+.chip.muted { background: #eef2f7; color: #6b7a90; }
+input.narrow { width: 90px; padding: 7px 9px; }
+:root[data-theme="dark"] .chip { background: #17253a; color: #9cabbe; border-color: #30415c; }
+:root[data-theme="dark"] .chip.ok { background: #12331f; color: #7ee2a8; border-color: #2a5c3c; }
+:root[data-theme="dark"] .chip.warn { background: #33280f; color: #f0c368; border-color: #5c4a1c; }
+:root[data-theme="dark"] .chip.error { background: #35161a; color: #f4a0a8; border-color: #5f2a31; }
+:root[data-theme="dark"] .switch { color: var(--ink); }
+
+/* Denser rows for the tables embedded inside a device card, where the
+   surrounding panel already carries the heading and the padding. */
+.data-table.compact th,
+.data-table.compact td { padding: 7px 10px; font-size: 12.5px; }

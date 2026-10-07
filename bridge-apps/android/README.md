@@ -66,17 +66,36 @@ receives under the tag `EstateMateBridge`.
 * holds one persistent `GET /ISAPI/Event/notification/alertStream` connection per
   terminal (multipart or bare-JSON firmware) and forwards events to the Worker in
   batches of up to 50, buffering up to `eventBufferLimit` documents while the
-  network is down;
+  network is down; the stream's keep-alive heartbeat (`videoloss`/`inactive`) is
+  read as activity but never forwarded as a gate event;
 * polls the Worker every `syncIntervalSeconds` for queued operations and applies
-  them over ISAPI with HTTP Digest: `upsert_card` / `enable_card` (JSON first,
-  XML fallback), `disable_card` / `delete_card` (PUT `CardInfo/Delete`),
-  `upsert_visitor` (XML `tempCard`);
+  them over ISAPI with HTTP Digest: `upsert_card` / `enable_card` (JSON
+  `CardInfo/Record`, then `CardInfo/Modify` when the terminal already holds the
+  card number), `disable_card` / `delete_card` (PUT `CardInfo/Delete` with the
+  `CardInfoDelCond` condition), and the remote door commands. `upsert_visitor`
+  adds/updates only the finite `UserInfo` account shown in the terminal editor:
+  employee ID, name, Company department, normal-user/non-administrator settings,
+  validity window and a 4-to-8-digit PIN. It sends no `CardInfo`, fingerprint or
+  face record; `revoke_visitor` deletes that account. XML is used only when a
+  firmware does not implement the JSON URL, never after a content rejection;
 * heartbeats every `heartbeatIntervalSeconds` with the same stats payload the
   Windows host sends, so the portal's agent row looks identical — including the
   per-terminal alertStream state (`devices: [{ deviceId, stream, lastError }]`),
   which is what promotes a terminal to **online** as soon as its stream is open
   instead of leaving it on `pending` until the first card is swiped;
 * reconnects with a 5 s → 60 s backoff and keeps running across reboots.
+
+**Node/Android deviation — terminal clock sync:** the Windows/Node bridge's
+optional `"timeSync"` check (read the terminal's system time, compare it to the
+host, set it back past a threshold, report it on the heartbeat) is **not
+ported** to this APK. The Android bridge reports no `clock` field, and the
+Worker leaves `hikvision_devices.device_clock` alone when a heartbeat carries
+none, so a terminal served only by an Android bridge simply shows no clock
+report in the portal. This is recorded here rather than fixed by porting a
+background clock loop into the service — the same treatment the LAN event
+listener and ZKTeco PUSH have. If an estate needs terminal clock correction and
+runs only Android bridges, it should set each terminal's time and timezone in
+the terminal's own setup menu.
 
 The app is deliberately plain Java against the platform APIs only (no Kotlin, no
 AndroidX, no native code, no Gradle). That is what makes the APK reproducible

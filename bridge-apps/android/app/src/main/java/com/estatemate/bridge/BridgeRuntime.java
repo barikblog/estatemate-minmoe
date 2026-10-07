@@ -128,6 +128,31 @@ public final class BridgeRuntime {
         }
     }
 
+    /**
+     * Queues one event document together with the remote-verification verdict the
+     * bridge reached for it, so the gate history records who decided and whether
+     * the door answered - not merely what the terminal thought.
+     */
+    public static void queueWithVerdict(String deviceId, String document, Map<String, Object> verdict) {
+        if (document == null || document.isEmpty() || document.length() > 512 * 1024) {
+            BridgeLog.append("warn", "skipping missing or oversized event document for " + deviceId);
+            return;
+        }
+        Map<String, Object> item = new LinkedHashMap<String, Object>();
+        item.put("deviceId", deviceId);
+        item.put("document", document);
+        if (verdict != null) item.put("remoteVerification", verdict);
+        synchronized (QUEUE_LOCK) {
+            PENDING.add(item);
+            while (PENDING.size() > bufferLimit) {
+                PENDING.remove(0);
+                eventsDropped++;
+            }
+            lastEventAt = nowLabel();
+            QUEUE_LOCK.notifyAll();
+        }
+    }
+
     /** Removes up to `max` items for the next flush; never blocks. */
     public static List<Object> drain(int max) {
         ArrayList<Object> items = new ArrayList<Object>();

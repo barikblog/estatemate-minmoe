@@ -82,11 +82,11 @@ describe('Fingerprint credentials', () => {
     expect(finger?.enrolled_device_id).toBe(deviceId);
     // The terminal identifies the person by employee number, which defaults to the
     // person's own Employee ID so a cardless event can be attributed later. It is
-    // *not* the raw EstateMate user id: a UUID is 36 characters and ISAPI
-    // employeeNo/employeeNoString stops at 32, so the default drops the hyphens
-    // and the same value is stored on the person for their next credential.
+    // *not* the raw EstateMate user id: a UUID is 36 characters, so the generated
+    // 30-character Employee ID drops the hyphens and some UUID text. The same
+    // value is stored on the person for their next credential.
     expect(finger?.employee_no).toBe(String(db.one(`SELECT employee_id FROM users WHERE id=?`, estate.residentId)?.employee_id));
-    expect(String(finger?.employee_no).length).toBeLessThanOrEqual(32);
+    expect(String(finger?.employee_no).length).toBeLessThanOrEqual(30);
     expect(String(finger?.employee_no)).not.toBe(estate.residentId);
 
     const operations = db.query(`SELECT * FROM device_operations WHERE fingerprint_id=?`, String(response.json.id));

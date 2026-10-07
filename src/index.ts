@@ -3,7 +3,23 @@ import type { Context, MiddlewareHandler } from 'hono';
 import { moneyToMinor, parseCsv, requireHeaders, validDate } from './csv';
 import type { CsvTable } from './csv';
 import { DEFAULT_ESTATE_TIMEZONE, normalizeTimeZone, parseEstateInstantMs } from './datetime';
+import {
+  AGENT_CAPABILITIES,
+  credentialsForPerson,
+  deviceSyncOverview,
+  fingerprintUploadOperation,
+  heldTemplateFor,
+  personKeyFor,
+  readPerson,
+  removePersonFromDevices,
+  setDevicePersonState,
+  syncDevices,
+  syncPersonToDevices,
+  type AgentCapability,
+  type SyncResult,
+} from './device-sync';
 import { EMPLOYEE_ID_MAX, deviceEmployeeNo, employeeIdFromUuid, readEmployeeId } from './employee-id';
+import { cardNumberValidationError, isDigitsOnlyCardNumber } from './card-number';
 import { AccessLiveFeed } from './live-feed';
 import { evaluateVisitorPass } from './visitor-pass';
 import { normalizeHikvisionDocument } from './hikvision';
@@ -75,7 +91,7 @@ function agentEffectiveStatus(alias: string): string {
   return `CASE WHEN ${alias}.status='online' AND COALESCE(${alias}.last_seen_at,'1970-01-01 00:00:00') < datetime('now','-${AGENT_OFFLINE_MINUTES} minutes') THEN 'offline' ELSE ${alias}.status END`;
 }
 
-function jsonError(c: AppContext, status: 400 | 401 | 403 | 404 | 409 | 413 | 500 | 503, message: string) {
+function jsonError(c: AppContext, status: 400 | 401 | 403 | 404 | 409 | 413 | 422 | 500 | 503, message: string) {
   return c.json({ error: message }, status);
 }
 
@@ -388,7 +404,7 @@ async function employeeIdInUse(
   return Boolean(dependant);
 }
 
-/** A fresh, unused 32-character Employee ID. */
+/** A fresh, unused 30-character Employee ID. */
 async function newEmployeeId(db: D1Database): Promise<string> {
   for (let attempt = 0; attempt < 10; attempt += 1) {
     const candidate = employeeIdFromUuid(crypto.randomUUID());
@@ -416,8 +432,8 @@ async function resolveNewEmployeeId(
     }
     return { value: reading.value, error: null, conflict: false };
   }
-  // The person's own UUID without hyphens is exactly 32 characters and is
-  // already unique in practice; fall back to a generated value on a collision.
+  // The person's UUID supplies a stable 30-character suffix; fall back to a
+  // newly generated value on a collision.
   const natural = employeeIdFromUuid(personId);
   if (natural && !(await employeeIdInUse(db, natural))) return { value: natural, error: null, conflict: false };
   return { value: await newEmployeeId(db), error: null, conflict: false };
@@ -559,7 +575,7 @@ app.post('/api/auth/bootstrap', async (c) => {
   if (!name || !email || !body.password) return jsonError(c, 400, 'name, email and password are required');
   const id = crypto.randomUUID();
   // Even the first seeded administrator gets a terminal identity at birth, so
-  // every person record carries a valid 32-character Employee ID from day one.
+  // every person record carries a valid 30-character Employee ID from day one.
   await c.env.DB.prepare(
     `INSERT INTO users(id, name, email, password_hash, role, employee_id) VALUES (?, ?, ?, ?, 'admin', ?)`,
   ).bind(id, name, email, await hashPassword(body.password), employeeIdFromUuid(id)).run();
@@ -1052,7 +1068,7 @@ app.post('/api/household-members', requireRoles('resident','admin','manager'), a
   const direct = isEstateOperator(user.role);
   // A dependant is a person on the terminal too: they hold cards and
   // fingerprints of their own, so they get an Employee ID at creation, capped at
-  // 32 characters like every other person's.
+  // 30 characters like every other person's.
   const employeeId=await resolveNewEmployeeId(c.env.DB,id,body.employeeId);
   if (employeeId.error) return jsonError(c,employeeId.conflict?409:400,employeeId.error);
   await c.env.DB.prepare(
@@ -1100,8 +1116,15 @@ app.patch('/api/household-members/:id', requireRoles('admin','manager'), async (
   if (status === 'inactive' || status === 'rejected') {
     await suspendDependantCredentials(c.env, c.req.param('id'), c.get('user').id, 'household membership inactive');
   }
-  await audit(c, body.action, 'household_member', c.req.param('id'), { canCreateVisitors: Boolean(visitorPermission), canViewBills: Boolean(billPermission) });
-  return c.json({ ok: true, status });
+  // An approved dependant is a person on the terminals too: approval alone does
+  // not put them there, so the membership becoming active (or the name changing)
+  // is what triggers the write. Nothing is sent for a membership that was never
+  // given a credential.
+  const personSync = status === 'active'
+    ? await autoSyncPerson(c.env, 'dependant', c.req.param('id'), 'household membership active')
+    : null;
+  await audit(c, body.action, 'household_member', c.req.param('id'), { canCreateVisitors: Boolean(visitorPermission), canViewBills: Boolean(billPermission), personSync: personSync ? describeSync(personSync) : undefined });
+  return c.json({ ok: true, status, personSync: personSync ? describeSync(personSync) : undefined });
 });
 
 app.post('/api/household-members/:id/login', requireRoles('admin','manager'), async (c) => {
@@ -1444,7 +1467,7 @@ app.post('/api/users', requireRoles('admin','manager'), async (c) => {
   const id = crypto.randomUUID();const persistedRole=storedRole(body.role);
   // Every person gets a terminal identity at creation so a card or fingerprint
   // can be pushed immediately. An administrator may supply their own; it is
-  // capped at 32 characters because that is what the terminal will store.
+  // capped at 30 characters, below the terminal's 32-character wire limit.
   const employeeId=await resolveNewEmployeeId(c.env.DB,id,body.employeeId);
   if (employeeId.error) return jsonError(c,employeeId.conflict?409:400,employeeId.error);
   const statements = [c.env.DB.prepare(
@@ -1519,8 +1542,15 @@ app.patch('/api/users/:id', requireRoles('admin','manager'), async (c) => {
   if (ownershipId && body.propertyId) statements.push(c.env.DB.prepare(`INSERT INTO property_ownerships(id,property_id,resident_id,status,approved_by) VALUES (?,?,?,'active',?)`).bind(ownershipId,body.propertyId,existing.id,c.get('user').id));
   await c.env.DB.batch(statements);
   if (status==='inactive' && existing.status==='active') await suspendUserCards(c.env,existing.id,c.get('user').id,'account deactivated');
-  await audit(c,'update','user',existing.id,{ name,email,role,status,propertyAssigned:body.propertyId || null,ownershipId,employeeId:touchesEmployeeId?employeeIdUpdate.value:undefined });
-  return c.json({ ok:true,id:existing.id,ownershipId,employeeId:touchesEmployeeId?employeeIdUpdate.value:undefined });
+  // A terminal shows the name it was given, so a rename (or a new employee
+  // number) has to be written back to the terminals this person is on. Only
+  // people already tracked there are touched; editing an unrelated account
+  // changes nothing on any gate.
+  const personSync = name!==existing.name || touchesEmployeeId
+    ? await autoSyncPerson(c.env,'account',existing.id,'person updated in the portal')
+    : null;
+  await audit(c,'update','user',existing.id,{ name,email,role,status,propertyAssigned:body.propertyId || null,ownershipId,employeeId:touchesEmployeeId?employeeIdUpdate.value:undefined,personSync:personSync?describeSync(personSync):undefined });
+  return c.json({ ok:true,id:existing.id,ownershipId,employeeId:touchesEmployeeId?employeeIdUpdate.value:undefined,personSync:personSync?describeSync(personSync):undefined });
 });
 
 app.post('/api/users/:id/reset-password', requireRoles('admin','manager'), async (c) => {
@@ -1551,8 +1581,15 @@ app.delete('/api/users/:id', requireRoles('admin','manager'), async (c) => {
   if (blocker) return jsonError(c,409,blocker);
   await c.env.DB.prepare(`UPDATE users SET status='inactive',updated_at=datetime('now') WHERE id=?`).bind(target.id).run();
   await suspendUserCards(c.env,target.id,c.get('user').id,'account deleted by administrator');
-  await audit(c,'delete','user',target.id,{ name:target.name,mode:'soft-delete-history-preserved' });
-  return c.json({ ok:true,historyPreserved:true });
+  // Deactivating a person leaves them on the terminal with suspended credentials,
+  // so they can come back. Deleting the account removes them properly: the
+  // person, their credentials and their door permissions leave the terminal.
+  const person = await syncPersonRef(c.env,'account',target.id);
+  const removal = person?.employeeNo
+    ? await removePersonFromDevices(c.env,person,{ reason:'account deleted by administrator' })
+    : null;
+  await audit(c,'delete','user',target.id,{ name:target.name,mode:'soft-delete-history-preserved',removal:removal?describeSync(removal):'nothing on a terminal' });
+  return c.json({ ok:true,historyPreserved:true,terminals:removal?describeSync(removal):'nothing on a terminal' });
 });
 
 app.post('/api/users/sample-logins', requireRoles('admin'), async (c) => {
@@ -1691,8 +1728,8 @@ async function findPerson(db: D1Database, key: PersonKey): Promise<PersonRef | n
  * Required columns: `person_type,name`. Accounts also need `email` and `role`;
  * dependants need `relationship` and either `primary_resident_email` or
  * `primary_resident_employee_id` so the household they join is unambiguous.
- * `employee_id` is optional everywhere and is rejected if longer than 32
- * characters, because that is all a terminal will store.
+ * `employee_id` is optional everywhere and is rejected if longer than 30
+ * characters, EstateMate's limit below the terminal's 32-character wire cap.
  */
 app.post('/api/people/bulk-upload', requireRoles('admin','manager'), async (c) => {
   const prepared = await prepareCsvImport(c, PEOPLE_BULK_MAX_ROWS, ['person_type','name'], 'people.csv', 'people-imports');
@@ -2089,12 +2126,14 @@ app.post('/api/people/bulk-resync', requireRoles('admin','manager'), async (c) =
   }
 
   const result = await resyncPeopleCredentials(c.env,people);
-  await audit(c,'bulk_resync','people',null,{ scope,people:people.length,...result });
+  await audit(c,'bulk_resync','people',null,{ scope,requested:people.length,...result });
   return c.json({
-    ok:true,scope,people:people.length,...result,
+    ok:true,scope,requested:people.length,people:result.people,
+    cards:result.cards,fingerprints:result.fingerprints,devices:result.devices,
+    queued:result.queued,manual:result.manual,skipped:result.skipped,
     notice: result.manual
-      ? `${result.queued} command(s) queued for the agent and ${result.manual} fingerprint task(s) raised for an operator under Hardware actions.`
-      : `${result.queued} command(s) queued for the estate agent.`,
+      ? `${result.people} person record(s) and ${result.queued} credential command(s) queued for the agent, and ${result.manual} task(s) for an operator under Hardware actions.`
+      : `${result.people} person record(s) and ${result.queued} credential command(s) queued for the estate agent.`,
   });
 });
 
@@ -2163,9 +2202,9 @@ async function resyncPersonCredentials(env: Env, person: PersonRef): Promise<{ c
 }
 
 /** Resynchronise a list of people, totalling what was queued. */
-async function resyncPeopleCredentials(env: Env, people: PersonRef[]): Promise<{ cards: number; fingerprints: number; queued: number; manual: number; skipped: number; devices: number }> {
+async function resyncPeopleCredentials(env: Env, people: PersonRef[]): Promise<{ cards: number; fingerprints: number; people: number; queued: number; manual: number; skipped: number; devices: number }> {
   const devices = await env.DB.prepare(`SELECT COUNT(*) AS count FROM hikvision_devices WHERE status!='disabled' AND deleted_at IS NULL`).first<{ count:number }>();
-  const totals = { cards:0,fingerprints:0,queued:0,manual:0,skipped:0 };
+  const totals = { cards:0,fingerprints:0,people:0,queued:0,manual:0,skipped:0 };
   for (const person of people) {
     try {
       const result = await resyncPersonCredentials(env,person);
@@ -2174,6 +2213,18 @@ async function resyncPeopleCredentials(env: Env, people: PersonRef[]): Promise<{
       totals.queued += result.queued;
       totals.manual += result.manual;
       totals.skipped += result.skipped;
+      // The person record itself, not only the credentials: a terminal that has
+      // never been told the person exists cannot honour their card, so a
+      // resynchronisation that skipped this left the estate with exactly the
+      // symptom people report — cards recorded, gate does not open.
+      const ref = await syncPersonRef(env,person.kind,person.id);
+      if (ref && ref.status === 'active' && (await ensureSyncEmployeeNo(env,ref))) {
+        const persons = await syncPersonToDevices(env,ref,{ reason:'bulk resynchronisation' });
+        totals.people += 1;
+        totals.queued += persons.queued;
+        totals.manual += persons.manual;
+        totals.skipped += persons.skipped;
+      }
     } catch (error) {
       // One person whose credentials cannot be queued must not abort the batch.
       console.error('Credential resynchronisation failed',person.id,error);
@@ -2310,14 +2361,14 @@ app.patch('/api/payments/:id/review', requireRoles('cashier', 'admin'), async (c
   return c.json({ ok: true });
 });
 
-async function prepareCsvImport(c:AppContext,maxRows:number,required:string[],defaultFilename:string,category:string):Promise<Response|{ table:CsvTable;jobId:string;filename:string;storageKey:string }> {
+async function prepareCsvImport(c:AppContext,maxRows:number,required:string[],defaultFilename:string,category:string,options:{ preserveCellWhitespace?:boolean }={}):Promise<Response|{ table:CsvTable;jobId:string;filename:string;storageKey:string }> {
   const length=Number(c.req.header('Content-Length') ?? 0);
   if (length>CSV_BODY_LIMIT) return jsonError(c,413,'CSV exceeds the 2 MB upload limit');
   const text=await c.req.text();
   if (!text || new TextEncoder().encode(text).byteLength>CSV_BODY_LIMIT) return jsonError(c,413,'CSV must be between 1 byte and 2 MB');
   let table:CsvTable;
   try {
-    table=parseCsv(text,maxRows);requireHeaders(table,required);
+    table=parseCsv(text,maxRows,{ trimValues:!options.preserveCellWhitespace });requireHeaders(table,required);
     if (!table.rows.length) throw new Error('CSV must contain at least one data row');
   } catch(error) { return jsonError(c,400,error instanceof Error?error.message:'Invalid CSV'); }
   const jobId=crypto.randomUUID();const filename=(c.req.header('X-Filename') ?? defaultFilename).slice(0,200);
@@ -2521,19 +2572,20 @@ app.post('/api/imports/tenancies', requireRoles('admin','manager'), async (c) =>
 });
 
 app.post('/api/imports/cards', requireRoles('admin','manager'), async (c) => {
-  const prepared=await prepareCsvImport(c,500,['resident_email','card_uid'],'access-cards.csv','operations-imports');
+  const prepared=await prepareCsvImport(c,500,['resident_email','card_uid'],'access-cards.csv','operations-imports',{ preserveCellWhitespace:true });
   if (prepared instanceof Response) return prepared;
   const errors:Array<{ row:number;error:string }>=[];let successful=0;const seen=new Set<string>();
   for (const [index,row] of prepared.table.rows.entries()) {
     try {
-      const email=row.resident_email?.trim().toLowerCase();const cardUid=row.card_uid?.trim();const status=(row.status?.trim().toLowerCase() || 'active');
-      if(!email || !cardUid)throw new Error('resident_email and card_uid are required');
-      const key=cardUid.toLowerCase();if(seen.has(key))throw new Error('duplicate card_uid in this CSV');seen.add(key);
+      const email=row.resident_email?.trim().toLowerCase();const cardUid=row.card_uid ?? '';const status=(row.status?.trim().toLowerCase() || 'active');
+      if(!email)throw new Error('resident_email is required');
+      const cardNumberError=cardNumberValidationError(cardUid);if(cardNumberError)throw new Error(cardNumberError);
+      const key=cardUid;if(seen.has(key))throw new Error('duplicate card_uid in this CSV');seen.add(key);
       if(!['active','expired','suspended','revoked'].includes(status))throw new Error('invalid card status');
       const resident=await c.env.DB.prepare(`SELECT id FROM users WHERE lower(email)=? AND role='resident' AND status='active'`).bind(email).first<{ id:string }>();
       if(!resident)throw new Error('active resident account was not found');
       const existing=await c.env.DB.prepare(`SELECT id FROM access_cards WHERE lower(card_uid)=?`).bind(key).first();if(existing)throw new Error('card_uid already exists');
-      const expiresAt=row.expires_at?validDate(row.expires_at,'expires_at'):null;const id=crypto.randomUUID();
+      const expiresValue=row.expires_at?.trim() ?? '';const expiresAt=expiresValue?validDate(expiresValue,'expires_at'):null;const id=crypto.randomUUID();
       await c.env.DB.prepare(`INSERT INTO access_cards(id,resident_id,card_uid,card_label,status,expires_at) VALUES (?,?,?,?,?,?)`).bind(id,resident.id,cardUid,row.card_label?.trim() || null,status,expiresAt).run();
       if(status==='active')await createDeviceOperations(c.env,id,'upsert_card',{ cardUid,residentId:resident.id,label:row.card_label?.trim() || null,expiresAt,enabled:true });
       successful+=1;
@@ -2733,14 +2785,16 @@ app.post('/api/visitors', requireRoles('resident','admin','manager'), async (c) 
   ).bind(id,residentId,propertyId,body.visitorName.trim(),body.visitorPhone?.trim() ?? null,pin,qrToken,credentialNumber,credentialNumber,credentialMode,device?.id ?? null,gateScope,1,requireGateIdVerification,validFrom,validUntil).run();
   await linkProofFiles(c.env.DB,proofKeys(body.proofKeys),'visitor_request',id,requester.id);
   // The visitor account is created on the access-control estate automatically:
-  // this queues the credential on every terminal (or the one gate an officer
-  // chose) without anyone opening Hardware actions. It is released again by
-  // releaseExpiredVisitorDeviceAccounts the moment validity ends.
+  // this queues the PIN-only account on every terminal (or the one gate an
+  // officer chose) without anyone opening Hardware actions. It is released again
+  // by releaseExpiredVisitorDeviceAccounts the moment validity ends.
   const visitorEmployeeNo=credentialNumber?deviceEmployeeNo('visitor',credentialNumber):null;
   const hardwareOperationsQueued = await queueVisitorDeviceOperations(c.env.DB, id, device?.id ?? null, {
     credentialNumber,
     employeeNo: visitorEmployeeNo,
     visitorName: body.visitorName.trim(),
+    department: 'Company',
+    pin,
     validFrom,
     validUntil,
     enabled: false,
@@ -3920,6 +3974,8 @@ app.get('/api/access/card-scan-sessions/:id', requireRoles('admin','manager'), a
 app.post('/api/access/card-scan-sessions/:id/complete', requireRoles('admin','manager'), async (c) => {
   const session=await c.env.DB.prepare(`SELECT * FROM credential_scan_sessions WHERE id=? AND requested_by=? AND purpose='card_enrollment' AND status='captured'`).bind(c.req.param('id'),c.get('user').id).first<Record<string,string|null>>();
   if (!session?.captured_credential || !session.resident_id) return jsonError(c,409,'No card credential has been captured yet');
+  const capturedCardError=cardNumberValidationError(session.captured_credential);
+  if (capturedCardError) return jsonError(c,422,'Captured card number may contain digits only. Cancel this scan and use a physical card with a numeric number.');
   const cardId=crypto.randomUUID();
   await c.env.DB.batch([
     c.env.DB.prepare(`INSERT INTO access_cards(id,resident_id,household_member_id,card_uid,card_label) VALUES (?,?,?,?,?)`).bind(cardId,session.resident_id,session.household_member_id,session.captured_credential,session.card_label),
@@ -4093,8 +4149,8 @@ app.post('/api/access/fingerprints', requireRoles('admin','manager'), async (c) 
   let personName = '';
   let personKind: PersonKind = 'account';
   let personId = '';
-  // An operator may still type the number the terminal already knows, but it has
-  // to fit: ISAPI employeeNo/employeeNoString stops at 32 characters.
+  // An operator may still type a terminal identity, but new values follow the
+  // 30-character EstateMate limit (the ISAPI wire field itself allows 32).
   const suppliedEmployeeNo = readEmployeeId(body.employeeNo);
   if (suppliedEmployeeNo.error) return jsonError(c, 400, suppliedEmployeeNo.error);
   let employeeNo = suppliedEmployeeNo.value;
@@ -4143,15 +4199,34 @@ app.post('/api/access/fingerprints', requireRoles('admin','manager'), async (c) 
   const instruction = deviceName
     ? `Enroll ${body.fingerLabel?.trim() || `finger ${fingerNo}`} for ${personName} on ${deviceName}, using finger slot ${fingerNo}${employeeNo ? ` and employee number ${employeeNo}` : ''}. Then mark this action applied.`
     : `Enroll ${body.fingerLabel?.trim() || `finger ${fingerNo}`} for ${personName} on the terminal, using finger slot ${fingerNo}${employeeNo ? ` and employee number ${employeeNo}` : ''}. Then mark this action applied.`;
+  // The person record goes to the terminals, so the new finger has somebody to
+  // belong to — but not the credentials, because the fingerprint command below is
+  // the one this action is about and two callers would queue it twice.
+  const person = { kind: (householdMemberId ? 'dependant' : 'account') as PersonKind, id: householdMemberId ?? String(residentId), name: personName, employeeNo, status: 'active' };
+  const personSync = await autoSyncPerson(c.env, person.kind, person.id, 'fingerprint recorded');
   const queued = await createFingerprintOperations(c.env, id, 'enroll_fingerprint', { fingerprintId:id, fingerNo, employeeNo, personName, deviceId, enabled:true }, instruction, { deviceId });
-  await audit(c, 'enroll', 'fingerprint_credential', id, { residentId, householdMemberId, fingerNo, employeeNo, deviceId });
+
+  // A template held for this slot is what actually reaches a terminal: when one
+  // exists (the finger was read on a terminal after this change) it is sent to
+  // every terminal whose bridge can write fingerprints. When none exists the
+  // manual instruction above is the only honest answer, and it says so.
+  let templateQueued = 0;
+  if (await heldTemplateFor(c.env, person, fingerNo)) {
+    for (const device of await syncDevices(c.env, null)) {
+      const outcome = await fingerprintUploadOperation(c.env, person, device, { id, finger_no: fingerNo, finger_label: body.fingerLabel?.trim() || null, employee_no: employeeNo, status: 'active' }, 'fingerprint recorded');
+      if (outcome === 'queued') templateQueued += 1;
+    }
+  }
+  await audit(c, 'enroll', 'fingerprint_credential', id, { residentId, householdMemberId, fingerNo, employeeNo, deviceId, templateQueued });
   return c.json({
     id,
     fingerNo,
     employeeNo,
     credentialType: 'fingerprint',
     queuedActions: queued,
-    hardwareSync: 'manual_action_required',
+    templateQueued,
+    personSync: describeSync(personSync),
+    hardwareSync: templateQueued ? 'queued' : 'manual_action_required',
     instruction,
   }, 201);
 });
@@ -4222,9 +4297,335 @@ app.delete('/api/access/fingerprints/:id', requireRoles('admin','manager'), asyn
   return c.json({ ok: true, historyPreserved: true, queuedActions: queued });
 });
 
+// ─────────────────────────────────────────────────────────────
+// Automatic person synchronisation and fingerprint capture
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * The person × terminal grid: what each terminal holds, and what it is waiting
+ * for. This is the honest answer the portal could not give before — it used to
+ * only say how many commands were queued, never whether a terminal had the
+ * person at all.
+ */
+app.get('/api/device-sync', requireRoles('admin','manager','security'), async (c) => {
+  const limit = Number(c.req.query('limit') ?? 500);
+  const overview = await deviceSyncOverview(c.env, { limit: Number.isFinite(limit) ? limit : 500 });
+  const captures = await c.env.DB.prepare(
+    `SELECT id,device_id,person_name,finger_no,finger_label,status,error_message,created_at,expires_at
+       FROM fingerprint_captures WHERE status='pending' OR (status='captured' AND updated_at > datetime('now','-1 day'))
+       ORDER BY created_at DESC LIMIT 20`,
+  ).all();
+  return c.json({
+    ...overview,
+    captures: captures.results,
+    supported: true,
+    note: 'A terminal only lets somebody through when the person record exists on it with door rights. EstateMate now writes the person, then the card, then any fingerprint template — and says here which terminal is still missing what.',
+  });
+});
+
+/**
+ * "Sync now" for the people and terminals the operator picked, defaulting to
+ * everyone holding a credential and every terminal. Idempotent: repeat presses
+ * reuse the operations already open.
+ */
+app.post('/api/device-sync/people', requireRoles('admin','manager'), async (c) => {
+  const body = await c.req.json<{
+    scope?: 'all'|'people';
+    people?: Array<{ personKind?: string; id?: string; employeeId?: string | null }>;
+    deviceIds?: string[] | null;
+    includeCredentials?: boolean;
+  }>();
+  const deviceIds = Array.isArray(body.deviceIds) && body.deviceIds.length ? body.deviceIds.map(String) : null;
+  const includeCredentials = body.includeCredentials !== false;
+
+  type Target = { kind: PersonKind; id: string };
+  const targets: Target[] = [];
+  if (body.scope === 'people') {
+    for (const entry of body.people ?? []) {
+      const kind: PersonKind = entry.personKind === 'dependant' ? 'dependant' : 'account';
+      if (entry.id) targets.push({ kind, id: String(entry.id) });
+    }
+    if (!targets.length) return jsonError(c, 400, 'List the people to synchronise with people[{personKind,id}]');
+    if (targets.length > PEOPLE_BULK_MAX_ROWS) return jsonError(c, 400, `At most ${PEOPLE_BULK_MAX_ROWS} people can be synchronised in one request`);
+  } else {
+    // Everyone a terminal could plausibly need: an active account with a
+    // credential or an employee number, plus every active dependant holding one.
+    const accounts = await c.env.DB.prepare(
+      `SELECT id FROM users
+        WHERE status='active' AND (
+          employee_id IS NOT NULL
+          OR EXISTS(SELECT 1 FROM access_cards c WHERE c.resident_id=users.id AND c.household_member_id IS NULL)
+          OR EXISTS(SELECT 1 FROM fingerprint_credentials f WHERE f.resident_id=users.id AND f.household_member_id IS NULL))
+        ORDER BY name LIMIT ?`,
+    ).bind(PEOPLE_BULK_MAX_ROWS).all<{ id: string }>();
+    const dependants = await c.env.DB.prepare(
+      `SELECT id FROM household_members
+        WHERE status='active' AND (
+          employee_id IS NOT NULL
+          OR EXISTS(SELECT 1 FROM access_cards c WHERE c.household_member_id=household_members.id)
+          OR EXISTS(SELECT 1 FROM fingerprint_credentials f WHERE f.household_member_id=household_members.id))
+        ORDER BY name LIMIT ?`,
+    ).bind(PEOPLE_BULK_MAX_ROWS).all<{ id: string }>();
+    targets.push(...accounts.results.map((row) => ({ kind: 'account' as PersonKind, id: row.id })));
+    targets.push(...dependants.results.map((row) => ({ kind: 'dependant' as PersonKind, id: row.id })));
+  }
+
+  const totals = { devices: 0, queued: 0, manual: 0, skipped: 0, removed: 0, unresolved: 0 };
+  let processed = 0;
+  for (const target of targets) {
+    try {
+      const result = await syncPersonEverywhere(c.env, target.kind, target.id, 'portal synchronisation', { deviceIds, includeCredentials });
+      totals.devices += result.devices;
+      totals.queued += result.queued;
+      totals.manual += result.manual;
+      totals.skipped += result.skipped;
+      totals.unresolved += result.unresolved.length;
+      processed += 1;
+    } catch (error) {
+      // One person who cannot be queued must not abort the batch.
+      console.error('Device synchronisation failed', target.kind, target.id, error);
+    }
+  }
+  await audit(c, 'sync', 'device_person_state', null, { scope: body.scope ?? 'all', people: processed, requestedDevices: deviceIds, ...totals });
+  return c.json({
+    ok: true,
+    scope: body.scope === 'people' ? 'people' : 'all',
+    people: processed,
+    devices: deviceIds ?? totals.devices,
+    queued: totals.queued,
+    manual: totals.manual,
+    skipped: totals.skipped,
+    removed: totals.removed,
+    unresolved: totals.unresolved,
+    notice: `${processed} person(s) synchronised across ${deviceIds ? deviceIds.length : totals.devices} terminal(s): ${totals.queued} command(s) for the agent, ${totals.manual} operator task(s), ${totals.skipped} already queued${totals.unresolved ? `, ${totals.unresolved} without an employee number` : ''}.`,
+  });
+});
+
+/**
+ * "Remove from device": take a person off one terminal, or off every terminal,
+ * together with their cards, fingerprints and door permissions.
+ *
+ * This is deliberately not what deactivating an account does. Deactivating
+ * suspends credentials so the person can come back; removing deletes them from
+ * the terminal, which is what an estate does when a tenancy ends.
+ */
+app.post('/api/device-sync/remove', requireRoles('admin','manager'), async (c) => {
+  const body = await c.req.json<{
+    personKind?: string; id?: string; employeeId?: string | null;
+    deviceIds?: string[] | null; reason?: string; fullRemoval?: boolean;
+  }>();
+  const kind: PersonKind = body.personKind === 'dependant' ? 'dependant' : 'account';
+  let personId = body.id ? String(body.id) : null;
+  if (!personId && body.employeeId) {
+    const table = kind === 'account' ? 'users' : 'household_members';
+    const row = await c.env.DB.prepare(`SELECT id FROM ${table} WHERE employee_id=? LIMIT 1`).bind(String(body.employeeId)).first<{ id: string }>();
+    personId = row?.id ?? null;
+  }
+  if (!personId) return jsonError(c, 400, 'id (or employeeId) is required');
+  const person = await syncPersonRef(c.env, kind, personId);
+  if (!person) return jsonError(c, 404, 'Person not found');
+  if (!person.employeeNo) return jsonError(c, 409, 'That person has no terminal employee number, so no terminal can be holding them');
+
+  const deviceIds = Array.isArray(body.deviceIds) && body.deviceIds.length ? body.deviceIds.map(String) : null;
+  const result = await removePersonFromDevices(c.env, person, {
+    reason: body.reason?.trim() || 'removed from the terminal by an administrator',
+    deviceIds,
+    fullRemoval: body.fullRemoval !== false,
+  });
+  await audit(c, 'remove_from_devices', 'device_person_state', personId, { kind, employeeNo: person.employeeNo, requestedDevices: deviceIds, ...result });
+  return c.json({
+    ok: true,
+    person: person.name,
+    employeeNo: person.employeeNo,
+    devices: result.devices,
+    queued: result.queued,
+    manual: result.manual,
+    skipped: result.skipped,
+    removed: result.removed,
+    notice: `${person.name} is being removed from ${result.removed} terminal(s): ${describeSync(result)}.`,
+  });
+});
+
+/**
+ * Starts a fingerprint capture on a chosen terminal.
+ *
+ * The operator picks the person, the finger and the terminal in front of them;
+ * the bridge arms the terminal's own reader, the finger goes on the glass, and
+ * the template is sent to every other terminal that can take one. Nothing is
+ * typed on the terminal.
+ */
+app.post('/api/access/fingerprints/capture', requireRoles('admin','manager'), async (c) => {
+  const body = await c.req.json<{
+    residentId?: string; householdMemberId?: string; personKind?: string; personId?: string;
+    fingerNo?: number | string; fingerLabel?: string; deviceId?: string;
+  }>();
+  const kind: PersonKind = body.personKind === 'dependant' || body.householdMemberId ? 'dependant' : 'account';
+  const personId = String(body.personId ?? body.householdMemberId ?? body.residentId ?? '').trim();
+  if (!personId) return jsonError(c, 400, 'personId (or residentId / householdMemberId) is required');
+  const fingerNo = Number(body.fingerNo);
+  if (!Number.isInteger(fingerNo) || fingerNo < 1 || fingerNo > 10) return jsonError(c, 400, 'fingerNo must be a whole number between 1 and 10');
+  if (!body.deviceId) return jsonError(c, 400, 'deviceId is required: a finger is captured at one terminal');
+  const person = await syncPersonRef(c.env, kind, personId);
+  if (!person) return jsonError(c, 404, 'Person not found');
+  if (person.status !== 'active') return jsonError(c, 409, 'Only an active person can be enrolled');
+
+  const started = await startFingerprintCapture(c.env, {
+    person,
+    fingerNo,
+    fingerLabel: body.fingerLabel?.trim() || null,
+    deviceId: String(body.deviceId),
+    createdBy: c.get('user').id,
+  });
+  if (!started.ok) return jsonError(c, started.status, started.error);
+  await audit(c, 'capture_start', 'fingerprint_capture', started.capture.id, { personId, kind, fingerNo, deviceId: body.deviceId, employeeNo: started.capture.employee_no });
+  return c.json({
+    ok: true,
+    captureId: started.capture.id,
+    status: started.capture.status,
+    employeeNo: started.capture.employee_no,
+    expiresAt: started.capture.expires_at,
+    instruction: started.instruction,
+  }, 201);
+});
+
+/** Polls one capture: pending until a finger is read, then where it was sent. */
+app.get('/api/access/fingerprints/captures/:id', requireRoles('admin','manager','security'), async (c) => {
+  const capture = await c.env.DB.prepare(`SELECT * FROM fingerprint_captures WHERE id=?`).bind(c.req.param('id')).first<FingerprintCaptureRow>();
+  if (!capture) return jsonError(c, 404, 'Capture not found');
+  const uploads = await c.env.DB.prepare(
+    `SELECT o.status,o.error_message,d.name AS device_name
+       FROM device_operations o JOIN hikvision_devices d ON d.id=o.device_id
+      WHERE o.capture_id=? AND o.operation='upload_fingerprint' ORDER BY d.name`,
+  ).bind(capture.id).all<{ status: string; error_message: string | null; device_name: string }>();
+  return c.json({
+    id: capture.id,
+    status: capture.status,
+    personName: capture.person_name,
+    fingerNo: capture.finger_no,
+    fingerLabel: capture.finger_label,
+    employeeNo: capture.employee_no,
+    error: capture.error_message,
+    expiresAt: capture.expires_at,
+    // Never the template itself: it exists to reach a terminal, not a browser.
+    hasTemplate: Boolean(capture.template_data),
+    uploads: uploads.results,
+  });
+});
+
+/** Stops waiting for a finger — the person walked away, or it was the wrong slot. */
+app.post('/api/access/fingerprints/captures/:id/cancel', requireRoles('admin','manager'), async (c) => {
+  const capture = await c.env.DB.prepare(`SELECT id,status FROM fingerprint_captures WHERE id=?`).bind(c.req.param('id')).first<{ id: string; status: string }>();
+  if (!capture) return jsonError(c, 404, 'Capture not found');
+  if (capture.status === 'pending') {
+    await c.env.DB.batch([
+      c.env.DB.prepare(`UPDATE fingerprint_captures SET status='cancelled',template_data=NULL,error_message='cancelled by the operator',updated_at=datetime('now') WHERE id=?`).bind(capture.id),
+      c.env.DB.prepare(`UPDATE device_operations SET status='failed',error_message='cancelled by the operator',updated_at=datetime('now') WHERE capture_id=? AND status IN ('pending','sent')`).bind(capture.id),
+    ]);
+  }
+  await audit(c, 'capture_cancel', 'fingerprint_capture', capture.id, {});
+  return c.json({ ok: true, status: capture.status === 'pending' ? 'cancelled' : capture.status });
+});
+
+/** Re-sends a stored fingerprint to the terminals, or says it must be re-read. */
+app.post('/api/access/fingerprints/:id/sync', requireRoles('admin','manager'), async (c) => {
+  const body = await c.req.json<{ deviceIds?: string[] | null }>().catch(() => ({} as { deviceIds?: string[] | null }));
+  const record = await c.env.DB.prepare(
+    `SELECT f.id,f.finger_no,f.finger_label,f.employee_no,f.status,f.resident_id,f.household_member_id,COALESCE(f.finger_label,'Finger ' || f.finger_no) AS label,u.name AS resident_name
+       FROM fingerprint_credentials f JOIN users u ON u.id=f.resident_id WHERE f.id=?`,
+  ).bind(c.req.param('id')).first<{
+    id: string; finger_no: number; finger_label: string | null; employee_no: string | null; status: string;
+    resident_id: string; household_member_id: string | null; label: string; resident_name: string;
+  }>();
+  if (!record) return jsonError(c, 404, 'Fingerprint credential not found');
+  const kind: PersonKind = record.household_member_id ? 'dependant' : 'account';
+  const person = await syncPersonRef(c.env, kind, record.household_member_id ?? record.resident_id);
+  if (!person) return jsonError(c, 404, 'Person not found');
+
+  const deviceIds = Array.isArray(body.deviceIds) && body.deviceIds.length ? body.deviceIds.map(String) : null;
+  const devices = await syncDevices(c.env, deviceIds);
+  const held = await heldTemplateFor(c.env, person, record.finger_no);
+  let queued = 0;
+  let manual = 0;
+  let skipped = 0;
+  for (const device of devices) {
+    const outcome = await fingerprintUploadOperation(c.env, person, device, {
+      id: record.id, finger_no: record.finger_no, finger_label: record.finger_label,
+      employee_no: record.employee_no, status: record.status,
+    }, 're-sent from the portal');
+    if (outcome === 'queued') queued += 1;
+    else if (outcome === 'manual') manual += 1;
+    else skipped += 1;
+  }
+  await audit(c, 'sync', 'fingerprint_credential', record.id, { queued, manual, skipped, templateHeld: Boolean(held) });
+  return c.json({
+    ok: true,
+    templateHeld: Boolean(held),
+    queued,
+    manual,
+    skipped,
+    notice: held
+      ? `The stored template for ${record.label} is being sent to ${queued} terminal(s); ${manual ? `${manual} terminal(s) need an operator because no agent there can write fingerprints.` : 'every terminal with an agent takes it directly.'}`
+      : `No template is held for ${record.label} any more — templates only live on the terminals. Enrol the finger again at a terminal (Capture at a terminal), and EstateMate will send the new template to the others.`,
+  });
+});
+
+/**
+ * "Remove from device" for one finger: deletes that slot on the chosen terminal
+ * (or every terminal) without touching the credential's history.
+ */
+app.post('/api/access/fingerprints/:id/remove-from-device', requireRoles('admin','manager'), async (c) => {
+  const body = await c.req.json<{ deviceId?: string; allDevices?: boolean; reason?: string }>().catch(() => ({} as { deviceId?: string; allDevices?: boolean; reason?: string }));
+  const record = await c.env.DB.prepare(
+    `SELECT f.id,f.finger_no,f.finger_label,f.employee_no,f.status,f.resident_id,f.household_member_id,u.name AS resident_name
+       FROM fingerprint_credentials f JOIN users u ON u.id=f.resident_id WHERE f.id=?`,
+  ).bind(c.req.param('id')).first<{ id: string; finger_no: number; finger_label: string | null; employee_no: string | null; status: string; resident_id: string; household_member_id: string | null; resident_name: string }>();
+  if (!record) return jsonError(c, 404, 'Fingerprint credential not found');
+  if (!body.deviceId && !body.allDevices) return jsonError(c, 400, 'Give deviceId, or allDevices: true to remove it from every terminal');
+  const deviceIds = body.allDevices ? null : [String(body.deviceId)];
+  const devices = await syncDevices(c.env, deviceIds);
+  if (!devices.length) return jsonError(c, 404, 'No matching terminal');
+
+  const open = await c.env.DB.prepare(
+    `SELECT device_id FROM device_operations WHERE fingerprint_id=? AND operation='delete_fingerprint_device' AND status IN ('pending','sent','manual_action_required')`,
+  ).bind(record.id).all<{ device_id: string }>();
+  const alreadyOpen = new Set(open.results.map((row) => row.device_id));
+
+  let queued = 0;
+  let manual = 0;
+  let skipped = 0;
+  const statements: D1PreparedStatement[] = [];
+  for (const device of devices) {
+    if (alreadyOpen.has(device.id)) { skipped += 1; continue; }
+    const agentReady = device.hasAgent && device.agentCapabilities.includes('fingerprint');
+    const payload = JSON.stringify({
+      fingerprintId: record.id,
+      fingerNo: record.finger_no,
+      employeeNo: record.employee_no,
+      personName: record.resident_name,
+      module: 1,
+      reason: body.reason?.trim() || 'removed from the terminal by an administrator',
+    });
+    statements.push(c.env.DB.prepare(
+      `INSERT INTO device_operations(id,device_id,fingerprint_id,operation,payload_json,status,manual_instruction)
+       VALUES (?,?,?,?,?,?,?)`,
+    ).bind(
+      crypto.randomUUID(), device.id, record.id, 'delete_fingerprint_device', payload,
+      agentReady ? 'pending' : 'manual_action_required',
+      agentReady ? null : `Delete finger ${record.finger_no}${record.employee_no ? ` (employee number ${record.employee_no})` : ''} for ${record.resident_name} from ${device.name}, then mark this action applied.`,
+    ));
+    if (agentReady) queued += 1; else manual += 1;
+  }
+  if (statements.length) await c.env.DB.batch(statements);
+  await audit(c, 'remove_from_devices', 'fingerprint_credential', record.id, { deviceIds, queued, manual, skipped });
+  return c.json({ ok: true, queued, manual, skipped, notice: `Finger ${record.finger_no} is being removed from ${queued + manual} terminal(s): ${queued} by the agent, ${manual} waiting for an operator${skipped ? `, ${skipped} already queued` : ''}.` });
+});
+
 app.post('/api/access/cards', requireRoles('admin','manager'), async (c) => {
   const body = await c.req.json<{ residentId?: string; householdMemberId?: string; cardUid?: string; cardLabel?: string }>();
-  if ((!body.residentId && !body.householdMemberId) || !body.cardUid?.trim()) return jsonError(c, 400, 'residentId or householdMemberId, and cardUid are required');
+  if (!body.residentId && !body.householdMemberId) return jsonError(c,400,'residentId or householdMemberId is required');
+  const cardNumberError=cardNumberValidationError(body.cardUid);
+  if (cardNumberError) return jsonError(c,400,cardNumberError);
+  const cardUid=body.cardUid as string;
   let residentId = body.residentId;
   let householdMemberId: string|null = null;
   let label = body.cardLabel?.trim() ?? null;
@@ -4239,15 +4640,20 @@ app.post('/api/access/cards', requireRoles('admin','manager'), async (c) => {
     if (!resident) return jsonError(c,404,'Active resident not found');
   }
   const id = crypto.randomUUID();
-  await c.env.DB.prepare(`INSERT INTO access_cards(id,resident_id,household_member_id,card_uid,card_label) VALUES (?,?,?,?,?)`).bind(id,residentId,householdMemberId,body.cardUid.trim(),label).run();
+  await c.env.DB.prepare(`INSERT INTO access_cards(id,resident_id,household_member_id,card_uid,card_label) VALUES (?,?,?,?,?)`).bind(id,residentId,householdMemberId,cardUid,label).run();
   // Send the card to the terminal together with the person's Employee ID, so the
   // device stores one identity for the human and both their card and their
   // fingerprint resolve to it. Without this the terminal invents its own number
   // and a cardless swipe cannot be attributed back to the person.
   const cardEmployeeNo=await ensurePersonEmployeeId(c.env.DB,householdMemberId?'dependant':'account',householdMemberId ?? String(residentId));
-  await createDeviceOperations(c.env,id,'upsert_card',{ cardUid:body.cardUid.trim(),residentId,householdMemberId,employeeNo:cardEmployeeNo,enabled:true });
-  await audit(c, 'issue', 'access_card', id, { ...body, residentId, householdMemberId, employeeNo: cardEmployeeNo });
-  return c.json({ id, employeeNo: cardEmployeeNo, hardwareSync: 'manual_action_required' }, 201);
+  // The person record goes first: a terminal stores a card against an employee
+  // number, and a card whose person has no door rights on that terminal is
+  // written but cannot open anything. The agent feed orders upsert_person before
+  // the credential operations queued in the same second.
+  const personSync = await autoSyncPerson(c.env, householdMemberId ? 'dependant' : 'account', householdMemberId ?? String(residentId), 'card issued', { includeCredentials: true });
+  await createDeviceOperations(c.env,id,'upsert_card',{ cardUid,residentId,householdMemberId,employeeNo:cardEmployeeNo,enabled:true });
+  await audit(c, 'issue', 'access_card', id, { ...body, cardUid, residentId, householdMemberId, employeeNo: cardEmployeeNo, personSync: personSync.queued + personSync.manual });
+  return c.json({ id, employeeNo: cardEmployeeNo, personSync: describeSync(personSync), hardwareSync: personSync.manual ? 'manual_action_required' : 'queued' }, 201);
 });
 
 app.patch('/api/access/cards/:id', requireRoles('admin','manager'), async (c) => {
@@ -4255,6 +4661,9 @@ app.patch('/api/access/cards/:id', requireRoles('admin','manager'), async (c) =>
   if (!body.status || !['active','expired','suspended','revoked'].includes(body.status)) return jsonError(c, 400, 'Invalid status');
   const card = await c.env.DB.prepare(`SELECT id,card_uid,status,resident_id FROM access_cards WHERE id=?`).bind(c.req.param('id')).first<Record<string,string>>();
   if (!card) return jsonError(c, 404, 'Card not found');
+  if (body.status==='active' && !isDigitsOnlyCardNumber(card.card_uid)) {
+    return jsonError(c,409,'This legacy card number contains non-digits and cannot be re-enabled. Issue a new card with a digits-only number.');
+  }
   await c.env.DB.batch([
     c.env.DB.prepare(`UPDATE access_cards SET status=?,deactivated_at=CASE WHEN ?='active' THEN NULL ELSE datetime('now') END,deactivated_reason=?,auto_expired=0,updated_at=datetime('now') WHERE id=?`).bind(body.status, body.status, body.reason ?? null, card.id),
     c.env.DB.prepare(`INSERT INTO card_status_changes(id,card_id,old_status,new_status,reason,changed_by) VALUES (?,?,?,?,?,?)`).bind(crypto.randomUUID(), card.id, card.status, body.status, body.reason ?? 'manual admin action', c.get('user').id),
@@ -4329,6 +4738,7 @@ app.get('/api/access/devices', requireRoles('admin','manager','security'), async
     `SELECT d.id,d.name,d.vendor,d.serial_number,d.model,d.firmware,d.mac_address,d.gate_name,d.direction,d.integration_mode,${deviceEffectiveStatus('d')} AS status,d.last_seen_at,d.profile_key,d.connection_pattern,d.profile_config_json,d.capabilities_json,
       d.isapi_agent_id,d.isapi_sync_enabled,d.last_isapi_sync_at,d.last_isapi_sync_status,d.isapi_host,d.isapi_port,d.isapi_username,
       CASE WHEN d.isapi_password_ciphertext IS NULL THEN 0 ELSE 1 END AS isapi_password_configured,d.isapi_protocol,
+      d.remote_verify_enabled,d.remote_verify_door_no,d.remote_verify_cooldown_ms,d.remote_verify_state,d.device_clock,
       d.created_at,d.updated_at,d.status AS stored_status,
       ap.id AS access_point_id,ap.name AS access_point_name,
       (SELECT COUNT(*) FROM device_operations o WHERE o.device_id=d.id AND o.status='manual_action_required') AS pending_operations,
@@ -4402,6 +4812,51 @@ app.patch('/api/access/devices/:id', requireRoles('admin','manager'), async (c) 
   ]);
   await audit(c,'update','access_device',c.req.param('id'),{ ...body,profileKey:profile.key,connectionPattern });
   return c.json({ ok:true,profile:{ key:profile.key,label:profile.label } });
+});
+
+/**
+ * Remote Network Verification, per terminal.
+ *
+ * Administrator-only on purpose, and deliberately not part of the general device
+ * edit route: this switch changes what happens when a human stands at a gate.
+ * A Manager gets operational administration, not a new way to make a door open.
+ *
+ * Switching it on does not by itself do anything - the host running the bridge
+ * also has to opt in - and the response says so, because "I turned it on and
+ * nothing happened" is otherwise the first thing anyone will report.
+ */
+app.patch('/api/access/devices/:id/remote-verify', requireRoles('admin'), async (c) => {
+  const body = await c.req.json<{ enabled?: unknown; doorNo?: unknown; cooldownMs?: unknown }>();
+  const existing = await c.env.DB.prepare(
+    `SELECT id,name,model,isapi_agent_id,remote_verify_enabled,remote_verify_door_no,remote_verify_cooldown_ms
+       FROM hikvision_devices WHERE id=? AND deleted_at IS NULL`,
+  ).bind(c.req.param('id')).first<{ id:string; name:string; model:string|null; isapi_agent_id:string|null; remote_verify_enabled:number; remote_verify_door_no:number; remote_verify_cooldown_ms:number }>();
+  if (!existing) return jsonError(c, 404, 'Access-control device not found');
+
+  const enabled = body.enabled === undefined ? Boolean(existing.remote_verify_enabled) : Boolean(body.enabled);
+  const rawDoorNo = body.doorNo === undefined ? Number(existing.remote_verify_door_no) : Number(body.doorNo);
+  const rawCooldown = body.cooldownMs === undefined ? Number(existing.remote_verify_cooldown_ms) : Number(body.cooldownMs);
+  if (!Number.isInteger(rawDoorNo) || rawDoorNo < 1 || rawDoorNo > 8) return jsonError(c, 400, 'doorNo must be an integer between 1 and 8');
+  if (!Number.isFinite(rawCooldown) || rawCooldown < 0 || rawCooldown > 60000) return jsonError(c, 400, 'cooldownMs must be between 0 and 60000');
+
+  await c.env.DB.prepare(
+    `UPDATE hikvision_devices SET remote_verify_enabled=?,remote_verify_door_no=?,remote_verify_cooldown_ms=?,updated_at=datetime('now') WHERE id=?`,
+  ).bind(enabled ? 1 : 0, rawDoorNo, Math.round(rawCooldown), existing.id).run();
+  await audit(c, 'update', 'access_device_remote_verify', existing.id, { enabled, doorNo: rawDoorNo, cooldownMs: Math.round(rawCooldown) });
+
+  const warnings: string[] = [];
+  if (enabled && !existing.isapi_agent_id) {
+    warnings.push('No agent is linked to this terminal yet, so nothing is serving it. Link one in "Device agent" and set "remoteVerify": {"enabled": true} in the bridge host\'s agent-config.json.');
+  }
+  if (enabled) {
+    warnings.push('The terminal must be configured as a reader (it reports the credential instead of deciding), and it must be set to upload unknown-card events, or a card it does not hold produces no event at all.');
+    warnings.push('The unlock command is best-effort: no device profile in this repository records a verified RemoteControl/door response, so a refusal is reported in Gate activity rather than assumed away. Prove this model at one gate before relying on it.');
+  }
+  return c.json({
+    ok: true,
+    remoteVerify: { enabled, doorNo: rawDoorNo, cooldownMs: Math.round(rawCooldown) },
+    warnings,
+  });
 });
 
 app.delete('/api/access/devices/:id', requireRoles('admin','manager'), async (c) => {
@@ -4769,7 +5224,7 @@ app.get('/api/access/operations', requireRoles('admin','manager'), async (c) => 
        WHERE o.status IN ('pending','manual_action_required','failed')
      ) ORDER BY created_at LIMIT ? OFFSET ?`,
   ).bind(limit, offset).all();
-  return c.json({ items: result.results, page: pageNumber, limit, note: 'Card, visitor and door commands are applied by a linked agent. Fingerprint enrollment always happens on the terminal and is confirmed here. Door commands are never sent through a public tunnel.' });
+  return c.json({ items: result.results, page: pageNumber, limit, note: 'Card, visitor, person and door commands are applied by a linked agent. Fingerprint work is applied by the agent when the bridge on that terminal is new enough to advertise the capability, and is confirmed here either way; a finger that has never been read by a terminal still has to be read by one. Door commands are never sent through a public tunnel.' });
 });
 
 app.patch('/api/access/operations/:id', requireRoles('admin','manager'), async (c) => {
@@ -5376,6 +5831,313 @@ async function createFingerprintOperations(
   return statements.length;
 }
 
+// ─────────────────────────────────────────────────────────────
+// Keeping every terminal's copy of a person in step with the portal
+//
+// src/device-sync.ts holds the queueing rules; this section is the connection
+// between them and the portal's own records — the employee number the terminal
+// keys a person by, the auto-sync hooks, and the fingerprint capture flow.
+// ─────────────────────────────────────────────────────────────
+
+/** What src/device-sync.ts expects a person to look like. */
+type SyncPersonRef = Parameters<typeof syncPersonToDevices>[1];
+
+/** How long a terminal is given to produce a fingerprint template. */
+const FINGERPRINT_CAPTURE_TTL_SECONDS = 3 * 60;
+/** How long a captured template is held before it is dropped untouched. */
+const FINGERPRINT_TEMPLATE_TTL_SECONDS = 24 * 60 * 60;
+
+/**
+ * A person's terminal identity, issuing one when they have none.
+ *
+ * Returns null for a dependant who is not active, because "active" is what a
+ * household membership means and a pending member must not be given gate access
+ * on any terminal.
+ */
+async function syncPersonRef(env: Env, kind: PersonKind, id: string): Promise<SyncPersonRef | null> {
+  if (kind === 'account') {
+    const row = await env.DB.prepare(`SELECT id,name,employee_id,status FROM users WHERE id=?`)
+      .bind(id).first<{ id: string; name: string; employee_id: string | null; status: string }>();
+    if (!row) return null;
+    return { kind, id: row.id, name: row.name, employeeNo: row.employee_id, status: row.status };
+  }
+  const row = await env.DB.prepare(`SELECT id,name,employee_id,status FROM household_members WHERE id=?`)
+    .bind(id).first<{ id: string; name: string; employee_id: string | null; status: string }>();
+  if (!row) return null;
+  return { kind, id: row.id, name: row.name, employeeNo: row.employee_id, status: row.status };
+}
+
+/** The employee number a terminal will store for this person, issued on demand. */
+async function ensureSyncEmployeeNo(env: Env, person: SyncPersonRef): Promise<string | null> {
+  if (person.employeeNo) return person.employeeNo;
+  const issued = await ensurePersonEmployeeId(env.DB, person.kind, person.id);
+  if (!issued) return null;
+  person.employeeNo = issued;
+  return issued;
+}
+
+/**
+ * Pushes a person to every terminal.
+ *
+ * `includeCredentials` also re-sends their cards and re-sends any held
+ * fingerprint template, which is what "sync" means to an operator. It is used
+ * when a credential is issued or changed; a plain profile edit only re-states the
+ * person record.
+ */
+async function syncPersonEverywhere(
+  env: Env,
+  kind: PersonKind,
+  id: string,
+  reason: string,
+  options: { deviceIds?: string[] | null; includeCredentials?: boolean; requireActive?: boolean } = {},
+): Promise<SyncResult & { person: string | null }> {
+  const person = await syncPersonRef(env, kind, id);
+  if (!person) return { devices: 0, queued: 0, manual: 0, skipped: 0, removed: 0, unresolved: [], person: null };
+  if (options.requireActive !== false && person.status !== 'active') {
+    return { devices: 0, queued: 0, manual: 0, skipped: 0, removed: 0, unresolved: [person.id], person: person.name };
+  }
+  if (!(await ensureSyncEmployeeNo(env, person))) {
+    return { devices: 0, queued: 0, manual: 0, skipped: 0, removed: 0, unresolved: [person.id], person: person.name };
+  }
+  const result = await syncPersonToDevices(env, person, {
+    reason,
+    deviceIds: options.deviceIds ?? null,
+    includeCredentials: options.includeCredentials === true,
+  });
+  return { ...result, person: person.name };
+}
+
+/**
+ * The automatic half: called after a person or one of their credentials changes.
+ *
+ * Only a person who already exists on a terminal, or who holds a credential, is
+ * pushed. That is the difference between "keep the access controls in step" and
+ * "queue an operation for every account the estate ever created" — editing an
+ * unrelated admin account must not touch a terminal.
+ */
+async function autoSyncPerson(
+  env: Env,
+  kind: PersonKind,
+  id: string,
+  reason: string,
+  options: { deviceIds?: string[] | null; includeCredentials?: boolean } = {},
+): Promise<SyncResult & { person: string | null }> {
+  const person = await syncPersonRef(env, kind, id);
+  if (!person || person.status !== 'active') {
+    return { devices: 0, queued: 0, manual: 0, skipped: 0, removed: 0, unresolved: [], person: person?.name ?? null };
+  }
+  const tracked = await env.DB.prepare(
+    `SELECT COUNT(*) AS count FROM device_person_state WHERE person_kind=? AND person_id=?`,
+  ).bind(kind, id).first<{ count: number }>();
+  if (!Number(tracked?.count ?? 0)) {
+    const credentials = await credentialsForPerson(env, person);
+    if (!credentials.cards.length && !credentials.fingerprints.length) {
+      return { devices: 0, queued: 0, manual: 0, skipped: 0, removed: 0, unresolved: [], person: person.name };
+    }
+  }
+  return syncPersonEverywhere(env, kind, id, reason, { ...options, requireActive: true });
+}
+
+/** A one-line human summary of a sync, for the portal's activity messages. */
+function describeSync(result: SyncResult): string {
+  const parts: string[] = [];
+  if (result.queued) parts.push(`${result.queued} command(s) sent to the agent`);
+  if (result.manual) parts.push(`${result.manual} task(s) for an operator on the terminal`);
+  if (result.removed) parts.push(`removed from ${result.removed} terminal(s)`);
+  if (result.skipped) parts.push(`${result.skipped} already queued`);
+  return parts.length ? parts.join(', ') : 'nothing to do';
+}
+
+interface FingerprintCaptureRow {
+  id: string;
+  device_id: string;
+  resident_id: string;
+  household_member_id: string | null;
+  employee_no: string | null;
+  person_name: string;
+  finger_no: number;
+  finger_label: string | null;
+  status: 'pending' | 'captured' | 'failed' | 'cancelled' | 'expired';
+  error_message: string | null;
+  template_data: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+  expires_at: string;
+}
+
+/**
+ * Starts a capture: the operator picks the person, the finger and the terminal
+ * they are standing at, and the terminal's own reader does the rest.
+ *
+ * A capture is only queued for an agent that advertises the fingerprint
+ * capability. Anything else would leave a window saying "touch the reader" on a
+ * terminal nobody is listening to.
+ */
+async function startFingerprintCapture(
+  env: Env,
+  input: { person: SyncPersonRef; fingerNo: number; fingerLabel: string | null; deviceId: string; createdBy: string },
+): Promise<{ ok: true; capture: FingerprintCaptureRow; instruction: string } | { ok: false; error: string; status: 400 | 404 | 409 }> {
+  const device = await env.DB.prepare(
+    `SELECT d.id,d.name,d.gate_name,
+       (SELECT a.capabilities FROM isapi_device_configs cfg JOIN isapi_agents a ON a.id=cfg.agent_id
+         WHERE cfg.device_id=d.id AND cfg.sync_enabled=1 AND a.deleted_at IS NULL LIMIT 1) AS capabilities,
+       (SELECT COUNT(*) FROM isapi_device_configs cfg WHERE cfg.device_id=d.id AND cfg.sync_enabled=1 AND cfg.agent_id IS NOT NULL) AS agents
+     FROM hikvision_devices d WHERE d.id=? AND d.deleted_at IS NULL AND d.status!='disabled'`,
+  ).bind(input.deviceId).first<{ id: string; name: string; gate_name: string; capabilities: string | null; agents: number }>();
+  if (!device) return { ok: false, error: 'Active access-control device not found', status: 404 };
+  const capabilities: string[] = device.capabilities ? (JSON.parse(device.capabilities) as string[]) : [];
+  if (!Number(device.agents) || !capabilities.includes('fingerprint')) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'That terminal has no agent that can capture fingerprints. Enrol the finger on the terminal itself and record the slot here, or update the bridge on the PC linked to it.',
+    };
+  }
+  const employeeNo = await ensureSyncEmployeeNo(env, input.person);
+  if (!employeeNo) return { ok: false, error: 'This person has no terminal employee number yet', status: 409 };
+
+  const duplicate = await env.DB.prepare(
+    `SELECT id FROM fingerprint_credentials WHERE resident_id=? AND COALESCE(household_member_id,'')=? AND finger_no=? AND status IN ('active','suspended')`,
+  ).bind(input.person.kind === 'account' ? input.person.id : await primaryResidentFor(env, input.person), input.person.kind === 'dependant' ? input.person.id : '', input.fingerNo).first();
+  if (duplicate) return { ok: false, status: 409, error: `Finger ${input.fingerNo} is already registered for ${input.person.name}` };
+
+  const id = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + FINGERPRINT_CAPTURE_TTL_SECONDS * 1000).toISOString().replace('T', ' ').slice(0, 19);
+  const residentId = input.person.kind === 'account' ? input.person.id : await primaryResidentFor(env, input.person);
+  await env.DB.prepare(
+    `INSERT INTO fingerprint_captures(id,device_id,resident_id,household_member_id,employee_no,person_name,finger_no,finger_label,status,created_by,expires_at)
+     VALUES (?,?,?,?,?,?,?,?,'pending',?,?)`,
+  ).bind(
+    id, device.id, residentId,
+    input.person.kind === 'dependant' ? input.person.id : null,
+    employeeNo, input.person.name, input.fingerNo, input.fingerLabel, input.createdBy, expiresAt,
+  ).run();
+  await env.DB.prepare(
+    `INSERT INTO device_operations(id,device_id,user_id,household_member_id,capture_id,operation,payload_json,status,manual_instruction)
+     VALUES (?,?,?,?,?,'capture_fingerprint',?,'pending',?)`,
+  ).bind(
+    crypto.randomUUID(), device.id,
+    input.person.kind === 'account' ? input.person.id : null,
+    input.person.kind === 'dependant' ? input.person.id : null,
+    id,
+    JSON.stringify({ captureId: id, fingerNo: input.fingerNo, fingerLabel: input.fingerLabel, employeeNo, personName: input.person.name, deviceName: device.name, expiresAt }),
+    `Ask ${input.person.name} to place finger ${input.fingerNo} on the reader of ${device.name}. The bridge collects the template and sends it to the other terminals; nothing has to be typed.`,
+  ).run();
+  const capture = await env.DB.prepare(`SELECT * FROM fingerprint_captures WHERE id=?`).bind(id).first<FingerprintCaptureRow>();
+  const instruction = `Ask ${input.person.name} to touch the reader on ${device.name} now — finger slot ${input.fingerNo}${input.fingerLabel ? ` (${input.fingerLabel})` : ''}, employee number ${employeeNo}.`;
+  await syncPersonToDevices(env, input.person, { reason: 'fingerprint capture', deviceIds: [device.id] });
+  return { ok: true, capture: capture!, instruction };
+}
+
+/** The resident a dependant's credentials hang off (household_members.primary_resident_id). */
+/**
+ * Recomputes what a terminal holds for one person.
+ *
+ * The state is not a note about the last command; it is the answer to "is there
+ * anything still waiting to be written, and did the last attempt succeed?". That
+ * is what makes the portal's grid truthful for every kind of work — a person
+ * record, a card, a fingerprint upload or a removal — without a separate rule per
+ * operation type.
+ */
+async function refreshDevicePersonState(env: Env, person: SyncPersonRef, deviceId: string): Promise<void> {
+  const personColumn = person.kind === 'account' ? 'user_id' : 'household_member_id';
+  const counts = await env.DB.prepare(
+    `SELECT
+       SUM(CASE WHEN status IN ('pending','sent','manual_action_required') THEN 1 ELSE 0 END) AS outstanding,
+       SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+       MAX(isapi_synced_at) AS last_synced
+     FROM device_operations WHERE device_id=? AND ${personColumn}=?`,
+  ).bind(deviceId, person.id).first<{ outstanding: number | null; failed: number | null; last_synced: string | null }>();
+  const outstanding = Number(counts?.outstanding ?? 0);
+  const failed = Number(counts?.failed ?? 0);
+  // Anything still waiting means the terminal does not have the person yet. A
+  // failure with nothing left to try is what "missing" means to an operator: act
+  // on it on the terminal itself.
+  const state: 'synced' | 'pending' | 'missing' = outstanding > 0 ? 'pending' : failed > 0 ? 'missing' : 'synced';
+  const credentials = await credentialsForPerson(env, person);
+  await setDevicePersonState(env, person, deviceId, state, {
+    fingerprintCount: credentials.fingerprints.length,
+    cardCount: credentials.cards.filter((card) => card.status === 'active').length,
+  });
+}
+
+async function primaryResidentFor(env: Env, person: SyncPersonRef): Promise<string> {
+  const row = await env.DB.prepare(`SELECT primary_resident_id FROM household_members WHERE id=?`)
+    .bind(person.id).first<{ primary_resident_id: string }>();
+  return row?.primary_resident_id ?? person.id;
+}
+
+/**
+ * Records a template the agent captured and sends it to every other terminal.
+ *
+ * This is the whole point of the feature: one finger on one reader, and every
+ * terminal this person should be on receives the same template — no second trip
+ * to each gate, and no template kept anywhere but the terminals (and briefly,
+ * encrypted at rest, in `fingerprint_captures`).
+ */
+async function applyCapturedTemplate(
+  env: Env,
+  capture: FingerprintCaptureRow,
+  templateData: string,
+): Promise<{ fingerprintId: string; queued: number; manual: number; devices: number }> {
+  const person: SyncPersonRef = {
+    kind: capture.household_member_id ? 'dependant' : 'account',
+    id: capture.household_member_id ?? capture.resident_id,
+    name: capture.person_name,
+    employeeNo: capture.employee_no,
+    status: 'active',
+  };
+  const existing = await env.DB.prepare(
+    `SELECT id FROM fingerprint_credentials WHERE resident_id=? AND COALESCE(household_member_id,'')=? AND finger_no=? AND status IN ('active','suspended')`,
+  ).bind(capture.resident_id, capture.household_member_id ?? '', capture.finger_no).first<{ id: string }>();
+
+  let fingerprintId = existing?.id ?? null;
+  if (fingerprintId) {
+    await env.DB.prepare(
+      `UPDATE fingerprint_credentials SET employee_no=?,finger_label=COALESCE(?,finger_label),enrolled_device_id=?,status='active',deactivated_at=NULL,deactivated_reason=NULL,updated_at=datetime('now') WHERE id=?`,
+    ).bind(capture.employee_no, capture.finger_label, capture.device_id, fingerprintId).run();
+  } else {
+    fingerprintId = crypto.randomUUID();
+    await env.DB.prepare(
+      `INSERT INTO fingerprint_credentials(id,resident_id,household_member_id,employee_no,finger_no,finger_label,enrolled_device_id,status,created_by)
+       VALUES (?,?,?,?,?,?,?,'active',?)`,
+    ).bind(fingerprintId, capture.resident_id, capture.household_member_id, capture.employee_no, capture.finger_no, capture.finger_label, capture.device_id, capture.created_by).run();
+    await env.DB.prepare(
+      `INSERT INTO fingerprint_status_changes(id,fingerprint_id,old_status,new_status,reason,changed_by) VALUES (?,?,'active','active',?,?)`,
+    ).bind(crypto.randomUUID(), fingerprintId, `template captured at ${capture.device_id}`, capture.created_by).run();
+  }
+
+  // Only the template each terminal needs is handed out, and only to terminals
+  // with an agent that can write fingerprints.
+  const devices = await syncDevices(env, null);
+  const finger = { id: fingerprintId, finger_no: capture.finger_no, finger_label: capture.finger_label, employee_no: capture.employee_no, status: 'active' };
+  let queued = 0;
+  let manual = 0;
+  for (const device of devices) {
+    if (!device.hasAgent || !device.agentCapabilities.includes('fingerprint')) continue;
+    const outcome = await fingerprintUploadOperation(env, { ...person, employeeNo: capture.employee_no }, device, finger, 'captured at another terminal');
+    if (outcome === 'queued') queued += 1;
+    else if (outcome === 'manual') manual += 1;
+  }
+  return { fingerprintId, queued, manual, devices: devices.length };
+}
+
+/** Drops templates nobody is waiting for any more. Runs hourly. */
+async function expireFingerprintTemplates(env: Env): Promise<{ captures: number; purged: number }> {
+  const captures = await env.DB.prepare(
+    `UPDATE fingerprint_captures SET status='failed',error_message='nobody touched the reader in time',updated_at=datetime('now')
+      WHERE status='pending' AND expires_at <= datetime('now')`,
+  ).run();
+  const purged = await env.DB.prepare(
+    `UPDATE fingerprint_captures
+        SET status='expired',template_data=NULL,updated_at=datetime('now')
+      WHERE status='captured' AND template_data IS NOT NULL
+        AND (expires_at <= datetime('now') OR updated_at <= datetime('now','-${FINGERPRINT_TEMPLATE_TTL_SECONDS} seconds'))`,
+  ).run();
+  return { captures: Number(captures.meta.changes ?? 0), purged: Number(purged.meta.changes ?? 0) };
+}
+
 function isRemoteDoorOperation(value: string): value is RemoteDoorOperation {
   return Object.prototype.hasOwnProperty.call(REMOTE_DOOR_COMMANDS, value);
 }
@@ -5399,9 +6161,9 @@ interface VisitorOperationRow {
 }
 
 /**
- * Queue a visitor credential for one device, or for every enabled access-control
- * device when targetDeviceId is null. Existing operations are reused so the
- * scheduled reconciliation and the manual sync endpoint are idempotent.
+ * Queue a visitor terminal account for one device, or for every enabled
+ * access-control device when targetDeviceId is null. Existing operations are
+ * reused so scheduled reconciliation and the manual sync endpoint are idempotent.
  */
 async function queueVisitorDeviceOperations(
   db: D1Database,
@@ -5423,7 +6185,12 @@ async function queueVisitorDeviceOperations(
   let queued = 0;
 
   for (const device of devices.results) {
-    const status = isPendingPattern(device.connection_pattern) ? 'pending' : 'manual_action_required';
+    // Same delivery rule as the revocation path: `pending` only when a live
+    // agent is actually linked to the terminal. A device whose connection
+    // pattern is agent-capable but that has no linked config would otherwise
+    // hold this upsert as `pending` forever — a command nothing will ever
+    // pick up — while the pass still records itself as provisioned.
+    const status = await visitorOperationDelivery(db, device);
     const current = byDevice.get(device.id);
     if (!current) {
       statements.push(db.prepare(
@@ -5463,7 +6230,7 @@ async function queueVisitorDeviceOperations(
  */
 async function syncActiveVisitorPasses(db: D1Database): Promise<{ passes: number; devices: number; queued: number }> {
   const passes = await db.prepare(
-    `SELECT id,credential_number,visitor_name,valid_from,valid_until,requires_security_approval,gate_scope,device_id
+    `SELECT id,credential_number,visitor_name,pin,valid_from,valid_until,requires_security_approval,gate_scope,device_id
      FROM visitor_requests
      WHERE status IN ('active','checked_in') AND datetime(valid_until)>datetime('now')
      ORDER BY created_at LIMIT 500`,
@@ -5471,6 +6238,7 @@ async function syncActiveVisitorPasses(db: D1Database): Promise<{ passes: number
     id: string;
     credential_number: string | null;
     visitor_name: string;
+    pin: string;
     valid_from: string;
     valid_until: string;
     requires_security_approval: number;
@@ -5485,10 +6253,12 @@ async function syncActiveVisitorPasses(db: D1Database): Promise<{ passes: number
     if (!pass.credential_number) continue;
     queued += await queueVisitorDeviceOperations(db, pass.id, pass.gate_scope === 'gate' ? pass.device_id : null, {
       credentialNumber: pass.credential_number,
-      // The number the terminal will know this visitor by. Composed centrally so
-      // it can never exceed the 32 characters ISAPI allows.
+      // The number the terminal will know this visitor by. Composed centrally
+      // so it stays within EstateMate's 30-character Employee ID limit.
       employeeNo: deviceEmployeeNo('visitor', pass.credential_number),
       visitorName: pass.visitor_name,
+      department: 'Company',
+      pin: pass.pin,
       validFrom: pass.valid_from,
       validUntil: pass.valid_until,
       enabled: false,
@@ -5518,10 +6288,10 @@ interface VisitorPassForRemoval {
 }
 
 /**
- * Queue the removal of one visitor credential from every access-control device.
+ * Queue the removal of one visitor account from every access-control device.
  *
- * Terminals have a limited number of person/card slots, so a visitor pass may
- * only occupy one while it is valid. Removal is queued for *all* enabled devices
+ * Terminals have a limited number of person slots, so a visitor pass may only
+ * occupy one while it is valid. Removal is queued for *all* enabled devices
  * rather than only the ones the pass was sent to: an every-gate pass reached all
  * of them, and an operator may have linked another terminal since it was issued.
  * Existing revocations are reused, so the sweep is safe to run every minute and
@@ -5755,16 +6525,60 @@ async function markTerminalStreamUp(env: Env, agentId: string, deviceId: string)
   return true;
 }
 
+/**
+ * What the bridge's time-sync check reports about a terminal's clock, reduced
+ * to the fields the portal shows. It is stored as reported — a status surface,
+ * never read back as an input to a decision (the same rule as
+ * `remote_verify_state`) — so this validates shape only, and an entry that
+ * cannot be trusted to display is dropped rather than stored.
+ */
+function normalizeDeviceClock(value: unknown): {
+  terminalTime: string;
+  driftMs: number;
+  lastCheckedAt: string | null;
+  lastSyncAt: string | null;
+  syncs: number;
+  lastError: string | null;
+} | null {
+  if (!value || typeof value !== 'object') return null;
+  const item = value as Record<string, unknown>;
+  const asIso = (value: number): string => new Date(value).toISOString();
+  const terminalTimeMs = typeof item.terminalTime === 'string' && item.terminalTime.trim() ? Date.parse(item.terminalTime) : Number.NaN;
+  const driftMs = typeof item.driftMs === 'number' ? item.driftMs : Number.NaN;
+  if (Number.isNaN(terminalTimeMs) || Number.isNaN(driftMs) || !Number.isFinite(driftMs)) return null;
+  const optionalInstant = (value: unknown): string | null =>
+    typeof value === 'string' && value.trim() && !Number.isNaN(Date.parse(value)) ? asIso(Date.parse(value)) : null;
+  const syncs = typeof item.syncs === 'number' && Number.isInteger(item.syncs) && item.syncs >= 0 ? item.syncs : 0;
+  return {
+    terminalTime: asIso(terminalTimeMs),
+    driftMs: Math.round(driftMs),
+    lastCheckedAt: optionalInstant(item.lastCheckedAt),
+    lastSyncAt: optionalInstant(item.lastSyncAt),
+    syncs,
+    lastError: typeof item.lastError === 'string' && item.lastError.trim() ? item.lastError.trim().slice(0, 300) : null,
+  };
+}
+
 async function handleIsapiAgentHeartbeat(request: Request, env: Env, agentId: string): Promise<Response> {
   if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'POST' } });
   const agent = await authenticateIsapiAgent(request, env, agentId);
   if (!agent) return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Bearer realm="EstateMate ISAPI agent"' } });
-  let body: { version?: string; hostname?: string; ip?: string; stats?: unknown; devices?: unknown } = {};
+  let body: { version?: string; hostname?: string; ip?: string; stats?: unknown; devices?: unknown; capabilities?: unknown; remoteVerify?: unknown } = {};
   try { body = await request.json(); } catch { body = {}; }
   const ip = request.headers.get('CF-Connecting-IP') || body.ip || null;
+  // What this bridge can do, as it says so itself. Only capabilities we know are
+  // stored, and an agent that sends none keeps its previous record (every agent
+  // built before this change sends none, and must keep receiving card commands
+  // while its person and fingerprint work stays manual).
+  const advertised = Array.isArray(body.capabilities)
+    ? body.capabilities
+      .map((value) => String(value).trim().toLowerCase())
+      .filter((value, index, all) => (AGENT_CAPABILITIES as readonly string[]).includes(value) && all.indexOf(value) === index)
+    : [];
   await env.DB.prepare(
-    `UPDATE isapi_agents SET status='online',last_seen_at=datetime('now'),last_ip=?,hostname=COALESCE(?,hostname),version=COALESCE(?,version),updated_at=datetime('now') WHERE id=?`,
-  ).bind(ip, body.hostname?.trim() || null, body.version?.trim() || null, agentId).run();
+    `UPDATE isapi_agents SET status='online',last_seen_at=datetime('now'),last_ip=?,hostname=COALESCE(?,hostname),version=COALESCE(?,version),
+       capabilities=CASE WHEN ?=1 THEN ? ELSE capabilities END,updated_at=datetime('now') WHERE id=?`,
+  ).bind(ip, body.hostname?.trim() || null, body.version?.trim() || null, advertised.length ? 1 : 0, JSON.stringify(advertised), agentId).run();
 
   // Per-terminal presence. The agent reports one entry per EstateMate device id
   // whose alertStream it is (or is not) holding open: `stream: 'up'` promotes the
@@ -5775,21 +6589,59 @@ async function handleIsapiAgentHeartbeat(request: Request, env: Env, agentId: st
   const reported = Array.isArray(body.devices) ? body.devices as Array<Record<string, unknown>> : [];
   let terminalsOffline = 0;
   let terminalsOnline = 0;
+  let terminalClocks = 0;
   for (const entry of reported.slice(0, 100)) {
     const deviceId = typeof entry?.deviceId === 'string' ? entry.deviceId.trim() : '';
+    if (!deviceId) continue;
+    // Stream presence and clock state are independent: a terminal whose event
+    // stream is off or down still gets its clock reported, and a device that
+    // reports only a clock is not a presence update.
     const stream = typeof entry?.stream === 'string' ? entry.stream.trim().toLowerCase() : '';
-    if (!deviceId || (stream !== 'up' && stream !== 'down')) continue;
     if (stream === 'up') {
       if (await markTerminalStreamUp(env, agentId, deviceId)) terminalsOnline += 1;
-      continue;
+    } else if (stream === 'down') {
+      const reason = typeof entry?.lastError === 'string' && entry.lastError.trim()
+        ? `Event stream down: ${entry.lastError.trim()}`
+        : 'Event stream down: the agent cannot hold the terminal connection open';
+      if (await markTerminalStreamDown(env, agentId, deviceId, reason)) terminalsOffline += 1;
     }
-    const reason = typeof entry?.lastError === 'string' && entry.lastError.trim()
-      ? `Event stream down: ${entry.lastError.trim()}`
-      : 'Event stream down: the agent cannot hold the terminal connection open';
-    if (await markTerminalStreamDown(env, agentId, deviceId, reason)) terminalsOffline += 1;
+    // The bridge host's time-sync check, per terminal. Scoped to this agent's
+    // own terminals, like everything else the heartbeat writes: one estate's
+    // bridge must not report onto another's device row. A heartbeat without a
+    // clock entry leaves the stored value alone — a bridge built before time
+    // sync (or with it switched off) keeps the row exactly as it was.
+    const clock = normalizeDeviceClock(entry?.clock);
+    if (clock) {
+      const saved = await env.DB.prepare(
+        `UPDATE hikvision_devices SET device_clock=? WHERE id=? AND isapi_agent_id=?`,
+      ).bind(JSON.stringify(clock), deviceId, agentId).run();
+      if (Number(saved.meta.changes ?? 0) > 0) terminalClocks += 1;
+    }
+  }
+
+  // Remote verification: the bridge reports, per terminal, what it decided and
+  // whether the door answered, plus how fresh its credential snapshot is. None of
+  // that is derivable from the database, and all of it is what an operator needs
+  // before trusting a gate to this feature - so it is stored as reported and shown
+  // as-is, never read back as an input to a decision.
+  const remoteVerify = body.remoteVerify;
+  if (remoteVerify && typeof remoteVerify === 'object') {
+    const perDevice = (remoteVerify as { perDevice?: unknown }).perDevice;
+    if (perDevice && typeof perDevice === 'object') {
+      const cache = (remoteVerify as { cache?: unknown }).cache ?? null;
+      const statements = Object.entries(perDevice as Record<string, unknown>)
+        .slice(0, 100)
+        .filter(([deviceId]) => typeof deviceId === 'string' && deviceId.trim().length > 0)
+        .map(([deviceId, state]) => env.DB.prepare(
+          // Scoped to this agent's own terminals: one estate's bridge must not
+          // write status onto another's device row.
+          `UPDATE hikvision_devices SET remote_verify_state=? WHERE id=? AND isapi_agent_id=?`,
+        ).bind(JSON.stringify({ ...(state && typeof state === 'object' ? state : {}), cache }), deviceId, agentId));
+      if (statements.length) await env.DB.batch(statements);
+    }
   }
   return Response.json(
-    { ok: true, agentId, terminalsOffline, terminalsOnline, serverTime: new Date().toISOString() },
+    { ok: true, agentId, terminalsOffline, terminalsOnline, terminalClocks, serverTime: new Date().toISOString() },
     { headers: { 'Cache-Control': 'no-store' } },
   );
 }
@@ -5800,12 +6652,138 @@ async function handleIsapiAgentDevices(request: Request, env: Env, agentId: stri
   if (!agent) return new Response('Unauthorized', { status: 401 });
   const result = await env.DB.prepare(
     `SELECT cfg.device_id,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol,cfg.sync_enabled,
-       d.name AS device_name,d.model,d.gate_name,d.connection_pattern,d.status AS device_status
+       d.name AS device_name,d.model,d.gate_name,d.connection_pattern,d.status AS device_status,
+       d.remote_verify_enabled,d.remote_verify_door_no,d.remote_verify_cooldown_ms
      FROM isapi_device_configs cfg JOIN hikvision_devices d ON d.id=cfg.device_id
      WHERE cfg.agent_id=? AND cfg.sync_enabled=1 AND d.deleted_at IS NULL AND d.status!='disabled'
      ORDER BY d.gate_name,d.name`,
   ).bind(agentId).all();
   return Response.json({ agentId, serverTime: new Date().toISOString(), items: result.results }, { headers: { 'Cache-Control': 'no-store' } });
+}
+
+// ---------------------------------------------------------------------------
+// Remote Network Verification: the credential snapshot
+//
+// A terminal running as a reader cannot hold the estate, so the bridge holds it
+// instead and decides on the LAN. This endpoint is how the bridge gets the set:
+// a full snapshot on first contact, then deltas keyed on `since`.
+//
+// Two properties the whole design depends on:
+//
+// * **It paces, it does not dump.** 20,000+ credentials is a few megabytes of
+//   JSON, which is too much for one Workers response and far too much to rebuild
+//   every minute, so pages are keyed by credential value and deltas carry only
+//   what moved.
+// * **Removals are part of the protocol.** A credential revoked between two
+//   syncs must leave the bridge's cache, or a card that was suspended an hour
+//   ago keeps opening the door until the next restart. Rows are kept for history
+//   (status flips rather than deletes), which is what makes that list possible.
+// ---------------------------------------------------------------------------
+const SNAPSHOT_DEFAULT_PAGE = 2000;
+const SNAPSHOT_MAX_PAGE = 5000;
+
+type SnapshotItem = {
+  kind: 'card' | 'employee';
+  value: string;
+  personId: string | null;
+  employeeNo: string | null;
+  status: 'active';
+  validUntil: string | null;
+  updatedAt: string | null;
+};
+
+async function handleIsapiAgentCredentialSnapshot(request: Request, env: Env, agentId: string): Promise<Response> {
+  if (request.method !== 'GET') return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET' } });
+  const agent = await authenticateIsapiAgent(request, env, agentId);
+  if (!agent) return new Response('Unauthorized', { status: 401 });
+
+  const url = new URL(request.url);
+  const requestedLimit = Number(url.searchParams.get('limit') ?? SNAPSHOT_DEFAULT_PAGE);
+  const limit = Math.min(SNAPSHOT_MAX_PAGE, Math.max(100, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : SNAPSHOT_DEFAULT_PAGE));
+  const cursor = (url.searchParams.get('cursor') ?? '').trim();
+  const since = (url.searchParams.get('since') ?? '').trim();
+  const full = !cursor && !since;
+  const cursorValue = cursor ? cursor.split('|')[0] ?? '' : '';
+  const cursorKind = cursor ? cursor.split('|')[1] ?? '' : '';
+  const serverTime = new Date().toISOString();
+
+  // A credential is only usable when the card is active *and* the person is: a
+  // deactivated account or a rejected dependant must not keep opening gates just
+  // because nobody remembered to suspend each card individually.
+  const cards = await env.DB.prepare(
+    `SELECT c.card_uid AS value,c.resident_id AS person_id,
+       COALESCE(hm.employee_id,u.employee_id) AS employee_no,
+       c.expires_at AS valid_until,c.updated_at
+     FROM access_cards c
+     JOIN users u ON u.id=c.resident_id
+     LEFT JOIN household_members hm ON hm.id=c.household_member_id
+     WHERE c.status='active' AND u.status='active' AND (hm.id IS NULL OR hm.status='active')
+       AND (?1 = '' OR c.updated_at > ?1)
+       AND (?2 = '' OR c.card_uid >= ?2)
+     ORDER BY c.card_uid LIMIT ?3`,
+  ).bind(since, cursorValue, limit + 1).all<{ value: string; person_id: string | null; employee_no: string | null; valid_until: string | null; updated_at: string | null }>();
+
+  // Employee numbers are the person's terminal identity. A fingerprint, a face
+  // or a PIN carries no card number at all - only this - so an estate whose
+  // gates are used by fingerprint is served entirely by this half.
+  const employees = await env.DB.prepare(
+    `SELECT value,person_id,employee_no,valid_until,updated_at FROM (
+       SELECT u.employee_id AS value,u.id AS person_id,u.employee_id AS employee_no,
+         NULL AS valid_until,u.updated_at
+       FROM users u
+       WHERE u.employee_id IS NOT NULL AND u.status='active'
+         AND (?1 = '' OR u.updated_at > ?1)
+         AND (?2 = '' OR u.employee_id >= ?2)
+       UNION ALL
+       SELECT hm.employee_id AS value,hm.primary_resident_id AS person_id,hm.employee_id AS employee_no,
+         NULL AS valid_until,hm.updated_at
+       FROM household_members hm
+       WHERE hm.employee_id IS NOT NULL AND hm.status='active'
+         AND (?1 = '' OR hm.updated_at > ?1)
+         AND (?2 = '' OR hm.employee_id >= ?2)
+     ) ORDER BY value LIMIT ?3`,
+  ).bind(since, cursorValue, limit + 1).all<{ value: string; person_id: string | null; employee_no: string | null; valid_until: string | null; updated_at: string | null }>();
+
+  const merged: SnapshotItem[] = [
+    ...cards.results.map((row) => ({ kind: 'card' as const, value: row.value, personId: row.person_id, employeeNo: row.employee_no, status: 'active' as const, validUntil: row.valid_until, updatedAt: row.updated_at })),
+    ...employees.results.map((row) => ({ kind: 'employee' as const, value: row.value, personId: row.person_id, employeeNo: row.employee_no, status: 'active' as const, validUntil: row.valid_until, updatedAt: row.updated_at })),
+  ]
+    // Anything already sent on a previous page is dropped by position in the
+    // ordering, so paging cannot repeat or skip a credential.
+    .filter((item) => !cursor || item.value > cursorValue || (item.value === cursorValue && item.kind > cursorKind))
+    .sort((a, b) => (a.value < b.value ? -1 : a.value > b.value ? 1 : a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0));
+
+  const page = merged.slice(0, limit);
+  const nextCursor = merged.length > limit ? `${page[page.length - 1]!.value}|${page[page.length - 1]!.kind}` : null;
+
+  // Removals only mean something against a cache that already exists, so a full
+  // snapshot - which replaces the set outright - never carries them.
+  let removed: Array<{ kind: string; value: string }> = [];
+  if (!full && since) {
+    const gone = await env.DB.prepare(
+      `SELECT 'card' AS kind,c.card_uid AS value
+         FROM access_cards c WHERE c.status<>'active' AND c.updated_at > ?
+       UNION ALL
+       SELECT 'employee',u.employee_id FROM users u
+        WHERE u.employee_id IS NOT NULL AND u.status<>'active' AND u.updated_at > ?
+       UNION ALL
+       SELECT 'employee',hm.employee_id FROM household_members hm
+        WHERE hm.employee_id IS NOT NULL AND hm.status<>'active' AND hm.updated_at > ?`,
+    ).bind(since, since, since).all<{ kind: string; value: string }>();
+    removed = gone.results.filter((row) => row.value);
+  }
+
+  const version = page.reduce<string | null>((latest, item) => (item.updatedAt && (!latest || item.updatedAt > latest) ? item.updatedAt : latest), null) ?? serverTime;
+
+  return Response.json({
+    agentId,
+    version,
+    serverTime,
+    full,
+    items: page,
+    removed,
+    nextCursor,
+  }, { headers: { 'Cache-Control': 'no-store' } });
 }
 
 const AGENT_EVENT_BATCH_LIMIT = 50;
@@ -5886,7 +6864,18 @@ async function handleIsapiAgentEvents(request: Request, env: Env, agentId: strin
     if (!identity) { rejected++; continue; }
     seenDevices.add(identity.id);
     const event = await normalizeHikvisionDocument(document, identity);
-    if (event) events.push(event); else rejected++;
+    if (!event) { rejected++; continue; }
+    // The bridge decides credentials itself when a terminal runs as a reader.
+    // Its verdict travels with the event so the gate history records who decided
+    // and whether the door answered - not merely what the terminal thought.
+    const verdict = (item as { remoteVerification?: unknown }).remoteVerification;
+    if (verdict && typeof verdict === 'object') {
+      const v = verdict as { decision?: unknown; reason?: unknown; doorResult?: unknown; latencyMs?: unknown };
+      event.remoteDecision = v.decision === 'granted' || v.decision === 'denied' ? v.decision : null;
+      event.remoteDecisionReason = typeof v.reason === 'string' ? v.reason.slice(0, 120) : null;
+      event.remoteDoorResult = v.doorResult === 'opened' || v.doorResult === 'refused' || v.doorResult === 'not_attempted' ? v.doorResult : null;
+    }
+    events.push(event);
   }
 
   if (seenDevices.size) {
@@ -5906,7 +6895,15 @@ async function handleIsapiAgentEvents(request: Request, env: Env, agentId: strin
   }, { headers: { 'Cache-Control': 'no-store' } });
 }
 
-type GatewayOperationKind = 'card'|'visitor';
+/**
+ * Operation families an agent can be handed. 'person' and 'fingerprint' are only
+ * ever queued for an agent whose heartbeat advertises the matching capability;
+ * everything else keeps the pre-existing routing so an older bridge is not
+ * silently starved of the commands it can still apply.
+ */
+type GatewayOperationKind = 'card'|'visitor'|'person'|'fingerprint'|'door';
+const GATEWAY_OPERATION_KINDS: readonly GatewayOperationKind[] = ['card','visitor','person','fingerprint','door'];
+
 type GatewayOperationRow = {
   id: string;
   kind: GatewayOperationKind;
@@ -5925,19 +6922,28 @@ async function handleIsapiAgentOperations(request: Request, env: Env, agentId: s
   const limit = Math.min(100, Math.max(1, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : 20));
   const result = await env.DB.prepare(
     `SELECT * FROM (
-       SELECT o.id,CASE WHEN o.operation IN ('remote_open','remote_close','remote_always_open','remote_always_close','remote_resume') THEN 'door' ELSE 'card' END AS kind,o.device_id,o.operation,o.payload_json,o.attempts,o.created_at,o.updated_at,d.name AS device_name,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol
+       SELECT o.id,
+         CASE
+           WHEN o.operation IN ('remote_open','remote_close','remote_always_open','remote_always_close','remote_resume') THEN 'door'
+           WHEN o.operation IN ('upsert_person','delete_person') THEN 'person'
+           WHEN o.operation IN ('capture_fingerprint','upload_fingerprint','delete_fingerprint_device','enroll_fingerprint','enable_fingerprint','disable_fingerprint','delete_fingerprint') THEN 'fingerprint'
+           ELSE 'card'
+         END AS kind,
+         o.device_id,o.operation,o.payload_json,o.attempts,o.created_at,o.updated_at,o.capture_id,
+         d.name AS device_name,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol
        FROM device_operations o
        JOIN isapi_device_configs cfg ON cfg.device_id=o.device_id
        JOIN hikvision_devices d ON d.id=o.device_id
-       WHERE cfg.agent_id=? AND cfg.sync_enabled=1 AND (o.status='pending' OR (o.status='sent' AND o.updated_at<datetime('now','-2 minutes')))
+       WHERE cfg.agent_id=? AND cfg.sync_enabled=1
+         AND (o.status='pending' OR (o.status='sent' AND o.updated_at < datetime('now', CASE WHEN o.operation='capture_fingerprint' THEN '-10 minutes' ELSE '-2 minutes' END)))
        UNION ALL
-       SELECT vo.id,'visitor' AS kind,vo.device_id,vo.operation,vo.payload_json,vo.attempts,vo.created_at,vo.updated_at,d.name AS device_name,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol
+       SELECT vo.id,'visitor' AS kind,vo.device_id,vo.operation,vo.payload_json,vo.attempts,vo.created_at,vo.updated_at,NULL AS capture_id,d.name AS device_name,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol
        FROM visitor_device_operations vo
        JOIN isapi_device_configs cfg ON cfg.device_id=vo.device_id
        JOIN hikvision_devices d ON d.id=vo.device_id
        JOIN visitor_requests v ON v.id=vo.visitor_request_id
        WHERE cfg.agent_id=? AND cfg.sync_enabled=1 AND (vo.status='pending' OR (vo.status='sent' AND vo.updated_at<datetime('now','-2 minutes')))
-     ) ORDER BY created_at LIMIT ?`,
+     ) ORDER BY created_at, CASE operation WHEN 'upsert_person' THEN 0 ELSE 1 END LIMIT ?`,
   ).bind(agentId, agentId, limit).all<GatewayOperationRow & { device_id:string; device_name:string; isapi_host:string; isapi_port:number; isapi_username:string|null; protocol:string }>();
 
   let claimed = result.results;
@@ -5952,6 +6958,18 @@ async function handleIsapiAgentOperations(request: Request, env: Env, agentId: s
     claimed = result.results.filter((_, i) => Number(claims[i]?.meta.changes ?? 0) > 0);
   }
 
+  // A fingerprint upload needs the transient template, and only the agent the
+  // operation was claimed by gets it. Everything else is already in payload.
+  const captureIds = claimed.map((op) => (op as Record<string, unknown>).capture_id).filter((value): value is string => typeof value === 'string' && value.length > 0);
+  const templates = new Map<string, string>();
+  if (captureIds.length) {
+    const rows = await env.DB.prepare(
+      `SELECT id,template_data FROM fingerprint_captures
+        WHERE id IN (${captureIds.map(() => '?').join(',')}) AND status='captured' AND template_data IS NOT NULL AND expires_at > datetime('now')`,
+    ).bind(...captureIds).all<{ id: string; template_data: string }>();
+    for (const row of rows.results) templates.set(row.id, row.template_data);
+  }
+
   return Response.json({
     agentId,
     serverTime: new Date().toISOString(),
@@ -5959,6 +6977,8 @@ async function handleIsapiAgentOperations(request: Request, env: Env, agentId: s
     items: claimed.map((op) => {
       let payload: unknown;
       try { payload = JSON.parse(op.payload_json); } catch { payload = {}; }
+      const captureId = (op as Record<string, unknown>).capture_id;
+      const template = typeof captureId === 'string' ? templates.get(captureId) : undefined;
       return {
         id: op.id,
         kind: op.kind,
@@ -5966,6 +6986,10 @@ async function handleIsapiAgentOperations(request: Request, env: Env, agentId: s
         deviceName: op.device_name,
         operation: op.operation,
         payload,
+        // The template a terminal must apply. Absent when the capture expired
+        // between claim and delivery, in which case the agent reports a failure
+        // and the portal asks for the finger again rather than writing nothing.
+        fingerData: template ?? null,
         attempt: op.attempts + 1,
         createdAt: op.created_at,
         isapi: { host: (op as Record<string,unknown>).isapi_host, port: (op as Record<string,unknown>).isapi_port, username: (op as Record<string,unknown>).isapi_username, protocol: (op as Record<string,unknown>).protocol },
@@ -5978,13 +7002,24 @@ async function handleIsapiAgentOperationResult(request: Request, env: Env, agent
   if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'POST' } });
   const agent = await authenticateIsapiAgent(request, env, agentId);
   if (!agent) return new Response('Unauthorized', { status: 401 });
-  let body: { kind?: GatewayOperationKind; status?: 'applied'|'failed'; errorMessage?: string; durationMs?: number };
+  let body: { kind?: GatewayOperationKind; status?: 'applied'|'failed'; errorMessage?: string; durationMs?: number; result?: Record<string, unknown> };
   try { body = await request.json(); } catch { return Response.json({ error: 'JSON body required' }, { status: 400 }); }
-  if (!body.kind || !['card','visitor','door'].includes(body.kind) || !body.status || !['applied','failed'].includes(body.status)) {
-    return Response.json({ error: 'kind must be card, visitor or door and status must be applied or failed' }, { status: 400 });
+  if (!body.kind || !GATEWAY_OPERATION_KINDS.includes(body.kind) || !body.status || !['applied','failed'].includes(body.status)) {
+    return Response.json({ error: `kind must be one of ${GATEWAY_OPERATION_KINDS.join(', ')} and status must be applied or failed` }, { status: 400 });
   }
   const errorMessage = body.status === 'failed' ? (body.errorMessage?.trim().slice(0, 1000) || 'ISAPI agent reported failure') : null;
   const duration = body.durationMs && Number.isFinite(body.durationMs) ? Math.max(0, Math.floor(body.durationMs)) : null;
+
+  // The row is read before the update so the side effects below know what kind of
+  // work this was (and which person it was about) without a second guess.
+  const detail = await env.DB.prepare(
+    `SELECT id,device_id,operation,user_id,household_member_id,card_id,fingerprint_id,capture_id,result_json FROM device_operations WHERE id=?
+     UNION ALL SELECT id,device_id,operation,NULL,NULL,NULL,NULL,NULL,NULL FROM visitor_device_operations WHERE id=? LIMIT 1`,
+  ).bind(operationId, operationId).first<{
+    id: string; device_id: string; operation: string;
+    user_id: string | null; household_member_id: string | null; card_id: string | null;
+    fingerprint_id: string | null; capture_id: string | null; result_json: string | null;
+  }>();
 
   // Try card first, then visitor
   let updated = await env.DB.prepare(
@@ -5999,9 +7034,87 @@ async function handleIsapiAgentOperationResult(request: Request, env: Env, agent
   }
   if (!updated.meta.changes) return Response.json({ error: 'Operation not found or not assigned to this agent' }, { status: 404 });
 
-  // The agent deleted the visitor credential from this terminal. Once it has done
-  // so on every terminal the pass was sent to, the pass is recorded as removed and
-  // its device slot is free again — while the pass record itself stays in the app.
+  // What a terminal now holds, from the terminal's own answer. Best effort: a
+  // result report must never fail because a bookkeeping row could not be written.
+  if (detail?.user_id || detail?.household_member_id) {
+    try {
+      const person = await syncPersonRef(env, detail.household_member_id ? 'dependant' : 'account', (detail.household_member_id ?? detail.user_id)!);
+      if (person) {
+        const applied = body.status === 'applied';
+        if (detail.operation === 'delete_person') {
+          await setDevicePersonState(env, person, detail.device_id, applied ? 'removed' : 'missing', { operationId, error: errorMessage });
+        } else {
+          await refreshDevicePersonState(env, person, detail.device_id);
+        }
+      }
+    } catch (error) { console.error('Device-person state update failed', operationId, error); }
+  }
+  if (detail?.operation === 'upload_fingerprint' || detail?.operation === 'delete_fingerprint_device') {
+    try {
+      const stillQueued = await env.DB.prepare(
+        `SELECT COUNT(*) AS count FROM device_operations
+          WHERE device_id=? AND fingerprint_id IS NOT NULL AND fingerprint_id=? AND status IN ('pending','sent')`,
+      ).bind(detail.device_id, detail.fingerprint_id).first<{ count: number }>();
+      if (body.status === 'applied' && detail.capture_id && Number(stillQueued?.count ?? 0) === 0) {
+        // Every terminal that could take the template has taken it: drop it, so
+        // the estate's fingerprints live on the terminals and nowhere else.
+        await env.DB.prepare(
+          `UPDATE fingerprint_captures SET template_data=NULL,status='expired',updated_at=datetime('now') WHERE id=? AND status='captured'`,
+        ).bind(detail.capture_id).run();
+      }
+      if (body.status === 'failed' && Number(stillQueued?.count ?? 0) === 0) {
+        // Nothing is left to deliver this finger automatically. Leave an
+        // instruction rather than a silently failed row.
+        const finger = await env.DB.prepare(
+          `SELECT f.finger_no,f.employee_no,u.name AS person_name FROM fingerprint_credentials f JOIN users u ON u.id=f.resident_id WHERE f.id=?`,
+        ).bind(detail.fingerprint_id).first<{ finger_no: number; employee_no: string | null; person_name: string }>();
+        if (finger) {
+          await env.DB.prepare(
+            `INSERT INTO device_operations(id,device_id,fingerprint_id,operation,payload_json,status,manual_instruction)
+             VALUES (?,?,?,'enroll_fingerprint',?,'manual_action_required',?)`,
+          ).bind(
+            crypto.randomUUID(), detail.device_id, detail.fingerprint_id,
+            JSON.stringify({ fingerprintId: detail.fingerprint_id, fingerNo: finger.finger_no, employeeNo: finger.employee_no, reason: 'the agent could not write the template' }),
+            `The agent could not write finger ${finger.finger_no} for ${finger.person_name} to this terminal (${errorMessage ?? 'ISAPI refused it'}). Enrol the finger on the terminal's own reader using slot ${finger.finger_no}, then mark this action applied.`,
+          ).run();
+        }
+      }
+    } catch (error) { console.error('Fingerprint template bookkeeping failed', operationId, error); }
+  }
+
+  // A capture is the one operation that returns data. The bridge writes the
+  // template back here and it is never sent to a browser; EstateMate then hands
+  // it to every terminal that can take it.
+  if (detail?.operation === 'capture_fingerprint') {
+    try {
+      const template = typeof body.result?.templateData === 'string' ? body.result.templateData : '';
+      const capture = detail.capture_id
+        ? await env.DB.prepare(`SELECT * FROM fingerprint_captures WHERE id=?`).bind(detail.capture_id).first<FingerprintCaptureRow>()
+        : null;
+      if (capture && body.status === 'applied' && template) {
+        await env.DB.prepare(
+          `UPDATE fingerprint_captures SET status='captured',template_data=?,error_message=NULL,updated_at=datetime('now'),
+             expires_at=datetime('now','+${FINGERPRINT_TEMPLATE_TTL_SECONDS} seconds') WHERE id=?`,
+        ).bind(template, capture.id).run();
+        const recorded = await env.DB.prepare(`SELECT * FROM fingerprint_captures WHERE id=?`).bind(capture.id).first<FingerprintCaptureRow>();
+        const applied = await applyCapturedTemplate(env, recorded ?? capture, template);
+        await env.DB.prepare(`UPDATE device_operations SET result_json=? WHERE id=?`)
+          .bind(JSON.stringify({ fingerprintId: applied.fingerprintId, queued: applied.queued, manual: applied.manual }), operationId).run();
+        const person = { kind: capture.household_member_id ? 'dependant' as PersonKind : 'account' as PersonKind, id: capture.household_member_id ?? capture.resident_id, name: capture.person_name, employeeNo: capture.employee_no, status: 'active' };
+        for (const device of await syncDevices(env, null)) {
+          await refreshDevicePersonState(env, person, device.id);
+        }
+      } else if (capture && body.status === 'failed') {
+        await env.DB.prepare(
+          `UPDATE fingerprint_captures SET status='failed',error_message=?,template_data=NULL,updated_at=datetime('now') WHERE id=?`,
+        ).bind(errorMessage, capture.id).run();
+      }
+    } catch (error) { console.error('Fingerprint capture result failed', operationId, error); }
+  }
+
+  // Refresh after every applied visitor-account operation. Once revocation has
+  // deleted the account from every terminal, the pass is recorded as removed and
+  // its person slot is free again — while the pass record itself stays in the app.
   if (visitorOperation && body.status === 'applied') {
     try {
       const owner = await env.DB.prepare(
@@ -6059,7 +7172,7 @@ async function consumeAccessEvents(batch: MessageBatch<AccessEventQueuePayload>,
        ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,created_at DESC LIMIT 1)`;
   const statements = events.map((event) => env.DB.prepare(
     `INSERT OR IGNORE INTO access_events(
-      id,vendor_event_id,device_id,access_point_id,card_id,fingerprint_id,resident_id,household_member_id,visitor_request_id,card_uid,employee_no,person_name,credential_type,door_no,direction,result,event_type,device_timestamp,profile_key,raw_summary
+      id,vendor_event_id,device_id,access_point_id,card_id,fingerprint_id,resident_id,household_member_id,visitor_request_id,card_uid,employee_no,person_name,credential_type,door_no,direction,result,event_type,device_timestamp,profile_key,raw_summary,remote_decision,remote_decision_reason,remote_door_result
      ) VALUES (?,?,?,?,
        (SELECT id FROM access_cards WHERE card_uid=? LIMIT 1),
        (SELECT id FROM fingerprint_credentials WHERE employee_no=? AND employee_no IS NOT NULL
@@ -6068,7 +7181,7 @@ async function consumeAccessEvents(batch: MessageBatch<AccessEventQueuePayload>,
        COALESCE((SELECT household_member_id FROM access_cards WHERE card_uid=? LIMIT 1),
          (SELECT household_member_id FROM fingerprint_credentials WHERE employee_no=? AND employee_no IS NOT NULL
           ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,created_at DESC LIMIT 1)),
-       (SELECT id FROM visitor_requests WHERE credential_number=? OR pin=? LIMIT 1),?,?,?,?,?,?,?,?,?,?,?)`,
+       (SELECT id FROM visitor_requests WHERE credential_number=? OR pin=? LIMIT 1),?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
   ).bind(
     event.id,event.vendorEventId,event.deviceId,event.accessPointId,
     event.cardUid,event.employeeNo,event.cardUid,event.employeeNo,
@@ -6076,6 +7189,7 @@ async function consumeAccessEvents(batch: MessageBatch<AccessEventQueuePayload>,
     event.cardUid,event.cardUid,
     event.cardUid,event.employeeNo,event.personName,event.credentialType,event.doorNo,event.direction,event.result,
     event.eventType,event.deviceTimestamp,event.profileKey,event.rawSummary,
+    event.remoteDecision ?? null,event.remoteDecisionReason ?? null,event.remoteDoorResult ?? null,
   ));
   await env.DB.batch(statements);
   const captured = events.filter((event) => Boolean(event.cardUid)).map((event) => env.DB.prepare(
@@ -6246,6 +7360,8 @@ export default {
     if (isapiHeartbeat?.[1]) return handleIsapiAgentHeartbeat(request, env, decodeURIComponent(isapiHeartbeat[1]));
     const isapiDevices = /^\/api\/isapi\/v1\/agents\/([^/]+)\/devices$/.exec(url.pathname);
     if (isapiDevices?.[1]) return handleIsapiAgentDevices(request, env, decodeURIComponent(isapiDevices[1]));
+    const isapiSnapshot = /^\/api\/isapi\/v1\/agents\/([^/]+)\/credential-snapshot$/.exec(url.pathname);
+    if (isapiSnapshot?.[1]) return handleIsapiAgentCredentialSnapshot(request, env, decodeURIComponent(isapiSnapshot[1]));
     const isapiEvents = /^\/api\/isapi\/v1\/agents\/([^/]+)\/events$/.exec(url.pathname);
     if (isapiEvents?.[1]) return handleIsapiAgentEvents(request, env, decodeURIComponent(isapiEvents[1]));
     const isapiOpsResult = /^\/api\/isapi\/v1\/agents\/([^/]+)\/operations\/([^/]+)\/result$/.exec(url.pathname);
@@ -6278,6 +7394,7 @@ export default {
       enforceFacilityFees(env),
       expireStalePresence(env),
       pruneAccessEvents(env),
+      expireFingerprintTemplates(env),
       syncActiveVisitorPasses(env.DB),
       // Also swept hourly, so a missed or delayed minute trigger still catches up.
       releaseExpiredVisitorDeviceAccounts(env),

@@ -9,6 +9,12 @@ describe('CSV import utilities', () => {
     expect(table.rows[1]?.description).toBe('He said "paid"');
   });
 
+  it('can preserve field whitespace when an identifier must not be normalized', () => {
+    const table = parseCsv('card_uid,card_label\n 001234 , Main gate card ', 500, { trimValues: false });
+    expect(table.rows[0]?.card_uid).toBe(' 001234 ');
+    expect(table.rows[0]?.card_label).toBe(' Main gate card ');
+  });
+
   it('reports missing required headers', () => {
     const table = parseCsv('unit_number,amount\nA-1,100');
     expect(() => requireHeaders(table, ['unit_number', 'due_date'])).toThrow('due_date');

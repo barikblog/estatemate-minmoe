@@ -14,9 +14,33 @@ describe('Hikvision profile registry', () => {
     ['DS-K2604', 'controller_k2600'],
     ['DS-K2802', 'controller_k2700_k2800'],
     ['DS-K2804', 'controller_k2700_k2800'],
+    ['ZAM180-NF', 'zkteco_push'],
+    ['SpeedFace-V5L-RFID', 'zkteco_push'],
+    ['X7', 'zkteco_push'],
+    ['MB460', 'zkteco_push'],
+    // eSSL firmware speaks the same PUSH protocol under the hood, so the profile
+    // that describes the transport is the right one for it too.
+    ['eSSL IN-BIO', 'zkteco_push'],
     ['UNKNOWN-100', 'generic_isapi'],
   ])('maps %s to %s', (model, expected) => {
     expect(resolveHikvisionProfile(model, 'auto').key).toBe(expected);
+  });
+
+  it('resolves the ZKTeco profile from a model the vendor doc names', () => {
+    const profile = resolveHikvisionProfile('SF400', 'auto');
+    expect(profile.key).toBe('zkteco_push');
+    // The aliases the agent's synthesised event document relies on.
+    expect(profile.aliases.employeeNo.slice(0, 2)).toEqual(['PIN', 'UserID']);
+    expect(profile.aliases.cardUid[0]).toBe('Card');
+    // The terminal's own record carries no verdict, and this profile does not
+    // invent one: the shared pattern lists are what map the words that do appear.
+    expect(profile.grantedPatterns).toEqual(expect.arrayContaining(['granted', 'success']));
+  });
+
+  it('never lets a ZKTeco pattern claim a Hikvision model', () => {
+    for (const model of ['DS-K1T341CMFW', 'DS-K2802', 'DS-K1A340FWX', 'DS-K1T808MFWX-B']) {
+      expect(resolveHikvisionProfile(model, 'auto').key).not.toBe('zkteco_push');
+    }
   });
 
   it('supports explicit selection for ambiguous K1T67 models', () => {

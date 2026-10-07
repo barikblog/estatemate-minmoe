@@ -49,6 +49,9 @@ const FLAG_SPEC = {
   'log-file': 'value',
   'from-installer': 'value',
   'devices-json': 'value',
+  'agent-id': 'value',
+  'agent-secret': 'value',
+  'worker-url': 'value',
   'task-name': 'value',
   user: 'value',
   quiet: 'bool',
@@ -71,8 +74,11 @@ Commands (default: run)
                       real-time alertStream events from every configured device.
   check               Pre-flight: validate the config, authenticate against the
                       Worker, then probe each terminal over ISAPI.
-  setup               Write agent-config.json/isapi-devices.json, optionally from
-                      the portal's "Download setup" script.
+  setup               The setup wizard: write agent-config.json/isapi-devices.json
+                      from the portal's "Download setup" script, prompting for each
+                      Hikvision terminal. On an unconfigured machine, running the
+                      executable with no arguments and no options starts this
+                      wizard; a Scheduled Task, a service or a pipe never does.
   init                Write example configuration files without prompting.
   status              Show resolved paths, scheduled-task state and recent logs.
   install-service     Keep it running: Windows Scheduled Task (SYSTEM, at boot,
@@ -89,6 +95,9 @@ Options
   --log-file <file>        default: <data-dir>\\logs\\bridge.log
   --from-installer <file>  portal installer script; "-" reads stdin
   --devices-json <file>    device list to import during setup; "-" reads stdin
+  --agent-id <uuid>        agent id to use when there is no portal script
+  --agent-secret <secret>  agent secret to go with --agent-id
+  --worker-url <url>       Worker base URL (default: the public estateMate Worker)
   --no-prompt              never ask questions (setup/init only)
   --no-verify              skip the Worker call during setup
   --task-name <name>       Scheduled Task name (default: EstateMateBridge)
@@ -100,6 +109,7 @@ Options
 
 Examples
   estatemate-bridge.exe setup --from-installer .\\installer.ps1
+  estatemate-bridge.exe setup --no-prompt --agent-id <uuid> --agent-secret <secret>
   estatemate-bridge.exe check --json
   estatemate-bridge.exe install-service
 `;
@@ -140,9 +150,29 @@ function parseArgs(argv) {
     result.flags[name] = next;
     index += 1;
   }
+  // Whether a command or any option was typed decides how `run` behaves on a
+  // machine that has no configuration yet: see shouldStartWizard().
+  result.commandExplicit = Boolean(result.command);
+  result.flagCount = Object.keys(result.flags).length;
   if (!result.command) result.command = result.flags.version ? 'version' : result.flags.help ? 'help' : 'run';
   if (!COMMANDS.has(result.command)) result.errors.push(`unknown command "${result.command}"`);
   return result;
+}
+
+/**
+ * Should this invocation hand over to the setup wizard?
+ *
+ * Only the exact shape a person produces by double-clicking the executable on an
+ * estate PC: no command, no options, no configuration on disk, and a real
+ * console on both ends. Everything else — `run` typed on purpose (what the
+ * Scheduled Task does), or any option at all (`--data-dir`, `--quiet`,
+ * `--no-prompt`, `--json`) — keeps the previous behaviour, so nothing
+ * unattended can ever block on a prompt.
+ */
+function shouldStartWizard({ parsed, ctx }) {
+  if (parsed.commandExplicit || parsed.flagCount > 0) return false;
+  if (ctx.configExists) return false;
+  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
 }
 
 function readJsonSafe(file, label, logger) {
@@ -215,6 +245,7 @@ async function commandRun({ ctx, logger }) {
     configPath: ctx.paths.configPath,
     devicesPath: ctx.paths.devicesPath,
     standby: false,
+    version: ctx.version,
     logger,
   });
 
@@ -364,6 +395,24 @@ async function runCli(meta) {
   const ctx = buildContext({ meta, paths, logger });
   if (!flags['log-level'] && ctx.config && ctx.config.logLevel) logger.setLevel(String(ctx.config.logLevel));
 
+  // First run on a fresh PC: the executable was double-clicked, so the useful
+  // answer is the wizard, not "no agent-config.json at C:\ProgramData\...".
+  // This is the same `setup` command; the wizard itself prints the portal
+  // steps and the next commands to run.
+  if (shouldStartWizard({ parsed, ctx })) {
+    logger.raw('');
+    logger.raw(`EstateMate Bridge ${ctx.version} is not configured on this computer yet.`);
+    logger.raw('Starting the setup wizard. Press Ctrl+C to cancel, or run');
+    logger.raw(`"${path.basename(ctx.exePath)} help" for every command.`);
+    const wizardCode = await runSetup({
+      ctx,
+      logger,
+      options: { fromInstaller: null, devicesJson: null, prompt: true, verify: true, force: false },
+    });
+    logger.close();
+    return wizardCode;
+  }
+
   let code = 0;
   switch (command) {
     case 'run':
@@ -383,6 +432,9 @@ async function runCli(meta) {
         options: {
           fromInstaller: flags['from-installer'] || null,
           devicesJson: flags['devices-json'] || null,
+          agentId: flags['agent-id'] || null,
+          agentSecret: flags['agent-secret'] || null,
+          workerUrl: flags['worker-url'] || null,
           prompt: !flags['no-prompt'],
           verify: !flags['no-verify'],
           force: Boolean(flags.force),
@@ -436,4 +488,5 @@ module.exports = {
   commandVersion,
   parseArgs,
   runCli,
+  shouldStartWizard,
 };
