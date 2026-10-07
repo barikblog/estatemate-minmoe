@@ -336,10 +336,11 @@ public final class ProtocolTest {
         Map<String, Object> refusedVisitor = new LinkedHashMap<String, Object>(visitor);
         refusedVisitor.put("employeeNo", "VIS9");
         refusedVisitor.put("credentialNumber", "VIS9");
-        IsapiClient.OpResult refused = client.applyOperation(device, "upsert_visitor", refusedVisitor);
+        IsapiClient.OpResult refusedVisitorResult = client.applyOperation(device, "upsert_visitor", refusedVisitor);
         check("a visitor content rejection keeps the terminal's own reason",
-                !refused.success && refused.error.contains("badJsonContent") && !refused.error.contains("employeeNoNotExist"),
-                String.valueOf(refused.error));
+                !refusedVisitorResult.success && refusedVisitorResult.error.contains("badJsonContent")
+                        && !refusedVisitorResult.error.contains("employeeNoNotExist"),
+                String.valueOf(refusedVisitorResult.error));
         check("a visitor content rejection never reaches Modify",
                 fake.requestOrder.subList(contentRejectStart, fake.requestOrder.size())
                         .equals(java.util.Arrays.asList("/ISAPI/AccessControl/UserInfo/Record")), fake.requestOrder.toString());

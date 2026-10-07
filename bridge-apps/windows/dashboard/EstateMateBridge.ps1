@@ -957,9 +957,9 @@ function Invoke-SelfTest {
     $script:Config = [pscustomobject]@{ timeSync = [pscustomobject]@{ enabled = $true; maxDriftMs = 90000; checkIntervalMinutes = 45 } }
     Fill-Fields
     Check 'the clock-sync checkbox follows the saved configuration' ($script:Controls.TimeSync.Checked -eq $true) "checked=$($script:Controls.TimeSync.Checked)"
-    Check 'the save carries an unchecked box as --time-sync-enabled=false' ((Get-TimeSyncFlagValue) -eq 'false') (Get-TimeSyncFlagValue)
-    $script:Controls.TimeSync.Checked = $true
     Check 'the save carries a checked box as --time-sync-enabled=true' ((Get-TimeSyncFlagValue) -eq 'true') (Get-TimeSyncFlagValue)
+    $script:Controls.TimeSync.Checked = $false
+    Check 'the save carries an unchecked box as --time-sync-enabled=false' ((Get-TimeSyncFlagValue) -eq 'false') (Get-TimeSyncFlagValue)
     $script:Config = [pscustomobject]@{ timeSync = [pscustomobject]@{ enabled = $false } }
     Fill-Fields
     Check 'the clock-sync checkbox clears when sync is off' ($script:Controls.TimeSync.Checked -eq $false) "checked=$($script:Controls.TimeSync.Checked)"
