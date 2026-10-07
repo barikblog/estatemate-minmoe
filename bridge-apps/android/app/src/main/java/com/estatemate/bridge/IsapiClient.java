@@ -594,7 +594,45 @@ public final class IsapiClient {
         return new OpResult(false, errorPrefix + describeAttempts(response, legacy));
     }
 
-    /** Adds or updates the finite PIN-only visitor account shown in the terminal UI. */
+    /**
+     * The estate zone named by a visitor operation, or null when the payload
+     * carries none this JVM can read. TimeZone.getTimeZone silently falls back
+     * to GMT for an unknown id, so the zone is validated through ZoneId first.
+     */
+    private static java.util.TimeZone visitorTimeZone(String timeZone) {
+        if (timeZone == null) return null;
+        String trimmed = timeZone.trim();
+        if (trimmed.isEmpty()) return null;
+        try {
+            return java.util.TimeZone.getTimeZone(java.time.ZoneId.of(trimmed));
+        } catch (java.time.DateTimeException error) {
+            return null;
+        }
+    }
+
+    /**
+     * Whether a Record answer reports that the employee number already exists
+     * on the terminal. That is the only answer that makes Modify the right next
+     * call: any other content rejection is the terminal refusing what was sent,
+     * and a Modify follow-up would only answer employeeNoNotExist — the account
+     * was never created — which hides the terminal's own reason.
+     */
+    private static boolean recordReportsExistingEmployeeNo(Response response) {
+        String body = response.body == null ? "" : response.body;
+        if (java.util.regex.Pattern.compile("notSupport|invalidURL|invalidOperation", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(body).find()) return false;
+        if (java.util.regex.Pattern.compile("notExist|not ?found", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(body).find()) return false;
+        return java.util.regex.Pattern
+                .compile("employeeNo(AlreadyExist|AlreadyExists|Exists|Exist|Repeated|Duplicate)", java.util.regex.Pattern.CASE_INSENSITIVE)
+                .matcher(body).find();
+    }
+
+    /**
+     * Adds or updates the finite PIN-only visitor account shown in the terminal
+     * UI. The validity window is stated in the estate's local time
+     * (`YYYY-MM-DDTHH:mm:ss`, `timeType: "local"`) — the zone the Worker sends
+     * with the operation — so the window the terminal enforces is the window the
+     * portal shows; a payload without a readable zone keeps the UTC form.
+     */
     private OpResult writeVisitorPerson(Device device, String employeeNo, Map<String, Object> payload) throws IOException {
         String fromText = Json.string(payload, "validFrom", null);
         String untilText = Json.string(payload, "validUntil", null);
@@ -610,13 +648,16 @@ public final class IsapiClient {
         name = name == null || name.trim().isEmpty() ? "Visitor" : name.trim();
         if (name.length() > 32) name = name.substring(0, 32);
 
-        java.text.SimpleDateFormat terminalTime = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US);
-        terminalTime.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+        java.util.TimeZone zone = visitorTimeZone(Json.string(payload, "timeZone", null));
+        String timeType = zone == null ? "UTC" : "local";
+        java.text.SimpleDateFormat terminalTime = new java.text.SimpleDateFormat(
+                zone == null ? "yyyy-MM-dd'T'HH:mm:ss'Z'" : "yyyy-MM-dd'T'HH:mm:ss", java.util.Locale.US);
+        terminalTime.setTimeZone(zone == null ? java.util.TimeZone.getTimeZone("UTC") : zone);
         Map<String, Object> valid = new LinkedHashMap<String, Object>();
         valid.put("enable", Boolean.TRUE);
         valid.put("beginTime", terminalTime.format(from));
         valid.put("endTime", terminalTime.format(until));
-        valid.put("timeType", "UTC");
+        valid.put("timeType", timeType);
         Map<String, Object> info = new LinkedHashMap<String, Object>();
         info.put("employeeNo", employeeNo);
         info.put("name", name);
@@ -632,9 +673,15 @@ public final class IsapiClient {
         Response record = request(device, "POST", "/ISAPI/AccessControl/UserInfo/Record?format=json", body, false);
         if (accepted(record)) return new OpResult(true, null);
         Response modify = null;
-        if (!unsupported(record)) {
+        if (recordReportsExistingEmployeeNo(record)) {
+            // The terminal already holds this employee number: update it in place.
             modify = request(device, "PUT", "/ISAPI/AccessControl/UserInfo/Modify?format=json", body, false);
             if (accepted(modify)) return new OpResult(true, null);
+        } else if (!unsupported(record)) {
+            // The terminal refused the content. Keep its answer: a Modify
+            // follow-up would answer employeeNoNotExist and report a follow-up
+            // failure instead of the reason the account was refused.
+            return new OpResult(false, "Visitor account " + describeAttempts(record));
         }
 
         Response setUp = request(device, "PUT", "/ISAPI/AccessControl/UserInfo/SetUp?format=json", body, false);
@@ -651,7 +698,7 @@ public final class IsapiClient {
                 + "  <employeeNo>" + employeeNo + "</employeeNo>\n  <name>" + xmlText(name) + "</name>\n"
                 + "  <belongGroup>Company</belongGroup>\n  <userType>normal</userType>\n"
                 + "  <Valid><enable>true</enable><beginTime>" + valid.get("beginTime") + "</beginTime>"
-                + "<endTime>" + valid.get("endTime") + "</endTime><timeType>UTC</timeType></Valid>\n"
+                + "<endTime>" + valid.get("endTime") + "</endTime><timeType>" + timeType + "</timeType></Valid>\n"
                 + "  <localUIRight>false</localUIRight>\n  <password>" + pin + "</password>\n</UserInfo>";
         Response legacy = request(device, "POST", "/ISAPI/AccessControl/UserInfo/Record", xml, true);
         if (accepted(legacy)) return new OpResult(true, null);

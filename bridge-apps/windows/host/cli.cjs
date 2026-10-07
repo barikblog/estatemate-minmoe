@@ -52,6 +52,7 @@ const FLAG_SPEC = {
   'agent-id': 'value',
   'agent-secret': 'value',
   'worker-url': 'value',
+  'time-sync-enabled': 'value',
   'task-name': 'value',
   user: 'value',
   quiet: 'bool',
@@ -98,6 +99,9 @@ Options
   --agent-id <uuid>        agent id to use when there is no portal script
   --agent-secret <secret>  agent secret to go with --agent-id
   --worker-url <url>       Worker base URL (default: the public estateMate Worker)
+  --time-sync-enabled <true|false>
+                           align the terminals' clocks with this PC (opt-in,
+                           default off; the Windows dashboard sends this)
   --no-prompt              never ask questions (setup/init only)
   --no-verify              skip the Worker call during setup
   --task-name <name>       Scheduled Task name (default: EstateMateBridge)
@@ -361,6 +365,21 @@ async function runCli(meta) {
     process.stderr.write('\nRun "estatemate-bridge.exe help" for usage.\n');
     return 2;
   }
+
+  // --time-sync-enabled is the Windows dashboard's checkbox: one writer (setup)
+  // turns it into the agent-config.json timeSync block, so the console, the
+  // window and a script cannot disagree about what "on" means.
+  let timeSyncEnabled;
+  if (flags['time-sync-enabled'] !== undefined) {
+    const value = String(flags['time-sync-enabled']).trim().toLowerCase();
+    if (value !== 'true' && value !== 'false') {
+      process.stderr.write(`error: --time-sync-enabled must be true or false, not "${flags['time-sync-enabled']}"\n`);
+      process.stderr.write('\nRun "estatemate-bridge.exe help" for usage.\n');
+      return 2;
+    }
+    timeSyncEnabled = value === 'true';
+  }
+
   if (command === 'help' || flags.help) {
     process.stdout.write(HELP);
     return 0;
@@ -407,7 +426,7 @@ async function runCli(meta) {
     const wizardCode = await runSetup({
       ctx,
       logger,
-      options: { fromInstaller: null, devicesJson: null, prompt: true, verify: true, force: false },
+      options: { fromInstaller: null, devicesJson: null, prompt: true, verify: true, force: false, timeSyncEnabled },
     });
     logger.close();
     return wizardCode;
@@ -435,6 +454,7 @@ async function runCli(meta) {
           agentId: flags['agent-id'] || null,
           agentSecret: flags['agent-secret'] || null,
           workerUrl: flags['worker-url'] || null,
+          timeSyncEnabled,
           prompt: !flags['no-prompt'],
           verify: !flags['no-verify'],
           force: Boolean(flags.force),

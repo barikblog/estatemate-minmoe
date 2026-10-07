@@ -292,7 +292,7 @@ is worth trying — see
 for the behaviour the agent depends on.
 
 - `POST /ISAPI/AccessControl/UserInfo/Record?format=json` — create the PIN-only visitor account with employee ID, name, Company department, `userType: "normal"`, enabled finite `Valid`, `localUIRight: false` and a 4-to-8-digit `password`.
-- `PUT /ISAPI/AccessControl/UserInfo/Modify?format=json` — update an existing visitor account; `UserInfo/SetUp` is the combined add/edit compatibility path.
+- `PUT /ISAPI/AccessControl/UserInfo/Modify?format=json` — update an existing visitor account. Attempted only when `Record` reports the employee number already exists (`employeeNoAlreadyExist`); any other content rejection is reported with the terminal's own reason, never as a misleading `employeeNoNotExist` follow-up. `UserInfo/SetUp` is the combined add/edit compatibility path.
 - `PUT /ISAPI/AccessControl/UserInfoDetail/Delete?format=json` — delete the expired/revoked visitor account (`UserInfo/Delete` fallback).
 - `POST /ISAPI/AccessControl/CardInfo/Record?format=json` — add a resident/dependant card. Visitor provisioning does not call a `CardInfo` endpoint.
 - `PUT /ISAPI/AccessControl/CardInfo/Modify?format=json` — update a card the terminal already holds (a duplicate `Record` is an error, so re-enable/re-issue lands here)
@@ -329,6 +329,13 @@ normal-user/non-administrator settings, enabled finite start/end validity, and t
 4-to-8-digit visitor PIN in `password`. No visitor `CardInfo`, fingerprint, face,
 door-right or right-plan field is sent. At expiry or manual revocation, the bridge
 deletes the `UserInfo` account so the person slot is available again.
+
+The validity window is stated in the **estate's local time** — `YYYY-MM-DDTHH:mm:ss`
+with `timeType: "local"`, no `Z` — using the timezone the Worker sends with every
+visitor operation (new and reconciled alike), so the window the terminal enforces
+against its own clock is the window the portal shows. A payload without a readable
+zone (an operation queued by an older Worker) keeps the UTC form. The Android bridge
+sends the same window and follows the same error rules.
 
 ## Terminal clock sync (opt-in)
 
@@ -367,6 +374,14 @@ went down must not erase the last known clock from the portal). Off by default:
 no `timeSync` key means no clock traffic at all, and a heartbeat without a clock
 entry leaves the stored value alone, so every existing estate behaves exactly as
 before.
+
+Turning it on is an estate decision, and every writer agrees on what "on" means:
+the Windows dashboard's **Configuration** tab has a **Terminal clock sync**
+checkbox, the interactive `setup` wizard asks, and the CLI accepts
+`--time-sync-enabled=true|false` — the checkbox and the flag both reach
+`agent-config.json` through the one writer, `setup`, which preserves the
+`maxDriftMs` / `checkIntervalMinutes` thresholds the configuration already had.
+A fresh setup defaults to off.
 
 > **Android bridge:** the Android bridge does not run the clock check — it records
 > the deviation in `../bridge-apps/android/README.md` rather than porting a

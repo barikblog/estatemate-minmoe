@@ -2797,6 +2797,10 @@ app.post('/api/visitors', requireRoles('resident','admin','manager'), async (c) 
     pin,
     validFrom,
     validUntil,
+    // The terminal checks the pass window against its own clock, so the
+    // bridge needs the estate's zone to state the window in the terminal's
+    // local time (see the agent's visitor write).
+    timeZone,
     enabled: false,
     requiresSecurityApproval: true,
   });
@@ -6158,6 +6162,7 @@ interface VisitorOperationRow {
   id: string;
   device_id: string;
   status: string;
+  payload_json: string;
 }
 
 /**
@@ -6177,7 +6182,7 @@ async function queueVisitorDeviceOperations(
   if (!devices.results.length) return 0;
 
   const existing = await db.prepare(
-    `SELECT id,device_id,status FROM visitor_device_operations WHERE visitor_request_id=? AND operation='upsert_visitor'`,
+    `SELECT id,device_id,status,payload_json FROM visitor_device_operations WHERE visitor_request_id=? AND operation='upsert_visitor'`,
   ).bind(visitorRequestId).all<VisitorOperationRow>();
   const byDevice = new Map(existing.results.map((row) => [row.device_id, row]));
   const payloadJson = JSON.stringify(payload);
@@ -6203,6 +6208,17 @@ async function queueVisitorDeviceOperations(
       statements.push(db.prepare(
         `UPDATE visitor_device_operations SET payload_json=?,status=?,error_message=NULL,updated_at=datetime('now') WHERE id=?`,
       ).bind(payloadJson, status, current.id));
+      queued += 1;
+    } else if (current.status === 'pending' && current.payload_json !== payloadJson) {
+      // A stale, unclaimed operation still carries an older payload — one
+      // queued before the estate timezone travelled with the pass, or before
+      // a detail of the account changed. No agent has picked it up yet, so
+      // refreshing the payload in place is safe and makes the next poll apply
+      // the current account instead of the old one. (`sent` rows are claimed
+      // by an agent and left for its result; `applied` rows are done.)
+      statements.push(db.prepare(
+        `UPDATE visitor_device_operations SET payload_json=?,error_message=NULL,updated_at=datetime('now') WHERE id=?`,
+      ).bind(payloadJson, current.id));
       queued += 1;
     }
   }
@@ -6248,6 +6264,9 @@ async function syncActiveVisitorPasses(db: D1Database): Promise<{ passes: number
   if (!passes.results.length) return { passes: 0, devices: 0, queued: 0 };
 
   const devices = await db.prepare(`SELECT COUNT(*) AS count FROM hikvision_devices WHERE status!='disabled' AND deleted_at IS NULL`).first<{ count: number }>();
+  // Reconciled operations carry the estate timezone exactly like new ones, so
+  // the bridge states the pass window in the terminal's local time either way.
+  const timeZone = await estateTimeZone(db);
   let queued = 0;
   for (const pass of passes.results) {
     if (!pass.credential_number) continue;
@@ -6261,6 +6280,7 @@ async function syncActiveVisitorPasses(db: D1Database): Promise<{ passes: number
       pin: pass.pin,
       validFrom: pass.valid_from,
       validUntil: pass.valid_until,
+      timeZone,
       enabled: false,
       requiresSecurityApproval: Boolean(pass.requires_security_approval),
     });

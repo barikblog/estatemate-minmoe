@@ -1,5 +1,48 @@
 # AI handoff — EstateMate
 
+## Visitor passes in the estate's local time, a gated visitor Modify, and the clock-sync switch (2026-10-07)
+
+Implemented locally; not deployed or published.
+
+- **Visitor provisioning states the validity window in the estate's local time.**
+  The Worker includes the estate timezone in every visitor device operation —
+  new (`POST /api/visitors`) and reconciled (`syncActiveVisitorPasses`, the manual
+  sync endpoint) alike — and both bridges write the finite `Valid` window as
+  `YYYY-MM-DDTHH:mm:ss` with `timeType: "local"` and no `Z`, so the window the
+  terminal enforces against its own clock is the window the portal shows. A
+  payload without a readable zone (an operation queued by an older Worker) keeps
+  the UTC form. The Android bridge uses the same format.
+- **Reconciliation refreshes stale, unclaimed operations.** A visitor upsert
+  still `pending` — never claimed by an agent — whose payload predates a change
+  (the timezone travelling with the pass, or a detail of the account) gets the
+  current payload written back in place, so the next poll applies the current
+  account. `sent` rows are left for the agent's own result; `applied` rows are
+  done.
+- **A visitor `Modify` is attempted only when `Record` explicitly reports an
+  existing employee number** (`employeeNoAlreadyExist`). Any other content
+  rejection is reported with the terminal's own reason: a `Modify` follow-up
+  would only answer `employeeNoNotExist` — the account was never created — and
+  bury the real one. The Android bridge follows the same error handling.
+- **Terminal clock sync stays opt-in, and the switch is now reachable.** The
+  Windows dashboard's Configuration tab has a **Terminal clock sync** checkbox,
+  the interactive `setup` wizard asks, and the CLI accepts
+  `--time-sync-enabled=true|false`. All three write through `setup`, which
+  preserves the existing `maxDriftMs` / `checkIntervalMinutes` thresholds; a
+  fresh setup defaults to off. The setting is for the Windows/Node bridge —
+  Android clock synchronization remains unimplemented (recorded in
+  `bridge-apps/android/README.md`).
+- Coverage: `test/visitor-device-accounts.test.ts` (timezone in the payload,
+  stale-pending refresh), `isapi-bridge/agent.card-operations.integration.mjs`
+  (local window, UTC fallback, content-rejection path), Android `ProtocolTest`
+  (same three), and five new packaged-executable smoke checks (flag on/off,
+  default off, thresholds preserved, wizard ask). The packaged Linux bridge smoke
+  test passes 36/36; `npm test` passes with 27 files / 283 tests.
+- **Caveat:** this is unverified on the target physical terminal. Hikvision's
+  schema permits both local and UTC representations of `Valid`, so the simulated
+  terminals cannot prove the firmware accepts the local form. Clock sync aligns
+  a terminal's clock with the PC; it does not set the terminal's timezone, which
+  must match the estate.
+
 ## Digit-only card numbers and 30-character Employee IDs (2026-10-07)
 
 This section supersedes the older 32-character application-policy notes below.

@@ -150,6 +150,60 @@ describe('visitor device-account lifecycle', () => {
     expect(payload.employeeNo).toBe(`visitor${String(pass.credentialNumber)}`);
   });
 
+  it('sends the estate timezone with the upsert and refreshes a stale, unclaimed operation on reconciliation', async () => {
+    addDevice('device-1', 'isapi_bridge');
+    await linkAgentToDevice('device-1');
+    const now = Date.now();
+    const pass = await issuePass(new Date(now - 60_000), new Date(now + 60 * 60_000));
+
+    // New operations carry the estate's zone, so the bridge can state the pass
+    // window in the terminal's local time.
+    let operation = database.one(
+      `SELECT status,payload_json FROM visitor_device_operations WHERE visitor_request_id=? AND operation='upsert_visitor'`,
+      String(pass.id),
+    );
+    expect(operation?.status).toBe('pending');
+    let payload = JSON.parse(String(operation?.payload_json)) as Record<string, unknown>;
+    expect(payload.timeZone).toBe('Africa/Lagos');
+
+    // Model an operation queued before the zone travelled with the pass: still
+    // pending, never claimed by an agent, carrying the old payload.
+    database.run(
+      `UPDATE visitor_device_operations SET payload_json=? WHERE visitor_request_id=? AND operation='upsert_visitor'`,
+      JSON.stringify({
+        credentialNumber: String(pass.credentialNumber),
+        employeeNo: `visitor${String(pass.credentialNumber)}`,
+        visitorName: 'Grace Visitor',
+        department: 'Company',
+        pin: '004217',
+        validFrom: pass.validFrom,
+        validUntil: pass.validUntil,
+        enabled: false,
+        requiresSecurityApproval: true,
+      }),
+      String(pass.id),
+    );
+
+    const sync = await call(env, 'POST', '/api/visitors/sync-active', { token: adminToken });
+    expect(sync.status).toBe(200);
+    expect(sync.json.queued).toBe(1);
+
+    operation = database.one(
+      `SELECT status,payload_json FROM visitor_device_operations WHERE visitor_request_id=? AND operation='upsert_visitor'`,
+      String(pass.id),
+    );
+    // Still unclaimed — no agent has polled — but the payload is current again.
+    expect(operation?.status).toBe('pending');
+    payload = JSON.parse(String(operation?.payload_json)) as Record<string, unknown>;
+    expect(payload.timeZone).toBe('Africa/Lagos');
+    expect(payload.pin).toBe(pass.pin);
+
+    // A second reconciliation has nothing stale left to refresh.
+    const again = await call(env, 'POST', '/api/visitors/sync-active', { token: adminToken });
+    expect(again.status).toBe(200);
+    expect(again.json.queued).toBe(0);
+  });
+
   it('marks a pass with no terminals as none and reports that from the creation call', async () => {
     const now = Date.now();
     const pass = await issuePass(new Date(now - 60_000), new Date(now + 60 * 60_000));

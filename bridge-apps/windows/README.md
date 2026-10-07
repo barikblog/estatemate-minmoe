@@ -57,7 +57,9 @@ appears at all) with three tabs:
 - **Status** — what the bridge is doing, what your last action returned, and the
   live log;
 - **Configuration** — the agent id, secret and Worker URL, the portal's
-  *Download setup* `.ps1`, and the Hikvision terminals as an editable table;
+  *Download setup* `.ps1`, the Hikvision terminals as an editable table, and the
+  **Terminal clock sync** checkbox (opt-in: the bridge sets a terminal's clock
+  back to this PC's when it drifts past the configured threshold);
 - **Service** — *Start at boot* / *Remove from boot*, which are `install-service`
   and `uninstall-service` with the elevation prompt handled for you.
 
@@ -171,7 +173,15 @@ estatemate-bridge.exe help
 
 Useful options: `--config`, `--devices`, `--data-dir`, `--log-level`,
 `--log-file`, `--from-installer <file|->`, `--devices-json <file>`,
-`--no-prompt`, `--dry-run`, `--quiet`, `--json`.
+`--time-sync-enabled <true|false>`, `--no-prompt`, `--dry-run`, `--quiet`,
+`--json`.
+
+`--time-sync-enabled` is the dashboard checkbox on the command line: `setup`
+writes it into `agent-config.json` as the `timeSync` block, keeps the
+`maxDriftMs` / `checkIntervalMinutes` thresholds the configuration already had,
+and leaves clock sync off when nothing says otherwise. The interactive `setup`
+wizard asks the same question. Clock sync aligns the terminals' clocks with this
+PC; it does not set a terminal's timezone, which must match the estate.
 
 ## Configuration
 

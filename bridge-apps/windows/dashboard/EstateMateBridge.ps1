@@ -12,7 +12,8 @@ This is the same agent behind a normal window:
   * Status        what the bridge is doing, the output of what you asked it to
                   do, and the live log;
   * Configuration agent id / secret / Worker URL, the portal's "Download setup"
-                  script, and the Hikvision terminals as an editable table;
+                  script, the Hikvision terminals as an editable table, and the
+                  terminal clock-sync switch;
   * Service       start it now, stop it, and keep it running from boot.
 
 Everything it does is the existing command line, run for you: `status --json`,
@@ -389,6 +390,23 @@ function New-DashboardForm {
   $script:Controls.SaveTerminalsButton = New-Button $terminalsGroup 'Save all settings' 282 292 140 28
   [void](New-Label $terminalsGroup 'Every terminal must be on the same LAN as this PC. "Live events" streams gate events in real time.' 432 296 330 40)
 
+  # Terminal clock sync is opt-in: the checkbox is the estate's decision, and
+  # saving hands it to `setup` as --time-sync-enabled, the same single writer
+  # every other setting goes through (which also preserves the thresholds the
+  # configuration already had).
+  $clockGroup = New-Object System.Windows.Forms.GroupBox
+  $clockGroup.Text = 'Terminal clock sync (opt-in)'
+  $clockGroup.Location = New-Object System.Drawing.Point(10, 548)
+  $clockGroup.Size = New-Object System.Drawing.Size(775, 76)
+  $configTab.Controls.Add($clockGroup)
+
+  $script:Controls.TimeSync = New-Object System.Windows.Forms.CheckBox
+  $script:Controls.TimeSync.Text = 'Synchronise the terminals'' clocks with this PC'
+  $script:Controls.TimeSync.Location = New-Object System.Drawing.Point(12, 24)
+  $script:Controls.TimeSync.Size = New-Object System.Drawing.Size(740, 22)
+  $clockGroup.Controls.Add($script:Controls.TimeSync)
+  [void](New-Label $clockGroup 'A terminal hours off rejects live visitor passes early and honours dead ones late. The bridge sets a terminal back only past its drift threshold; this PC''s clock is the reference, and the terminal''s timezone should match it.' 12 48 740 26)
+
   $serviceTab = New-Object System.Windows.Forms.TabPage
   $serviceTab.Text = 'Service'
   $serviceTab.AutoScroll = $true
@@ -488,6 +506,12 @@ function Fill-Fields {
     $script:Controls.WorkerUrl.Text = 'https://estatemate.estatemate.workers.dev'
   }
 
+  if ($script:Controls.TimeSync) {
+    $sync = $null
+    if ($script:Config) { $sync = $script:Config.timeSync }
+    $script:Controls.TimeSync.Checked = [bool]($sync -and $sync.enabled -eq $true)
+  }
+
   # Only when the table is empty: the timer must never overwrite an edit in progress.
   if ($script:Controls.Grid -and $script:Controls.Grid.Rows.Count -eq 0) {
     foreach ($device in @($script:Devices)) {
@@ -535,6 +559,13 @@ function Get-DevicesJson {
   return [pscustomobject]@{ devices = @($devices) }
 }
 
+function Get-TimeSyncFlagValue {
+  # The checkbox as the one value the CLI accepts, so the dashboard and a typed
+  # command line mean the same thing.
+  if ($script:Controls.TimeSync -and $script:Controls.TimeSync.Checked) { return 'true' }
+  return 'false'
+}
+
 function Save-Configuration([string] $fromInstaller) {
   # One writer for both files: `setup`. It validates the values, hardens the file
   # permissions and writes agent-config.json + isapi-devices.json exactly as the
@@ -563,6 +594,11 @@ function Save-Configuration([string] $fromInstaller) {
     $arguments += @('--agent-id', $agentId, '--agent-secret', $agentSecret)
     if ($workerUrl) { $arguments += @('--worker-url', $workerUrl) }
   }
+
+  # The clock-sync checkbox rides the same single writer as every other setting:
+  # setup turns it into the timeSync block and keeps the thresholds the
+  # configuration already had.
+  $arguments += @('--time-sync-enabled', (Get-TimeSyncFlagValue))
 
   # The elevated retry runs the very same command line, so the devices file has
   # to survive until every attempt is done. It is removed in the finally, and
@@ -861,7 +897,7 @@ function Invoke-SelfTest {
     $needed = @('Form', 'Report', 'LiveLog', 'Grid', 'AgentId', 'AgentSecret', 'WorkerUrl', 'InstallerPath',
                 'BridgeState', 'AgentState', 'DeviceState', 'PortalState', 'ServiceState',
                 'StartButton', 'StopButton', 'CheckButton', 'OpenLogsButton', 'InstallServiceButton',
-                'RemoveServiceButton', 'SaveTerminalsButton', 'AddTerminalButton', 'ApplyPortalButton')
+                'RemoveServiceButton', 'SaveTerminalsButton', 'AddTerminalButton', 'ApplyPortalButton', 'TimeSync')
     $missing = @()
     foreach ($name in $needed) { if (-not $script:Controls.ContainsKey($name)) { $missing += $name } }
     Check 'every control the dashboard uses exists' ($missing.Count -eq 0) ($missing -join ', ')
@@ -915,6 +951,21 @@ function Invoke-SelfTest {
     $grid.Rows.Clear()
     Fill-Fields
     Check 'the table can be rebuilt from the saved state' ($grid.Rows.Count -eq @($script:Devices).Count) "rows=$($grid.Rows.Count) devices=$(@($script:Devices).Count)"
+
+    # The clock-sync checkbox reads the saved configuration and becomes the one
+    # flag value `setup` accepts, so the window and the console cannot disagree.
+    $script:Config = [pscustomobject]@{ timeSync = [pscustomobject]@{ enabled = $true; maxDriftMs = 90000; checkIntervalMinutes = 45 } }
+    Fill-Fields
+    Check 'the clock-sync checkbox follows the saved configuration' ($script:Controls.TimeSync.Checked -eq $true) "checked=$($script:Controls.TimeSync.Checked)"
+    Check 'the save carries an unchecked box as --time-sync-enabled=false' ((Get-TimeSyncFlagValue) -eq 'false') (Get-TimeSyncFlagValue)
+    $script:Controls.TimeSync.Checked = $true
+    Check 'the save carries a checked box as --time-sync-enabled=true' ((Get-TimeSyncFlagValue) -eq 'true') (Get-TimeSyncFlagValue)
+    $script:Config = [pscustomobject]@{ timeSync = [pscustomobject]@{ enabled = $false } }
+    Fill-Fields
+    Check 'the clock-sync checkbox clears when sync is off' ($script:Controls.TimeSync.Checked -eq $false) "checked=$($script:Controls.TimeSync.Checked)"
+    $script:Config = $null
+    Fill-Fields
+    Check 'the clock-sync checkbox starts off with no configuration' ($script:Controls.TimeSync.Checked -eq $false) "checked=$($script:Controls.TimeSync.Checked)"
   } catch {
     Check 'the window builds' $false $_.Exception.Message
   }

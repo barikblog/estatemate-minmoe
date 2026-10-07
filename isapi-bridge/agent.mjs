@@ -1230,38 +1230,95 @@ function xmlText(value) {
 }
 
 /**
+ * The estate zone the Worker sends with every visitor operation. A terminal
+ * checks the pass window against its own clock, and Hikvision's schema accepts
+ * the window either as UTC (`…Z`, `timeType: "UTC"`) or as the terminal's local
+ * wall clock (`YYYY-MM-DDTHH:mm:ss`, `timeType: "local"`). EstateMate states it
+ * in the estate's local time, so the window the terminal enforces is the window
+ * the portal shows. Operations from a Worker that predates the field — and
+ * payloads with a zone the bridge cannot read — keep the UTC form.
+ */
+function visitorTimeZone(payload) {
+  const timeZone = typeof payload?.timeZone === 'string' ? payload.timeZone.trim() : '';
+  if (!timeZone) return null;
+  try {
+    void new Intl.DateTimeFormat('en-US', { timeZone });
+    return timeZone;
+  } catch {
+    return null;
+  }
+}
+
+/** `YYYY-MM-DDTHH:mm:ss` — the estate's local wall clock, no offset, no `Z`. */
+function formatEstateLocalTime(instant, timeZone) {
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+  const parts = formatter.formatToParts(instant);
+  const read = (type) => parts.find((part) => part.type === type)?.value ?? '';
+  return `${read('year')}-${read('month')}-${read('day')}T${read('hour')}:${read('minute')}:${read('second')}`;
+}
+
+/**
  * Build only the temporary terminal account shown in the device's person UI:
  * employee ID, name, Company department, finite validity, non-administrator
  * normal-user role, and PIN. Visitor provisioning intentionally sends no card,
  * fingerprint, face, door-right, or right-plan record.
  */
 function visitorPersonInfo(payload, employeeNo) {
-  const asUtc = (value, label) => {
+  const asInstant = (value, label) => {
     const instant = new Date(String(value || ''));
     if (!Number.isFinite(instant.getTime())) throw new Error(`visitor ${label} is not a valid date`);
-    return instant.toISOString().replace(/\.\d{3}Z$/, 'Z');
+    return instant;
   };
-  const beginTime = asUtc(payload.validFrom, 'validFrom');
-  const endTime = asUtc(payload.validUntil, 'validUntil');
-  if (Date.parse(endTime) <= Date.parse(beginTime)) throw new Error('visitor validUntil must be after validFrom');
+  const from = asInstant(payload.validFrom, 'validFrom');
+  const until = asInstant(payload.validUntil, 'validUntil');
+  if (until.getTime() <= from.getTime()) throw new Error('visitor validUntil must be after validFrom');
   const pin = String(payload.pin || '').trim();
   if (!/^\d{4,8}$/.test(pin)) throw new Error('visitor PIN must contain 4 to 8 digits');
+  const timeZone = visitorTimeZone(payload);
+  const beginTime = timeZone ? formatEstateLocalTime(from, timeZone) : from.toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const endTime = timeZone ? formatEstateLocalTime(until, timeZone) : until.toISOString().replace(/\.\d{3}Z$/, 'Z');
   return {
     employeeNo: String(employeeNo),
     name: String(payload.visitorName || 'Visitor').trim().slice(0, 32) || 'Visitor',
     belongGroup: 'Company',
     userType: 'normal',
-    Valid: { enable: true, beginTime, endTime, timeType: 'UTC' },
+    Valid: { enable: true, beginTime, endTime, timeType: timeZone ? 'local' : 'UTC' },
     localUIRight: false,
     password: pin,
   };
 }
 
 /**
+ * Whether a `Record` answer reports that the employee number already exists on
+ * the terminal. That is the only answer that makes `Modify` the right next
+ * call. Any other content rejection is the terminal refusing what was sent,
+ * and a `Modify` follow-up would only answer `employeeNoNotExist` — the
+ * account was never created — which hides the terminal's own reason.
+ */
+function recordReportsExistingEmployeeNo(result) {
+  const body = String(result.body || '');
+  if (/notSupport|invalidURL|invalidOperation/i.test(body)) return false;
+  if (/notExist|not ?found/i.test(body)) return false;
+  return /employeeNo(AlreadyExist|AlreadyExists|Exists|Exist|Repeated|Duplicate)/i.test(body);
+}
+
+/**
  * Add or update the finite visitor UserInfo account. Record is the documented
- * add call; duplicate IDs continue through Modify, and SetUp covers firmware
- * exposing only the combined add/edit operation. XML is used only when the JSON
- * URL is unsupported, never to hide a content rejection.
+ * add call; an employee number the terminal already holds continues through
+ * Modify, and SetUp covers firmware exposing only the combined add/edit
+ * operation. A content rejection is reported as the terminal stated it — it is
+ * never retried in another shape, because the retry would only bury the real
+ * reason. XML is used only when the JSON URL is unsupported, never to hide a
+ * content rejection.
  */
 async function writeTerminalVisitorPerson(device, payload, employeeNo) {
   const info = visitorPersonInfo(payload, employeeNo);
@@ -1271,10 +1328,15 @@ async function writeTerminalVisitorPerson(device, payload, employeeNo) {
   attempts.push(result);
   if (isapiOk(result)) return { ok: true, result, attempts };
 
-  if (!isapiUnsupported(result)) {
+  if (recordReportsExistingEmployeeNo(result)) {
     const modify = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/UserInfo/Modify?format=json', body, false);
     attempts.push(modify);
     if (isapiOk(modify)) return { ok: true, result: modify, attempts };
+  } else if (!isapiUnsupported(result)) {
+    // The terminal refused the content. Keep its answer: a Modify follow-up
+    // would answer employeeNoNotExist and report a follow-up failure instead
+    // of the reason the account was refused.
+    return { ok: false, result, attempts };
   }
 
   result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/UserInfo/SetUp?format=json', body, false);
@@ -1289,7 +1351,7 @@ async function writeTerminalVisitorPerson(device, payload, employeeNo) {
   <name>${xmlText(info.name)}</name>
   <belongGroup>Company</belongGroup>
   <userType>normal</userType>
-  <Valid><enable>true</enable><beginTime>${info.Valid.beginTime}</beginTime><endTime>${info.Valid.endTime}</endTime><timeType>UTC</timeType></Valid>
+  <Valid><enable>true</enable><beginTime>${info.Valid.beginTime}</beginTime><endTime>${info.Valid.endTime}</endTime><timeType>${info.Valid.timeType}</timeType></Valid>
   <localUIRight>false</localUIRight>
   <password>${info.password}</password>
 </UserInfo>`;

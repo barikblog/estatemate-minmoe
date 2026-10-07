@@ -553,6 +553,87 @@ async function main() {
       `status=${badId.status} ${badId.stderr}${badId.stdout}`.slice(-300),
     );
 
+    // 1e. Terminal clock sync plumbing: the CLI flag (what the Windows
+    //     dashboard's checkbox sends), the interactive ask, the default-off
+    //     fresh setup, and the thresholds a re-save must preserve.
+    const syncSetup = (dir, extraArgs) => runCli(exe, [
+      'setup', '--no-prompt', '--no-verify',
+      '--agent-id', state.agentId,
+      '--agent-secret', manualSecret,
+      '--worker-url', `http://127.0.0.1:${workerPort}`,
+      '--devices-json', wizardDevicesPath,
+      ...extraArgs,
+      '--data-dir', dir,
+      '--log-file', path.join(dir, 'bridge.log'),
+    ]);
+
+    const syncOnDir = path.join(workDir, 'time-sync-on');
+    const syncOn = await syncSetup(syncOnDir, ['--time-sync-enabled=true']);
+    const syncOnConfig = readJsonIfExists(path.join(syncOnDir, 'agent-config.json'));
+    check(
+      'setup --time-sync-enabled=true writes terminal clock sync on',
+      syncOn.status === 0 && Boolean(syncOnConfig) && syncOnConfig.timeSync?.enabled === true,
+      `status=${syncOn.status} timeSync=${JSON.stringify(syncOnConfig && syncOnConfig.timeSync)}`,
+    );
+
+    const syncOffDir = path.join(workDir, 'time-sync-off');
+    const syncOff = await syncSetup(syncOffDir, ['--time-sync-enabled=false']);
+    const syncOffConfig = readJsonIfExists(path.join(syncOffDir, 'agent-config.json'));
+    check(
+      'setup --time-sync-enabled=false writes terminal clock sync off',
+      syncOff.status === 0 && Boolean(syncOffConfig) && syncOffConfig.timeSync?.enabled === false,
+      `status=${syncOff.status} timeSync=${JSON.stringify(syncOffConfig && syncOffConfig.timeSync)}`,
+    );
+
+    const syncDefaultDir = path.join(workDir, 'time-sync-default');
+    const syncDefault = await syncSetup(syncDefaultDir, []);
+    const syncDefaultConfig = readJsonIfExists(path.join(syncDefaultDir, 'agent-config.json'));
+    check(
+      'a fresh setup without the flag keeps terminal clock sync off',
+      syncDefault.status === 0 && Boolean(syncDefaultConfig) && syncDefaultConfig.timeSync?.enabled === false,
+      `status=${syncDefault.status} timeSync=${JSON.stringify(syncDefaultConfig && syncDefaultConfig.timeSync)}`,
+    );
+
+    // The dashboard's save path: the configuration on disk already carries
+    // thresholds, and saving again (with the checkbox flipped) must keep them.
+    const preserveDir = path.join(workDir, 'time-sync-preserve');
+    fs.mkdirSync(preserveDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(preserveDir, 'agent-config.json'),
+      `${JSON.stringify({
+        agentId: state.agentId,
+        agentSecret: manualSecret,
+        workerUrl: `http://127.0.0.1:${workerPort}`,
+        timeSync: { enabled: true, maxDriftMs: 90000, checkIntervalMinutes: 45 },
+      }, null, 2)}\n`,
+    );
+    const preserve = await syncSetup(preserveDir, ['--time-sync-enabled=false']);
+    const preserveConfig = readJsonIfExists(path.join(preserveDir, 'agent-config.json'));
+    check(
+      'saving preserves the existing sync thresholds',
+      preserve.status === 0 && Boolean(preserveConfig)
+        && preserveConfig.timeSync?.enabled === false
+        && preserveConfig.timeSync?.maxDriftMs === 90000
+        && preserveConfig.timeSync?.checkIntervalMinutes === 45,
+      `status=${preserve.status} timeSync=${JSON.stringify(preserveConfig && preserveConfig.timeSync)}`,
+    );
+
+    // The interactive wizard asks about clock sync and honours the answer.
+    const askDir = path.join(workDir, 'time-sync-ask');
+    const asked = await runCli(exe, [
+      'setup', '--no-verify',
+      '--from-installer', installerPath,
+      '--devices-json', wizardDevicesPath,
+      '--data-dir', askDir,
+      '--log-file', path.join(askDir, 'bridge.log'),
+    ], { input: 'y\n' });
+    const askConfig = readJsonIfExists(path.join(askDir, 'agent-config.json'));
+    check(
+      'the setup wizard asks about terminal clock sync and honours the answer',
+      asked.status === 0 && Boolean(askConfig) && askConfig.timeSync?.enabled === true,
+      `status=${asked.status} timeSync=${JSON.stringify(askConfig && askConfig.timeSync)}`,
+    );
+
     // 2. Real configuration pointing at the fake Worker and the fake terminal.
     fs.writeFileSync(
       configPath,

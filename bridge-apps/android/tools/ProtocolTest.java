@@ -269,6 +269,10 @@ public final class ProtocolTest {
         visitor.put("pin", "482731");
         visitor.put("validFrom", "2026-10-05T08:00:00.000Z");
         visitor.put("validUntil", "2026-10-05T18:00:00.000Z");
+        // The Worker sends the estate's zone with every visitor operation; the
+        // bridge states the window in that zone's local time (Africa/Lagos is
+        // UTC+1, so 08:00Z is 09:00 on the terminal's wall clock).
+        visitor.put("timeZone", "Africa/Lagos");
 
         Map<String, Object> badPin = new LinkedHashMap<String, Object>(visitor);
         badPin.put("pin", "123");
@@ -296,6 +300,12 @@ public final class ProtocolTest {
         check("upsert_visitor makes one UserInfo request and no CardInfo request",
                 fake.requestOrder.subList(visitorRequestStart, fake.requestOrder.size()).equals(java.util.Arrays.asList(
                         "/ISAPI/AccessControl/UserInfo/Record")) && fake.visitorRecords.isEmpty(), fake.requestOrder.toString());
+        check("upsert_visitor states the pass window in the estate's local time",
+                fake.visitorPersonRecords.get(0).contains("\"beginTime\":\"2026-10-05T09:00:00\"")
+                        && fake.visitorPersonRecords.get(0).contains("\"endTime\":\"2026-10-05T19:00:00\"")
+                        && fake.visitorPersonRecords.get(0).contains("\"timeType\":\"local\"")
+                        && !fake.visitorPersonRecords.get(0).contains("T08:00:00Z")
+                        && !fake.visitorPersonRecords.get(0).contains("T18:00:00Z"), fake.visitorPersonRecords.toString());
 
         int visitorRetryStart = fake.requestOrder.size();
         IsapiClient.OpResult visitorRetry = client.applyOperation(device, "upsert_visitor", visitor);
@@ -304,6 +314,36 @@ public final class ProtocolTest {
                         "/ISAPI/AccessControl/UserInfo/Record", "/ISAPI/AccessControl/UserInfo/Modify"))
                 && fake.visitorPersonRecords.size() == 2
                 && fake.visitorPersonRecords.get(1).equals(fake.visitorPersonRecords.get(0)), String.valueOf(visitorRetry.error));
+
+        // A payload from a Worker that predates the timezone field keeps the UTC
+        // window, exactly as before.
+        Map<String, Object> zonelessVisitor = new LinkedHashMap<String, Object>(visitor);
+        zonelessVisitor.remove("timeZone");
+        zonelessVisitor.put("employeeNo", "VIS8");
+        zonelessVisitor.put("credentialNumber", "VIS8");
+        IsapiClient.OpResult zoneless = client.applyOperation(device, "upsert_visitor", zonelessVisitor);
+        check("a visitor payload without a zone keeps the UTC window", zoneless.success
+                && fake.visitorPersonRecords.get(fake.visitorPersonRecords.size() - 1).contains("\"beginTime\":\"2026-10-05T08:00:00Z\"")
+                && fake.visitorPersonRecords.get(fake.visitorPersonRecords.size() - 1).contains("\"endTime\":\"2026-10-05T18:00:00Z\"")
+                && fake.visitorPersonRecords.get(fake.visitorPersonRecords.size() - 1).contains("\"timeType\":\"UTC\""),
+                String.valueOf(zoneless.error));
+
+        // A content rejection keeps the terminal's own reason: Modify is only
+        // attempted when Record reports an existing employee number, so no
+        // misleading employeeNoNotExist follow-up is generated.
+        fake.rejectVisitorContent = true;
+        int contentRejectStart = fake.requestOrder.size();
+        Map<String, Object> refusedVisitor = new LinkedHashMap<String, Object>(visitor);
+        refusedVisitor.put("employeeNo", "VIS9");
+        refusedVisitor.put("credentialNumber", "VIS9");
+        IsapiClient.OpResult refused = client.applyOperation(device, "upsert_visitor", refusedVisitor);
+        check("a visitor content rejection keeps the terminal's own reason",
+                !refused.success && refused.error.contains("badJsonContent") && !refused.error.contains("employeeNoNotExist"),
+                String.valueOf(refused.error));
+        check("a visitor content rejection never reaches Modify",
+                fake.requestOrder.subList(contentRejectStart, fake.requestOrder.size())
+                        .equals(java.util.Arrays.asList("/ISAPI/AccessControl/UserInfo/Record")), fake.requestOrder.toString());
+        fake.rejectVisitorContent = false;
 
         Map<String, Object> revoke = new LinkedHashMap<String, Object>();
         revoke.put("credentialNumber", "VIS7");
@@ -675,6 +715,7 @@ public final class ProtocolTest {
         int rejected;
         boolean rejectJsonCards;
         boolean rejectContent;
+        boolean rejectVisitorContent;
         boolean staleNonceOnce;
         int staleNonceChallenges;
         final java.util.Set<String> heldCards = new java.util.HashSet<String>();
@@ -823,6 +864,12 @@ public final class ProtocolTest {
                 java.util.regex.Matcher personNo = java.util.regex.Pattern.compile("\"employeeNo\":\"([^\"]*)\"").matcher(body);
                 String employeeNo = personNo.find() ? personNo.group(1) : "";
                 if (employeeNo.startsWith("VIS")) {
+                    if (device.rejectVisitorContent) {
+                        // A terminal refusing the visitor content, for the
+                        // rejection-path checks below.
+                        respond(exchange, 400, "{\"statusCode\":6,\"statusString\":\"Invalid Content\",\"subStatusCode\":\"badJsonContent\",\"errorMsg\":\"UserInfo\"}");
+                        return;
+                    }
                     if (!body.contains("\"userType\":\"normal\"") || !body.contains("\"Valid\"")
                             || !body.contains("\"belongGroup\":\"Company\"")
                             || !java.util.regex.Pattern.compile("\"password\":\"\\d{4,8}\"").matcher(body).find()
