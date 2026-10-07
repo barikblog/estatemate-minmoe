@@ -25,13 +25,14 @@ const {
   validateAgentConfig,
   validateDevicesConfig,
 } = require('./config.cjs');
-const { runCheck } = require('./diagnostics.cjs');
+const { runCheck, runSyncClocks } = require('./diagnostics.cjs');
 const { installService, serviceState, uninstallService } = require('./service.cjs');
 const { runInit, runSetup } = require('./setup.cjs');
 
 const COMMANDS = new Set([
   'run',
   'check',
+  'sync-clocks',
   'status',
   'setup',
   'init',
@@ -53,6 +54,7 @@ const FLAG_SPEC = {
   'agent-secret': 'value',
   'worker-url': 'value',
   'time-sync-enabled': 'value',
+  'time-sync-timezone': 'value',
   'task-name': 'value',
   user: 'value',
   quiet: 'bool',
@@ -75,6 +77,9 @@ Commands (default: run)
                       real-time alertStream events from every configured device.
   check               Pre-flight: validate the config, authenticate against the
                       Worker, then probe each terminal over ISAPI.
+  sync-clocks         One synchronisation pass over every terminal's clock, on
+                      demand (the dashboard's "Synchronise clocks now" button).
+                      Runs even when automatic clock sync is switched off.
   setup               The setup wizard: write agent-config.json/isapi-devices.json
                       from the portal's "Download setup" script, prompting for each
                       Hikvision terminal. On an unconfigured machine, running the
@@ -102,6 +107,10 @@ Options
   --time-sync-enabled <true|false>
                            align the terminals' clocks with this PC (opt-in,
                            default off; the Windows dashboard sends this)
+  --time-sync-timezone <zone>
+                           the terminals' IANA time zone (e.g. Africa/Lagos);
+                           empty clears it and means "this PC's zone" (setup
+                           only; the Windows dashboard sends this)
   --no-prompt              never ask questions (setup/init only)
   --no-verify              skip the Worker call during setup
   --task-name <name>       Scheduled Task name (default: EstateMateBridge)
@@ -115,6 +124,7 @@ Examples
   estatemate-bridge.exe setup --from-installer .\\installer.ps1
   estatemate-bridge.exe setup --no-prompt --agent-id <uuid> --agent-secret <secret>
   estatemate-bridge.exe check --json
+  estatemate-bridge.exe sync-clocks
   estatemate-bridge.exe install-service
 `;
 
@@ -368,7 +378,9 @@ async function runCli(meta) {
 
   // --time-sync-enabled is the Windows dashboard's checkbox: one writer (setup)
   // turns it into the agent-config.json timeSync block, so the console, the
-  // window and a script cannot disagree about what "on" means.
+  // window and a script cannot disagree about what "on" means. The timezone
+  // flag is the dashboard's zone chooser, validated the same way: an IANA zone
+  // name the bridge can actually read, or empty (meaning "this PC's zone").
   let timeSyncEnabled;
   if (flags['time-sync-enabled'] !== undefined) {
     const value = String(flags['time-sync-enabled']).trim().toLowerCase();
@@ -378,6 +390,26 @@ async function runCli(meta) {
       return 2;
     }
     timeSyncEnabled = value === 'true';
+  }
+  let timeSyncTimeZone;
+  if (flags['time-sync-timezone'] !== undefined) {
+    const value = String(flags['time-sync-timezone']).trim();
+    if (value) {
+      let readable = true;
+      try {
+        void new Intl.DateTimeFormat('en-US', { timeZone: value });
+      } catch {
+        readable = false;
+      }
+      if (!readable) {
+        process.stderr.write(`error: --time-sync-timezone must be an IANA time zone (e.g. Africa/Lagos), not "${value}"\n`);
+        process.stderr.write('\nRun "estatemate-bridge.exe help" for usage.\n');
+        return 2;
+      }
+      timeSyncTimeZone = value;
+    } else {
+      timeSyncTimeZone = null; // explicitly cleared: the terminals share this PC's zone
+    }
   }
 
   if (command === 'help' || flags.help) {
@@ -426,7 +458,7 @@ async function runCli(meta) {
     const wizardCode = await runSetup({
       ctx,
       logger,
-      options: { fromInstaller: null, devicesJson: null, prompt: true, verify: true, force: false, timeSyncEnabled },
+      options: { fromInstaller: null, devicesJson: null, prompt: true, verify: true, force: false, timeSyncEnabled, timeSyncTimeZone },
     });
     logger.close();
     return wizardCode;
@@ -440,6 +472,9 @@ async function runCli(meta) {
       break;
     case 'check':
       code = await runCheck({ ctx, logger, json: Boolean(flags.json) });
+      break;
+    case 'sync-clocks':
+      code = await runSyncClocks({ ctx, logger, json: Boolean(flags.json) });
       break;
     case 'status':
       code = commandStatus({ ctx, logger, json: Boolean(flags.json) });
@@ -455,6 +490,7 @@ async function runCli(meta) {
           agentSecret: flags['agent-secret'] || null,
           workerUrl: flags['worker-url'] || null,
           timeSyncEnabled,
+          timeSyncTimeZone,
           prompt: !flags['no-prompt'],
           verify: !flags['no-verify'],
           force: Boolean(flags.force),

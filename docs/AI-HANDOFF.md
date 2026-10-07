@@ -1,5 +1,43 @@
 # AI handoff — EstateMate
 
+## Time-zone chooser and synchronisation button on the bridge app (2026-10-07)
+
+Implemented locally; not deployed or published. Windows/Node bridge only — the
+Android bridge does not run clock sync at all (recorded deviation).
+
+- **The bridge app lets the estate choose the terminals' time zone.** The
+  Windows dashboard's Configuration tab (Terminal clock sync group) has an
+  editable **time-zone chooser** (common IANA zones listed, any other IANA name
+  typeable) next to the on/off checkbox. It saves as `timeSync.timeZone` in
+  `agent-config.json` via the new `--time-sync-timezone=<zone>` CLI flag
+  (empty clears it); `setup` preserves the chosen zone on re-save, exactly like
+  the thresholds. Unset means "this PC's zone" — the historical assumption.
+- **A chosen zone is read and written by the synchronisation.** The agent
+  interprets every terminal time report in the chosen zone (instead of assuming
+  the host's), and every clock set carries the zone (`timeZone` in the JSON
+  body, `<timeZone>` in the XML fallback) with the wall clock rendered in that
+  zone — so a terminal still configured to a different zone is re-zoned as
+  part of the synchronisation instead of showing a constant offset in the
+  portal forever. With no zone configured the wire format is byte-for-byte the
+  old one.
+- **There is a synchronisation button.** "Synchronise clocks now" runs the new
+  `estatemate-bridge.exe sync-clocks` command: one pass over every terminal —
+  read, measure against this PC, set only past `maxDriftMs`, re-read to
+  confirm — reporting each terminal's time, drift and outcome (`--json`
+  available). It runs even when automatic sync is off: an explicit operator
+  action is not the schedule. The dashboard shows the output and retries
+  elevated like `check` does.
+- Coverage: `isapi-bridge/agent.time-sync.integration.mjs` (zone-aware report
+  reading, zone-carrying set in JSON and XML, unchanged no-zone wire format),
+  and seven new packaged-executable smoke checks (zone saved / cleared /
+  rejected, sync-clocks end to end against a drifted simulated terminal in
+  Africa/Lagos, within-tolerance second pass, on-demand run with automatic
+  sync off). The packaged Linux bridge smoke test passes 43/43; `npm test`
+  still passes with 27 files / 283 tests (no Worker-side change).
+- The dashboard self-test gained checks for the chooser (follows the saved
+  config, sentinel clears it, falls back to the PC zone) and for `sync-clocks`
+  answering cleanly without a configuration; it runs on the Windows runner.
+
 ## Visitor passes in the estate's local time, a gated visitor Modify, and the clock-sync switch (2026-10-07)
 
 Implemented locally; not deployed or published.

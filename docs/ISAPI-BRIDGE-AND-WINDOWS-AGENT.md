@@ -167,18 +167,28 @@ and the last sync. It is a status surface, never read back as an input to a
 decision.
 
 Two assumptions are operational, not technical, and are enforced by convention:
-the bridge host's clock is correct, and each terminal's timezone matches the
-host's. The sync aligns wall clocks; a terminal in a different timezone shows up
-as a constant offset in the portal and belongs re-zoned at the terminal. A failed
-read keeps the last good reading plus the error, so a terminal that just went
-down never erases the last known clock from the portal.
+the bridge host's clock is correct, and each terminal's timezone is the one
+chosen on the bridge app (`timeSync.timeZone`, an IANA name, defaulting to the
+host's zone). The sync aligns wall clocks, and a chosen zone travels with every
+clock set, so a terminal in a different timezone is re-zoned as part of the
+synchronisation rather than showing a constant offset in the portal forever.
+A failed read keeps the last good reading plus the error, so a terminal that
+just went down never erases the last known clock from the portal.
 
 The switch itself is an estate decision with one meaning everywhere: the Windows
-dashboard's **Configuration** tab has a **Terminal clock sync** checkbox, the
-interactive `setup` wizard asks, and the CLI accepts `--time-sync-enabled=true|false`.
-All three reach `agent-config.json` through the single writer (`setup`), which
-preserves the `maxDriftMs` / `checkIntervalMinutes` thresholds the configuration
-already had; a fresh setup defaults to off.
+dashboard's **Configuration** tab has a **Terminal clock sync** checkbox, a
+**time-zone chooser** and a **Synchronise clocks now** button, the interactive
+`setup` wizard asks, and the CLI accepts `--time-sync-enabled=true|false` and
+`--time-sync-timezone=<zone>`. All of them reach `agent-config.json` through
+the single writer (`setup`), which preserves the `maxDriftMs` /
+`checkIntervalMinutes` thresholds and the chosen zone the configuration already
+had; a fresh setup defaults to off and to no zone.
+
+`estatemate-bridge.exe sync-clocks` (the button's command) runs one
+synchronisation pass over every terminal on demand — it reports what time each
+terminal shows, how far that is from this PC, and whether the pass set it back
+(only past the threshold) or left it alone (already within it). It runs even when
+automatic sync is switched off: an explicit operator action is not the schedule.
 
 **Android deviation, recorded:** the Android bridge does not run the clock check
 (see `bridge-apps/android/README.md`). A terminal served only by an Android

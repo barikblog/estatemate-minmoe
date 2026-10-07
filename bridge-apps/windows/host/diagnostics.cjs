@@ -12,6 +12,15 @@
  *
  * Exit codes: 0 everything passed, 1 a device or Worker check failed, 2 the
  * configuration itself is unusable.
+ *
+ * `bridge sync-clocks` — one synchronisation pass over every terminal's
+ * clock, on demand (the Windows dashboard's "Synchronise clocks now" button).
+ * It answers: what time each terminal reports, how far that is from this PC,
+ * and whether the pass set it back (only past the configured threshold) or
+ * left it alone (already within it). Unlike the scheduled loop it runs even
+ * when automatic clock sync is switched off — an explicit operator action is
+ * not the schedule. Exit codes: 0 every terminal answered, 1 a terminal
+ * failed or none is configured, 2 the configuration itself is unusable.
  */
 'use strict';
 
@@ -405,4 +414,82 @@ async function runCheck({ ctx, logger, json = false }) {
   return report.exitCode;
 }
 
-module.exports = { parseDeviceInfo, parseCardCount, probeEventStream, runCheck };
+function printSyncReport(report, logger) {
+  const line = (text) => logger.raw(text);
+  line('');
+  line(`Terminal clock synchronisation (bridge ${report.version})`);
+  line(`  automatic sync: ${report.automaticSync ? `on — every ${report.checkIntervalMinutes} min, set when off by more than ${report.maxDriftMs} ms` : 'off — this pass ran on demand'}`);
+  line(`  terminals' time zone: ${report.timeZone ? `${report.timeZone} (chosen on the bridge app)` : 'not set — the terminals share this PC\'s zone'}`);
+  line('');
+  for (const terminal of report.terminals) {
+    if (terminal.lastError) {
+      line(`  [FAIL] ${terminal.name} — could not be read: ${terminal.lastError}`);
+      continue;
+    }
+    const seconds = Math.round(terminal.driftMs / 1000);
+    const when = terminal.terminalTime ? `terminal ${terminal.terminalTime}, off by ${seconds}s` : 'no readable time';
+    if (terminal.synced) line(`  [OK  ] ${terminal.name} — ${when} — set to the bridge's time`);
+    else if (terminal.withinTolerance) line(`  [OK  ] ${terminal.name} — ${when} — within tolerance, nothing to do`);
+    else line(`  [WARN] ${terminal.name} — ${when} — not corrected`);
+  }
+  line('');
+  for (const warning of report.warnings) line(`  WARN  ${warning}`);
+  for (const error of report.errors) line(`  ERROR ${error}`);
+  if (report.terminals.length) {
+    const synced = report.terminals.filter((terminal) => terminal.synced).length;
+    const within = report.terminals.filter((terminal) => terminal.withinTolerance && !terminal.synced).length;
+    line(`  ${report.terminals.length} terminal(s) checked, ${synced} synchronised, ${within} already in sync.`);
+  }
+  if (report.exitCode === 2) line('  Fix the configuration errors above, then run "sync-clocks" again.');
+  else if (report.exitCode === 1) line('  Some terminals failed — see the entries marked FAIL above.');
+  line('');
+}
+
+async function runSyncClocks({ ctx, logger, json = false }) {
+  const { paths, agentEntry, config, devicesFile, configValidation, devicesValidation } = ctx;
+  const timeSync = config && typeof config.timeSync === 'object' && config.timeSync ? config.timeSync : {};
+  const zone = typeof timeSync.timeZone === 'string' ? timeSync.timeZone.trim() : '';
+  const report = {
+    version: ctx.version,
+    commit: ctx.commit,
+    node: ctx.nodeVersion,
+    platform: `${process.platform} ${process.arch}`,
+    exePath: ctx.exePath,
+    config: { path: paths.configPath, source: paths.configSource },
+    automaticSync: timeSync.enabled === true,
+    checkIntervalMinutes: Number.isFinite(Number(timeSync.checkIntervalMinutes)) && Number(timeSync.checkIntervalMinutes) > 0 ? Number(timeSync.checkIntervalMinutes) : 15,
+    maxDriftMs: Number.isFinite(Number(timeSync.maxDriftMs)) && Number(timeSync.maxDriftMs) > 0 ? Number(timeSync.maxDriftMs) : 30000,
+    timeZone: zone || null,
+    terminals: [],
+    errors: [...configValidation.errors, ...devicesValidation.errors],
+    warnings: [...configValidation.warnings, ...devicesValidation.warnings],
+    exitCode: 0,
+  };
+
+  if (report.errors.length) {
+    report.exitCode = 2;
+    if (json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    else printSyncReport(report, logger);
+    return 2;
+  }
+
+  const agent = await loadAgent({ agentEntry, configPath: paths.configPath, devicesPath: paths.devicesPath, standby: true, logger });
+  // The agent's own device map is only resolved by `run`; in standby the
+  // command builds the device list itself, exactly like `check` does.
+  const entries = (devicesFile.devices || []).filter((d) => d && d.isapiHost && d.enabled !== false);
+  const deviceList = entries.map((entry) => deviceFromEntry(entry));
+  report.terminals = await agent.syncTerminalClocksNow(deviceList);
+
+  if (!report.terminals.length) {
+    report.errors.push('no usable device entries in isapi-devices.json');
+    report.exitCode = 1;
+  } else if (report.terminals.some((terminal) => terminal.lastError)) {
+    report.exitCode = 1;
+  }
+
+  if (json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  else printSyncReport(report, logger);
+  return report.exitCode;
+}
+
+module.exports = { parseDeviceInfo, parseCardCount, probeEventStream, runCheck, runSyncClocks };

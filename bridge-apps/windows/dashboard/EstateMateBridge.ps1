@@ -13,7 +13,8 @@ This is the same agent behind a normal window:
                   do, and the live log;
   * Configuration agent id / secret / Worker URL, the portal's "Download setup"
                   script, the Hikvision terminals as an editable table, and the
-                  terminal clock-sync switch;
+                  terminal clock sync: on/off switch, time-zone chooser and a
+                  "Synchronise clocks now" button;
   * Service       start it now, stop it, and keep it running from boot.
 
 Everything it does is the existing command line, run for you: `status --json`,
@@ -52,6 +53,8 @@ $script:Busy        = $false
 $script:Ticks       = 0
 $script:LogText     = ''
 $script:Controls    = @{}
+# The first entry of the time-zone chooser: the terminals share this PC's zone.
+$script:TimeZoneSentinel = '(this PC''s time zone)'
 
 # ----------------------------------------------------------------- windows bits ---
 
@@ -390,22 +393,48 @@ function New-DashboardForm {
   $script:Controls.SaveTerminalsButton = New-Button $terminalsGroup 'Save all settings' 282 292 140 28
   [void](New-Label $terminalsGroup 'Every terminal must be on the same LAN as this PC. "Live events" streams gate events in real time.' 432 296 330 40)
 
-  # Terminal clock sync is opt-in: the checkbox is the estate's decision, and
-  # saving hands it to `setup` as --time-sync-enabled, the same single writer
-  # every other setting goes through (which also preserves the thresholds the
-  # configuration already had).
+  # Terminal clock sync is opt-in: the checkbox is the estate's decision, the
+  # zone chooser names the terminals' zone, and saving hands both to `setup` as
+  # --time-sync-enabled / --time-sync-timezone, the same single writer every
+  # other setting goes through (which also preserves the thresholds and the
+  # zone the configuration already had). The button runs one synchronisation
+  # pass over every terminal now, without waiting for the interval.
   $clockGroup = New-Object System.Windows.Forms.GroupBox
   $clockGroup.Text = 'Terminal clock sync (opt-in)'
   $clockGroup.Location = New-Object System.Drawing.Point(10, 548)
-  $clockGroup.Size = New-Object System.Drawing.Size(775, 76)
+  $clockGroup.Size = New-Object System.Drawing.Size(775, 104)
   $configTab.Controls.Add($clockGroup)
 
   $script:Controls.TimeSync = New-Object System.Windows.Forms.CheckBox
   $script:Controls.TimeSync.Text = 'Synchronise the terminals'' clocks with this PC'
-  $script:Controls.TimeSync.Location = New-Object System.Drawing.Point(12, 24)
-  $script:Controls.TimeSync.Size = New-Object System.Drawing.Size(740, 22)
+  $script:Controls.TimeSync.Location = New-Object System.Drawing.Point(12, 22)
+  $script:Controls.TimeSync.Size = New-Object System.Drawing.Size(400, 22)
   $clockGroup.Controls.Add($script:Controls.TimeSync)
-  [void](New-Label $clockGroup 'A terminal hours off rejects live visitor passes early and honours dead ones late. The bridge sets a terminal back only past its drift threshold; this PC''s clock is the reference, and the terminal''s timezone should match it.' 12 48 740 26)
+
+  [void](New-Label $clockGroup 'Terminals'' time zone:' 12 50 170 20)
+  $script:Controls.TimeZone = New-Object System.Windows.Forms.ComboBox
+  # Editable on purpose: any IANA zone name is valid, not only the listed ones.
+  $script:Controls.TimeZone.DropDownStyle = 'DropDown'
+  $script:Controls.TimeZone.Location = New-Object System.Drawing.Point(186, 47)
+  $script:Controls.TimeZone.Size = New-Object System.Drawing.Size(230, 24)
+  [void]($script:Controls.TimeZone.Items.Add($script:TimeZoneSentinel))
+  foreach ($zone in @(
+    'UTC', 'Africa/Lagos', 'Africa/Cairo', 'Africa/Johannesburg', 'Africa/Nairobi',
+    'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles',
+    'America/Sao_Paulo', 'America/Mexico_City', 'America/Toronto', 'America/Bogota',
+    'America/Lima', 'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Madrid',
+    'Europe/Rome', 'Europe/Amsterdam', 'Europe/Stockholm', 'Europe/Warsaw',
+    'Europe/Athens', 'Europe/Istanbul', 'Europe/Moscow', 'Asia/Dubai', 'Asia/Karachi',
+    'Asia/Kolkata', 'Asia/Dhaka', 'Asia/Bangkok', 'Asia/Singapore', 'Asia/Hong_Kong',
+    'Asia/Shanghai', 'Asia/Tokyo', 'Asia/Seoul', 'Australia/Perth', 'Australia/Sydney',
+    'Australia/Brisbane', 'Pacific/Auckland'
+  )) {
+    [void]($script:Controls.TimeZone.Items.Add($zone))
+  }
+  $clockGroup.Controls.Add($script:Controls.TimeZone)
+
+  $script:Controls.SyncClocksButton = New-Button $clockGroup 'Synchronise clocks now' 428 46 180 28
+  [void](New-Label $clockGroup 'A terminal hours off rejects live visitor passes early and honours dead ones late. The bridge sets a terminal back only past its drift threshold; this PC''s clock is the reference. The chosen zone is written with the clock set, so a terminal in another zone is re-zoned with it.' 12 78 740 24)
 
   $serviceTab = New-Object System.Windows.Forms.TabPage
   $serviceTab.Text = 'Service'
@@ -511,6 +540,14 @@ function Fill-Fields {
     if ($script:Config) { $sync = $script:Config.timeSync }
     $script:Controls.TimeSync.Checked = [bool]($sync -and $sync.enabled -eq $true)
   }
+  if ($script:Controls.TimeZone) {
+    $zone = ''
+    if ($script:Config -and $script:Config.timeSync -and $script:Config.timeSync.timeZone) {
+      $zone = [string]$script:Config.timeSync.timeZone
+    }
+    if ($zone.Trim()) { $script:Controls.TimeZone.Text = $zone.Trim() }
+    else { $script:Controls.TimeZone.Text = $script:TimeZoneSentinel }
+  }
 
   # Only when the table is empty: the timer must never overwrite an edit in progress.
   if ($script:Controls.Grid -and $script:Controls.Grid.Rows.Count -eq 0) {
@@ -566,6 +603,15 @@ function Get-TimeSyncFlagValue {
   return 'false'
 }
 
+function Get-TimeSyncTimeZoneFlagValue {
+  # The zone chooser as the value the CLI accepts. The sentinel entry clears the
+  # setting, so a terminal estate goes back to "this PC's time zone".
+  $value = ''
+  if ($script:Controls.TimeZone -and $script:Controls.TimeZone.Text) { $value = [string]$script:Controls.TimeZone.Text.Trim() }
+  if ($value -eq $script:TimeZoneSentinel) { return '' }
+  return $value
+}
+
 function Save-Configuration([string] $fromInstaller) {
   # One writer for both files: `setup`. It validates the values, hardens the file
   # permissions and writes agent-config.json + isapi-devices.json exactly as the
@@ -595,10 +641,11 @@ function Save-Configuration([string] $fromInstaller) {
     if ($workerUrl) { $arguments += @('--worker-url', $workerUrl) }
   }
 
-  # The clock-sync checkbox rides the same single writer as every other setting:
-  # setup turns it into the timeSync block and keeps the thresholds the
-  # configuration already had.
+  # The clock-sync checkbox and the zone chooser ride the same single writer as
+  # every other setting: setup turns them into the timeSync block and keeps the
+  # thresholds and the zone the configuration already had.
   $arguments += @('--time-sync-enabled', (Get-TimeSyncFlagValue))
+  $arguments += @('--time-sync-timezone', (Get-TimeSyncTimeZoneFlagValue))
 
   # The elevated retry runs the very same command line, so the devices file has
   # to survive until every attempt is done. It is removed in the finally, and
@@ -689,6 +736,30 @@ function Start-Check {
       Show-CommandResult 'check (as administrator)' $result
     }
     if ($result.Code -eq 0) { Write-Activity 'Check finished. The lines above say what the Worker and each terminal answered.' }
+  } finally {
+    [System.Windows.Forms.Cursor]::Current = $cursor
+    $script:Busy = $false
+  }
+  Refresh-Summary
+  Update-LiveLog
+}
+
+function Sync-Clocks {
+  # The "Synchronise clocks now" button: one pass over every terminal's clock,
+  # without waiting for the interval. Runs even when automatic sync is off.
+  $script:Busy = $true
+  $cursor = [System.Windows.Forms.Cursor]::Current
+  [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::WaitCursor
+  try {
+    Write-Activity '--- synchronising the terminals'' clocks now (one pass over every terminal) ---'
+    $result = Invoke-Bridge @('sync-clocks')
+    Show-CommandResult 'sync-clocks' $result
+    if ($result.Code -ne 0 -and -not (Test-Admin)) {
+      Write-Activity 'The synchronisation needs to read the administrator-only configuration; asking Windows.'
+      $result = Invoke-BridgeElevated @('sync-clocks')
+      Show-CommandResult 'sync-clocks (as administrator)' $result
+    }
+    if ($result.Code -eq 0) { Write-Activity 'Synchronisation pass finished. The lines above say what each terminal answered.' }
   } finally {
     [System.Windows.Forms.Cursor]::Current = $cursor
     $script:Busy = $false
@@ -805,6 +876,7 @@ function Initialize-EventHandlers {
   $script:Controls.StartButton.Add_Click({ Start-Bridge })
   $script:Controls.StopButton.Add_Click({ Stop-Bridge })
   $script:Controls.CheckButton.Add_Click({ Start-Check })
+  $script:Controls.SyncClocksButton.Add_Click({ Sync-Clocks })
   $script:Controls.OpenLogsButton.Add_Click({ Open-Logs })
   $script:Controls.ElevateButton.Add_Click({ Restart-Elevated })
   $script:Controls.BrowseButton.Add_Click({ Browse-PortalFile })
@@ -897,7 +969,8 @@ function Invoke-SelfTest {
     $needed = @('Form', 'Report', 'LiveLog', 'Grid', 'AgentId', 'AgentSecret', 'WorkerUrl', 'InstallerPath',
                 'BridgeState', 'AgentState', 'DeviceState', 'PortalState', 'ServiceState',
                 'StartButton', 'StopButton', 'CheckButton', 'OpenLogsButton', 'InstallServiceButton',
-                'RemoveServiceButton', 'SaveTerminalsButton', 'AddTerminalButton', 'ApplyPortalButton', 'TimeSync')
+                'RemoveServiceButton', 'SaveTerminalsButton', 'AddTerminalButton', 'ApplyPortalButton',
+                'TimeSync', 'TimeZone', 'SyncClocksButton')
     $missing = @()
     foreach ($name in $needed) { if (-not $script:Controls.ContainsKey($name)) { $missing += $name } }
     Check 'every control the dashboard uses exists' ($missing.Count -eq 0) ($missing -join ', ')
@@ -966,6 +1039,23 @@ function Invoke-SelfTest {
     $script:Config = $null
     Fill-Fields
     Check 'the clock-sync checkbox starts off with no configuration' ($script:Controls.TimeSync.Checked -eq $false) "checked=$($script:Controls.TimeSync.Checked)"
+
+    # The zone chooser reads the saved configuration and becomes the value the
+    # CLI accepts; the sentinel clears the setting. The button's command must
+    # answer cleanly even with no configuration on the machine.
+    $script:Config = [pscustomobject]@{ timeSync = [pscustomobject]@{ enabled = $true; timeZone = 'Africa/Lagos' } }
+    Fill-Fields
+    Check 'the time-zone chooser follows the saved configuration' ([string]$script:Controls.TimeZone.Text -eq 'Africa/Lagos') "text=$($script:Controls.TimeZone.Text)"
+    Check 'the save carries the chosen zone as --time-sync-timezone' ((Get-TimeSyncTimeZoneFlagValue) -eq 'Africa/Lagos') (Get-TimeSyncTimeZoneFlagValue)
+    $script:Controls.TimeZone.Text = $script:TimeZoneSentinel
+    Check 'the sentinel clears the zone on save' ((Get-TimeSyncTimeZoneFlagValue) -eq '') (Get-TimeSyncTimeZoneFlagValue)
+    $script:Config = [pscustomobject]@{ timeSync = [pscustomobject]@{ enabled = $false } }
+    Fill-Fields
+    Check 'the time-zone chooser falls back to the PC zone when none is saved' ([string]$script:Controls.TimeZone.Text -eq $script:TimeZoneSentinel) "text=$($script:Controls.TimeZone.Text)"
+    $syncClocks = Invoke-Bridge @('sync-clocks')
+    Check 'the synchronisation command answers without a configuration' ($syncClocks.Code -eq 2 -and $syncClocks.Output -match 'configuration') ($syncClocks.Output -replace "`r?`n", ' | ')
+    $script:Config = $null
+    Fill-Fields
   } catch {
     Check 'the window builds' $false $_.Exception.Message
   }

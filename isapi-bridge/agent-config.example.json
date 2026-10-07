@@ -31,7 +31,8 @@
   "timeSync": {
     "enabled": false,
     "maxDriftMs": 30000,
-    "checkIntervalMinutes": 15
+    "checkIntervalMinutes": 15,
+    "timeZone": ""
   },
   "lanEvents": {
     "enabled": false,

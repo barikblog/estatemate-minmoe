@@ -283,24 +283,30 @@ async function runSetup({ ctx, logger, options }) {
 
     // Terminal clock sync stays opt-in: the --time-sync-enabled flag wins, an
     // interactive setup asks, and an unattended fresh setup leaves it off. The
-    // thresholds are whatever the estate already had — saving the configuration
-    // again (the dashboard does, on every "Save all settings") must never reset
-    // them to the defaults.
+    // thresholds and the chosen zone are whatever the estate already had —
+    // saving the configuration again (the dashboard does, on every "Save all
+    // settings") must never reset them to the defaults. The zone defaults to
+    // unset, which means "the terminals share this PC's time zone".
     const previousTimeSync = ctx.config && typeof ctx.config.timeSync === 'object' && ctx.config.timeSync ? ctx.config.timeSync : {};
     const previousDrift = Number(previousTimeSync.maxDriftMs);
     const previousInterval = Number(previousTimeSync.checkIntervalMinutes);
+    const previousZone = typeof previousTimeSync.timeZone === 'string' ? previousTimeSync.timeZone.trim() : '';
     let timeSyncOn = options.timeSyncEnabled;
     if (timeSyncOn === undefined || timeSyncOn === null) {
       timeSyncOn = prompter
         ? await prompter.confirm('  Synchronise the terminals\' clocks with this PC? (a terminal hours off rejects live passes early and honours dead ones late)', false)
         : false;
     }
+    // undefined = not chosen on this save (keep the estate's zone); null =
+    // explicitly cleared (back to "this PC's zone"); a string = the choice.
+    const timeSyncZone = options.timeSyncTimeZone === undefined ? (previousZone || null) : options.timeSyncTimeZone;
     config.timeSync = {
       enabled: timeSyncOn === true,
       maxDriftMs: Number.isFinite(previousDrift) && previousDrift > 0 ? previousDrift : 30000,
       checkIntervalMinutes: Number.isFinite(previousInterval) && previousInterval > 0 ? previousInterval : 15,
+      timeZone: timeSyncZone,
     };
-    logger.info(`Terminal clock sync ${config.timeSync.enabled ? 'on' : 'off'} (set when off by more than ${config.timeSync.maxDriftMs} ms, checked every ${config.timeSync.checkIntervalMinutes} min)`);
+    logger.info(`Terminal clock sync ${config.timeSync.enabled ? 'on' : 'off'} (set when off by more than ${config.timeSync.maxDriftMs} ms, checked every ${config.timeSync.checkIntervalMinutes} min${config.timeSync.timeZone ? `, terminals in ${config.timeSync.timeZone}` : ', terminals in this PC\'s zone'})`);
 
     const configValidation = validateAgentConfig(config);
     if (configValidation.errors.length) {
