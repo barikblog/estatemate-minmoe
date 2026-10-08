@@ -75,8 +75,14 @@ receives under the tag `EstateMateBridge`.
   `CardInfoDelCond` condition), and the remote door commands. `upsert_visitor`
   adds/updates only the finite `UserInfo` account shown in the terminal editor:
   employee ID, name, Company department, normal-user/non-administrator settings,
-  validity window and a 4-to-8-digit PIN. It sends no `CardInfo`, fingerprint or
-  face record; `revoke_visitor` deletes that account. XML is used only when a
+  validity window and a 4-to-8-digit PIN. The validity window is stated in the
+  estate's local time (`YYYY-MM-DDTHH:mm:ss`, `timeType: "local"`) using the
+  timezone the Worker sends with the operation — the same format the Node bridge
+  writes. `UserInfo/Modify` is attempted only when `Record` reports the employee
+  number already exists; any other content rejection is reported with the
+  terminal's own reason, never as a misleading `employeeNoNotExist` follow-up —
+  the same error handling as the Node bridge. It sends no `CardInfo`, fingerprint
+  or face record; `revoke_visitor` deletes that account. XML is used only when a
   firmware does not implement the JSON URL, never after a content rejection;
 * heartbeats every `heartbeatIntervalSeconds` with the same stats payload the
   Windows host sends, so the portal's agent row looks identical — including the

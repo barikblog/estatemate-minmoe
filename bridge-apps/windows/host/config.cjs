@@ -203,6 +203,13 @@ function exampleAgentConfig({ workerUrl = DEFAULT_WORKER_URL } = {}) {
     eventBufferLimit: 500,
     logLevel: 'info',
     isapiTimeoutMs: 15000,
+    // Terminal clock sync, opt-in: off in a fresh template. `setup` asks (or
+    // takes --time-sync-enabled) and preserves these thresholds when it saves.
+    timeSync: {
+      enabled: false,
+      maxDriftMs: 30000,
+      checkIntervalMinutes: 15,
+    },
   };
 }
 

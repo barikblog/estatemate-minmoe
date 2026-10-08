@@ -210,6 +210,64 @@ try {
     await agent.checkAllTerminalClocks();
     console.log('scheduled entry point no-ops cleanly OK');
   }
+
+  // 6. A zone chosen on the bridge app is read with every report and written
+  //    with every set. This agent's config sets no zone, so the historical
+  //    behaviour (the host's zone, nothing about zones on the wire) holds.
+  {
+    assert.equal(agent.timeSyncTimeZone, null, 'no timeSync.timeZone configured means the host zone');
+
+    // A report is interpreted in the chosen zone: 09:00 in Africa/Lagos is
+    // 08:00 UTC — one hour behind reading the same wall clock in a UTC host.
+    const report = JSON.stringify({ time: { date: '2026-10-05', time: '09:00:00' } });
+    const inZone = agent.parseTerminalClockTime(report, false, 'Africa/Lagos');
+    assert.equal(new Date(inZone).toISOString(), '2026-10-05T08:00:00.000Z', 'a report is read in the chosen zone');
+    const inHost = agent.parseTerminalClockTime(report, false, null);
+    assert.notEqual(inZone, inHost, 'a chosen zone must change how a report is read');
+
+    // Reading the live terminal through a chosen zone shifts the reported
+    // instant by exactly the difference between the two zones.
+    const plain = await agent.readTerminalClock(device);
+    const zoned = await agent.readTerminalClock(device, 'Africa/Lagos');
+    assert.ok(plain.timeMs !== undefined && zoned.timeMs !== undefined, 'both reads must answer');
+    const hostOffsetMs = -new Date().getTimezoneOffset() * 60000;
+    const expectedShift = 3600000 - hostOffsetMs; // Africa/Lagos is UTC+1, no DST
+    assert.ok(Math.abs(plain.timeMs - zoned.timeMs - expectedShift) <= 2000,
+      `reading in the chosen zone must shift the instant by the zone difference (${plain.timeMs - zoned.timeMs} vs ${expectedShift})`);
+
+    // A set carries the zone and renders the wall clock in it: the bridge's
+    // 12:00Z is 13:00 in Lagos. This firmware refuses the JSON URL, so both the
+    // refused JSON body and the XML fallback must carry the zone.
+    const target = Date.UTC(2026, 9, 5, 12, 0, 0);
+    const before = requests.length;
+    const write = await agent.setTerminalClock(device, target, 'Africa/Lagos');
+    assert.equal(write.ok, true, 'the set must succeed through the XML fallback');
+    const attempts = requests.slice(before).filter((request) => request.method === 'PUT');
+    assert.equal(attempts.length, 2, 'JSON set refused, XML set applied');
+    const sent = JSON.parse(attempts[0].body).time;
+    assert.equal(sent.timeZone, 'Africa/Lagos', 'the JSON set carries the chosen zone');
+    assert.equal(sent.timeType, 'local');
+    assert.equal(sent.date, '2026-10-05');
+    assert.equal(sent.time, '13:00:00', 'the wall clock is rendered in the chosen zone');
+    assert.match(attempts[1].body, /<timeZone>Africa\/Lagos<\/timeZone>/, 'the XML fallback carries the zone too');
+
+    // Without a zone the write is exactly the historical shape: the host's
+    // wall clock and nothing about zones on the wire.
+    const beforePlain = requests.length;
+    const plainWrite = await agent.setTerminalClock(device, target, null);
+    assert.equal(plainWrite.ok, true);
+    const plainAttempts = requests.slice(beforePlain).filter((request) => request.method === 'PUT');
+    const plainSent = JSON.parse(plainAttempts[0].body).time;
+    const hostClock = new Date(target);
+    const pad = (value) => String(value).padStart(2, '0');
+    assert.deepEqual(plainSent, {
+      date: `${hostClock.getFullYear()}-${pad(hostClock.getMonth() + 1)}-${pad(hostClock.getDate())}`,
+      time: `${pad(hostClock.getHours())}:${pad(hostClock.getMinutes())}:${pad(hostClock.getSeconds())}`,
+      timeType: 'local',
+    }, 'no zone means the historical write, byte for byte');
+    assert.doesNotMatch(plainAttempts[1].body, /timeZone/i, 'no zone is written when none is chosen');
+    console.log('chosen time zone read and written OK');
+  }
 } finally {
   deviceServer.close();
   rmSync(dir, { recursive: true, force: true });

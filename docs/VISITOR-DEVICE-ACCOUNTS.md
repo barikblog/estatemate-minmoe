@@ -47,6 +47,11 @@ under EstateMate's current Employee ID policy; the terminal wire field allows
 - `userType: "normal"` and `localUIRight: false`;
 - the stored pass PIN as `password`, validated as 4–8 decimal digits.
 
+The upsert also carries the **estate's timezone**, and the bridge states the
+validity window in that zone's local time (`YYYY-MM-DDTHH:mm:ss` with
+`timeType: "local"`, no `Z`), so the window the terminal enforces against its own
+clock is the window the portal shows. New and reconciled operations both carry it.
+
 No visitor `CardInfo`, fingerprint, face, door-right or right-plan data is sent.
 The response tells the resident plainly that the account is created now and
 deleted from all devices automatically when validity ends, while the record is
@@ -59,6 +64,14 @@ paper but has no linked agent gets a `manual_action_required` Hardware-actions
 task instead — otherwise the operation would sit as `pending` forever, a command
 nothing will ever pick up, while the pass's state still recorded the slot as
 held.
+
+Reconciliation (the hourly pass over active passes, and the manual **Sync
+active passes**) also **refreshes a stale, unclaimed operation in place**: a row
+still `pending` — never picked up by an agent — whose payload predates a change
+(such as the estate timezone travelling with the pass) gets the current payload
+written back, so the next poll applies the current account instead of the old
+one. `sent` rows are left for the agent's own result, and `applied` rows are
+done.
 
 ## How deletion happens
 

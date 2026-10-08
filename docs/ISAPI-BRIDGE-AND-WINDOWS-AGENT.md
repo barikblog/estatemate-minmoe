@@ -56,7 +56,8 @@ Recorded from the terminals these bridges were fixed against; the simulated term
 - **Duplicate cards are an error.** `POST CardInfo/Record` for a card number the terminal already holds answers `cardNoAlreadyExist`. The bridge treats that as "update in place" and issues `PUT CardInfo/Modify` with the same `CardInfo` body, which is what makes a re-enabled or re-issued card work. If `Modify` answers `cardNoNotExist`, the card is genuinely absent and `Record`'s own reason is reported.
 - **Delete conditions are wrapped.** `PUT CardInfo/Delete` accepts `{"CardInfoDelCond":{"CardNoList":[{"cardNo":"…"}]}}` — lower-case `cardNo` inside `CardInfoDelCond`. The bare `{"CardNoList":[{"CardNo":"…"}]}` shape answers `Invalid Format / badJsonFormat` and deletes nothing.
 - **Already-absent records count as removed.** `cardNoNotExist`, `employeeNoNotExist`, `not exist` or `not found` on the corresponding delete is success (idempotent), but a terminal that does not implement the call at all (`notSupport`) is **not** — that is a real failure an operator must see.
-- **Visitors are PIN-only `UserInfo` accounts.** Both Hikvision bridges send only issued employee number, name, `belongGroup: "Company"`, `userType: "normal"`, enabled UTC validity, `localUIRight: false`, and the 4-to-8-digit PIN as `password`. They send no `CardInfo`, fingerprint, face, `doorRight` or `RightPlan`, so the terminal UI keeps Card/Fingerprint as “Not added.” Revocation deletes the person account.
+- **Visitors are PIN-only `UserInfo` accounts.** Both Hikvision bridges send only issued employee number, name, `belongGroup: "Company"`, `userType: "normal"`, enabled finite validity stated in the estate's local time (`YYYY-MM-DDTHH:mm:ss`, `timeType: "local"`, no `Z` — the zone travels with the operation), `localUIRight: false`, and the 4-to-8-digit PIN as `password`. They send no `CardInfo`, fingerprint, face, `doorRight` or `RightPlan`, so the terminal UI keeps Card/Fingerprint as “Not added.” Revocation deletes the person account.
+- **A visitor `Modify` is gated on the terminal's own answer.** `Modify` is attempted only when `Record` reports the employee number already exists (`employeeNoAlreadyExist`). Any other content rejection is reported with the terminal's own reason — a `Modify` follow-up would only answer `employeeNoNotExist` (the account was never created) and bury the real one. Both bridges follow the same rule.
 - **PIN length fails closed.** Any PIN other than exactly 4–8 decimal digits is rejected before a terminal request. The Worker places the pass's stored PIN in initial and reconciled operations.
 - **XML bodies carry the namespace**: `<CardInfo xmlns="http://www.isapi.org/ver20/XMLSchema" version="2.0">`, likewise `<UserInfo>`, delete conditions and `<RemoteControlDoor>`.
 - **Failures are summarised, not truncated.** The reason is read from the `ResponseStatus` fields (`statusString` / `subStatusCode` / `errorMsg`), from JSON or XML, and both attempts are shown when a fallback was legitimately tried — real rejections first, unsupported-URL answers only if there are no rejections.
@@ -166,11 +167,28 @@ and the last sync. It is a status surface, never read back as an input to a
 decision.
 
 Two assumptions are operational, not technical, and are enforced by convention:
-the bridge host's clock is correct, and each terminal's timezone matches the
-host's. The sync aligns wall clocks; a terminal in a different timezone shows up
-as a constant offset in the portal and belongs re-zoned at the terminal. A failed
-read keeps the last good reading plus the error, so a terminal that just went
-down never erases the last known clock from the portal.
+the bridge host's clock is correct, and each terminal's timezone is the one
+chosen on the bridge app (`timeSync.timeZone`, an IANA name, defaulting to the
+host's zone). The sync aligns wall clocks, and a chosen zone travels with every
+clock set, so a terminal in a different timezone is re-zoned as part of the
+synchronisation rather than showing a constant offset in the portal forever.
+A failed read keeps the last good reading plus the error, so a terminal that
+just went down never erases the last known clock from the portal.
+
+The switch itself is an estate decision with one meaning everywhere: the Windows
+dashboard's **Configuration** tab has a **Terminal clock sync** checkbox, a
+**time-zone chooser** and a **Synchronise clocks now** button, the interactive
+`setup` wizard asks, and the CLI accepts `--time-sync-enabled=true|false` and
+`--time-sync-timezone=<zone>`. All of them reach `agent-config.json` through
+the single writer (`setup`), which preserves the `maxDriftMs` /
+`checkIntervalMinutes` thresholds and the chosen zone the configuration already
+had; a fresh setup defaults to off and to no zone.
+
+`estatemate-bridge.exe sync-clocks` (the button's command) runs one
+synchronisation pass over every terminal on demand — it reports what time each
+terminal shows, how far that is from this PC, and whether the pass set it back
+(only past the threshold) or left it alone (already within it). It runs even when
+automatic sync is switched off: an explicit operator action is not the schedule.
 
 **Android deviation, recorded:** the Android bridge does not run the clock check
 (see `bridge-apps/android/README.md`). A terminal served only by an Android

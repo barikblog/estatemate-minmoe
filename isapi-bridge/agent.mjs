@@ -120,11 +120,16 @@ const cardNumberFormats = Array.isArray(config.remoteVerify?.cardNumberFormats) 
 // offset exceeds the threshold; the per-terminal state rides on the heartbeat.
 // Off by default, so an estate that does not opt in gets no extra ISAPI
 // traffic and exactly the bridge it had before. The bridge host's clock is the
-// reference — see the clock section below for the two assumptions that makes.
+// reference — see the clock section below for the assumptions that makes.
 const timeSyncConfigured = config.timeSync && typeof config.timeSync === 'object' ? config.timeSync : {};
 const timeSyncEnabled = timeSyncConfigured.enabled === true;
 const timeSyncMaxDriftMs = Math.max(5000, Number(timeSyncConfigured.maxDriftMs || 30000));
 const timeSyncCheckIntervalMs = Math.max(60 * 1000, Number(timeSyncConfigured.checkIntervalMinutes || 15) * 60 * 1000);
+// The estate's zone, chosen on the bridge app. Unset means "the terminals
+// share the bridge host's zone" — the historical assumption. A zone set here
+// is read with every terminal report and written with every clock set, so a
+// terminal still in another zone is re-zoned as part of the synchronisation.
+const timeSyncTimeZone = readTimeZone(timeSyncConfigured.timeZone);
 
 // LAN event listener: the terminal pushes its events here instead of the bridge
 // pulling them from an alertStream. Off by default and bound to loopback, so a
@@ -1022,10 +1027,13 @@ const ISAPI_XML_NS = 'xmlns="http://www.isapi.org/ver20/XMLSchema" version="2.0"
 //   are checked against it, the remote-verify cache ages against it). If the
 //   office PC's time is wrong, set the PC's time — this feature makes the
 //   terminals agree with the estate, it does not make the estate right.
-// * The terminal's **timezone matches the bridge host's**. The sync aligns
-//   wall clocks. A terminal configured to a different zone shows up as a
-//   constant offset in the portal and belongs re-zoned at the terminal, not
-//   "corrected" into a wrong wall clock by the bridge.
+// * The terminal's **timezone is the one chosen on the bridge app**
+//   (`timeSync.timeZone`), and it defaults to the bridge host's zone. The
+//   sync aligns wall clocks, and a chosen zone travels with every clock set,
+//   so a terminal still configured to a different zone is re-zoned as part of
+//   the synchronisation instead of showing a constant offset in the portal
+//   forever. Without a chosen zone nothing about the zone is written, exactly
+//   as before.
 //
 // Off by default (see the config block at the top): no key means no clock
 // traffic at all, so every existing estate behaves exactly as before.
@@ -1035,14 +1043,43 @@ const ISAPI_XML_NS = 'xmlns="http://www.isapi.org/ver20/XMLSchema" version="2.0"
 const clockStates = new Map();
 
 /**
+ * The instant a wall-clock reading names in `timeZone` — the inverse of
+ * formatEstateLocalTime. The zone offset is sampled twice so a reading either
+ * side of a DST transition lands on the right instant.
+ */
+function instantFromWallClock(wall, timeZone) {
+  const asIfUtc = Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second);
+  if (!Number.isFinite(asIfUtc)) return null;
+  const offsetAt = (instantMs) => {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      hourCycle: 'h23',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    }).formatToParts(new Date(instantMs));
+    const read = (type) => Number(parts.find((part) => part.type === type)?.value ?? 0);
+    const rendered = Date.UTC(read('year'), read('month') - 1, read('day'), read('hour'), read('minute'), read('second'));
+    return rendered - Math.floor(instantMs / 1000) * 1000;
+  };
+  const candidate = asIfUtc - offsetAt(asIfUtc);
+  return asIfUtc - offsetAt(candidate);
+}
+
+/**
  * Parse a system-time answer into epoch milliseconds, or null.
  *
- * The terminal reports a wall-clock date and time (in its own zone). It is
- * read in the bridge host's zone: that is what makes "the gate shows the same
- * wall clock as the office PC" the invariant, and it is the reading under
- * which drift means what the portal says it means (see the section above).
+ * The terminal reports a wall-clock date and time in its own zone. It is read
+ * in the zone chosen on the bridge app (`timeSync.timeZone`) when one is set,
+ * and in the bridge host's zone otherwise — that is what makes "the gate
+ * shows the same wall clock as the office PC" the invariant, and it is the
+ * reading under which drift means what the portal says it means (see the
+ * section above).
  */
-function parseTerminalClockTime(body, isXml) {
+function parseTerminalClockTime(body, isXml, timeZone = null) {
   let date;
   let time;
   if (isXml) {
@@ -1056,37 +1093,55 @@ function parseTerminalClockTime(body, isXml) {
   }
   const match = /^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/.exec(`${String(date || '').trim()} ${String(time || '').trim()}`);
   if (!match) return null;
-  const ms = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5]), Number(match[6])).getTime();
+  const wall = {
+    year: Number(match[1]),
+    month: Number(match[2]),
+    day: Number(match[3]),
+    hour: Number(match[4]),
+    minute: Number(match[5]),
+    second: Number(match[6]),
+  };
+  if (timeZone) {
+    const ms = instantFromWallClock(wall, timeZone);
+    return Number.isFinite(ms) ? ms : null;
+  }
+  const ms = new Date(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second).getTime();
   return Number.isFinite(ms) ? ms : null;
 }
 
 /** Reads the terminal's system time. JSON first; XML only when the JSON URL is not supported. */
-async function readTerminalClock(device) {
+async function readTerminalClock(device, timeZone = timeSyncTimeZone) {
   const attempts = [];
   let result = await isapiRequest(device, 'GET', '/ISAPI/System/time/Get?format=json', null, false);
   attempts.push(result);
-  const jsonTime = parseTerminalClockTime(result.body, false);
+  const jsonTime = parseTerminalClockTime(result.body, false, timeZone);
   if (isapiOk(result) && jsonTime !== null) return { timeMs: jsonTime };
   if (!isapiUnsupported(result)) return { error: describeIsapiFailure(result) };
   result = await isapiRequest(device, 'GET', '/ISAPI/System/time/Get', null, true);
   attempts.push(result);
-  const xmlTime = parseTerminalClockTime(result.body, true);
+  const xmlTime = parseTerminalClockTime(result.body, true, timeZone);
   if (isapiOk(result) && xmlTime !== null) return { timeMs: xmlTime };
   return { error: describeAttempts(attempts) };
 }
 
 /**
- * Writes the bridge host's wall clock to the terminal. JSON first; XML only
+ * Writes the bridge host's wall clock to the terminal, in the zone chosen on
+ * the bridge app (the host's own zone when none is set). JSON first; XML only
  * when the firmware does not support the JSON URL. The body is the wall clock
- * with `timeType: local`, matching how the terminal reports its own time.
+ * with `timeType: local`, matching how the terminal reports its own time, and
+ * carries the chosen zone with it so the terminal is re-zoned with the clock.
  */
-async function setTerminalClock(device, timeMs = Date.now()) {
+async function setTerminalClock(device, timeMs = Date.now(), timeZone = timeSyncTimeZone) {
+  const local = timeZone ? formatEstateLocalTime(new Date(timeMs), timeZone) : null;
   const d = new Date(timeMs);
   const pad = (value) => String(value).padStart(2, '0');
-  const date = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-  const time = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-  const jsonBody = JSON.stringify({ time: { date, time, timeType: 'local' } });
-  const xmlBody = `<?xml version="1.0" encoding="UTF-8"?>\n<time ${ISAPI_XML_NS}><date>${date}</date><time>${time}</time><timeType>local</timeType></time>`;
+  const date = local ? local.slice(0, 10) : `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const time = local ? local.slice(11) : `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  const clock = { date, time, timeType: 'local' };
+  if (timeZone) clock.timeZone = timeZone;
+  const jsonBody = JSON.stringify({ time: clock });
+  const zoneElement = timeZone ? `<timeZone>${timeZone}</timeZone>` : '';
+  const xmlBody = `<?xml version="1.0" encoding="UTF-8"?>\n<time ${ISAPI_XML_NS}><date>${date}</date><time>${time}</time><timeType>local</timeType>${zoneElement}</time>`;
   const attempts = [];
   let result = await isapiRequest(device, 'PUT', '/ISAPI/System/time/Set?format=json', jsonBody, false);
   attempts.push(result);
@@ -1156,6 +1211,37 @@ async function checkAllTerminalClocks() {
     if (device.transport !== 'isapi') continue;
     await checkTerminalClock(device);
   }
+}
+
+/**
+ * One synchronisation pass over the given terminals, on demand — the Windows
+ * dashboard's "Synchronise clocks now" button. Unlike the scheduled loop it
+ * runs even when automatic sync is switched off: an explicit operator action
+ * is not the schedule. The caller supplies the device list because in standby
+ * mode the agent's own device map is not resolved yet. Each result carries the
+ * terminal's reported time, the measured drift, whether it was within the
+ * threshold or set back, and the error when it could not be read at all.
+ */
+async function syncTerminalClocksNow(deviceList) {
+  const passStart = Date.now();
+  const results = [];
+  for (const device of deviceList) {
+    if (shutdownRequested) break;
+    const state = await checkTerminalClock(device);
+    results.push({
+      deviceId: device.estateMateDeviceId || null,
+      name: device.name || device.isapiHost || 'terminal',
+      terminalTime: state.terminalTime,
+      driftMs: state.driftMs,
+      lastCheckedAt: state.lastCheckedAt,
+      lastSyncAt: state.lastSyncAt,
+      syncs: state.syncs,
+      lastError: state.lastError,
+      withinTolerance: !state.lastError && Math.abs(state.driftMs) <= timeSyncMaxDriftMs,
+      synced: Boolean(state.lastSyncAt && Date.parse(state.lastSyncAt) >= passStart),
+    });
+  }
+  return results;
 }
 
 /**
@@ -1229,6 +1315,48 @@ function xmlText(value) {
     .replaceAll("'", '&apos;');
 }
 
+/** A readable IANA zone name, or null when the value is unset or unreadable. */
+function readTimeZone(value) {
+  const timeZone = typeof value === 'string' ? value.trim() : '';
+  if (!timeZone) return null;
+  try {
+    void new Intl.DateTimeFormat('en-US', { timeZone });
+    return timeZone;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The estate zone the Worker sends with every visitor operation. A terminal
+ * checks the pass window against its own clock, and Hikvision's schema accepts
+ * the window either as UTC (`…Z`, `timeType: "UTC"`) or as the terminal's local
+ * wall clock (`YYYY-MM-DDTHH:mm:ss`, `timeType: "local"`). EstateMate states it
+ * in the estate's local time, so the window the terminal enforces is the window
+ * the portal shows. Operations from a Worker that predates the field — and
+ * payloads with a zone the bridge cannot read — keep the UTC form.
+ */
+function visitorTimeZone(payload) {
+  return readTimeZone(payload?.timeZone);
+}
+
+/** `YYYY-MM-DDTHH:mm:ss` — the estate's local wall clock, no offset, no `Z`. */
+function formatEstateLocalTime(instant, timeZone) {
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+  const parts = formatter.formatToParts(instant);
+  const read = (type) => parts.find((part) => part.type === type)?.value ?? '';
+  return `${read('year')}-${read('month')}-${read('day')}T${read('hour')}:${read('minute')}:${read('second')}`;
+}
+
 /**
  * Build only the temporary terminal account shown in the device's person UI:
  * employee ID, name, Company department, finite validity, non-administrator
@@ -1236,32 +1364,52 @@ function xmlText(value) {
  * fingerprint, face, door-right, or right-plan record.
  */
 function visitorPersonInfo(payload, employeeNo) {
-  const asUtc = (value, label) => {
+  const asInstant = (value, label) => {
     const instant = new Date(String(value || ''));
     if (!Number.isFinite(instant.getTime())) throw new Error(`visitor ${label} is not a valid date`);
-    return instant.toISOString().replace(/\.\d{3}Z$/, 'Z');
+    return instant;
   };
-  const beginTime = asUtc(payload.validFrom, 'validFrom');
-  const endTime = asUtc(payload.validUntil, 'validUntil');
-  if (Date.parse(endTime) <= Date.parse(beginTime)) throw new Error('visitor validUntil must be after validFrom');
+  const from = asInstant(payload.validFrom, 'validFrom');
+  const until = asInstant(payload.validUntil, 'validUntil');
+  if (until.getTime() <= from.getTime()) throw new Error('visitor validUntil must be after validFrom');
   const pin = String(payload.pin || '').trim();
   if (!/^\d{4,8}$/.test(pin)) throw new Error('visitor PIN must contain 4 to 8 digits');
+  const timeZone = visitorTimeZone(payload);
+  const beginTime = timeZone ? formatEstateLocalTime(from, timeZone) : from.toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const endTime = timeZone ? formatEstateLocalTime(until, timeZone) : until.toISOString().replace(/\.\d{3}Z$/, 'Z');
   return {
     employeeNo: String(employeeNo),
     name: String(payload.visitorName || 'Visitor').trim().slice(0, 32) || 'Visitor',
     belongGroup: 'Company',
     userType: 'normal',
-    Valid: { enable: true, beginTime, endTime, timeType: 'UTC' },
+    Valid: { enable: true, beginTime, endTime, timeType: timeZone ? 'local' : 'UTC' },
     localUIRight: false,
     password: pin,
   };
 }
 
 /**
+ * Whether a `Record` answer reports that the employee number already exists on
+ * the terminal. That is the only answer that makes `Modify` the right next
+ * call. Any other content rejection is the terminal refusing what was sent,
+ * and a `Modify` follow-up would only answer `employeeNoNotExist` — the
+ * account was never created — which hides the terminal's own reason.
+ */
+function recordReportsExistingEmployeeNo(result) {
+  const body = String(result.body || '');
+  if (/notSupport|invalidURL|invalidOperation/i.test(body)) return false;
+  if (/notExist|not ?found/i.test(body)) return false;
+  return /employeeNo(AlreadyExist|AlreadyExists|Exists|Exist|Repeated|Duplicate)/i.test(body);
+}
+
+/**
  * Add or update the finite visitor UserInfo account. Record is the documented
- * add call; duplicate IDs continue through Modify, and SetUp covers firmware
- * exposing only the combined add/edit operation. XML is used only when the JSON
- * URL is unsupported, never to hide a content rejection.
+ * add call; an employee number the terminal already holds continues through
+ * Modify, and SetUp covers firmware exposing only the combined add/edit
+ * operation. A content rejection is reported as the terminal stated it — it is
+ * never retried in another shape, because the retry would only bury the real
+ * reason. XML is used only when the JSON URL is unsupported, never to hide a
+ * content rejection.
  */
 async function writeTerminalVisitorPerson(device, payload, employeeNo) {
   const info = visitorPersonInfo(payload, employeeNo);
@@ -1271,10 +1419,15 @@ async function writeTerminalVisitorPerson(device, payload, employeeNo) {
   attempts.push(result);
   if (isapiOk(result)) return { ok: true, result, attempts };
 
-  if (!isapiUnsupported(result)) {
+  if (recordReportsExistingEmployeeNo(result)) {
     const modify = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/UserInfo/Modify?format=json', body, false);
     attempts.push(modify);
     if (isapiOk(modify)) return { ok: true, result: modify, attempts };
+  } else if (!isapiUnsupported(result)) {
+    // The terminal refused the content. Keep its answer: a Modify follow-up
+    // would answer employeeNoNotExist and report a follow-up failure instead
+    // of the reason the account was refused.
+    return { ok: false, result, attempts };
   }
 
   result = await isapiRequest(device, 'PUT', '/ISAPI/AccessControl/UserInfo/SetUp?format=json', body, false);
@@ -1289,7 +1442,7 @@ async function writeTerminalVisitorPerson(device, payload, employeeNo) {
   <name>${xmlText(info.name)}</name>
   <belongGroup>Company</belongGroup>
   <userType>normal</userType>
-  <Valid><enable>true</enable><beginTime>${info.Valid.beginTime}</beginTime><endTime>${info.Valid.endTime}</endTime><timeType>UTC</timeType></Valid>
+  <Valid><enable>true</enable><beginTime>${info.Valid.beginTime}</beginTime><endTime>${info.Valid.endTime}</endTime><timeType>${info.Valid.timeType}</timeType></Valid>
   <localUIRight>false</localUIRight>
   <password>${info.password}</password>
 </UserInfo>`;
@@ -2244,15 +2397,18 @@ export {
   basicAuthHeader,
   alertStreamPath,
   // Terminal clock sync, exported so the integration checks can drive the real
-  // read/measure/set/confirm loop against a simulated terminal.
+  // read/measure/set/confirm loop against a simulated terminal, and so the
+  // CLI's `sync-clocks` command can run one pass on demand.
   clockStates,
   timeSyncEnabled,
   timeSyncMaxDriftMs,
+  timeSyncTimeZone,
   parseTerminalClockTime,
   readTerminalClock,
   setTerminalClock,
   checkTerminalClock,
   checkAllTerminalClocks,
+  syncTerminalClocksNow,
 };
 const isEntrypoint = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
 if (!isEntrypoint && !process.env.ESTATEMATE_AGENT_STANDBY) {

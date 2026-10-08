@@ -155,6 +155,38 @@ function startFakeWorker(state) {
  * deviceInfo/card endpoints, and streams two multipart events on the
  * alertStream — the three interactions the bridge performs in production.
  */
+/** The fake terminal's wall clock rendered in a zone, the way it reports it. */
+function wallClockInZone(instantMs, timeZone) {
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+  const parts = {};
+  for (const part of formatter.formatToParts(new Date(instantMs))) parts[part.type] = part.value;
+  return { date: `${parts.year}-${parts.month}-${parts.day}`, time: `${parts.hour}:${parts.minute}:${parts.second}` };
+}
+
+/** The instant a wall-clock reading names in a zone (the inverse of the above). */
+function instantFromWallClockInZone(date, time, timeZone) {
+  const [year, month, day] = String(date).split('-').map(Number);
+  const [hour, minute, second] = String(time).split(':').map(Number);
+  const asIfUtc = Date.UTC(year, month - 1, day, hour, minute, second);
+  const offsetAt = (instantMs) => {
+    const rendered = wallClockInZone(instantMs, timeZone);
+    const [y, mo, d] = rendered.date.split('-').map(Number);
+    const [h, mi, s] = rendered.time.split(':').map(Number);
+    return Date.UTC(y, mo - 1, d, h, mi, s) - Math.floor(instantMs / 1000) * 1000;
+  };
+  const candidate = asIfUtc - offsetAt(asIfUtc);
+  return asIfUtc - offsetAt(candidate);
+}
+
 function startFakeDevice(state) {
   const realm = 'FakeMinMoe';
   const nonce = 'smoke-nonce-0001';
@@ -222,6 +254,23 @@ function startFakeDevice(state) {
       }
       if (url.pathname === '/ISAPI/AccessControl/CardInfo/Delete') {
         state.cardDeletes.push(body);
+        response.writeHead(200, { 'Content-Type': 'application/json' });
+        response.end(JSON.stringify({ statusCode: 1, statusString: 'OK' }));
+        return;
+      }
+      if (url.pathname === '/ISAPI/System/time/Get') {
+        const { date, time } = wallClockInZone(state.terminalClockMs, 'Africa/Lagos');
+        response.writeHead(200, { 'Content-Type': 'application/json' });
+        response.end(JSON.stringify({ time: { date, time, timeType: 'local' } }));
+        return;
+      }
+      if (url.pathname === '/ISAPI/System/time/Set') {
+        state.timeSets.push(body);
+        const clock = JSON.parse(body || '{}').time || {};
+        // The terminal applies the wall clock in the zone the bridge sent —
+        // that is what re-zoning with the clock set means.
+        const zone = typeof clock.timeZone === 'string' && clock.timeZone.trim() ? clock.timeZone.trim() : 'Africa/Lagos';
+        state.terminalClockMs = instantFromWallClockInZone(clock.date, clock.time, zone);
         response.writeHead(200, { 'Content-Type': 'application/json' });
         response.end(JSON.stringify({ statusCode: 1, statusString: 'OK' }));
         return;
@@ -378,6 +427,12 @@ async function main() {
     results: [],
     cardRecords: [],
     cardDeletes: [],
+    // The fake terminal's own clock, mutable through /ISAPI/System/time/Set.
+    // It starts 2h ahead; the wall clock it reports is rendered in the zone the
+    // sync-clocks configuration chooses (Africa/Lagos), the way a terminal in
+    // that zone would report it.
+    terminalClockMs: Date.now() + 2 * 60 * 60 * 1000,
+    timeSets: [],
     challenges: 0,
     rejected: 0,
     basicRequests: 0,
@@ -551,6 +606,199 @@ async function main() {
       'setup refuses an agent id that is not a UUID',
       badId.status !== 0 && /not an agent id/i.test(`${badId.stdout}${badId.stderr}`),
       `status=${badId.status} ${badId.stderr}${badId.stdout}`.slice(-300),
+    );
+
+    // 1e. Terminal clock sync plumbing: the CLI flag (what the Windows
+    //     dashboard's checkbox sends), the interactive ask, the default-off
+    //     fresh setup, and the thresholds a re-save must preserve.
+    const syncSetup = (dir, extraArgs) => runCli(exe, [
+      'setup', '--no-prompt', '--no-verify',
+      '--agent-id', state.agentId,
+      '--agent-secret', manualSecret,
+      '--worker-url', `http://127.0.0.1:${workerPort}`,
+      '--devices-json', wizardDevicesPath,
+      ...extraArgs,
+      '--data-dir', dir,
+      '--log-file', path.join(dir, 'bridge.log'),
+    ]);
+
+    const syncOnDir = path.join(workDir, 'time-sync-on');
+    const syncOn = await syncSetup(syncOnDir, ['--time-sync-enabled=true']);
+    const syncOnConfig = readJsonIfExists(path.join(syncOnDir, 'agent-config.json'));
+    check(
+      'setup --time-sync-enabled=true writes terminal clock sync on',
+      syncOn.status === 0 && Boolean(syncOnConfig) && syncOnConfig.timeSync?.enabled === true,
+      `status=${syncOn.status} timeSync=${JSON.stringify(syncOnConfig && syncOnConfig.timeSync)}`,
+    );
+
+    const syncOffDir = path.join(workDir, 'time-sync-off');
+    const syncOff = await syncSetup(syncOffDir, ['--time-sync-enabled=false']);
+    const syncOffConfig = readJsonIfExists(path.join(syncOffDir, 'agent-config.json'));
+    check(
+      'setup --time-sync-enabled=false writes terminal clock sync off',
+      syncOff.status === 0 && Boolean(syncOffConfig) && syncOffConfig.timeSync?.enabled === false,
+      `status=${syncOff.status} timeSync=${JSON.stringify(syncOffConfig && syncOffConfig.timeSync)}`,
+    );
+
+    const syncDefaultDir = path.join(workDir, 'time-sync-default');
+    const syncDefault = await syncSetup(syncDefaultDir, []);
+    const syncDefaultConfig = readJsonIfExists(path.join(syncDefaultDir, 'agent-config.json'));
+    check(
+      'a fresh setup without the flag keeps terminal clock sync off',
+      syncDefault.status === 0 && Boolean(syncDefaultConfig) && syncDefaultConfig.timeSync?.enabled === false,
+      `status=${syncDefault.status} timeSync=${JSON.stringify(syncDefaultConfig && syncDefaultConfig.timeSync)}`,
+    );
+
+    // The dashboard's save path: the configuration on disk already carries
+    // thresholds and a chosen zone, and saving again (with the checkbox
+    // flipped and no zone flag) must keep both.
+    const preserveDir = path.join(workDir, 'time-sync-preserve');
+    fs.mkdirSync(preserveDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(preserveDir, 'agent-config.json'),
+      `${JSON.stringify({
+        agentId: state.agentId,
+        agentSecret: manualSecret,
+        workerUrl: `http://127.0.0.1:${workerPort}`,
+        timeSync: { enabled: true, maxDriftMs: 90000, checkIntervalMinutes: 45, timeZone: 'Africa/Lagos' },
+      }, null, 2)}\n`,
+    );
+    const preserve = await syncSetup(preserveDir, ['--time-sync-enabled=false']);
+    const preserveConfig = readJsonIfExists(path.join(preserveDir, 'agent-config.json'));
+    check(
+      'saving preserves the existing sync thresholds and zone',
+      preserve.status === 0 && Boolean(preserveConfig)
+        && preserveConfig.timeSync?.enabled === false
+        && preserveConfig.timeSync?.maxDriftMs === 90000
+        && preserveConfig.timeSync?.checkIntervalMinutes === 45
+        && preserveConfig.timeSync?.timeZone === 'Africa/Lagos',
+      `status=${preserve.status} timeSync=${JSON.stringify(preserveConfig && preserveConfig.timeSync)}`,
+    );
+
+    // The interactive wizard asks about clock sync and honours the answer.
+    const askDir = path.join(workDir, 'time-sync-ask');
+    const asked = await runCli(exe, [
+      'setup', '--no-verify',
+      '--from-installer', installerPath,
+      '--devices-json', wizardDevicesPath,
+      '--data-dir', askDir,
+      '--log-file', path.join(askDir, 'bridge.log'),
+    ], { input: 'y\n' });
+    const askConfig = readJsonIfExists(path.join(askDir, 'agent-config.json'));
+    check(
+      'the setup wizard asks about terminal clock sync and honours the answer',
+      asked.status === 0 && Boolean(askConfig) && askConfig.timeSync?.enabled === true,
+      `status=${asked.status} timeSync=${JSON.stringify(askConfig && askConfig.timeSync)}`,
+    );
+
+    // 1f. The time-zone chooser (the --time-sync-timezone flag) and the
+    //     synchronisation button's command (sync-clocks), end to end against
+    //     the fake terminal, whose clock starts 2h ahead in Africa/Lagos.
+    const zoneDir = path.join(workDir, 'time-sync-zone');
+    const zone = await syncSetup(zoneDir, ['--time-sync-timezone=Africa/Lagos']);
+    const zoneConfig = readJsonIfExists(path.join(zoneDir, 'agent-config.json'));
+    check(
+      'setup --time-sync-timezone saves the chosen zone',
+      zone.status === 0 && Boolean(zoneConfig) && zoneConfig.timeSync?.timeZone === 'Africa/Lagos',
+      `status=${zone.status} timeSync=${JSON.stringify(zoneConfig && zoneConfig.timeSync)}`,
+    );
+
+    const zoneClearDir = path.join(workDir, 'time-sync-zone-clear');
+    const zoneClear = await syncSetup(zoneClearDir, ['--time-sync-timezone=']);
+    const zoneClearConfig = readJsonIfExists(path.join(zoneClearDir, 'agent-config.json'));
+    check(
+      'setup --time-sync-timezone= (empty) clears the zone',
+      zoneClear.status === 0 && Boolean(zoneClearConfig) && !zoneClearConfig.timeSync?.timeZone,
+      `status=${zoneClear.status} timeSync=${JSON.stringify(zoneClearConfig && zoneClearConfig.timeSync)}`,
+    );
+
+    const zoneBad = await runCli(exe, ['setup', '--no-prompt', '--no-verify', '--agent-id', state.agentId, '--agent-secret', manualSecret, '--time-sync-timezone=Mars/Olympus', '--data-dir', path.join(workDir, 'time-sync-zone-bad')]);
+    check(
+      'setup rejects a time zone that is not an IANA zone',
+      zoneBad.status !== 0 && /IANA time zone/i.test(`${zoneBad.stdout}${zoneBad.stderr}`),
+      `status=${zoneBad.status} ${zoneBad.stderr}${zoneBad.stdout}`.slice(-300),
+    );
+
+    const clocksDir = path.join(workDir, 'sync-clocks');
+    fs.mkdirSync(clocksDir, { recursive: true });
+    const clocksConfigPath = path.join(clocksDir, 'agent-config.json');
+    const clocksDevicesPath = path.join(clocksDir, 'isapi-devices.json');
+    fs.writeFileSync(
+      clocksDevicesPath,
+      `${JSON.stringify({
+        devices: [
+          {
+            estateMateDeviceId: state.deviceId,
+            name: 'Fake MinMoe',
+            isapiHost: '127.0.0.1',
+            isapiPort: devicePort,
+            isapiUsername: state.user,
+            isapiPassword: state.password,
+            protocol: 'http',
+            enabled: true,
+            eventStream: false,
+          },
+        ],
+      }, null, 2)}\n`,
+    );
+    const writeClocksConfig = (enabled) => fs.writeFileSync(
+      clocksConfigPath,
+      `${JSON.stringify({
+        agentId: state.agentId,
+        agentSecret: state.agentSecret,
+        workerUrl: `http://127.0.0.1:${workerPort}`,
+        eventStream: false,
+        logLevel: 'info',
+        timeSync: { enabled, maxDriftMs: 30000, checkIntervalMinutes: 15, timeZone: 'Africa/Lagos' },
+      }, null, 2)}\n`,
+    );
+    writeClocksConfig(true);
+    const clocksArgs = ['sync-clocks', '--config', clocksConfigPath, '--devices', clocksDevicesPath, '--log-file', path.join(clocksDir, 'bridge.log')];
+    const timeSetsBefore = state.timeSets.length;
+    const firstPass = await runCli(exe, clocksArgs);
+    const firstOutput = `${firstPass.stdout}${firstPass.stderr}`;
+    const setBody = state.timeSets.length > timeSetsBefore ? JSON.parse(state.timeSets[state.timeSets.length - 1]) : null;
+    const setInstant = setBody ? instantFromWallClockInZone(setBody.time.date, setBody.time.time, 'Africa/Lagos') : null;
+    check(
+      'sync-clocks synchronises a drifted terminal in the chosen zone',
+      firstPass.status === 0
+        && Boolean(setBody)
+        && setBody.time.timeZone === 'Africa/Lagos'
+        && setBody.time.timeType === 'local'
+        && Boolean(setInstant)
+        && Math.abs(setInstant - Date.now()) <= 5000
+        && Math.abs(state.terminalClockMs - Date.now()) <= 5000,
+      `status=${firstPass.status} set=${JSON.stringify(setBody)} terminalClock=${state.terminalClockMs}`,
+    );
+    check(
+      'sync-clocks reports the terminal, its drift and the chosen zone',
+      firstPass.status === 0
+        && firstOutput.includes('Fake MinMoe')
+        && /off by \d+s/.test(firstOutput)
+        && firstOutput.includes('Africa/Lagos'),
+      firstOutput.slice(-400),
+    );
+
+    const secondPass = await runCli(exe, clocksArgs);
+    const secondOutput = `${secondPass.stdout}${secondPass.stderr}`;
+    check(
+      'a second sync-clocks pass finds the clock within tolerance',
+      secondPass.status === 0
+        && state.timeSets.length === timeSetsBefore + 1
+        && secondOutput.includes('within tolerance'),
+      `status=${secondPass.status} sets=${state.timeSets.length} ${secondOutput}`.slice(-300),
+    );
+
+    // The button's command runs on demand even when the automatic sync is off.
+    writeClocksConfig(false);
+    const offPass = await runCli(exe, clocksArgs);
+    const offOutput = `${offPass.stdout}${offPass.stderr}`;
+    check(
+      'sync-clocks runs even when automatic sync is off',
+      offPass.status === 0
+        && offOutput.includes('Fake MinMoe')
+        && /automatic sync: off/.test(offOutput),
+      `status=${offPass.status} ${offOutput}`.slice(-300),
     );
 
     // 2. Real configuration pointing at the fake Worker and the fake terminal.

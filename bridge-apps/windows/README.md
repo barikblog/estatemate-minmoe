@@ -57,7 +57,14 @@ appears at all) with three tabs:
 - **Status** — what the bridge is doing, what your last action returned, and the
   live log;
 - **Configuration** — the agent id, secret and Worker URL, the portal's
-  *Download setup* `.ps1`, and the Hikvision terminals as an editable table;
+  *Download setup* `.ps1`, the Hikvision terminals as an editable table, and
+  **Terminal clock sync**: the opt-in checkbox (the bridge sets a terminal's
+  clock back to this PC's when it drifts past the configured threshold), the
+  **time-zone chooser** (the terminals' IANA zone — empty means "this PC's
+  zone" — written with every clock set, so a terminal in another zone is
+  re-zoned with it), and the **Synchronise clocks now** button, which runs one
+  synchronisation pass over every terminal immediately (the `sync-clocks`
+  command), even when automatic sync is off;
 - **Service** — *Start at boot* / *Remove from boot*, which are `install-service`
   and `uninstall-service` with the elevation prompt handled for you.
 
@@ -160,6 +167,9 @@ boot as SYSTEM, restarts up to 10 times after a failure, and logs to
 ```
 estatemate-bridge.exe run                 start the bridge (default command)
 estatemate-bridge.exe check [--json]      configuration + Worker + device pre-flight
+estatemate-bridge.exe sync-clocks [--json]
+                                          one clock-synchronisation pass over every
+                                          terminal, on demand (the dashboard button)
 estatemate-bridge.exe setup               write configuration (from the portal installer)
 estatemate-bridge.exe init [--force]      write example configuration files
 estatemate-bridge.exe status [--json]     resolved paths, task state, recent log lines
@@ -171,7 +181,17 @@ estatemate-bridge.exe help
 
 Useful options: `--config`, `--devices`, `--data-dir`, `--log-level`,
 `--log-file`, `--from-installer <file|->`, `--devices-json <file>`,
+`--time-sync-enabled <true|false>`, `--time-sync-timezone <zone>`,
 `--no-prompt`, `--dry-run`, `--quiet`, `--json`.
+
+`--time-sync-enabled` and `--time-sync-timezone` are the dashboard checkbox and
+zone chooser on the command line: `setup` writes them into `agent-config.json`
+as the `timeSync` block, keeps the `maxDriftMs` / `checkIntervalMinutes`
+thresholds and the chosen zone the configuration already had, and leaves clock
+sync off (and the zone unset, meaning "this PC's zone") when nothing says
+otherwise. The interactive `setup` wizard asks the same question. Clock sync
+aligns the terminals' clocks with this PC; the chosen zone is written with every
+clock set, so a terminal in another zone is re-zoned with it.
 
 ## Configuration
 

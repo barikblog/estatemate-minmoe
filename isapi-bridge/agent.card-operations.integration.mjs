@@ -26,6 +26,9 @@ const cards = new Map();
 const persons = new Map();
 const requests = [];
 const refusedEmployeeNumbers = new Set(['900000008']);
+// Employee numbers this terminal refuses on content grounds, for the visitor
+// rejection-path checks: the bridge must report the refusal as it is.
+const refusedVisitorContent = new Set(['VIS900000009']);
 const deviceServer = createServer((req, res) => {
   let body = '';
   req.on('data', (chunk) => { body += chunk; });
@@ -56,6 +59,7 @@ const deviceServer = createServer((req, res) => {
         || 'doorRight' in info || 'RightPlan' in info || 'gender' in info) {
         return reject('badJsonContent', 'UserInfo');
       }
+      if (refusedVisitorContent.has(info.employeeNo)) return reject('badJsonContent', 'UserInfo');
       if (persons.has(info.employeeNo)) return reject('employeeNoAlreadyExist', 'employeeNo');
       persons.set(info.employeeNo, info);
       return ok();
@@ -270,6 +274,9 @@ try {
     assert.equal(requests.length, invalidBefore, 'invalid PIN must fail before contacting the terminal');
 
     const before = requests.length;
+    // The Worker sends the estate's zone with every visitor operation; the
+    // bridge states the window in that zone's local time (Africa/Lagos is
+    // UTC+1, so 08:00Z is 09:00 on the terminal's wall clock).
     const visitorPayload = {
       credentialNumber: '55443322',
       employeeNo: 'VIS55443322',
@@ -278,6 +285,7 @@ try {
       pin: '482731',
       validFrom: '2026-10-05T08:00:00.000Z',
       validUntil: '2026-10-05T18:00:00.000Z',
+      timeZone: 'Africa/Lagos',
     };
     const result = await apply('upsert_visitor', visitorPayload);
     assert.deepEqual(result, { success: true });
@@ -289,9 +297,9 @@ try {
       userType: 'normal',
       Valid: {
         enable: true,
-        beginTime: '2026-10-05T08:00:00Z',
-        endTime: '2026-10-05T18:00:00Z',
-        timeType: 'UTC',
+        beginTime: '2026-10-05T09:00:00',
+        endTime: '2026-10-05T19:00:00',
+        timeType: 'local',
       },
       localUIRight: false,
       password: '482731',
@@ -309,6 +317,51 @@ try {
       '/ISAPI/AccessControl/UserInfo/Modify?format=json',
     ]);
     assert.deepEqual(persons.get('VIS55443322'), person, 'the idempotent update must preserve the exact PIN-only account');
+
+    // A payload from a Worker that predates the timezone field keeps the UTC
+    // window, exactly as before.
+    const zonelessPayload = {
+      credentialNumber: '55443321',
+      employeeNo: 'VIS55443321',
+      visitorName: 'Grace Visitor',
+      department: 'Untrusted operation value',
+      pin: '482731',
+      validFrom: '2026-10-05T08:00:00.000Z',
+      validUntil: '2026-10-05T18:00:00.000Z',
+    };
+    const zoneless = await apply('upsert_visitor', zonelessPayload);
+    assert.deepEqual(zoneless, { success: true });
+    assert.deepEqual(persons.get('VIS55443321'), {
+      employeeNo: 'VIS55443321',
+      name: 'Grace Visitor',
+      belongGroup: 'Company',
+      userType: 'normal',
+      Valid: {
+        enable: true,
+        beginTime: '2026-10-05T08:00:00Z',
+        endTime: '2026-10-05T18:00:00Z',
+        timeType: 'UTC',
+      },
+      localUIRight: false,
+      password: '482731',
+    }, 'a payload without a readable zone must keep the UTC window');
+
+    // A content rejection keeps the terminal's own reason: Modify is only
+    // attempted when Record reports an existing employee number, so no
+    // misleading employeeNoNotExist follow-up is generated.
+    const refusedBefore = requests.length;
+    const refused = await apply('upsert_visitor', {
+      credentialNumber: '900000009', employeeNo: 'VIS900000009', visitorName: 'Refused Visitor',
+      pin: '482731', validFrom: '2026-10-05T08:00:00.000Z', validUntil: '2026-10-05T18:00:00.000Z',
+      timeZone: 'Africa/Lagos',
+    });
+    assert.equal(refused.success, false);
+    assert.match(refused.error, /badJsonContent/, 'the terminal\'s own reason must be reported');
+    assert.doesNotMatch(refused.error, /employeeNoNotExist/, 'no misleading follow-up failure may replace the real reason');
+    assert.deepEqual(requests.slice(refusedBefore).map((request) => request.url), [
+      '/ISAPI/AccessControl/UserInfo/Record?format=json',
+    ], 'a content rejection must not be retried as Modify');
+    assert.equal(persons.has('VIS900000009'), false, 'a refused account is never created');
 
     const revokeBefore = requests.length;
     const revoked = await apply('revoke_visitor', { credentialNumber: '55443322', employeeNo: 'VIS55443322' });
