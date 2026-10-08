@@ -469,3 +469,14 @@ input.narrow { width: 90px; padding: 7px 9px; }
    surrounding panel already carries the heading and the padding. */
 .data-table.compact th,
 .data-table.compact td { padding: 7px 10px; font-size: 12.5px; }
+
+/* Visitor pass: always reachable on a phone — sticky header close, tap-outside, sticky footer. */
+.visitor-pass-modal .pass-topbar { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; justify-content: space-between; margin: 0 0 6px; padding: 4px 0 8px; background: inherit; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: #68748a; }
+.visitor-pass-modal .pass-close { width: 44px; height: 44px; border-radius: 50%; padding: 0; font-size: 30px; line-height: 1; display: grid; place-items: center; background: #eef4fc; color: #14213d; border: 0; cursor: pointer; }
+.visitor-pass-modal .pass-footer { position: sticky; bottom: 0; z-index: 2; margin: 0; padding: 12px 0 8px; background: inherit; }
+@media (max-width: 640px) {
+  .modal-backdrop { padding: 8px; align-items: end; }
+  .visitor-pass-modal { max-height: calc(100dvh - 16px); width: 100%; border-radius: 18px 18px 0 0; padding: 18px; }
+  .visitor-pass-modal .pass-footer button { flex: 1 1 100%; min-height: 46px; }
+  .visitor-pass-modal .visitor-pass { padding: 16px; }
+}
