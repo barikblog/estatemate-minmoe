@@ -86,7 +86,6 @@ const navGroups: NavGroup[] = [
     { id: 'properties', label: 'Property administration', roles: ['admin','manager','cashier','security','resident'] },
     { id: 'bills', label: 'Bills & payments', roles: ['admin','cashier','resident'] },
     { id: 'maintenance', label: 'Service operations', roles: ['admin','manager','resident'] },
-    { id: 'bookings', label: 'Facility bookings', roles: ['admin','manager','cashier','resident'] },
     { id: 'notices', label: 'Estate notices' },
     { id: 'emergency', label: 'Emergency contacts' },
   ]},
@@ -95,7 +94,6 @@ const navGroups: NavGroup[] = [
   ]},
   { id: 'info', label: 'Information resources', items: [
     { id: 'information', label: 'Information hub' },
-    { id: 'legal', label: 'Legal & governance' },
   ]},
   { id: 'admin', label: 'Administration', items: [
     { id: 'imports', label: 'Import centre', roles: ['admin','manager'] },
@@ -445,10 +443,8 @@ function SectionView({ section, user, config, gate, onNavigate }: { section: Sec
     // New module pages (placeholder/information surfaces; backend wiring to follow):
     case 'dependants': return <DependantsManager user={user} onNavigate={onNavigate} />;
     case 'staff': return <StaffManagement user={user} />;
-    case 'bookings': return <FacilityBookings user={user} />;
     case 'emergency': return <EmergencyContacts user={user} />;
     case 'information': return <InformationHub user={user} onNavigate={onNavigate} />;
-    case 'legal': return <LegalGovernance user={user} />;
   }
 }
 
@@ -519,7 +515,6 @@ function Dashboard({ user, config, gate, onNavigate }: { user: User; config: Por
       <div>
         <p className="eyebrow">Estate operations</p>
         <h2>Welcome, {user.name.split(' ')[0]}.</h2>
-        <p>Good day — here is the latest picture across {config.estate_name || config.portal_name}.</p>
         {image && config.portal_gate_image_caption && <p className="gate-image-caption">{config.portal_gate_image_caption}</p>}
       </div>
       <div className="hero-orb"><span>{config.portal_short_name || 'EM'}</span></div>
@@ -1139,7 +1134,7 @@ function VisitorPass({ pass,onClose,branding }: { pass:Row;onClose:()=>void;bran
     } catch(reason) { setShareState(reason instanceof Error?reason.message:'Could not prepare the pass file'); }
   }
 
-  return <div className="modal-backdrop" role="dialog" aria-modal="true"><section className="notice-modal visitor-pass-modal"><div className="visitor-pass printable-pass"><p className="eyebrow">ESTATE VISITOR PASS</p><h2>{String(pass.visitor_name ?? pass.visitorName ?? 'Visitor')}</h2><p>Host: <strong>{host}</strong></p><p>Property: <strong>{propertyText}</strong></p>{qr&&<img className="pass-qr" src={qr} alt={`Visitor QR ${credential}`} />}<svg className="pass-barcode" ref={barcode} /><strong className="credential-number">{credential}</strong><small>Unique visitor number</small>{Boolean(pass.pin)&&<p className="pass-pin">Keypad PIN: <strong>{String(pass.pin)}</strong></p>}<div className="pass-dates"><span>From {readableDate(pass.valid_from ?? pass.validFrom)}</span><span>Until {readableDate(pass.valid_until ?? pass.validUntil)}</span></div><p className="pass-gates">{gateText}</p><p className="pass-policy">Security must scan and review this pass before accepting entry. Device recognition requires a compatible, configured reader.</p></div>{shareState&&<p className="share-status no-print">{shareState}</p>}<div className="row-actions no-print"><button className="primary" onClick={()=>window.print()}>Print pass</button><button className="secondary" onClick={()=>share('image')}>Share as image</button><button className="secondary" onClick={()=>share('pdf')}>Share as PDF</button><button className="secondary" onClick={onClose}>Close</button></div></section></div>;
+  return <div className="modal-backdrop" role="dialog" aria-modal="true" onClick={onClose}><section className="notice-modal visitor-pass-modal" onClick={(event)=>event.stopPropagation()}><div className="pass-topbar no-print"><span>Visitor pass</span><button type="button" className="pass-close" aria-label="Close visitor pass" onClick={onClose}>×</button></div><div className="visitor-pass printable-pass"><p className="eyebrow">ESTATE VISITOR PASS</p><h2>{String(pass.visitor_name ?? pass.visitorName ?? 'Visitor')}</h2><p>Host: <strong>{host}</strong></p><p>Property: <strong>{propertyText}</strong></p>{qr&&<img className="pass-qr" src={qr} alt={`Visitor QR ${credential}`} />}<svg className="pass-barcode" ref={barcode} /><strong className="credential-number">{credential}</strong><small>Unique visitor number</small>{Boolean(pass.pin)&&<p className="pass-pin">Keypad PIN: <strong>{String(pass.pin)}</strong></p>}<div className="pass-dates"><span>From {readableDate(pass.valid_from ?? pass.validFrom)}</span><span>Until {readableDate(pass.valid_until ?? pass.validUntil)}</span></div><p className="pass-gates">{gateText}</p><p className="pass-policy">Security must scan and review this pass before accepting entry. Device recognition requires a compatible, configured reader.</p></div>{shareState&&<p className="share-status no-print">{shareState}</p>}<div className="row-actions no-print pass-footer"><button className="primary" onClick={()=>window.print()}>Print pass</button><button className="secondary" onClick={()=>share('image')}>Share as image</button><button className="secondary" onClick={()=>share('pdf')}>Share as PDF</button><button className="secondary" onClick={onClose}>Close pass</button></div></section></div>;
 }
 
 function Visitors({ user }: { user: User }) {
@@ -2881,114 +2876,6 @@ function StaffManagement({ user }: { user: User }) {
   </PagePanel>;
 }
 
-function FacilityBookings({ user }: { user: User }) {
-  const canOperate = user.role === 'admin' || user.role === 'manager';
-  const canBook = ['admin', 'manager', 'resident'].includes(user.role);
-  const facilities = useList('/api/facilities');
-  const [statusFilter, setStatusFilter] = useState('');
-  const bookings = useList(`/api/facility-bookings?limit=100${statusFilter ? `&status=${statusFilter}` : ''}${!canOperate ? '&mine=1' : ''}`);
-  const [message, setMessage] = useState('');
-  const [showFacilityForm, setShowFacilityForm] = useState(false);
-  const [editingFacility, setEditingFacility] = useState<Row | null>(null);
-  const [showBookForm, setShowBookForm] = useState(false);
-  const [rateValue, setRateValue] = useState('');
-  function refresh() { facilities.reload(); bookings.reload(); }
-  async function submitFacility(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setMessage('');
-    const values = Object.fromEntries(new FormData(event.currentTarget));
-    const body = {
-      name: values.name, description: values.description, location: values.location,
-      capacity: values.capacity === '' ? undefined : Number(values.capacity),
-      hourlyRateMinor: Math.round(Number(values.hourlyRate || 0) * 100),
-      depositMinor: Math.round(Number(values.deposit || 0) * 100),
-      requiresApproval: values.requiresApproval === '1', requiresPayment: values.requiresPayment === '1',
-      minNoticeHours: Number(values.minNoticeHours || 0), maxHoursPerBooking: Number(values.maxHoursPerBooking || 8),
-      rules: values.rules,
-    };
-    try {
-      await api(editingFacility ? `/api/facilities/${editingFacility.id}` : '/api/facilities', { method: editingFacility ? 'PATCH' : 'POST', body: JSON.stringify(body) });
-      setShowFacilityForm(false); setEditingFacility(null); setMessage(editingFacility ? 'Facility updated.' : 'Facility added.'); refresh();
-    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not save facility'); }
-  }
-  async function submitBooking(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setMessage('');
-    const values = Object.fromEntries(new FormData(event.currentTarget));
-    try {
-      const result = await api<{ status: string }>('/api/facility-bookings', { method: 'POST', body: JSON.stringify({ ...values, attendees: values.attendees === '' ? undefined : Number(values.attendees) }) });
-      setShowBookForm(false);
-      setMessage(result.status === 'approved' ? 'Booking confirmed.' : 'Booking requested — an administrator or manager will confirm it.');
-      refresh();
-    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Booking request failed'); }
-  }
-  async function decide(row: Row, action: string) {
-    const note = action === 'decline' ? prompt('Reason to share with the resident:') : null;
-    if (action === 'decline' && note === null) return;
-    try {
-      const result = await api<{ billId?: string }>(`/api/facility-bookings/${row.id}`, { method: 'PATCH', body: JSON.stringify({ action, note: note ?? undefined }) });
-      setMessage(action === 'approve' ? `Booking approved${result.billId ? ' and the fee billed' : ''}.` : `Booking ${action === 'decline' ? 'declined' : 'cancelled'}.`);
-      refresh();
-    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Booking decision failed'); }
-  }
-  const facilityItems = (facilities.data?.items ?? []) as Row[];
-  const pendingCount = facilityItems.reduce((sum, row) => sum + Number(row.pending_bookings ?? 0), 0);
-  return <PagePanel title="Facility bookings" subtitle="Reserve shared amenities — request, approval, billing and one calendar" action={<div className="row-actions">{canOperate && <button className="secondary" onClick={() => { setShowFacilityForm(!showFacilityForm); setEditingFacility(null); setRateValue(''); }}>Add facility</button>}{canBook && <button className="primary" onClick={() => setShowBookForm(!showBookForm)}>Request booking</button>}</div>}>
-    {message && <Notice tone={/failed|refused|Could not/i.test(message) ? 'error' : 'success'}>{message}</Notice>}
-    {pendingCount > 0 && canOperate && <Notice tone="warning">{pendingCount} booking request(s) are waiting for a decision below.</Notice>}
-    {showFacilityForm && <FormCard title={editingFacility ? `Edit ${String(editingFacility.name)}` : 'Add a facility'} onSubmit={submitFacility} message="">
-      <label>Name<input name="name" defaultValue={String(editingFacility?.name ?? '')} required /></label>
-      <label>Location<input name="location" defaultValue={String(editingFacility?.location ?? '')} /></label>
-      <label>Capacity<input name="capacity" type="number" min="1" defaultValue={String(editingFacility?.capacity ?? '')} /></label>
-      <label>Hourly rate (₦)<input name="hourlyRate" type="number" min="0" step="0.01" value={rateValue} onChange={(event) => setRateValue(event.target.value)} placeholder="0.00" /></label>
-      <label>Refundable deposit (₦)<input name="deposit" type="number" min="0" step="0.01" defaultValue={editingFacility ? String(Number(editingFacility.deposit_minor ?? 0) / 100) : '0'} /></label>
-      <label>Approval<select name="requiresApproval" defaultValue={String(editingFacility?.requires_approval ?? 1) === String(1) || Number(editingFacility?.requires_approval ?? 1) ? '1' : '0'}><option value="1">Approval required</option><option value="0">Auto-approve</option></select></label>
-      <label>Payment<select name="requiresPayment" defaultValue={Number(editingFacility?.requires_payment ?? 0) ? '1' : '0'}><option value="0">Free to book</option><option value="1">Bill the requester</option></select></label>
-      <label>Minimum notice (hours)<input name="minNoticeHours" type="number" min="0" defaultValue={Number(editingFacility?.min_notice_hours ?? 0)} /></label>
-      <label>Max hours per booking<input name="maxHoursPerBooking" type="number" min="1" defaultValue={Number(editingFacility?.max_hours_per_booking ?? 8)} /></label>
-      <label className="span-2">Rules<input name="rules" defaultValue={String(editingFacility?.rules ?? '')} placeholder="Noise curfew, guest count, cleanup…" /></label>
-      <label className="span-2">Description<input name="description" defaultValue={String(editingFacility?.description ?? '')} /></label>
-      <div className="row-actions"><button className="primary">{editingFacility ? 'Save facility' : 'Add facility'}</button><button type="button" className="secondary" onClick={() => { setShowFacilityForm(false); setEditingFacility(null); }}>Cancel</button></div>
-    </FormCard>}
-    {showBookForm && <FormCard title="Request a booking" onSubmit={submitBooking} message="">
-      <label>Facility<select name="facilityId" required><option value="">Choose…</option>{facilityItems.map((row) => <option key={String(row.id)} value={String(row.id)}>{String(row.name)}{row.location ? ` — ${String(row.location)}` : ''}{Number(row.hourly_rate_minor) ? ` (₦${(Number(row.hourly_rate_minor) / 100).toLocaleString()}/hr)` : ''}</option>)}</select></label>
-      <label>Starts<input name="startsAt" type="datetime-local" required /></label>
-      <label>Ends<input name="endsAt" type="datetime-local" required /></label>
-      <label>Purpose<input name="purpose" placeholder="Birthday, meeting…" /></label>
-      <label>Attendees<input name="attendees" type="number" min="1" /></label>
-      <label>Contact phone<input name="contactPhone" /></label>
-      <div className="row-actions"><button className="primary">Send request</button><button type="button" className="secondary" onClick={() => setShowBookForm(false)}>Cancel</button></div>
-    </FormCard>}
-    <h3>Facilities</h3>
-    <ListState list={facilities}>
-      <DataTable rows={facilityItems} columns={[
-        ['name', 'Name'], ['location', 'Location'], ['capacity', 'Capacity'],
-        ['hourly_rate_minor', 'Hourly rate', 'money'], ['deposit_minor', 'Deposit', 'money'],
-        ['upcoming_bookings', 'Upcoming'], ['pending_bookings', 'Waiting decision'], ['status', 'Status'],
-      ]} action={canOperate ? (row) => <div className="row-actions"><button className="text" onClick={() => { setEditingFacility(row); setShowFacilityForm(true); setRateValue(String(Number(row.hourly_rate_minor ?? 0) / 100)); }}>Edit</button>
-        {String(row.status) === 'active'
-          ? <button className="text" onClick={async () => { await api(`/api/facilities/${row.id}`, { method: 'PATCH', body: JSON.stringify({ status: 'inactive' }) }); refresh(); }}>Retire</button>
-          : <button className="text" onClick={async () => { await api(`/api/facilities/${row.id}`, { method: 'PATCH', body: JSON.stringify({ status: 'active' }) }); refresh(); }}>Restore</button>}</div> : undefined} />
-    </ListState>
-    <div className="people-filters">
-      <label>Booking status<select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">All bookings</option><option value="pending">Pending</option><option value="approved">Approved</option><option value="declined">Declined</option><option value="cancelled">Cancelled</option><option value="completed">Completed</option></select></label>
-    </div>
-    <h3>Bookings</h3>
-    <ListState list={bookings}>
-      <DataTable exportTitle="Facility bookings" rows={bookings.data?.items ?? []} columns={[
-        ['facility_name', 'Facility'], ['requester_name', 'Requested by'], ['unit_number', 'Unit'],
-        ['starts_at', 'Starts', 'date'], ['ends_at', 'Ends', 'date'], ['purpose', 'Purpose'],
-        ['estimated_cost_minor', 'Est. cost', 'money'], ['payment_status', 'Payment'], ['status', 'Status'],
-      ]} action={(row) => (
-        <div className="row-actions">
-          {canOperate && String(row.status) === 'pending' && <button className="text" onClick={() => decide(row, 'approve')}>Approve</button>}
-          {canOperate && String(row.status) === 'pending' && <button className="text" onClick={() => decide(row, 'decline')}>Decline</button>}
-          {(canOperate || String(row.requester_id) === user.id) && ['pending', 'approved'].includes(String(row.status)) && <button className="text danger" onClick={() => decide(row, 'cancel')}>Cancel</button>}
-        </div>
-      )} />
-    </ListState>
-    <Notice tone="info">Approving a paid booking raises an ordinary bill — cashiers clear it in Bills &amp; payments like any other. Cancelling before payment voids the bill. Deposits are included in the billed total and refunded manually.</Notice>
-  </PagePanel>;
-}
-
 function EmergencyContacts({ user }: { user: User }) {
   const canManage = user.role === 'admin' || user.role === 'manager';
   const [category, setCategory] = useState('');
@@ -3187,10 +3074,8 @@ function InformationShortcuts({ onNavigate }: { onNavigate?: (s: Section) => voi
   const cards: Array<[Section, string, string]> = [
     ['notices', 'Estate notices', 'Announcements, policy updates and urgent broadcasts pushed to every resident.'],
     ['maintenance', 'Service operations', 'Open maintenance requests, fault reports and resolution status.'],
-    ['bookings', 'Facility bookings', 'Reserve estate amenities and view the upcoming events calendar.'],
     ['emergency', 'Emergency contacts', 'Quick access to security, medical, fire and utility response lines.'],
     ['visitors', 'Visitor management', 'Invite guests, issue passes and review arrival history.'],
-    ['legal', 'Legal & governance', 'Estate by-laws, house rules, data handling and governance documents.'],
   ];
   return <section className="feature-grid">
     {cards.map(([id, title, body]) => (
@@ -3203,12 +3088,6 @@ function InformationShortcuts({ onNavigate }: { onNavigate?: (s: Section) => voi
       </button>
     ))}
   </section>;
-}
-
-function LegalGovernance({ user }: { user: User }) {
-  return <DocumentLibrary user={user} set="legal" title="Legal & governance" subtitle="By-laws, house rules, residents’ agreement, privacy and data-handling notices, AGM minutes and Exco resolutions" categories={[
-    ['bylaw', 'By-law'], ['house_rule', 'House rule'], ['privacy', 'Privacy & data'], ['agreement', 'Residents’ agreement'], ['minutes', 'Meeting minutes'], ['policy', 'Policy'],
-  ]} />;
 }
 
 export default App;
