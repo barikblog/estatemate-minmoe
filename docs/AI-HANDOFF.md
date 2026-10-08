@@ -2,8 +2,8 @@
 
 ## Time-zone chooser and synchronisation button on the bridge app (2026-10-07)
 
-Implemented locally; not deployed or published. Windows/Node bridge only — the
-Android bridge does not run clock sync at all (recorded deviation).
+Windows/Node bridge only — the Android bridge does not run clock sync at all
+(recorded deviation).
 
 - **The bridge app lets the estate choose the terminals' time zone.** The
   Windows dashboard's Configuration tab (Terminal clock sync group) has an
@@ -38,9 +38,24 @@ Android bridge does not run clock sync at all (recorded deviation).
   config, sentinel clears it, falls back to the PC zone) and for `sync-clocks`
   answering cleanly without a configuration; it runs on the Windows runner.
 
-## Visitor passes in the estate's local time, a gated visitor Modify, and the clock-sync switch (2026-10-07)
+### Deployment and publish outcome
 
-Implemented locally; not deployed or published.
+- Shipped in PR #59 (merge `1b7e048`): production deploy workflow `37736432661`
+  succeeded (no new migrations — the change is Worker and bridge code only),
+  and production smoke test `37736535369` succeeded after it (`GET
+  /api/health` plus the unauthenticated login probe, from outside).
+- Bridge release workflow `37736982894` passed every job — validation, Windows
+  bundle, executable/MSI installer, Android APK — and published
+  **`bridge-0.4.5`** (`2026-10-08T06:26:23Z`) with checksums and the
+  Windows/Android install artifacts. The dashboard self-test covering the
+  chooser and the button, and the packaged-executable smoke test's 43 checks
+  (including `sync-clocks` end to end), ran green on that release build.
+- **Caveat:** the `timeZone` field written with a clock set is unverified on
+  physical firmware. It is sent JSON-first with the XML fallback and confirmed
+  by re-reading, but a terminal that ignores it keeps its zone — its wall clock
+  is still aligned, and it would need re-zoning in its own setup menu.
+
+## Visitor passes in the estate's local time, a gated visitor Modify, and the clock-sync switch (2026-10-07)
 
 - **Visitor provisioning states the validity window in the estate's local time.**
   The Worker includes the estate timezone in every visitor device operation —
@@ -74,12 +89,27 @@ Implemented locally; not deployed or published.
   (local window, UTC fallback, content-rejection path), Android `ProtocolTest`
   (same three), and five new packaged-executable smoke checks (flag on/off,
   default off, thresholds preserved, wizard ask). The packaged Linux bridge smoke
-  test passes 36/36; `npm test` passes with 27 files / 283 tests.
+  test passes 43/43 (36 then, plus the seven the follow-up section below added);
+  `npm test` passes with 27 files / 283 tests.
 - **Caveat:** this is unverified on the target physical terminal. Hikvision's
   schema permits both local and UTC representations of `Valid`, so the simulated
   terminals cannot prove the firmware accepts the local form. Clock sync aligns
   a terminal's clock with the PC; it does not set the terminal's timezone, which
   must match the estate.
+
+### Deployment and publish outcome
+
+- PR #59 merged as `1b7e048`. Production deploy workflow `37736432661`
+  succeeded, including the D1 migration rollout (no new migrations — the
+  change is Worker and bridge code only) and the Worker/web deployment.
+- Production smoke test `37736535369` succeeded after the deploy: the
+  unauthenticated `/api/health` check and the login-JSON probe from outside
+  GitHub's runners. No API contract changed (the visitor endpoints' response
+  shapes are unchanged; covered by the 283-test suite).
+- Bridge release workflow `37736982894` passed all validation, Windows bundle,
+  executable/MSI installer and Android APK jobs. **`bridge-0.4.5`** is the
+  published release (`2026-10-08T06:26:23Z`), with checksums and the
+  Windows/Android install artifacts.
 
 ## Digit-only card numbers and 30-character Employee IDs (2026-10-07)
 
