@@ -1115,7 +1115,7 @@ jobs:
           if (-not $msi) { throw 'the client MSI was not built' }
           $log = Join-Path $env:RUNNER_TEMP 'client-install.log'
           $dir = Join-Path $env:LOCALAPPDATA 'Programs\EstateMate'
-          $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\EstateMate.lnk'
+          $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\EstateMate\EstateMate.lnk'
           $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'EstateMate.lnk'
 
           $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', "`"$($msi.FullName)`"", '/qn', '/norestart', '/l*v', "`"$log`"")
