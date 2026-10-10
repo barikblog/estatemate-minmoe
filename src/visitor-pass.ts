@@ -1,10 +1,16 @@
 import { formatEstateDateTime, parseEstateInstantMs } from './datetime';
 
-/** Any visitor row shape; only these three fields drive the decision. */
+/**
+ * Any visitor row shape. The window and status drive the decision; `visit_times`
+ * and `visits_used` cap how many times the pass may be used, and are only read
+ * when the caller's query counted accepted check-ins.
+ */
 export interface VisitorPassWindow {
   valid_from?: unknown;
   valid_until?: unknown;
   status?: unknown;
+  visit_times?: unknown;
+  visits_used?: unknown;
   [column: string]: unknown;
 }
 
@@ -44,6 +50,16 @@ export function evaluateVisitorPass(
   }
   if (nowMs > endsAtMs) {
     return reject(`This pass expired at ${formatEstateDateTime(endsAtMs, timeZone)} estate time`);
+  }
+  // Visit times: a pass admits the visitor a fixed number of times, and
+  // EstateMate counts those check-ins itself rather than asking a terminal to
+  // enforce a field no device profile records (see src/visitor-account.ts).
+  // Letting somebody who is already inside back out is never blocked by this —
+  // the decision route overrides an invalid evaluation for a check-out.
+  const visitTimes = Number(pass.visit_times ?? 0);
+  const visitsUsed = Number(pass.visits_used ?? 0);
+  if (Number.isFinite(visitTimes) && visitTimes >= 1 && Number.isFinite(visitsUsed) && visitsUsed >= visitTimes) {
+    return reject(`This pass has used all ${visitTimes} permitted visit${visitTimes === 1 ? '' : 's'}. Ask the host to issue a new pass`);
   }
   return { valid: true, reason: null, ...base };
 }

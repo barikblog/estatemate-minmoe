@@ -22,6 +22,26 @@ import { EMPLOYEE_ID_MAX, deviceEmployeeNo, employeeIdFromUuid, readEmployeeId }
 import { cardNumberValidationError, isDigitsOnlyCardNumber } from './card-number';
 import { AccessLiveFeed } from './live-feed';
 import { evaluateVisitorPass } from './visitor-pass';
+import {
+  VISITOR_DEFAULT_MAX_VALIDITY_DAYS,
+  VISITOR_DEFAULT_VALIDITY_DAYS,
+  VISITOR_PERSON_TYPES,
+  VISITOR_PIN_DIGITS,
+  VISITOR_VALIDITY_MAX_CEILING_DAYS,
+  VISITOR_VALIDITY_MIN_DAYS,
+  readValidityDays,
+  readVisitTimes,
+  readVisitorDefaultValidityDays,
+  readVisitorMaxValidityDays,
+  readVisitorPersonType,
+  readVisitorPurpose,
+  readVisitorRemark,
+  visitorPersonTypeLabel,
+  visitorPurposeLabel,
+  visitorValidityError,
+  withinVisitorValidity,
+  type VisitorPersonType,
+} from './visitor-account';
 import { normalizeHikvisionDocument } from './hikvision';
 import { HIKVISION_PROFILES, getHikvisionProfile, isConnectionSupported, resolveHikvisionProfile } from './hikvision-profiles';
 import {
@@ -362,6 +382,49 @@ async function linkProofFiles(db: D1Database, keys: string[], entityType: string
   ).bind(entityType,entityId,...keys,uploaderId).run();
 }
 
+/**
+ * Visitor account rules: the default window a new pass gets, the longest window
+ * the estate allows, and the terminal person type a visitor account is filed
+ * under.
+ *
+ * The maximum is deliberately enforced for everybody who requests a pass,
+ * Administrator and Manager included: raising the ceiling is an explicit
+ * Settings change, which is audited, rather than a quiet exception taken at the
+ * gate. See `src/visitor-account.ts` for the limits behind the numbers.
+ */
+interface VisitorAccountRules {
+  defaultDays: number;
+  maxDays: number;
+  personType: VisitorPersonType;
+}
+
+async function visitorAccountRules(db: D1Database): Promise<VisitorAccountRules> {
+  let values = new Map<string, string>();
+  try {
+    const rows = await db.prepare(
+      `SELECT key,value FROM settings WHERE key IN ('visitor_default_validity_days','visitor_max_validity_days','visitor_person_type')`,
+    ).all<{ key: string; value: string }>();
+    values = new Map(rows.results.map((row) => [row.key, row.value]));
+  } catch { /* A migration may still be running; the built-in defaults apply. */ }
+  const defaultDays = readVisitorDefaultValidityDays(values.get('visitor_default_validity_days'));
+  const maxDays = readVisitorMaxValidityDays(values.get('visitor_max_validity_days'), defaultDays);
+  const personType = readVisitorPersonType(values.get('visitor_person_type')).value;
+  return { defaultDays, maxDays, personType };
+}
+
+/**
+ * Accepted check-ins on a pass, i.e. how much of its visit allowance has been
+ * spent. Refused and previewed scans never count, and a check-in that was
+ * later checked out still counts — the visit happened.
+ */
+const VISITS_USED_SQL = `(SELECT COUNT(*) FROM visitor_code_scans s WHERE s.visitor_request_id=v.id AND s.decision='accepted' AND s.action='in') AS visits_used`;
+
+/** Exactly six digits: the keypad code the visitor types at the terminal. */
+function newVisitorPin(): string {
+  const bytes = crypto.getRandomValues(new Uint32Array(1));
+  return String(bytes[0]! % 10 ** VISITOR_PIN_DIGITS).padStart(VISITOR_PIN_DIGITS, '0');
+}
+
 async function newVisitorCredential(db: D1Database): Promise<string> {
   for (let attempt=0; attempt<10; attempt+=1) {
     const parts = crypto.getRandomValues(new Uint32Array(2));
@@ -482,6 +545,7 @@ const PORTAL_SETTING_KEYS = [
   'theme_primary_color','theme_accent_color','theme_navigation_color','theme_surface_color','theme_corner_style',
   'support_email','support_phone','estate_timezone','currency','visitor_default_duration_hours',
   'visitor_gate_policy','visitor_credential_format','card_scan_timeout_minutes',
+  'visitor_default_validity_days','visitor_max_validity_days','visitor_person_type',
   'portal_gate_image_key','portal_gate_image_caption','portal_gate_image_enabled',
 ] as const;
 
@@ -2725,7 +2789,8 @@ app.get('/api/visitors', async (c) => {
   const scopedGate = gateScope(c);
   const result = await c.env.DB.prepare(
     `SELECT v.*,u.name AS resident_name,p.unit_number,p.street,d.name AS device_name,d.model AS device_model,d.profile_key,
-       (SELECT COUNT(*) FROM stored_files sf WHERE sf.linked_entity_type='visitor_request' AND sf.linked_entity_id=v.id AND sf.status='active') AS proof_count
+       (SELECT COUNT(*) FROM stored_files sf WHERE sf.linked_entity_type='visitor_request' AND sf.linked_entity_id=v.id AND sf.status='active') AS proof_count,
+       ${VISITS_USED_SQL}
      FROM visitor_requests v JOIN users u ON u.id=v.resident_id
      LEFT JOIN properties p ON p.id=COALESCE(v.property_id,u.property_id)
      LEFT JOIN hikvision_devices d ON d.id=v.device_id
@@ -2736,13 +2801,30 @@ app.get('/api/visitors', async (c) => {
 });
 
 app.post('/api/visitors', requireRoles('resident','admin','manager'), async (c) => {
-  const body = await c.req.json<{ visitorName?: string; visitorPhone?: string; validFrom?: string; validUntil?: string; residentId?: string; propertyId?: string; deviceId?: string; proofKeys?: string[]; requireGateIdVerification?: boolean|number|string }>();
+  const body = await c.req.json<{ visitorName?: string; visitorPhone?: string; validFrom?: string; validUntil?: string; residentId?: string; propertyId?: string; deviceId?: string; proofKeys?: string[]; requireGateIdVerification?: boolean|number|string; personType?: string; visitTimes?: number|string; purposeOfVisit?: string; purposeOfVisitOther?: string; remark?: string }>();
   if (!body.visitorName?.trim() || !body.validFrom || !body.validUntil) return jsonError(c, 400, 'visitorName, validFrom and validUntil are required');
   const timeZone=await estateTimeZone(c.env.DB);
+  const rules=await visitorAccountRules(c.env.DB);
+  // The person type is an operational choice: an estate officer may pick it per
+  // pass, while a resident's request takes the estate default. Anything else
+  // the route accepts is validated before a row is written.
+  const operator = c.get('user').role === 'admin' || c.get('user').role === 'manager';
+  const personType=readVisitorPersonType(operator ? body.personType : undefined,rules.personType);
+  if (personType.error) return jsonError(c,400,personType.error);
+  const visitTimes=readVisitTimes(body.visitTimes);
+  if (visitTimes.error) return jsonError(c,400,visitTimes.error);
+  const purpose=readVisitorPurpose(body.purposeOfVisit,body.purposeOfVisitOther);
+  if (purpose.error) return jsonError(c,400,purpose.error);
+  const remark=readVisitorRemark(body.remark);
+  if (remark.error) return jsonError(c,400,remark.error);
   const validFromMs=parseEstateInstantMs(body.validFrom,timeZone,'start');
   const validUntilMs=parseEstateInstantMs(body.validUntil,timeZone,'end');
   if (validFromMs===null || validUntilMs===null) return jsonError(c,400,'validFrom and validUntil must be readable dates');
   if (validUntilMs<=validFromMs) return jsonError(c,400,'validUntil must be after validFrom');
+  // Validity period: a pass defaults to the estate's window (one day until an
+  // administrator changes it) and never outlives the estate's maximum, whoever
+  // asks. The maximum itself is edited in Settings.
+  if (!withinVisitorValidity(validFromMs,validUntilMs,rules.maxDays)) return jsonError(c,400,visitorValidityError(rules.maxDays));
   // Stored as absolute UTC instants so scans, SQL and the portal all agree.
   const validFrom=new Date(validFromMs).toISOString();
   const validUntil=new Date(validUntilMs).toISOString();
@@ -2773,16 +2855,19 @@ app.post('/api/visitors', requireRoles('resident','admin','manager'), async (c) 
   }
   const gateScope=device?'gate':'both';
   const id = crypto.randomUUID();
-  const pin = String(crypto.getRandomValues(new Uint32Array(1))[0]! % 1_000_000).padStart(6, '0');
+  // Six digits, always: the code the visitor types on the terminal keypad, and
+  // the code the pass prints. Generated here and never chosen by the requester,
+  // so it cannot collide with a resident PIN or be guessed from a name.
+  const pin = newVisitorPin();
   const qrToken = randomToken(24);
   const credentialNumber=await newVisitorCredential(c.env.DB);
   const profile=device?getHikvisionProfile(device.profile_key):null;
   const credentialMode=profile?.authenticationMethods.some((method)=>method==='QR')?'qr':profile?.authenticationMethods.includes('PIN')?'pin':'hybrid';
   const requireGateIdVerification = (body.requireGateIdVerification === true || body.requireGateIdVerification === 1 || body.requireGateIdVerification === '1' || body.requireGateIdVerification === 'mandatory') ? 1 : 0;
   await c.env.DB.prepare(
-    `INSERT INTO visitor_requests(id,resident_id,property_id,visitor_name,visitor_phone,pin,qr_token,credential_number,barcode_payload,credential_mode,device_id,gate_scope,requires_security_approval,require_gate_id_verification,status,valid_from,valid_until)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'active',?,?)`,
-  ).bind(id,residentId,propertyId,body.visitorName.trim(),body.visitorPhone?.trim() ?? null,pin,qrToken,credentialNumber,credentialNumber,credentialMode,device?.id ?? null,gateScope,1,requireGateIdVerification,validFrom,validUntil).run();
+    `INSERT INTO visitor_requests(id,resident_id,property_id,visitor_name,visitor_phone,pin,qr_token,credential_number,barcode_payload,credential_mode,device_id,gate_scope,requires_security_approval,require_gate_id_verification,status,valid_from,valid_until,person_type,visit_times,purpose_of_visit,purpose_of_visit_other,remark)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'active',?,?,?,?,?,?,?)`,
+  ).bind(id,residentId,propertyId,body.visitorName.trim(),body.visitorPhone?.trim() ?? null,pin,qrToken,credentialNumber,credentialNumber,credentialMode,device?.id ?? null,gateScope,1,requireGateIdVerification,validFrom,validUntil,personType.value,visitTimes.value,purpose.value.purpose,purpose.value.purposeOther,remark.value).run();
   await linkProofFiles(c.env.DB,proofKeys(body.proofKeys),'visitor_request',id,requester.id);
   // The visitor account is created on the access-control estate automatically:
   // this queues the PIN-only account on every terminal (or the one gate an
@@ -2803,10 +2888,28 @@ app.post('/api/visitors', requireRoles('resident','admin','manager'), async (c) 
     timeZone,
     enabled: false,
     requiresSecurityApproval: true,
+    // The terminal files this account under the person type the estate chose.
+    // The bridge writes it as the ISAPI `userType`; visit times stay an
+    // EstateMate-side count because no device profile records a firmware field
+    // that counts visits.
+    personType: personType.value,
+    visitTimes: visitTimes.value,
   });
   const deviceAccountState = await c.env.DB.prepare(`SELECT device_account_state FROM visitor_requests WHERE id=?`).bind(id).first<{ device_account_state:string }>();
-  await audit(c,'create','visitor_request',id,{ propertyId,deviceId:device?.id ?? null,gateScope,credentialMode,requireGateIdVerification,hardwareOperationsQueued,deviceEmployeeNo:visitorEmployeeNo });
-  return c.json({ id, propertyId, pin, qrToken, credentialNumber, barcodePayload:credentialNumber, credentialMode, gateScope, validFrom, validUntil, requiresSecurityApproval:true, requireGateIdVerification, hardwareOperationsQueued, deviceEmployeeNo:visitorEmployeeNo, deviceAccountState:deviceAccountState?.device_account_state ?? 'none', deviceAccountNotice:'The visitor account is created on the estate access-control devices now and deleted from all of them automatically when validity expires. The pass record is kept.' }, 201);
+  await audit(c,'create','visitor_request',id,{ propertyId,deviceId:device?.id ?? null,gateScope,credentialMode,requireGateIdVerification,hardwareOperationsQueued,deviceEmployeeNo:visitorEmployeeNo,personType:personType.value,visitTimes:visitTimes.value,purposeOfVisit:purpose.value.purpose,remark:remark.value ? true : false });
+  return c.json({
+    id, propertyId, pin, qrToken, credentialNumber, barcodePayload:credentialNumber, credentialMode, gateScope,
+    validFrom, validUntil, requiresSecurityApproval:true, requireGateIdVerification,
+    personType: personType.value, personTypeLabel: visitorPersonTypeLabel(personType.value),
+    visitTimes: visitTimes.value, visitsUsed: 0, visitsRemaining: visitTimes.value,
+    validityDays: Math.max(1, Math.round((validUntilMs-validFromMs)/86_400_000)),
+    purposeOfVisit: purpose.value.purpose, purposeOfVisitOther: purpose.value.purposeOther,
+    purposeOfVisitLabel: visitorPurposeLabel(purpose.value.purpose,purpose.value.purposeOther),
+    remark: remark.value,
+    maxValidityDays: rules.maxDays, defaultValidityDays: rules.defaultDays,
+    hardwareOperationsQueued, deviceEmployeeNo:visitorEmployeeNo, deviceAccountState:deviceAccountState?.device_account_state ?? 'none',
+    deviceAccountNotice:'The visitor account is created on the estate access-control devices now and deleted from all of them automatically when validity expires. The pass record is kept.',
+  }, 201);
 });
 
 /**
@@ -2879,7 +2982,8 @@ app.post('/api/visitors/scan', requireRoles('security','admin','manager'), async
   try { await releaseExpiredVisitorDeviceAccounts(c.env); } catch (error) { console.error('Visitor device-account sweep failed', error); }
   const visitor=await c.env.DB.prepare(
     `SELECT v.*,u.name AS resident_name,u.phone AS resident_phone,p.unit_number,p.street,p.address,d.name AS device_name,
-       (SELECT COUNT(*) FROM stored_files sf WHERE sf.linked_entity_type='visitor_request' AND sf.linked_entity_id=v.id AND sf.status='active') AS proof_count
+       (SELECT COUNT(*) FROM stored_files sf WHERE sf.linked_entity_type='visitor_request' AND sf.linked_entity_id=v.id AND sf.status='active') AS proof_count,
+       ${VISITS_USED_SQL}
      FROM visitor_requests v JOIN users u ON u.id=v.resident_id
      LEFT JOIN properties p ON p.id=v.property_id LEFT JOIN hikvision_devices d ON d.id=v.device_id
      WHERE v.pin=? OR v.qr_token=? OR v.credential_number=? OR v.barcode_payload=? LIMIT 1`,
@@ -2905,8 +3009,19 @@ app.post('/api/visitors/scan', requireRoles('security','admin','manager'), async
   const visitorProofs = await c.env.DB.prepare(
     `SELECT storage_key,original_name,content_type,size_bytes FROM stored_files WHERE linked_entity_type='visitor_request' AND linked_entity_id=? AND status='active' ORDER BY created_at`,
   ).bind(visitor.id).all();
-  await audit(c,'preview','visitor_pass',String(visitor.id),{ scanId,source:body.source ?? 'manual',valid,reason:evaluation.reason });
-  return c.json({ scanId,valid,reason:evaluation.reason,validFrom:visitor.valid_from,validUntil:visitor.valid_until,timeZone,visitor,proofs:visitorProofs.results });
+  // What an officer needs before deciding: why the visitor is here, the host's
+  // remark, and how much of the visit allowance is left.
+  const visitTimes=readVisitTimes(visitor.visit_times).value;
+  const visitsUsed=Number(visitor.visits_used ?? 0);
+  await audit(c,'preview','visitor_pass',String(visitor.id),{ scanId,source:body.source ?? 'manual',valid,reason:evaluation.reason,visitTimes,visitsUsed });
+  return c.json({
+    scanId,valid,reason:evaluation.reason,validFrom:visitor.valid_from,validUntil:visitor.valid_until,timeZone,visitor,proofs:visitorProofs.results,
+    visitTimes,visitsUsed,visitsRemaining:Math.max(0,visitTimes-visitsUsed),
+    personType:visitor.person_type ?? null,personTypeLabel:visitorPersonTypeLabel(visitor.person_type),
+    purposeOfVisit:visitor.purpose_of_visit ?? null,purposeOfVisitOther:visitor.purpose_of_visit_other ?? null,
+    purposeOfVisitLabel:visitorPurposeLabel(visitor.purpose_of_visit,visitor.purpose_of_visit_other),
+    remark:visitor.remark ?? null,
+  });
 });
 
 app.post('/api/visitors/:id/decision', requireRoles('security','admin','manager'), async (c) => {
@@ -2915,7 +3030,9 @@ app.post('/api/visitors/:id/decision', requireRoles('security','admin','manager'
   if (!body.scanId) return jsonError(c,400,'Preview the scanned visitor code before making a decision');
   const scan=await c.env.DB.prepare(`SELECT id FROM visitor_code_scans WHERE id=? AND visitor_request_id=? AND scanned_by=? AND decision='previewed'`).bind(body.scanId,c.req.param('id'),c.get('user').id).first();
   if (!scan) return jsonError(c,409,'This visitor scan is missing, already decided, or belongs to another security user');
-  const visitor=await c.env.DB.prepare(`SELECT * FROM visitor_requests WHERE id=?`).bind(c.req.param('id')).first<Record<string,string|number|null>>();
+  // `visits_used` travels with the row so the visit allowance is enforced by
+  // the same evaluation the preview showed the officer.
+  const visitor=await c.env.DB.prepare(`SELECT v.*,${VISITS_USED_SQL} FROM visitor_requests v WHERE v.id=?`).bind(c.req.param('id')).first<Record<string,string|number|null>>();
   if (!visitor) return jsonError(c,404,'Visitor pass not found');
   const evaluation=evaluateVisitorPass(visitor,await estateTimeZone(c.env.DB));
   const action=body.action ?? 'in';
@@ -2950,8 +3067,10 @@ app.post('/api/visitors/:id/decision', requireRoles('security','admin','manager'
     await c.env.DB.prepare(`UPDATE visitor_requests SET rejected_at=datetime('now'),rejected_by=?,rejection_note=? WHERE id=?`).bind(c.get('user').id,body.note?.trim() ?? 'Rejected by gate security',visitor.id).run();
   }
   await c.env.DB.prepare(`UPDATE visitor_code_scans SET decision=?,action=?,note=? WHERE id=? AND scanned_by=?`).bind(body.decision,body.action ?? null,body.note?.trim() ?? null,body.scanId,c.get('user').id).run();
-  await audit(c,body.decision,'visitor_pass',String(visitor.id),{ action:body.action,note:body.note,gateProofsCount:gateProofs.length });
-  return c.json({ ok:true,decision:body.decision,action:body.action ?? null });
+  const visitTimes=readVisitTimes(visitor.visit_times).value;
+  const visitsUsed=Number(visitor.visits_used ?? 0) + (body.decision==='accepted' && action==='in' ? 1 : 0);
+  await audit(c,body.decision,'visitor_pass',String(visitor.id),{ action:body.action,note:body.note,gateProofsCount:gateProofs.length,visitTimes,visitsUsed });
+  return c.json({ ok:true,decision:body.decision,action:body.action ?? null,visitTimes,visitsUsed,visitsRemaining:Math.max(0,visitTimes-visitsUsed) });
 });
 
 app.post('/api/visitors/device-scan-sessions', requireRoles('security','admin','manager'), async (c) => {
@@ -5682,7 +5801,35 @@ app.put('/api/portal-config', requireRoles('admin'), async (c) => {
     if (key === 'theme_corner_style' && !['compact','comfortable','rounded'].includes(value)) return jsonError(c,400,'Invalid corner style');
     if (key === 'visitor_gate_policy' && value !== 'security_approval') return jsonError(c,400,'Security approval is the configured visitor gate policy');
     if (['visitor_default_duration_hours','card_scan_timeout_minutes'].includes(key) && (!/^\d{1,3}$/.test(value) || Number(value)<1)) return jsonError(c,400,`${key} must be a positive number`);
+    // Visitor pass windows: the default the form offers and the longest the
+    // estate accepts, both in whole days and both inside the ceiling in
+    // src/visitor-account.ts. A maximum below the default would make the
+    // estate's own default impossible to request, so it is refused here with
+    // the number to aim at.
+    if (key === 'visitor_default_validity_days' || key === 'visitor_max_validity_days') {
+      if (!/^\d{1,3}$/.test(value) || Number(value) < VISITOR_VALIDITY_MIN_DAYS || Number(value) > VISITOR_VALIDITY_MAX_CEILING_DAYS) {
+        return jsonError(c,400,`${key} must be a whole number of days between ${VISITOR_VALIDITY_MIN_DAYS} and ${VISITOR_VALIDITY_MAX_CEILING_DAYS}`);
+      }
+    }
+    if (key === 'visitor_person_type' && !VISITOR_PERSON_TYPES.includes(value as VisitorPersonType)) {
+      return jsonError(c,400,`visitor_person_type must be one of: ${VISITOR_PERSON_TYPES.join(', ')}`);
+    }
     if (BOOLEAN_SETTING_KEYS.includes(key) && !['true','false'].includes(value)) return jsonError(c,400,`${key} must be true or false`);
+  }
+  // The two visitor window settings are validated against each other: a maximum
+  // below the estate's default would make the estate's own default impossible
+  // to request, and that is a configuration mistake worth refusing up front.
+  const submitted = new Map(entries);
+  if (submitted.has('visitor_default_validity_days') || submitted.has('visitor_max_validity_days')) {
+    const stored = await c.env.DB.prepare(
+      `SELECT key,value FROM settings WHERE key IN ('visitor_default_validity_days','visitor_max_validity_days')`,
+    ).all<{ key: string; value: string }>();
+    const current = new Map(stored.results.map((row) => [row.key, row.value]));
+    const defaultDays = readValidityDays(submitted.get('visitor_default_validity_days') ?? current.get('visitor_default_validity_days'), VISITOR_DEFAULT_VALIDITY_DAYS);
+    const maxDays = readValidityDays(submitted.get('visitor_max_validity_days') ?? current.get('visitor_max_validity_days'), VISITOR_DEFAULT_MAX_VALIDITY_DAYS);
+    if (maxDays < defaultDays) {
+      return jsonError(c,400,`visitor_max_validity_days (${maxDays}) cannot be lower than the default window of ${defaultDays} day(s)`);
+    }
   }
   await c.env.DB.batch(entries.map(([key,value]) => c.env.DB.prepare(
     `INSERT INTO settings(key,value,updated_by,updated_at) VALUES (?,?,?,datetime('now'))
@@ -6246,7 +6393,7 @@ async function queueVisitorDeviceOperations(
  */
 async function syncActiveVisitorPasses(db: D1Database): Promise<{ passes: number; devices: number; queued: number }> {
   const passes = await db.prepare(
-    `SELECT id,credential_number,visitor_name,pin,valid_from,valid_until,requires_security_approval,gate_scope,device_id
+    `SELECT id,credential_number,visitor_name,pin,valid_from,valid_until,requires_security_approval,gate_scope,device_id,person_type,visit_times
      FROM visitor_requests
      WHERE status IN ('active','checked_in') AND datetime(valid_until)>datetime('now')
      ORDER BY created_at LIMIT 500`,
@@ -6260,6 +6407,8 @@ async function syncActiveVisitorPasses(db: D1Database): Promise<{ passes: number
     requires_security_approval: number;
     gate_scope: string;
     device_id: string | null;
+    person_type: string | null;
+    visit_times: number | null;
   }>();
   if (!passes.results.length) return { passes: 0, devices: 0, queued: 0 };
 
@@ -6283,6 +6432,10 @@ async function syncActiveVisitorPasses(db: D1Database): Promise<{ passes: number
       timeZone,
       enabled: false,
       requiresSecurityApproval: Boolean(pass.requires_security_approval),
+      // Stored on the pass when it was issued, so a reconciliation rebuilds the
+      // same terminal account instead of resetting it to the estate default.
+      personType: readVisitorPersonType(pass.person_type).value,
+      visitTimes: readVisitTimes(pass.visit_times).value,
     });
   }
   return { passes: passes.results.length, devices: Number(devices?.count ?? 0), queued };

@@ -59,7 +59,11 @@ const deviceServer = createServer((req, res) => {
       if (typeof info.belongGroup !== 'string' || (info.belongGroup !== '' && !/^\d+(,\d+)*$/.test(info.belongGroup))) {
         return reject('badJsonContent', 'belongGroup');
       }
-      if (!info.employeeNo || !info.Valid || info.userType !== 'normal'
+      // Documented ISAPI userType values for an access-control person. The
+      // terminal accepts the two EstateMate sends: `normal` for residents (and
+      // for a visitor on firmware without a visitor type) and `visitor` for a
+      // temporary visitor account.
+      if (!info.employeeNo || !info.Valid || !['normal', 'visitor'].includes(info.userType)
         || info.localUIRight !== false || !/^\d{4,8}$/.test(String(info.password || ''))
         || 'doorRight' in info || 'RightPlan' in info || 'gender' in info) {
         return reject('badJsonContent', 'UserInfo');
@@ -376,6 +380,47 @@ try {
     ]);
     assert.equal(persons.has('VIS55443322'), false, 'expiry/revocation must free the visitor person slot');
     console.log('visitor PIN-only UserInfo and automatic account deletion OK');
+  }
+
+  // 3d-bis. The person type the estate chose reaches the terminal as the ISAPI
+  //     `userType`. Without it (an operation queued before the option existed)
+  //     the account stays `normal`, and a value no terminal can take is refused
+  //     before anything is written.
+  {
+    const typed = await apply('upsert_visitor', {
+      credentialNumber: '55443320', employeeNo: 'VIS55443320', visitorName: 'Tayo Visitor',
+      pin: '482731', validFrom: '2026-10-05T08:00:00.000Z', validUntil: '2026-10-05T18:00:00.000Z',
+      timeZone: 'Africa/Lagos', personType: 'visitor',
+    });
+    assert.deepEqual(typed, { success: true });
+    assert.equal(persons.get('VIS55443320').userType, 'visitor', 'the visitor person type must reach the terminal');
+    assert.equal(persons.get('VIS55443320').password, '482731', 'the account stays PIN-only');
+
+    const explicitNormal = await apply('upsert_visitor', {
+      credentialNumber: '55443318', employeeNo: 'VIS55443318', visitorName: 'Fallback Visitor',
+      pin: '482731', validFrom: '2026-10-05T08:00:00.000Z', validUntil: '2026-10-05T18:00:00.000Z',
+      timeZone: 'Africa/Lagos', personType: 'normal',
+    });
+    assert.deepEqual(explicitNormal, { success: true });
+    assert.equal(persons.get('VIS55443318').userType, 'normal', 'an estate on firmware without the visitor type keeps normal');
+
+    const badBefore = requests.length;
+    const bad = await apply('upsert_visitor', {
+      credentialNumber: '55443319', employeeNo: 'VIS55443319', visitorName: 'Wrong Type Visitor',
+      pin: '482731', validFrom: '2026-10-05T08:00:00.000Z', validUntil: '2026-10-05T18:00:00.000Z',
+      timeZone: 'Africa/Lagos', personType: 'administrator',
+    });
+    assert.equal(bad.success, false);
+    assert.match(bad.error, /personType must be "visitor" or "normal"/);
+    assert.equal(requests.length, badBefore, 'an unsupported person type must fail before contacting the terminal');
+    assert.equal(persons.has('VIS55443319'), false, 'a refused account is never created');
+
+    for (const employeeNo of ['VIS55443320', 'VIS55443318']) {
+      const cleanup = await apply('revoke_visitor', { credentialNumber: '55443320', employeeNo });
+      assert.deepEqual(cleanup, { success: true });
+      assert.equal(persons.has(employeeNo), false, 'the visitor slot must be freed');
+    }
+    console.log('visitor person type reaches the terminal OK');
   }
 
   // 3e. A visitor account filed before the charset rule (hyphenated

@@ -1,6 +1,9 @@
 # Visitor device accounts: created on request, deleted at expiry
 
-Introduced in migration `0018_employee_id_bulk_people_visitor_device_lifecycle_modules.sql`.
+Introduced in migration `0018_employee_id_bulk_people_visitor_device_lifecycle_modules.sql`;
+the account's options (person type, visit times, PIN, validity period) and the
+request form's purpose of visit and remark were added in
+`0025_visitor_account_options.sql`.
 
 ## The problem
 
@@ -44,8 +47,63 @@ under EstateMate's current Employee ID policy; the terminal wire field allows
 - issued employee number and visitor name;
 - no on-terminal group assignment (`belongGroup: ""`); Hikvision expects numeric group IDs, so the Worker’s `department: "Company"` metadata is not sent as a terminal group;
 - enabled finite start/end validity, not a long-term account;
-- `userType: "normal"` and `localUIRight: false`;
-- the stored pass PIN as `password`, validated as 4–8 decimal digits.
+- the **person type the estate chose** as `userType` (see below) and `localUIRight: false`;
+- the stored pass PIN as `password` — always **six digits**, validated as 4–8 decimal digits on the wire.
+
+## What the visitor account is: person type, visit times, PIN, validity
+
+Introduced in migration `0025_visitor_account_options.sql`. The request form and
+`POST /api/visitors` accept, and the pass stores, four things about the account:
+
+| Option | Values | Where it lands |
+|---|---|---|
+| **Person type** | `visitor` (default) or `normal` | sent to the terminal as the ISAPI `UserInfo` `userType` |
+| **Visit times** | 1–10, default 1 | counted and enforced by EstateMate |
+| **PIN** | exactly 6 digits, generated | sent as `password`, printed on the pass |
+| **Validity period** | whole days, default 1, maximum 7 | the `Valid` window, in the estate's local time |
+
+**Person type.** `visitor` is what a visitor slot is for, so every pass issued
+from now on is filed under it. `normal` stays selectable because firmware varies:
+a terminal that refuses the type answers the write with `badJsonContent`, which
+would stop the account being created at all — an estate that hits that chooses
+`normal` in **Settings → Visitor person type on terminals**, or per pass at the
+moment it is issued (Administrator and Manager only). A payload with no
+`personType` — one queued before this option existed — keeps the previous
+`normal`, and the migration leaves historical passes on `normal` so a
+reconciliation rewrites the account the terminal already holds instead of trying
+to change a live account's type. Only `visitor` and `normal` are accepted; any
+other value is refused before the terminal is contacted. Both bridges (Node and
+Android) send it in the JSON body and in the XML fallback.
+
+**Visit times are counted by EstateMate, not the terminal.** No device profile
+in `docs/device-profiles/` records a firmware field that counts visits, and an
+ISAPI write carrying an undocumented field is refused outright. So the pass
+stores how many visits it allows (1–10, default 1) and the gate counts accepted
+check-ins: `visits_used` is the number of accepted `in` decisions, the preview
+shows what is left, and once the allowance is spent the next *entry* is refused
+with "This pass has used all N permitted visits". Check-out is never blocked —
+somebody already inside must always be able to leave.
+
+**PIN.** Six digits, generated when the pass is issued, shown on the pass and
+typed on the terminal keypad. It is never chosen by the requester, so it cannot
+collide with a resident's credential or be guessed from a name.
+
+**Validity period.** A pass defaults to **1 day** and may not outlive the estate
+maximum, **7 days** until an administrator changes it. Both live in **Settings**
+(`visitor_default_validity_days`, `visitor_max_validity_days`, 1–30 days) and the
+maximum is enforced for everybody — resident, Security, Manager and
+Administrator alike — so a longer pass is an explicit, audited settings change
+rather than a quiet exception at the gate. A maximum below the estate default is
+refused, because it would make the default impossible to request.
+
+## Purpose of visit and remark
+
+The request form also captures **purpose of visit** (family/social, delivery,
+service & repair, business, domestic staff, event, or *other* with the reason
+typed in) and a free-text **remark** from the host. Both are stored on the pass,
+shown on the printed pass, shown to the officer in the gate preview, listed in
+the visitor table and included in its Excel/PDF export. Neither is ever sent to
+a terminal — they are for the estate's record, not the hardware.
 
 The upsert also carries the **estate's timezone**, and the bridge states the
 validity window in that zone's local time (`YYYY-MM-DDTHH:mm:ss` with

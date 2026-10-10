@@ -611,6 +611,27 @@ public final class IsapiClient {
     }
 
     /**
+     * The terminal person type a visitor account is filed under.
+     *
+     * `visitor` is what a visitor slot is for, and the Worker sends it for every
+     * pass issued from now on. `normal` stays supported because firmware varies:
+     * an ISAPI write carrying an unsupported userType is answered with
+     * badJsonContent, which would stop the account being created at all, so an
+     * estate whose terminals refuse the visitor type can choose it in Settings.
+     * A payload without the field — one queued before the option existed —
+     * keeps the previous `normal`. Returns null for a value this bridge cannot
+     * send, so the caller can report it instead of guessing.
+     */
+    private static String visitorUserType(Map<String, Object> payload) {
+        String requested = Json.string(payload, "personType", null);
+        if (requested == null) return "normal";
+        String trimmed = requested.trim().toLowerCase(java.util.Locale.US);
+        if (trimmed.isEmpty() || trimmed.equals("normal")) return "normal";
+        if (trimmed.equals("visitor")) return "visitor";
+        return null;
+    }
+
+    /**
      * Whether a Record answer reports that the employee number already exists
      * on the terminal. That is the only answer that makes Modify the right next
      * call: any other content rejection is the terminal refusing what was sent,
@@ -648,6 +669,9 @@ public final class IsapiClient {
         name = name == null || name.trim().isEmpty() ? "Visitor" : name.trim();
         if (name.length() > 32) name = name.substring(0, 32);
 
+        String userType = visitorUserType(payload);
+        if (userType == null) return new OpResult(false, "visitor personType must be \"visitor\" or \"normal\"");
+
         java.util.TimeZone zone = visitorTimeZone(Json.string(payload, "timeZone", null));
         String timeType = zone == null ? "UTC" : "local";
         java.text.SimpleDateFormat terminalTime = new java.text.SimpleDateFormat(
@@ -667,7 +691,7 @@ public final class IsapiClient {
         // firmware. Visitors are not assigned to any on-terminal group, which
         // matches what the Node bridge and the residents' person body send.
         info.put("belongGroup", "");
-        info.put("userType", "normal");
+        info.put("userType", userType);
         info.put("Valid", valid);
         info.put("localUIRight", Boolean.FALSE);
         info.put("password", pin);
@@ -701,7 +725,7 @@ public final class IsapiClient {
 
         String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<UserInfo " + XML_NS + ">\n"
                 + "  <employeeNo>" + employeeNo + "</employeeNo>\n  <name>" + xmlText(name) + "</name>\n"
-                + "  <belongGroup></belongGroup>\n  <userType>normal</userType>\n"
+                + "  <belongGroup></belongGroup>\n  <userType>" + userType + "</userType>\n"
                 + "  <Valid><enable>true</enable><beginTime>" + valid.get("beginTime") + "</beginTime>"
                 + "<endTime>" + valid.get("endTime") + "</endTime><timeType>" + timeType + "</timeType></Valid>\n"
                 + "  <localUIRight>false</localUIRight>\n  <password>" + pin + "</password>\n</UserInfo>";
