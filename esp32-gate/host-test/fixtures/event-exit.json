@@ -1,0 +1,1 @@
+{"eventType":"AccessControllerEvent","dateTime":"2026-10-10T08:17:00Z","AccessControllerEvent":{"serialNo":"5eed1234-4","doorNo":1,"eventState":"granted","eventDescription":"Exit button pressed at the ESP32 gate controller","direction":"exit"}}

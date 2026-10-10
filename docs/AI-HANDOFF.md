@@ -1,5 +1,59 @@
 # AI handoff — EstateMate
 
+## ESP32 gate controller: sketch + secrets.h downloads (2026-10-10)
+
+An ESP32 with a Wiegand reader and a relay can now *be* a gate. It is a
+dedicated device agent (`agent_kind='esp32'`, migration
+`0026_esp32_gate_agents.sql`) speaking the existing agent protocol, so the
+single-transport rule holds. User-facing guide: `esp32-gate/README.md`.
+
+- **Sketch**: `esp32-gate/EstateMateGate/EstateMateGate.ino` (v1.0.0, esp32
+  core 2.x/3.x + ArduinoJson 7). It reads the Wiegand reader (26/34-bit parity
+  checked; 4/8-bit keypads), decides from a packed, sorted card snapshot
+  persisted to LittleFS (full snapshot streamed then swapped; deltas apply removals
+  before adds; cold cache denies; a failed refresh keeps the last snapshot),
+  holds visitor PINs from `upsert_visitor`/`revoke_visitor`, pulses the relay,
+  honours the exit button in every mode, carries out the five remote-door
+  operations and sends heartbeats and `AccessControllerEvent` events with its
+  verdict in `remoteVerification`. Networking runs in its own task on core 0,
+  so the reader is never blocked by HTTPS. TLS uses an embedded root bundle
+  (or `ESTATEMATE_CUSTOM_CA_PEM`).
+- **Portal** (Device agent page): the agent form offers "ESP32 gate controller".
+  ESP32 rows get **Download ESP32 sketch** (`GET
+  /api/isapi/agents/:id/esp32-sketch`; Administrator + Manager; no secret, no
+  rotation) and **Download ESP32 config** (`POST .../esp32-config`;
+  Administrator only). The config is a full `secrets.h` for the single linked
+  terminal and rotates only that agent's secret. With zero or several linked
+  terminals it is an `#error` file explaining what to do, and nothing rotates.
+  Linking a terminal to an ESP32 agent needs no password (the controller never
+  dials it), a second terminal is refused with 409, and the bridge installer
+  endpoint refuses ESP32 agents before rotating anything.
+- **Generated module**: `src/esp32-gate-sketch.ts` is produced by `npm run
+  build:esp32-sketch` (Vite `?raw` imports do not work in the Wrangler build).
+  `test/esp32-gate.test.ts` fails on drift.
+- **Tests**: `npm run test:esp32-gate` (part of `npm test`) compiles the real
+  sketch with g++ against stand-ins in `esp32-gate/host-test/stubs/` under
+  ASan/UBSan and drives it against a scripted fake Worker. It runs 125 checks
+  covering Wiegand decoding, snapshot paging/deltas/persistence, decisions,
+  operations, the event ring and HTTP failure handling. The Worker side is
+  covered by `test/esp32-gate.test.ts` (9 tests), which posts the same fixture
+  documents (`esp32-gate/host-test/fixtures/`) the host test asserts the sketch
+  produces.
+- **Server fix found on the way**: `credential-snapshot?since=` compared the
+  stored `YYYY-MM-DD HH:MM:SS` text against an ISO instant, and `' '` sorts
+  before `'T'`, so every change made earlier the same UTC day was missed by a
+  delta (including revocations). `snapshotSince()` in `src/index.ts` now
+  normalises `since` to the stored format; an unreadable value gives a full
+  snapshot. This affected the Node/Android bridges too. Covered by
+  `test/credential-snapshot-since.test.ts`.
+- **Known, not changed**: the Node bridge's `CredentialCache` clears
+  `lastSyncAt` after a failed sync, so one failed refresh makes it deny
+  everyone until the next success. The ESP32 keeps its previous snapshot
+  instead.
+- **Not verified**: no Xtensa toolchain was reachable from the build sandbox,
+  so the sketch has not been compiled for, or run on, an ESP32. Flash a bench
+  board before relying on it.
+
 ## Visitor account options: person type, visit times, PIN, validity, purpose (2026-10-10)
 
 Migration `0025_visitor_account_options.sql` adds five columns to

@@ -112,6 +112,7 @@ apps/web/                  React + Vite portal
 apps/android/              Android Studio Kotlin/Compose project
 isapi-bridge/              The only device transport: cross-platform LAN agent
                            (real-time alertStream events + ISAPI card operations)
+esp32-gate/                ESP32 gate controller sketch (a device agent itself) + host tests
 windows-agent/             Windows Service wrapper for the ISAPI bridge agent
 src/                       Worker/API, parser, auth, Queue and Durable Object
 migrations/                Versioned D1 schema
@@ -191,6 +192,8 @@ A scoped Cloudflare token needs permissions for Workers Scripts, D1, Queues, acc
 6. Present a test card and confirm **last seen** and **Gate activity** update within seconds; issue a test card and confirm it appears on the terminal within the polling interval.
 
 Do not expose ISAPI to the public Internet. Do not configure router port-forwarding to any terminal. Full details: [`isapi-bridge/README.md`](isapi-bridge/README.md).
+
+A gate with no Hikvision terminal and no PC can run on an **ESP32 gate controller** instead: a Wiegand reader, a relay and an ESP32 that signs in as its own device agent, decides from a cached credential snapshot (offline too) and reports every decision. Add an agent with **Runs on: ESP32 gate controller**, connect its terminal, then use **Download ESP32 sketch** and **Download ESP32 config** on the Device agent page. See [`esp32-gate/README.md`](esp32-gate/README.md).
 
 ## Android
 

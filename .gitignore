@@ -26,3 +26,6 @@ isup-gateway/vendor/
 *.tsbuildinfo
 
 __pycache__/
+
+# ESP32 gate: a downloaded secrets.h carries the agent secret (esp32-gate/README.md)
+esp32-gate/EstateMateGate/secrets.h
