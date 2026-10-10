@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX source for the EstateMate desktop app (per-user MSI).
+
+  Built by scripts/package-client-msi.mjs with the WiX Toolset v3 that the
+  GitHub Actions windows-latest runner ships preinstalled:
+
+      candle -arch x86 -dVersion=<x.y.z> -dLauncherSource=<EstateMate.vbs>
+             -dUrlSource=<estatemate-url.txt> -dReadmeSource=<README.txt>
+             estatemate-client.wxs -out <obj>
+      light  <obj> -out estatemate-client-<x.y.z>.msi
+
+  It installs for the signed-in user only, so no administrator rights are
+  needed: files go to %LOCALAPPDATA%\Programs\EstateMate, with a Start Menu
+  and a Desktop shortcut. Uninstalling removes the program but leaves the
+  browser profile in %LOCALAPPDATA%\EstateMate, where the sign-in is kept.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <!-- Id="*" gives every build a fresh ProductCode; the UpgradeCode is
+       permanent so a newer MSI upgrades an older one in place. -->
+  <Product Id="*" Name="EstateMate" Language="1033" Version="$(var.Version)"
+           Manufacturer="EstateMate" UpgradeCode="6F3B1C7E-4A2D-4C9B-9E31-5D8A0B7C2F14">
+
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser"
+             Description="EstateMate desktop app" />
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of EstateMate is already installed. Uninstall it in Settings - Apps and try again." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/barikblog/estatemate-minmoe" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="ProgramsLocalFolder" Name="Programs">
+          <Directory Id="INSTALLFOLDER" Name="EstateMate" />
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="AppMenuDir" Name="EstateMate" />
+      </Directory>
+      <Directory Id="DesktopFolder" Name="Desktop" />
+    </Directory>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="ProgramFiles" Guid="2B9D4F10-6E7A-4C3B-8F21-7A1E5C9D0B63">
+        <File Id="EstateMateLauncher" Name="EstateMate.vbs" Source="$(var.LauncherSource)" KeyPath="yes" />
+        <File Id="EstateMateUrl" Name="estatemate-url.txt" Source="$(var.UrlSource)" />
+        <File Id="EstateMateReadme" Name="README.txt" Source="$(var.ReadmeSource)" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="AppMenuDir">
+      <Component Id="StartMenuShortcut" Guid="8C1E7A52-3D9B-4F06-A4E8-1B6D2F0C9E75">
+        <Shortcut Id="StartMenuEstateMate" Name="EstateMate" Description="Open EstateMate"
+                  Target="[#EstateMateLauncher]" WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\EstateMate\DesktopApp" Name="StartMenuShortcut"
+                       Type="integer" Value="1" KeyPath="yes" />
+        <RemoveFolder Id="RemoveAppMenuDir" On="uninstall" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="A5D3C2E8-19F4-4B7D-B6C0-3E8F1A2D4C97">
+        <Shortcut Id="DesktopEstateMate" Name="EstateMate" Description="Open EstateMate"
+                  Target="[#EstateMateLauncher]" WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\EstateMate\DesktopApp" Name="DesktopShortcut"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="EstateMateApp" Title="EstateMate" Level="1">
+      <ComponentRef Id="ProgramFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+  </Product>
+</Wix>
