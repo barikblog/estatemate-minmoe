@@ -1,0 +1,1 @@
+{"eventType":"AccessControllerEvent","dateTime":"2026-10-10T08:16:00Z","AccessControllerEvent":{"serialNo":"5eed1234-3","doorNo":1,"eventState":"granted","eventDescription":"PIN accepted by the ESP32 gate controller","currentVerifyMode":"pin","employeeNoString":"visitorV12345"}}

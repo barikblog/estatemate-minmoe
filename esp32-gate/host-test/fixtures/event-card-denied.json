@@ -1,0 +1,1 @@
+{"eventType":"AccessControllerEvent","dateTime":"2026-10-10T08:15:00Z","AccessControllerEvent":{"serialNo":"5eed1234-2","doorNo":1,"eventState":"denied","eventDescription":"Card refused by the ESP32 gate controller: unknown_credential","currentVerifyMode":"card","cardNo":"99999999"}}

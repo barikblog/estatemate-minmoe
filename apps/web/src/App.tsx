@@ -2092,6 +2092,10 @@ function IsapiBridge({ user }: { user: User }) {
   const [credentials, setCredentials] = useState<Row | null>(null);
   const [error, setError] = useState('');
   const [copyNotice, copy] = useCopy();
+  const [linkAgentId, setLinkAgentId] = useState('');
+  const isEsp32 = (row: Row | undefined | null) => String(row?.agent_kind ?? '') === 'esp32';
+  const linkToEsp32 = isEsp32(agents.data?.items.find((agent) => String(agent.id) === linkAgentId));
+  const agentRows = (agents.data?.items ?? []).map((row) => isEsp32(row) ? { ...row, platform: 'ESP32 gate controller' } : row);
 
   async function submitAgent(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setError('');
@@ -2125,6 +2129,34 @@ function IsapiBridge({ user }: { user: User }) {
       link.click();
       URL.revokeObjectURL(url);
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not generate installer'); }
+  }
+
+  // Saves a file the Worker generates. The response body is the file itself;
+  // errors come back as JSON and are shown on the page instead.
+  async function saveDownload(path: string, method: 'GET' | 'POST', fallbackName: string) {
+    setError('');
+    try {
+      const response = await fetch(path, { method, credentials: 'include' });
+      if (!response.ok) { const data = await response.json().catch(() => ({ error: `Request failed (${response.status})` })) as { error?: string }; throw new Error(data.error || `Request failed (${response.status})`); }
+      const filename = /filename="([^"]+)"/.exec(response.headers.get('Content-Disposition') ?? '')?.[1] ?? fallbackName;
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Download failed'); }
+  }
+
+  function downloadEsp32Sketch(row: Row) {
+    void saveDownload(`/api/isapi/agents/${String(row.id)}/esp32-sketch`, 'GET', 'EstateMateGate.ino');
+  }
+
+  function downloadEsp32Config(row: Row) {
+    // With no linked terminal nothing is rotated (the file explains what to do),
+    // so only warn when a working board could actually be cut off.
+    if (Number(row.linked_devices ?? 0) === 1 && !confirm(`Create a new ESP32 config for ${String(row.name)}? It carries a new secret: a board flashed with an older secrets.h stops being accepted until it is flashed again.`)) return;
+    void saveDownload(`/api/isapi/agents/${String(row.id)}/esp32-config`, 'POST', 'secrets.h');
   }
 
   async function removeAgent(row: Row) {
@@ -2178,6 +2210,13 @@ function IsapiBridge({ user }: { user: User }) {
           <li>Run <strong>Check</strong> or <strong>Test connection</strong>, start the bridge and confirm the agent status below changes to <strong>online</strong>.</li>
           <li>Configuring a bridge by hand instead? <em>Copy ID</em> on the agent and terminal rows supplies the two IDs a bridge config needs — the agent ID and each terminal's EstateMate device ID.</li>
         </ol>
+        <p><strong>ESP32 gate controller</strong> (a Wiegand reader, a door relay and an exit button, no PC):</p>
+        <ol>
+          <li>Add an agent that runs on <strong>ESP32 gate controller</strong> — one per gate, never shared with a bridge.</li>
+          <li>Register the gate under <strong>Terminals &amp; devices</strong>, then <strong>Connect terminal</strong> here with that agent. Any LAN address will do: the ESP32 never dials it. This is what gives the gate its EstateMate device ID.</li>
+          <li>On the agent row, <strong>Download ESP32 sketch</strong> and <strong>Download ESP32 config</strong>. Put both files in one folder named <code>EstateMateGate</code>, fill in the Wi-Fi name and password in <code>secrets.h</code>, and flash it with the Arduino IDE (esp32 core and the ArduinoJson library).</li>
+          <li>The agent turns <strong>online</strong> within a minute. Cards are checked against the controller's own copy of the estate, so the gate keeps working when the internet drops; the exit button always opens the door.</li>
+        </ol>
       </details>
     </div>
 
@@ -2197,17 +2236,18 @@ function IsapiBridge({ user }: { user: User }) {
     {showAgent && administrator && <FormCard title="Add device agent" onSubmit={submitAgent}>
       <label>Agent name<input name="name" placeholder="Estate office PC" required /></label>
       <label>Computer name (optional)<input name="hostname" placeholder="OFFICE-PC" /></label>
-      <label>Runs on<select name="platform"><option value="windows">Windows</option><option value="linux">Linux</option><option value="darwin">macOS</option><option value="other">Android or other</option></select></label>
+      <label>Runs on<select name="platform"><option value="windows">Windows</option><option value="linux">Linux</option><option value="darwin">macOS</option><option value="other">Android or other</option><option value="esp32">ESP32 gate controller</option></select><small>Choose ESP32 gate controller for a microcontroller at the gate. It gets an agent of its own, because its config download replaces the secret.</small></label>
       <button className="primary">Add agent</button>
     </FormCard>}
 
     {showLink && <FormCard title="Connect a gate terminal" onSubmit={submitLink}>
       <label>Terminal<select name="deviceId" required><option value="">Select terminal</option>{devices.data?.items.map((device) => <option key={String(device.id)} value={String(device.id)}>{String(device.gate_name)} — {String(device.name)} ({String(device.model)})</option>)}</select></label>
-      <label>Agent<select name="agentId" required><option value="">Select agent</option>{agents.data?.items.map((agent) => <option key={String(agent.id)} value={String(agent.id)}>{String(agent.name)} — {String(agent.platform)} ({String(agent.status)})</option>)}</select></label>
+      <label>Agent<select name="agentId" required value={linkAgentId} onChange={(event) => setLinkAgentId(event.currentTarget.value)}><option value="">Select agent</option>{agents.data?.items.map((agent) => <option key={String(agent.id)} value={String(agent.id)}>{String(agent.name)} — {isEsp32(agent) ? 'ESP32 gate controller' : String(agent.platform)} ({String(agent.status)})</option>)}</select></label>
+      {linkToEsp32 && <Notice tone="info">An ESP32 gate controller <strong>is</strong> the gate: it never contacts this address or logs in to a terminal. Enter any LAN address (for example the ESP32's own) and leave the password empty. One ESP32 serves one terminal.</Notice>}
       <label>Terminal LAN address<input name="isapiHost" placeholder="192.168.1.100" required /></label>
       <label>Port<input name="isapiPort" type="number" min={1} max={65535} defaultValue={80} /></label>
       <label>Terminal username<input name="isapiUsername" defaultValue="admin" /></label>
-      <label>Terminal password<input name="isapiPassword" type="password" placeholder="Device administrator password" required /><small>Encrypted at rest and never displayed again.</small></label>
+      <label>Terminal password<input name="isapiPassword" type="password" placeholder={linkToEsp32 ? 'Not used by an ESP32 controller' : 'Device administrator password'} required={!linkToEsp32} /><small>Encrypted at rest and never displayed again.</small></label>
       <label>Connection<select name="protocol"><option value="http">HTTP on the private LAN</option><option value="https">HTTPS</option></select></label>
       <label className="check"><input name="syncEnabled" type="checkbox" defaultChecked /> Enable automatic updates</label>
       <button className="primary">Connect terminal</button>
@@ -2215,7 +2255,17 @@ function IsapiBridge({ user }: { user: User }) {
 
     <section className="panel agent-section">
       <div className="panel-title"><div><p className="eyebrow">Bridge hosts</p><h3>Agents</h3></div><button className="secondary sm" onClick={() => agents.reload()}>Refresh</button></div>
-      <ListState list={agents}><DataTable rows={agents.data?.items ?? []} columns={[['name','Agent'],['id','Agent ID','id'],['hostname','Computer'],['platform','Runs on'],['status','Status'],['last_seen_at','Last heartbeat','date'],['linked_devices','Terminals'],['pending_operations','Pending actions']]} action={administrator ? (row) => <div className="row-actions"><button className="text" onClick={() => copy(row.id, 'Agent ID')}>Copy ID</button><button className="text" onClick={() => downloadInstaller(row)}>Download setup</button><button className="text" onClick={() => rotateAgent(row)}>Rotate secret</button><button className="text danger" onClick={() => removeAgent(row)}>Delete</button></div> : undefined} /></ListState>
+      <ListState list={agents}><DataTable rows={agentRows} columns={[['name','Agent'],['id','Agent ID','id'],['hostname','Computer'],['platform','Runs on'],['status','Status'],['last_seen_at','Last heartbeat','date'],['linked_devices','Terminals'],['pending_operations','Pending actions']]} action={operator ? (row) => <div className="row-actions">
+        {administrator && <button className="text" onClick={() => copy(row.id, 'Agent ID')}>Copy ID</button>}
+        {isEsp32(row)
+          ? <>
+            <button className="text" onClick={() => downloadEsp32Sketch(row)}>Download ESP32 sketch</button>
+            {administrator && <button className="text" onClick={() => downloadEsp32Config(row)}>Download ESP32 config</button>}
+          </>
+          : administrator && <button className="text" onClick={() => downloadInstaller(row)}>Download setup</button>}
+        {administrator && <button className="text" onClick={() => rotateAgent(row)}>Rotate secret</button>}
+        {administrator && <button className="text danger" onClick={() => removeAgent(row)}>Delete</button>}
+      </div> : undefined} /></ListState>
     </section>
 
     <section className="panel agent-section">

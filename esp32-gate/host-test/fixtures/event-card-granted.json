@@ -1,0 +1,1 @@
+{"eventType":"AccessControllerEvent","dateTime":"2026-10-10T08:15:00Z","AccessControllerEvent":{"serialNo":"5eed1234-1","doorNo":1,"eventState":"granted","eventDescription":"Card accepted by the ESP32 gate controller","currentVerifyMode":"card","cardNo":"77881"}}

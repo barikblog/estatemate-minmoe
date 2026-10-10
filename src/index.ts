@@ -21,6 +21,7 @@ import {
 import { EMPLOYEE_ID_MAX, deviceEmployeeNo, employeeIdFromUuid, readEmployeeId } from './employee-id';
 import { cardNumberValidationError, isDigitsOnlyCardNumber } from './card-number';
 import { AccessLiveFeed } from './live-feed';
+import { ESP32_CONFIG_FILENAME, ESP32_SKETCH_FILENAME, renderEsp32Config, renderEsp32ConfigProblem, renderEsp32Sketch } from './esp32-gate';
 import { evaluateVisitorPass } from './visitor-pass';
 import {
   VISITOR_DEFAULT_MAX_VALIDITY_DAYS,
@@ -5374,7 +5375,7 @@ app.patch('/api/access/operations/:id', requireRoles('admin','manager'), async (
 
 app.get('/api/isapi/agents', requireRoles('admin','manager'), async (c) => {
   const agents = await c.env.DB.prepare(
-    `SELECT a.id,a.name,a.hostname,a.platform,a.version,${agentEffectiveStatus('a')} AS status,a.status AS stored_status,a.last_seen_at,a.last_ip,a.created_at,a.updated_at,
+    `SELECT a.id,a.name,a.hostname,a.platform,a.agent_kind,a.version,${agentEffectiveStatus('a')} AS status,a.status AS stored_status,a.last_seen_at,a.last_ip,a.created_at,a.updated_at,
        (SELECT COUNT(*) FROM isapi_device_configs cfg WHERE cfg.agent_id=a.id AND cfg.sync_enabled=1) AS linked_devices,
        (SELECT COUNT(*) FROM device_operations o JOIN isapi_device_configs cfg ON cfg.device_id=o.device_id WHERE cfg.agent_id=a.id AND o.status IN ('pending','sent','failed')) +
        (SELECT COUNT(*) FROM visitor_device_operations vo JOIN isapi_device_configs cfg ON cfg.device_id=vo.device_id WHERE cfg.agent_id=a.id AND vo.status IN ('pending','sent','failed')) AS pending_operations
@@ -5386,21 +5387,32 @@ app.get('/api/isapi/agents', requireRoles('admin','manager'), async (c) => {
 app.post('/api/isapi/agents', requireRoles('admin'), async (c) => {
   const body = await c.req.json<{ name?: string; hostname?: string; platform?: string; version?: string }>();
   if (!body.name?.trim()) return jsonError(c, 400, 'Agent name is required');
-  const platform = (body.platform?.trim().toLowerCase() || 'windows') as 'windows'|'linux'|'darwin'|'other';
-  if (!['windows','linux','darwin','other'].includes(platform)) return jsonError(c, 400, 'platform must be windows, linux, darwin or other');
+  const requested = body.platform?.trim().toLowerCase() || 'windows';
+  if (!['windows','linux','darwin','other','esp32'].includes(requested)) return jsonError(c, 400, 'platform must be windows, linux, darwin, other or esp32');
+  // An ESP32 gate controller is its own agent (migration 0026): its config
+  // download rotates the secret, which must never knock a PC bridge offline.
+  // `platform` keeps its original CHECK list, so the controller is stored as
+  // 'other' and told apart by agent_kind.
+  const agentKind = requested === 'esp32' ? 'esp32' : 'bridge';
+  const platform = (requested === 'esp32' ? 'other' : requested) as 'windows'|'linux'|'darwin'|'other';
   const id = crypto.randomUUID();
   const secret = randomToken(32);
   const secretHash = await sha256(`${secret}:${c.env.DEVICE_INGEST_PEPPER}`);
   await c.env.DB.prepare(
-    `INSERT INTO isapi_agents(id,name,hostname,platform,version,status,secret_hash,created_by) VALUES (?,?,?,?,?,?,?,?)`,
-  ).bind(id, body.name.trim(), body.hostname?.trim() || null, platform, body.version?.trim() || null, 'pending', secretHash, c.get('user').id).run();
-  await audit(c, 'create', 'isapi_agent', id, { name: body.name.trim(), platform, hostname: body.hostname?.trim() });
-  return c.json({ id, name: body.name.trim(), hostname: body.hostname?.trim() || null, platform, secret, warning: 'Secret is shown once. Store it securely on the Windows agent host.' }, 201);
+    `INSERT INTO isapi_agents(id,name,hostname,platform,agent_kind,version,status,secret_hash,created_by) VALUES (?,?,?,?,?,?,?,?,?)`,
+  ).bind(id, body.name.trim(), body.hostname?.trim() || null, platform, agentKind, body.version?.trim() || null, 'pending', secretHash, c.get('user').id).run();
+  await audit(c, 'create', 'isapi_agent', id, { name: body.name.trim(), platform, agentKind, hostname: body.hostname?.trim() });
+  return c.json({
+    id, name: body.name.trim(), hostname: body.hostname?.trim() || null, platform, agentKind, secret,
+    warning: agentKind === 'esp32'
+      ? 'Secret is shown once. You do not need to copy it: connect the gate terminal to this agent, then use Download ESP32 config, which writes a fresh secret into secrets.h.'
+      : 'Secret is shown once. Store it securely on the Windows agent host.',
+  }, 201);
 });
 
 app.get('/api/isapi/agents/:id', requireRoles('admin','manager'), async (c) => {
   const agent = await c.env.DB.prepare(
-    `SELECT id,name,hostname,platform,version,${agentEffectiveStatus('isapi_agents')} AS status,last_seen_at,last_ip,created_at,updated_at FROM isapi_agents WHERE id=? AND deleted_at IS NULL`,
+    `SELECT id,name,hostname,platform,agent_kind,version,${agentEffectiveStatus('isapi_agents')} AS status,last_seen_at,last_ip,created_at,updated_at FROM isapi_agents WHERE id=? AND deleted_at IS NULL`,
   ).bind(c.req.param('id')).first();
   if (!agent) return jsonError(c, 404, 'ISAPI agent not found');
   const configs = await c.env.DB.prepare(
@@ -5461,8 +5473,11 @@ app.post('/api/isapi/agents/:id/rotate-secret', requireRoles('admin'), async (c)
 // Administrator-only just like explicit secret rotation; Managers may link and
 // monitor devices but must not gain credential-control permissions.
 app.post('/api/isapi/agents/:id/installer', requireRoles('admin'), async (c) => {
-  const agent = await c.env.DB.prepare(`SELECT id,name,platform FROM isapi_agents WHERE id=? AND deleted_at IS NULL`).bind(c.req.param('id')).first<{ id:string;name:string;platform:string }>();
+  const agent = await c.env.DB.prepare(`SELECT id,name,platform,agent_kind FROM isapi_agents WHERE id=? AND deleted_at IS NULL`).bind(c.req.param('id')).first<{ id:string;name:string;platform:string;agent_kind:string }>();
   if (!agent) return jsonError(c, 404, 'ISAPI agent not found');
+  // Checked before anything is rotated: a bridge script is useless to a
+  // microcontroller, and rotating its secret would only disconnect the gate.
+  if (agent.agent_kind === 'esp32') return jsonError(c, 409, 'This is an ESP32 gate controller. Use Download ESP32 sketch and Download ESP32 config instead of a bridge setup file.');
   const secret = randomToken(32);
   const secretHash = await sha256(`${secret}:${c.env.DEVICE_INGEST_PEPPER}`);
   const installerKey = randomToken(32);
@@ -5630,6 +5645,68 @@ echo "Installer completed for ${agent.name}"
   });
 });
 
+// ---------------------------------------------------------------------------
+// ESP32 gate controller downloads (esp32-gate/, src/esp32-gate.ts)
+// ---------------------------------------------------------------------------
+
+async function esp32AgentFor(c: AppContext): Promise<{ id: string; name: string } | Response> {
+  const agent = await c.env.DB.prepare(
+    `SELECT id,name,agent_kind FROM isapi_agents WHERE id=? AND deleted_at IS NULL`,
+  ).bind(c.req.param('id')).first<{ id: string; name: string; agent_kind: string }>();
+  if (!agent) return jsonError(c, 404, 'ISAPI agent not found');
+  if (agent.agent_kind !== 'esp32') {
+    return jsonError(c, 409, 'This agent is a bridge, not an ESP32 gate controller. Add an agent that runs on "ESP32 gate controller" so its secret is never shared with a bridge.');
+  }
+  return { id: agent.id, name: agent.name };
+}
+
+function fileDownload(content: string, filename: string, contentType: string): Response {
+  return new Response(content, {
+    status: 200,
+    headers: {
+      'Content-Type': contentType,
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
+}
+
+// The sketch carries no secret, so a Manager (who can see the agent list) may
+// download it too. Nothing is rotated.
+app.get('/api/isapi/agents/:id/esp32-sketch', requireRoles('admin','manager'), async (c) => {
+  const agent = await esp32AgentFor(c);
+  if (agent instanceof Response) return agent;
+  await audit(c, 'download_esp32_sketch', 'isapi_agent', agent.id);
+  return fileDownload(renderEsp32Sketch(agent, new Date()), ESP32_SKETCH_FILENAME, 'text/x-arduino; charset=utf-8');
+});
+
+// The config writes a fresh agent secret, so - exactly like a bridge setup file
+// - it is Administrator-only. It is rotated only when the file will be usable:
+// with no linked terminal (or several) the download explains what to do and the
+// controller already in the field keeps working.
+app.post('/api/isapi/agents/:id/esp32-config', requireRoles('admin'), async (c) => {
+  const agent = await esp32AgentFor(c);
+  if (agent instanceof Response) return agent;
+  const linked = await c.env.DB.prepare(
+    `SELECT cfg.device_id,d.name,d.gate_name FROM isapi_device_configs cfg JOIN hikvision_devices d ON d.id=cfg.device_id
+      WHERE cfg.agent_id=? AND cfg.sync_enabled=1 AND d.deleted_at IS NULL ORDER BY d.gate_name,d.name`,
+  ).bind(agent.id).all<{ device_id: string; name: string; gate_name: string | null }>();
+  const terminals = linked.results.map((row) => ({ deviceId: row.device_id, name: row.name, gateName: row.gate_name }));
+  const generatedAt = new Date();
+  if (terminals.length !== 1) {
+    const problem = renderEsp32ConfigProblem(agent, terminals, generatedAt);
+    await audit(c, 'generate_esp32_config', 'isapi_agent', agent.id, { ready: false, terminals: terminals.length });
+    return fileDownload(problem.content, ESP32_CONFIG_FILENAME, 'text/x-c; charset=utf-8');
+  }
+  const secret = randomToken(32);
+  const secretHash = await sha256(`${secret}:${c.env.DEVICE_INGEST_PEPPER}`);
+  await c.env.DB.prepare(`UPDATE isapi_agents SET secret_hash=?,updated_at=datetime('now') WHERE id=?`).bind(secretHash, agent.id).run();
+  const config = renderEsp32Config(agent, terminals[0]!, new URL(c.req.url).origin, secret, generatedAt);
+  await audit(c, 'generate_esp32_config', 'isapi_agent', agent.id, { ready: true, deviceId: terminals[0]!.deviceId });
+  return fileDownload(config.content, ESP32_CONFIG_FILENAME, 'text/x-c; charset=utf-8');
+});
+
 app.get('/api/isapi/device-configs', requireRoles('admin','manager'), async (c) => {
   const result = await c.env.DB.prepare(
     `SELECT cfg.id,cfg.device_id,cfg.agent_id,cfg.isapi_host,cfg.isapi_port,cfg.isapi_username,cfg.protocol,cfg.sync_enabled,cfg.last_sync_at,cfg.last_sync_status,cfg.last_error,cfg.created_at,
@@ -5658,8 +5735,17 @@ app.post('/api/isapi/device-configs', requireRoles('admin','manager'), async (c)
   const device = await c.env.DB.prepare(`SELECT id,connection_pattern FROM hikvision_devices WHERE id=? AND deleted_at IS NULL`).bind(body.deviceId).first<{ id:string;connection_pattern:string }>();
   if (!device) return jsonError(c, 404, 'Device not found');
   if (body.agentId) {
-    const agent = await c.env.DB.prepare(`SELECT id FROM isapi_agents WHERE id=? AND deleted_at IS NULL`).bind(body.agentId).first();
+    const agent = await c.env.DB.prepare(`SELECT id,agent_kind FROM isapi_agents WHERE id=? AND deleted_at IS NULL`).bind(body.agentId).first<{ id: string; agent_kind: string }>();
     if (!agent) return jsonError(c, 404, 'ISAPI agent not found');
+    if (agent.agent_kind === 'esp32') {
+      // An ESP32 drives one relay at one gate. A second terminal would receive
+      // door and visitor work that no hardware can carry out.
+      const other = await c.env.DB.prepare(
+        `SELECT d.name FROM isapi_device_configs cfg JOIN hikvision_devices d ON d.id=cfg.device_id
+          WHERE cfg.agent_id=? AND cfg.device_id<>? AND cfg.sync_enabled=1 AND d.deleted_at IS NULL LIMIT 1`,
+      ).bind(agent.id, body.deviceId).first<{ name: string }>();
+      if (other) return jsonError(c, 409, `This ESP32 gate controller already serves ${other.name}. An ESP32 controls one gate: disconnect that terminal first, or add another ESP32 agent.`);
+    }
   }
   const port = Number(body.isapiPort ?? 80);
   if (!Number.isInteger(port) || port < 1 || port > 65535) return jsonError(c, 400, 'Invalid ISAPI port');
@@ -6865,6 +6951,27 @@ type SnapshotItem = {
   updatedAt: string | null;
 };
 
+/**
+ * The `since` of a delta, in the format the rows are compared in.
+ *
+ * `updated_at` is D1's `datetime('now')`: "YYYY-MM-DD HH:MM:SS". Bridges send
+ * an ISO instant ("YYYY-MM-DDTHH:MM:SS.sssZ"), and the two compare as text:
+ * on the same calendar day ' ' sorts before 'T', so every change made earlier
+ * that day looked older than the bridge's last sync and was silently left out
+ * of the delta - including revocations, which kept a card suspended this
+ * morning opening the gate until midnight. Any parseable instant is therefore
+ * rewritten to the stored format; anything unparseable is ignored, which asks
+ * for a full snapshot rather than a delta against an unknown point in time.
+ */
+function snapshotSince(value: string | null | undefined): string {
+  const raw = (value ?? '').trim();
+  if (!raw) return '';
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw)) return raw;
+  const parsed = Date.parse(/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(raw) ? raw : `${raw.replace(' ', 'T')}Z`);
+  if (Number.isNaN(parsed)) return '';
+  return new Date(parsed).toISOString().slice(0, 19).replace('T', ' ');
+}
+
 async function handleIsapiAgentCredentialSnapshot(request: Request, env: Env, agentId: string): Promise<Response> {
   if (request.method !== 'GET') return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET' } });
   const agent = await authenticateIsapiAgent(request, env, agentId);
@@ -6874,7 +6981,7 @@ async function handleIsapiAgentCredentialSnapshot(request: Request, env: Env, ag
   const requestedLimit = Number(url.searchParams.get('limit') ?? SNAPSHOT_DEFAULT_PAGE);
   const limit = Math.min(SNAPSHOT_MAX_PAGE, Math.max(100, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : SNAPSHOT_DEFAULT_PAGE));
   const cursor = (url.searchParams.get('cursor') ?? '').trim();
-  const since = (url.searchParams.get('since') ?? '').trim();
+  const since = snapshotSince(url.searchParams.get('since'));
   const full = !cursor && !since;
   const cursorValue = cursor ? cursor.split('|')[0] ?? '' : '';
   const cursorKind = cursor ? cursor.split('|')[1] ?? '' : '';

@@ -1,0 +1,19 @@
+-- ESP32 gate controllers as dedicated device agents.
+--
+-- An ESP32 gate controller (esp32-gate/) is a microcontroller that *is* the
+-- gate: it reads a Wiegand card reader/keypad, decides against its cached
+-- credential snapshot and drives the door relay. It speaks the ordinary agent
+-- protocol, so it is an `isapi_agents` row like every bridge — but it is never
+-- a bridge, and the portal must know which is which:
+--
+--   * its setup is a sketch plus a secrets.h config, not a bridge installer;
+--   * generating that config rotates the agent secret, so a controller must
+--     have an agent of its own (rotating a shared bridge secret would take the
+--     estate's PC bridge offline);
+--   * it serves exactly one terminal record, the one that gives the gate its
+--     EstateMate device ID.
+--
+-- `platform` keeps its original CHECK list (an ESP32 agent is stored as
+-- 'other'), so this is a plain additive column with a default every existing
+-- row satisfies.
+ALTER TABLE isapi_agents ADD COLUMN agent_kind TEXT NOT NULL DEFAULT 'bridge' CHECK (agent_kind IN ('bridge','esp32'));
