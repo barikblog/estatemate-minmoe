@@ -1358,9 +1358,27 @@ function formatEstateLocalTime(instant, timeZone) {
 }
 
 /**
+ * The terminal person type a visitor account is filed under.
+ *
+ * `visitor` is what a visitor slot is for, and the Worker sends it for every
+ * pass issued from now on. `normal` stays supported because firmware varies —
+ * an ISAPI write carrying an unsupported `userType` is answered with
+ * `badJsonContent`, which would stop the account being created at all — so an
+ * estate whose terminals refuse the visitor type can choose it in Settings.
+ * A payload without the field (an operation queued before the option existed)
+ * keeps the previous `normal`.
+ */
+function visitorUserType(payload) {
+  const requested = String(payload?.personType ?? '').trim().toLowerCase();
+  if (!requested || requested === 'normal') return 'normal';
+  if (requested === 'visitor') return 'visitor';
+  throw new Error('visitor personType must be "visitor" or "normal"');
+}
+
+/**
  * Build only the temporary terminal account shown in the device's person UI:
  * employee ID, name, an unassigned group (`belongGroup: ""`), finite validity,
- * non-administrator normal-user role, and PIN. Hikvision group IDs are numeric;
+ * the configured person type, and PIN. Hikvision group IDs are numeric;
  * a display label such as `Company` is not a valid `belongGroup`. Visitor
  * provisioning intentionally sends no card,
  * fingerprint, face, door-right, or right-plan record.
@@ -1389,7 +1407,7 @@ function visitorPersonInfo(payload, employeeNo) {
     // assigned to any on-terminal group, which matches what residents use
     // (personBody omits belongGroup entirely and the device stores it as "").
     belongGroup: '',
-    userType: 'normal',
+    userType: visitorUserType(payload),
     Valid: { enable: true, beginTime, endTime, timeType: timeZone ? 'local' : 'UTC' },
     localUIRight: false,
     password: pin,
@@ -1449,7 +1467,7 @@ async function writeTerminalVisitorPerson(device, payload, employeeNo) {
   <employeeNo>${info.employeeNo}</employeeNo>
   <name>${xmlText(info.name)}</name>
   <belongGroup></belongGroup>
-  <userType>normal</userType>
+  <userType>${info.userType}</userType>
   <Valid><enable>true</enable><beginTime>${info.Valid.beginTime}</beginTime><endTime>${info.Valid.endTime}</endTime><timeType>${info.Valid.timeType}</timeType></Valid>
   <localUIRight>false</localUIRight>
   <password>${info.password}</password>

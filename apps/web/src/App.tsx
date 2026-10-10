@@ -26,8 +26,80 @@ const defaultPortalConfig: PortalConfig = {
   portal_welcome_text:'Manage residents, visitors, accounts and gate access from a single, secure workspace.',theme_mode:'light',
   theme_primary_color:'#1769e0',theme_accent_color:'#35d07f',theme_navigation_color:'#0d1b37',theme_surface_color:'#ffffff',
   theme_corner_style:'comfortable',currency:'NGN',estate_timezone:'Africa/Lagos',visitor_default_duration_hours:'8',visitor_gate_policy:'security_approval',
+  visitor_default_validity_days:'1',visitor_max_validity_days:'7',visitor_person_type:'visitor',
   portal_gate_image_key:'',portal_gate_image_caption:'',portal_gate_image_enabled:'false',
 };
+
+/**
+ * Visitor account options.
+ *
+ * The Worker owns the rules (src/visitor-account.ts) and rejects anything it
+ * does not accept; this is the same vocabulary the portal renders, kept here
+ * because the browser bundle cannot import the Worker's module.
+ */
+const VISITOR_PURPOSE_OPTIONS: Array<[string, string]> = [
+  ['family_social', 'Family or social visit'],
+  ['delivery', 'Delivery or collection'],
+  ['service_repair', 'Service, repair or maintenance'],
+  ['business', 'Business or official'],
+  ['domestic_staff', 'Domestic staff or caregiver'],
+  ['event', 'Event or celebration'],
+  ['other', 'Other — state it below'],
+];
+const VISITOR_PERSON_TYPES: Array<[string, string]> = [
+  ['visitor', 'Visitor'],
+  ['normal', 'Normal user'],
+];
+/** The wording a picker uses, where there is room to explain the choice. */
+const VISITOR_PERSON_TYPE_CHOICES: Array<[string, string]> = [
+  ['visitor', 'Visitor (recommended)'],
+  ['normal', 'Normal user — terminals that refuse the visitor type'],
+];
+const VISIT_TIMES_MIN = 1;
+const VISIT_TIMES_MAX = 10;
+const VISITOR_DEFAULT_VALIDITY_DAYS = 1;
+const VISITOR_DEFAULT_MAX_VALIDITY_DAYS = 7;
+const VISITOR_MAX_VALIDITY_CEILING = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function visitorPurposeLabel(purpose: unknown, purposeOther?: unknown): string {
+  const id = String(purpose ?? '').trim().toLowerCase();
+  if (!id) return '';
+  const preset = VISITOR_PURPOSE_OPTIONS.find(([key]) => key === id);
+  if (id === 'other') return String(purposeOther ?? '').trim() || 'Other';
+  return preset?.[1] ?? id;
+}
+
+/**
+ * Whether the visitor is physically inside the estate: checked in, or checked
+ * in on a pass the sweep has since marked expired. Either way they must stay
+ * checkable out, so the gate offers the check-out action regardless of what the
+ * pass evaluation says.
+ */
+function visitorInside(pass: Row): boolean {
+  const status = String(pass.status ?? '');
+  return status === 'checked_in' || (status === 'expired' && pass.checked_in_at != null);
+}
+
+function visitorPersonTypeLabel(value: unknown): string {
+  const type = String(value ?? '').trim().toLowerCase();
+  return VISITOR_PERSON_TYPES.find(([key]) => key === type)?.[1] ?? type;
+}
+
+/**
+ * The estate's visitor window: the default a new pass gets and the longest it
+ * may be, both in whole days and both inside the ceiling the API enforces.
+ */
+function visitorValidityDays(config: PortalConfig | null | undefined): { defaultDays: number; maxDays: number } {
+  const clamp = (value: unknown, fallback: number): number => {
+    const days = Number(value);
+    if (!Number.isFinite(days)) return fallback;
+    return Math.min(VISITOR_MAX_VALIDITY_CEILING, Math.max(1, Math.trunc(days)));
+  };
+  const defaultDays = clamp(config?.visitor_default_validity_days, VISITOR_DEFAULT_VALIDITY_DAYS);
+  const maxDays = Math.max(defaultDays, clamp(config?.visitor_max_validity_days, Math.max(VISITOR_DEFAULT_MAX_VALIDITY_DAYS, defaultDays)));
+  return { defaultDays, maxDays };
+}
 
 /**
  * URL of the administrator-published estate gate photograph, or null when none is
@@ -1112,6 +1184,9 @@ function VisitorPass({ pass,onClose,branding }: { pass:Row;onClose:()=>void;bran
   const gateText=String(pass.gate_scope ?? pass.gateScope ?? 'both')==='gate'
     ? `Gate device: ${String(pass.device_name ?? 'Selected device')}`
     : 'Valid at every gate — entry and exit';
+  const purposeText=visitorPurposeLabel(pass.purpose_of_visit ?? pass.purposeOfVisit,pass.purpose_of_visit_other ?? pass.purposeOfVisitOther);
+  const remarkText=String(pass.remark ?? '');
+  const visitsText=`${Number(pass.visitsUsed ?? pass.visits_used ?? 0)} of ${Number(pass.visitTimes ?? pass.visit_times ?? 1)} visit(s) used`;
 
   async function share(format:'image'|'pdf') {
     if (!credential) { setShareState('This pass has no credential to share.'); return; }
@@ -1134,7 +1209,7 @@ function VisitorPass({ pass,onClose,branding }: { pass:Row;onClose:()=>void;bran
     } catch(reason) { setShareState(reason instanceof Error?reason.message:'Could not prepare the pass file'); }
   }
 
-  return <div className="modal-backdrop" role="dialog" aria-modal="true" onClick={onClose}><section className="notice-modal visitor-pass-modal" onClick={(event)=>event.stopPropagation()}><div className="pass-topbar no-print"><span>Visitor pass</span><button type="button" className="pass-close" aria-label="Close visitor pass" onClick={onClose}>×</button></div><div className="visitor-pass printable-pass"><p className="eyebrow">ESTATE VISITOR PASS</p><h2>{String(pass.visitor_name ?? pass.visitorName ?? 'Visitor')}</h2><p>Host: <strong>{host}</strong></p><p>Property: <strong>{propertyText}</strong></p>{qr&&<img className="pass-qr" src={qr} alt={`Visitor QR ${credential}`} />}<svg className="pass-barcode" ref={barcode} /><strong className="credential-number">{credential}</strong><small>Unique visitor number</small>{Boolean(pass.pin)&&<p className="pass-pin">Keypad PIN: <strong>{String(pass.pin)}</strong></p>}<div className="pass-dates"><span>From {readableDate(pass.valid_from ?? pass.validFrom)}</span><span>Until {readableDate(pass.valid_until ?? pass.validUntil)}</span></div><p className="pass-gates">{gateText}</p><p className="pass-policy">Security must scan and review this pass before accepting entry. Device recognition requires a compatible, configured reader.</p></div>{shareState&&<p className="share-status no-print">{shareState}</p>}<div className="row-actions no-print pass-footer"><button className="primary" onClick={()=>window.print()}>Print pass</button><button className="secondary" onClick={()=>share('image')}>Share as image</button><button className="secondary" onClick={()=>share('pdf')}>Share as PDF</button><button className="secondary" onClick={onClose}>Close pass</button></div></section></div>;
+  return <div className="modal-backdrop" role="dialog" aria-modal="true" onClick={onClose}><section className="notice-modal visitor-pass-modal" onClick={(event)=>event.stopPropagation()}><div className="pass-topbar no-print"><span>Visitor pass</span><button type="button" className="pass-close" aria-label="Close visitor pass" onClick={onClose}>×</button></div><div className="visitor-pass printable-pass"><p className="eyebrow">ESTATE VISITOR PASS</p><h2>{String(pass.visitor_name ?? pass.visitorName ?? 'Visitor')}</h2><p>Host: <strong>{host}</strong></p><p>Property: <strong>{propertyText}</strong></p>{qr&&<img className="pass-qr" src={qr} alt={`Visitor QR ${credential}`} />}<svg className="pass-barcode" ref={barcode} /><strong className="credential-number">{credential}</strong><small>Unique visitor number</small>{Boolean(pass.pin)&&<p className="pass-pin">Keypad PIN: <strong>{String(pass.pin)}</strong></p>}<div className="pass-dates"><span>From {readableDate(pass.valid_from ?? pass.validFrom)}</span><span>Until {readableDate(pass.valid_until ?? pass.validUntil)}</span></div>{Boolean(purposeText)&&<p className="pass-purpose">Purpose of visit: <strong>{purposeText}</strong></p>}{Boolean(remarkText)&&<p className="pass-remark">Remark: {remarkText}</p>}<p className="pass-visits">{visitsText}</p><p className="pass-gates">{gateText}</p><p className="pass-policy">Security must scan and review this pass before accepting entry. Device recognition requires a compatible, configured reader.</p></div>{shareState&&<p className="share-status no-print">{shareState}</p>}<div className="row-actions no-print pass-footer"><button className="primary" onClick={()=>window.print()}>Print pass</button><button className="secondary" onClick={()=>share('image')}>Share as image</button><button className="secondary" onClick={()=>share('pdf')}>Share as PDF</button><button className="secondary" onClick={onClose}>Close pass</button></div></section></div>;
 }
 
 function Visitors({ user }: { user: User }) {
@@ -1142,7 +1217,30 @@ function Visitors({ user }: { user: User }) {
   const properties = useList('/api/properties?limit=100');
   const devices=useAsync<{ items:Row[] }>(()=>api('/api/access/device-options'),[]);
   const portal=useAsync<PortalConfig>(()=>api('/api/portal-config'),[]);
-  const defaultStart=useMemo(()=>new Date(),[]);const defaultEnd=new Date(defaultStart.valueOf()+Number(portal.data?.visitor_default_duration_hours||8)*3600000);
+  const defaultStart=useMemo(()=>new Date(),[]);
+  // Validity period: the estate's default window in whole days, never longer
+  // than the maximum an administrator set. Changing "valid from" or the number
+  // of days moves "valid until" with it; the officer can still fine-tune the
+  // end by hand.
+  const validity=visitorValidityDays(portal.data);
+  const [fromValue,setFromValue]=useState(localDateTime(defaultStart));
+  const [validityDays,setValidityDays]=useState(VISITOR_DEFAULT_VALIDITY_DAYS);
+  const [untilValue,setUntilValue]=useState(localDateTime(new Date(defaultStart.valueOf()+VISITOR_DEFAULT_VALIDITY_DAYS*DAY_MS)));
+  const [purpose,setPurpose]=useState('');
+  const settingsApplied=useRef(false);
+  useEffect(()=>{
+    if (!portal.data) return;
+    const allowed=visitorValidityDays(portal.data);
+    // Only the first load plants the estate's default; after that the officer's
+    // choice wins, clamped to a maximum that may have been lowered since.
+    setValidityDays((days)=>settingsApplied.current?Math.min(days,allowed.maxDays):allowed.defaultDays);
+    settingsApplied.current=true;
+  },[portal.data]);
+  useEffect(()=>{
+    const start=new Date(fromValue);
+    if (Number.isNaN(start.valueOf())) return;
+    setUntilValue(localDateTime(new Date(start.valueOf()+validityDays*DAY_MS)));
+  },[fromValue,validityDays]);
   const [show, setShow] = useState(false);
   const [result, setResult] = useState('');
   const [selectedPass,setSelectedPass]=useState<Row|null>(null);
@@ -1164,8 +1262,8 @@ function Visitors({ user }: { user: User }) {
   const previewCode=useCallback(async(code:string,source:'phone_camera'|'device'|'manual')=>{
     setResult('');setCamera(false);
     try {
-      const checked=await api<{ scanId:string;valid:boolean;reason?:string;visitor:Row;proofs?:Row[] }>('/api/visitors/scan',{ method:'POST',body:JSON.stringify({ code,source }) });
-      setPreview({ ...checked.visitor,valid:checked.valid,invalid_reason:checked.reason,proofs:checked.proofs ?? [] });
+      const checked=await api<{ scanId:string;valid:boolean;reason?:string;visitor:Row;proofs?:Row[];visitTimes?:number;visitsUsed?:number;visitsRemaining?:number }>('/api/visitors/scan',{ method:'POST',body:JSON.stringify({ code,source }) });
+      setPreview({ ...checked.visitor,valid:checked.valid,invalid_reason:checked.reason,proofs:checked.proofs ?? [],visitTimes:checked.visitTimes,visitsUsed:checked.visitsUsed,visitsRemaining:checked.visitsRemaining });
       setScanId(checked.scanId);
     }
     catch(reason) { setPreview(null);setResult(reason instanceof Error?reason.message:'Pass lookup failed'); }
@@ -1237,8 +1335,35 @@ function Visitors({ user }: { user: User }) {
       {(user.role==='admin'||user.role==='manager')&&<label>Resident ID<input name="residentId" required /></label>}
       {user.role === 'resident' ? <label>Property<select name="propertyId" required><option value="">Select property</option>{properties.data?.items.map((property) => <option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)}</option>)}</select></label> : <label>Property ID<input name="propertyId" required /></label>}
       {(user.role==='admin'||user.role==='manager')&&<label>Preferred gate device<select name="deviceId"><option value="">Every gate, entry and exit</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.model||device.vendor)} {device.supportsQr?'(QR)':'(PIN/card)'}</option>)}</select></label>}
-      <label>Valid from<input name="validFrom" type="datetime-local" defaultValue={localDateTime(defaultStart)} required /></label>
-      <label>Valid until<input name="validUntil" type="datetime-local" defaultValue={localDateTime(defaultEnd)} required /></label>
+      <label>Valid from<input name="validFrom" type="datetime-local" value={fromValue} onChange={(event)=>setFromValue(event.target.value)} required /></label>
+      <label>Validity period
+        <select name="validityDays" value={validityDays} onChange={(event)=>setValidityDays(Number(event.target.value))}>
+          {Array.from({length:validity.maxDays},(_,index)=>index+1).map((days)=><option key={days} value={days}>{days} day{days===1?'':'s'}</option>)}
+        </select>
+        <small>Defaults to {validity.defaultDays} day{validity.defaultDays===1?'':'s'}; {validity.maxDays} day{validity.maxDays===1?'':'s'} is the longest this estate allows.</small>
+      </label>
+      <label>Valid until<input name="validUntil" type="datetime-local" value={untilValue} onChange={(event)=>setUntilValue(event.target.value)} required /></label>
+      <label>Purpose of visit
+        <select name="purposeOfVisit" value={purpose} onChange={(event)=>setPurpose(event.target.value)} required>
+          <option value="">Select a purpose</option>
+          {VISITOR_PURPOSE_OPTIONS.map(([id,label])=><option key={id} value={id}>{label}</option>)}
+        </select>
+      </label>
+      {purpose === 'other' && <label>State the purpose<input name="purposeOfVisitOther" maxLength={120} required /><small>Shown on the pass and to the officer at the gate.</small></label>}
+      <label className="span-2">Remark<textarea name="remark" rows={2} maxLength={500} placeholder="Anything the gate should know — vehicle, arrival time, who to call" /></label>
+      <label>Visit times
+        <select name="visitTimes" defaultValue={String(VISIT_TIMES_MIN)}>
+          {Array.from({length:VISIT_TIMES_MAX-VISIT_TIMES_MIN+1},(_,index)=>VISIT_TIMES_MIN+index).map((times)=><option key={times} value={times}>{times}</option>)}
+        </select>
+        <small>How many times this pass may be used at the gate.</small>
+      </label>
+      {(user.role==='admin'||user.role==='manager')&&<label>Person type on the terminals
+        <select name="personType" defaultValue={portal.data?.visitor_person_type||'visitor'}>
+          {VISITOR_PERSON_TYPE_CHOICES.map(([id,label])=><option key={id} value={id}>{label}</option>)}
+        </select>
+        <small>Visitor is the right type for a temporary account. Choose Normal user only if a terminal rejects the visitor type.</small>
+      </label>}
+      <p className="span-2 form-note">A six-digit PIN is generated with the pass and printed on it — the visitor types it on the terminal keypad.</p>
       <label className="span-2">Gate ID / Invitation verification
         <select name="requireGateIdVerification" defaultValue="0">
           <option value="0">Optional — security can verify credentials without mandatory gate upload</option>
@@ -1249,7 +1374,8 @@ function Visitors({ user }: { user: User }) {
       <button className="primary">Issue secure pass</button>
     </FormCard>}
     {staff&&<section className="scan-grid"><form className="form-card" onSubmit={manualPreview}><h3>Phone or manual scan</h3><label>QR, barcode, unique number or PIN<input name="code" required /></label><div className="row-actions"><button className="primary">Preview details</button><button type="button" className="secondary" onClick={()=>setCamera(!camera)}>Use phone camera</button></div>{camera&&<CameraCodeScanner onCode={(code)=>previewCode(code,'phone_camera')} onClose={()=>setCamera(false)} />}</form><form className="form-card" onSubmit={startDeviceScan}><h3>Scan at an access-control device</h3><label>Device<select name="deviceId" required><option value="">Select device</option>{devices.data?.items.map((device)=><option key={String(device.id)} value={String(device.id)}>{String(device.name)} — {String(device.gate_name)}</option>)}</select></label><button className="primary">Start device scan</button><small>The next credential event from this device is captured for review. No entry is accepted automatically.</small></form></section>}
-    {preview&&<section className={`visitor-preview ${preview.valid?'valid':'invalid'}`}><p className="eyebrow">VISITOR PASS PREVIEW — NO ENTRY ACCEPTED YET</p><h3>{String(preview.visitor_name)}</h3><dl><div><dt>Host</dt><dd>{String(preview.resident_name)}</dd></div><div><dt>Property</dt><dd>{String(preview.unit_number)} — {String(preview.street)}</dd></div><div><dt>Phone</dt><dd>{String(preview.visitor_phone??'—')}</dd></div><div><dt>Valid</dt><dd>{readableDate(preview.valid_from)} to {readableDate(preview.valid_until)}</dd></div><div><dt>Gates</dt><dd>{String(preview.gate_scope ?? 'both')==='gate'?String(preview.device_name ?? 'Selected device'):'Every gate, entry and exit'}</dd></div><div><dt>Gate verification</dt><dd>{Number(preview.require_gate_id_verification) === 1 ? '⚠️ Mandatory ID/invitation verification required' : 'Optional'}</dd></div><div><dt>Status</dt><dd>{String(preview.status)}</dd></div></dl>{Boolean((preview.proofs as Row[])?.length)&&<div className="span-2"><p className="eyebrow">RESIDENT UPLOADED VISITOR ID / INVITATION PROOF</p>{(preview.proofs as Row[]).map((p)=><a key={String(p.storage_key)} className="evidence-link" href={`/api/files/${encodeURIComponent(String(p.storage_key))}`} target="_blank" rel="noreferrer">🖼️ Host-uploaded {String(p.original_name)} ({Math.ceil(Number(p.size_bytes)/1024)} KB)</a>)}</div>}{!preview.valid&&<Notice tone="error">{String(preview.invalid_reason||'This pass is not valid.')}</Notice>}{Boolean(preview.valid)&&<label className="span-2"><span>Upload gate verification photo {Number(preview.require_gate_id_verification) === 1 ? '(REQUIRED before entry)' : '(optional)'}</span><input id="gateVerificationFile" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" /><small>Capture the visitor physical ID card, driver license, or physical invitation presented at the gate.</small></label>}<div className="row-actions">{Boolean(preview.valid)&&<><button className="primary" onClick={()=>decide('accepted','in')}>Accept check-in</button>{preview.status==='checked_in'&&<button className="secondary" onClick={()=>decide('accepted','out')}>Accept check-out</button>}</>}<button className="secondary" onClick={()=>decide('rejected')}>Reject</button></div></section>}
+    {preview&&<section className={`visitor-preview ${preview.valid?'valid':'invalid'}`}><p className="eyebrow">VISITOR PASS PREVIEW — NO ENTRY ACCEPTED YET</p><h3>{String(preview.visitor_name)}</h3><dl><div><dt>Host</dt><dd>{String(preview.resident_name)}</dd></div><div><dt>Property</dt><dd>{String(preview.unit_number)} — {String(preview.street)}</dd></div><div><dt>Phone</dt><dd>{String(preview.visitor_phone??'—')}</dd></div><div><dt>Valid</dt><dd>{readableDate(preview.valid_from)} to {readableDate(preview.valid_until)}</dd></div><div><dt>Gates</dt><dd>{String(preview.gate_scope ?? 'both')==='gate'?String(preview.device_name ?? 'Selected device'):'Every gate, entry and exit'}</dd></div><div><dt>Purpose</dt><dd>{visitorPurposeLabel(preview.purpose_of_visit,preview.purpose_of_visit_other) || '—'}</dd></div><div><dt>Remark</dt><dd>{String(preview.remark ?? '—')}</dd></div><div><dt>Visits</dt><dd>{Number(preview.visitsUsed ?? 0)} of {Number(preview.visitTimes ?? 1)} used{Number(preview.visitsRemaining ?? 0) > 0 ? ` — ${String(preview.visitsRemaining)} left` : ' — none left'}</dd></div><div><dt>Gate verification</dt><dd>{Number(preview.require_gate_id_verification) === 1 ? '⚠️ Mandatory ID/invitation verification required' : 'Optional'}</dd></div><div><dt>Status</dt><dd>{String(preview.status)}</dd></div></dl>{Boolean((preview.proofs as Row[])?.length)&&<div className="span-2"><p className="eyebrow">RESIDENT UPLOADED VISITOR ID / INVITATION PROOF</p>{(preview.proofs as Row[]).map((p)=><a key={String(p.storage_key)} className="evidence-link" href={`/api/files/${encodeURIComponent(String(p.storage_key))}`} target="_blank" rel="noreferrer">🖼️ Host-uploaded {String(p.original_name)} ({Math.ceil(Number(p.size_bytes)/1024)} KB)</a>)}</div>}{!preview.valid&&<Notice tone="error">{String(preview.invalid_reason||'This pass is not valid.')}</Notice>}{Boolean(preview.valid)&&<label className="span-2"><span>Upload gate verification photo {Number(preview.require_gate_id_verification) === 1 ? '(REQUIRED before entry)' : '(optional)'}</span><input id="gateVerificationFile" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" /><small>Capture the visitor physical ID card, driver license, or physical invitation presented at the gate.</small></label>}<div className="row-actions">{Boolean(preview.valid)&&<button className="primary" onClick={()=>decide('accepted','in')}>Accept check-in</button>}{/* Somebody already inside is always checkable out: an overstayed window or a
+              used-up visit allowance must never strand them on the estate. */}{visitorInside(preview)&&<button className={preview.valid?'secondary':'primary'} onClick={()=>decide('accepted','out')}>Accept check-out</button>}<button className="secondary" onClick={()=>decide('rejected')}>Reject</button></div></section>}
     {canSync&&deviceAccounts.data&&(
       <div className="stat-grid">
         <article className="stat-card"><p>Slots held on terminals</p><strong>{Number(deviceAccounts.data.summary.active_slots ?? 0)}</strong></article>
@@ -1259,7 +1385,7 @@ function Visitors({ user }: { user: User }) {
         <article className="stat-card"><p>Fully released</p><strong>{Number(deviceAccounts.data.summary.released ?? 0)}</strong></article>
       </div>
     )}
-    <ListState list={list}><DataTable exportTitle="Visitor Passes" rows={(list.data?.items ?? []).map((row)=>({ ...row,gates:String(row.gate_scope ?? 'both')==='gate'?'Selected gate only':'Every gate, entry and exit' }))} columns={[['visitor_name','Visitor'],['resident_name','Resident'],['unit_number','Unit'],['street','Street'],['credential_number','Unique number'],...(staff?[['gates','Gates'],['device_name','Preferred device'],['device_account_state','Device account']] as Column[]:[]),['status','Status'],['valid_until','Valid until','date']]} action={(row)=><div className="row-actions"><button className="text" onClick={()=>setSelectedPass(row)}>View pass</button><EvidenceButton entityType="visitor_request" entityId={row.id} count={row.proof_count} /></div>} /></ListState>
+    <ListState list={list}><DataTable exportTitle="Visitor Passes" rows={(list.data?.items ?? []).map((row)=>({ ...row,gates:String(row.gate_scope ?? 'both')==='gate'?'Selected gate only':'Every gate, entry and exit',purpose:visitorPurposeLabel(row.purpose_of_visit,row.purpose_of_visit_other) || '—',visits:`${Number(row.visits_used ?? 0)} of ${Number(row.visit_times ?? 1)}`,person_type:visitorPersonTypeLabel(row.person_type) }))} columns={[['visitor_name','Visitor'],['resident_name','Resident'],['unit_number','Unit'],['purpose','Purpose of visit'],['visits','Visits used'],['credential_number','Unique number'],...(staff?[['gates','Gates'],['person_type','Person type'],['device_name','Preferred device'],['device_account_state','Device account']] as Column[]:[]),['status','Status'],['valid_until','Valid until','date']]} action={(row)=><div className="row-actions"><button className="text" onClick={()=>setSelectedPass(row)}>View pass</button><EvidenceButton entityType="visitor_request" entityId={row.id} count={row.proof_count} /></div>} /></ListState>
     {selectedPass&&<VisitorPass pass={selectedPass} onClose={()=>setSelectedPass(null)} branding={{ portalName:portal.data?.portal_name||'EstateMate',shortName:portal.data?.portal_short_name||'EM' }} />}
   </PagePanel>;
 }
@@ -2542,7 +2668,9 @@ function Settings() {
       <button className="primary">Save bank account</button>
     </FormCard>}
     {portalMessage&&<Notice tone={portalMessage.includes('saved')?'success':'error'}>{portalMessage}</Notice>}
-    {portal.data&&<FormCard title="Portal identity, theme and recommended defaults" onSubmit={savePortal}><label>Portal name<input name="portal_name" defaultValue={portal.data.portal_name||'EstateMate'} required /></label><label>Estate name<input name="estate_name" defaultValue={portal.data.estate_name||'EstateMate Estate'} required /></label><label>Short mark<input name="portal_short_name" maxLength={4} defaultValue={portal.data.portal_short_name||'EM'} required /></label><label>Tagline<input name="portal_tagline" defaultValue={portal.data.portal_tagline} /></label><label className="span-2">Welcome text<textarea name="portal_welcome_text" rows={3} defaultValue={portal.data.portal_welcome_text} /></label><label>Theme mode<select name="theme_mode" defaultValue={portal.data.theme_mode||'light'}><option value="light">Light (recommended)</option><option value="dark">Dark</option><option value="system">Follow device</option></select></label><label>Corner style<select name="theme_corner_style" defaultValue={portal.data.theme_corner_style||'comfortable'}><option value="comfortable">Comfortable (recommended)</option><option value="compact">Compact</option><option value="rounded">Rounded</option></select></label><label>Primary colour<input name="theme_primary_color" type="color" defaultValue={portal.data.theme_primary_color||'#1769e0'} /></label><label>Accent colour<input name="theme_accent_color" type="color" defaultValue={portal.data.theme_accent_color||'#35d07f'} /></label><label>Navigation colour<input name="theme_navigation_color" type="color" defaultValue={portal.data.theme_navigation_color||'#0d1b37'} /></label><label>Surface colour<input name="theme_surface_color" type="color" defaultValue={portal.data.theme_surface_color||'#ffffff'} /></label><label>Support email<input name="support_email" type="email" defaultValue={portal.data.support_email} /></label><label>Support phone<input name="support_phone" defaultValue={portal.data.support_phone} /></label><label>Timezone<input name="estate_timezone" defaultValue={portal.data.estate_timezone||'Africa/Lagos'} /></label><label>Currency<input name="currency" defaultValue={portal.data.currency||'NGN'} maxLength={3} /></label><label>Default visitor hours<input name="visitor_default_duration_hours" type="number" min="1" max="168" defaultValue={portal.data.visitor_default_duration_hours||'8'} /></label><label>Gate decision policy<select name="visitor_gate_policy" defaultValue="security_approval"><option value="security_approval">Show details, then Security approves (recommended)</option></select></label><label>Visitor credential format<select name="visitor_credential_format" defaultValue="qr_code128_pin"><option value="qr_code128_pin">QR + Code 128 + PIN (recommended)</option></select></label><label>Card scan timeout (minutes)<input name="card_scan_timeout_minutes" type="number" min="1" max="30" defaultValue={portal.data.card_scan_timeout_minutes||'5'} /></label><button className="primary">Save portal customisation</button></FormCard>}
+    {portal.data&&<FormCard title="Portal identity, theme and recommended defaults" onSubmit={savePortal}><label>Portal name<input name="portal_name" defaultValue={portal.data.portal_name||'EstateMate'} required /></label><label>Estate name<input name="estate_name" defaultValue={portal.data.estate_name||'EstateMate Estate'} required /></label><label>Short mark<input name="portal_short_name" maxLength={4} defaultValue={portal.data.portal_short_name||'EM'} required /></label><label>Tagline<input name="portal_tagline" defaultValue={portal.data.portal_tagline} /></label><label className="span-2">Welcome text<textarea name="portal_welcome_text" rows={3} defaultValue={portal.data.portal_welcome_text} /></label><label>Theme mode<select name="theme_mode" defaultValue={portal.data.theme_mode||'light'}><option value="light">Light (recommended)</option><option value="dark">Dark</option><option value="system">Follow device</option></select></label><label>Corner style<select name="theme_corner_style" defaultValue={portal.data.theme_corner_style||'comfortable'}><option value="comfortable">Comfortable (recommended)</option><option value="compact">Compact</option><option value="rounded">Rounded</option></select></label><label>Primary colour<input name="theme_primary_color" type="color" defaultValue={portal.data.theme_primary_color||'#1769e0'} /></label><label>Accent colour<input name="theme_accent_color" type="color" defaultValue={portal.data.theme_accent_color||'#35d07f'} /></label><label>Navigation colour<input name="theme_navigation_color" type="color" defaultValue={portal.data.theme_navigation_color||'#0d1b37'} /></label><label>Surface colour<input name="theme_surface_color" type="color" defaultValue={portal.data.theme_surface_color||'#ffffff'} /></label><label>Support email<input name="support_email" type="email" defaultValue={portal.data.support_email} /></label><label>Support phone<input name="support_phone" defaultValue={portal.data.support_phone} /></label><label>Timezone<input name="estate_timezone" defaultValue={portal.data.estate_timezone||'Africa/Lagos'} /></label><label>Currency<input name="currency" defaultValue={portal.data.currency||'NGN'} maxLength={3} /></label><label>Default visitor validity (days)<input name="visitor_default_validity_days" type="number" min="1" max="30" defaultValue={portal.data.visitor_default_validity_days||'1'} /><small>The window the visitor form offers for a new pass.</small></label>
+<label>Maximum visitor validity (days)<input name="visitor_max_validity_days" type="number" min="1" max="30" defaultValue={portal.data.visitor_max_validity_days||'7'} /><small>The longest window anyone may request. Residents, Managers and Administrators are all held to it — raise it here when the estate needs longer passes.</small></label>
+<label>Visitor person type on terminals<select name="visitor_person_type" defaultValue={portal.data.visitor_person_type||'visitor'}>{VISITOR_PERSON_TYPE_CHOICES.map(([id,label])=><option key={id} value={id}>{label}</option>)}</select><small>How a visitor account is filed on the access-control terminals. Choose Normal user only if your terminals reject the visitor type.</small></label><label>Gate decision policy<select name="visitor_gate_policy" defaultValue="security_approval"><option value="security_approval">Show details, then Security approves (recommended)</option></select></label><label>Visitor credential format<select name="visitor_credential_format" defaultValue="qr_code128_pin"><option value="qr_code128_pin">QR + Code 128 + PIN (recommended)</option></select></label><label>Card scan timeout (minutes)<input name="card_scan_timeout_minutes" type="number" min="1" max="30" defaultValue={portal.data.card_scan_timeout_minutes||'5'} /></label><button className="primary">Save portal customisation</button></FormCard>}
     {portal.data&&<GateImageCard config={portal.data} onSaved={portal.reload} />}
     <SecurityGateAssignments />
     {storageMessage && <Notice tone={storageMessage.includes('updated') ? 'success' : 'error'}>{storageMessage}</Notice>}
