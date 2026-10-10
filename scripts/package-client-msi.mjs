@@ -22,12 +22,18 @@ export const DEFAULT_PORTAL_URL = 'https://estatemate.estatemate.workers.dev/';
 
 const WIX_INSTALL_DIRS = [
   process.env.WIX ? path.join(process.env.WIX, 'bin') : null,
-  'C:\\Program Files (x86)\\WiX Toolset v3.11\\bin',
   'C:\\Program Files (x86)\\WiX Toolset v3.14\\bin',
+  'C:\\Program Files (x86)\\WiX Toolset v3.11\\bin',
+  'C:\\Program Files (x86)\\WiX Toolset v3.10\\bin',
+  'C:\\ProgramData\\chocolatey\\bin',
 ].filter(Boolean);
 
 function fail(message) {
   console.error(`package-client-msi: ${message}`);
+  if (process.env.GITHUB_ACTIONS) {
+    const escaped = String(message).slice(0, 900).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+    console.log(`::error title=package-client-msi::${escaped}`);
+  }
   process.exit(1);
 }
 
@@ -79,12 +85,20 @@ export function parseArgs(argv) {
 function discoverTool(name, explicit) {
   if (explicit) return fs.existsSync(explicit) ? explicit : null;
   const exe = `${name}.exe`;
+  const onPath = spawnSync(process.platform === 'win32' ? 'where' : 'which', [exe], {
+    encoding: 'utf8',
+    shell: process.platform === 'win32',
+  });
+  if (onPath.status === 0) {
+    const found = String(onPath.stdout || '')
+      .split(/\r?\n/)
+      .find((candidate) => candidate && fs.existsSync(candidate.trim()));
+    if (found) return found.trim();
+  }
   for (const dir of WIX_INSTALL_DIRS) {
     const candidate = path.join(dir, exe);
     if (fs.existsSync(candidate)) return candidate;
   }
-  const probe = spawnSync(process.platform === 'win32' ? 'where' : 'which', [exe], { encoding: 'utf8' });
-  if (probe.status === 0) return probe.stdout.split(/\r?\n/)[0].trim();
   return null;
 }
 
@@ -157,8 +171,17 @@ function main() {
 
   fs.mkdirSync(out, { recursive: true });
   for (const [tool, args] of [[candle, candleArgs], [light, lightArgs]]) {
-    const result = spawnSync(tool, args, { stdio: 'inherit' });
-    if (result.status !== 0) fail(`${path.basename(tool)} exited ${result.status}`);
+    const result = spawnSync(tool, args, { encoding: 'utf8' });
+    const output = `${result.stdout || ''}\n${result.stderr || ''}`.trim();
+    if (output) process.stdout.write(`${output}\n`);
+    if (result.error || result.status !== 0) {
+      const diagnostics = output
+        .split(/\r?\n/)
+        .filter((line) => /error|warning|exception|CNDL|LGHT|ICE/i.test(line))
+        .slice(-12);
+      const reason = result.error ? result.error.message : `exit code ${result.status}`;
+      fail(`${path.basename(tool)} failed (${reason})${diagnostics.length ? `: ${diagnostics.join(' | ')}` : ''}`);
+    }
   }
   console.log(`built ${msi}`);
 }
