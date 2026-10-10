@@ -6865,6 +6865,27 @@ type SnapshotItem = {
   updatedAt: string | null;
 };
 
+/**
+ * The `since` of a delta, in the format the rows are compared in.
+ *
+ * `updated_at` is D1's `datetime('now')`: "YYYY-MM-DD HH:MM:SS". Bridges send
+ * an ISO instant ("YYYY-MM-DDTHH:MM:SS.sssZ"), and the two compare as text:
+ * on the same calendar day ' ' sorts before 'T', so every change made earlier
+ * that day looked older than the bridge's last sync and was silently left out
+ * of the delta - including revocations, which kept a card suspended this
+ * morning opening the gate until midnight. Any parseable instant is therefore
+ * rewritten to the stored format; anything unparseable is ignored, which asks
+ * for a full snapshot rather than a delta against an unknown point in time.
+ */
+function snapshotSince(value: string | null | undefined): string {
+  const raw = (value ?? '').trim();
+  if (!raw) return '';
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw)) return raw;
+  const parsed = Date.parse(/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(raw) ? raw : `${raw.replace(' ', 'T')}Z`);
+  if (Number.isNaN(parsed)) return '';
+  return new Date(parsed).toISOString().slice(0, 19).replace('T', ' ');
+}
+
 async function handleIsapiAgentCredentialSnapshot(request: Request, env: Env, agentId: string): Promise<Response> {
   if (request.method !== 'GET') return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET' } });
   const agent = await authenticateIsapiAgent(request, env, agentId);
@@ -6874,7 +6895,7 @@ async function handleIsapiAgentCredentialSnapshot(request: Request, env: Env, ag
   const requestedLimit = Number(url.searchParams.get('limit') ?? SNAPSHOT_DEFAULT_PAGE);
   const limit = Math.min(SNAPSHOT_MAX_PAGE, Math.max(100, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : SNAPSHOT_DEFAULT_PAGE));
   const cursor = (url.searchParams.get('cursor') ?? '').trim();
-  const since = (url.searchParams.get('since') ?? '').trim();
+  const since = snapshotSince(url.searchParams.get('since'));
   const full = !cursor && !since;
   const cursorValue = cursor ? cursor.split('|')[0] ?? '' : '';
   const cursorKind = cursor ? cursor.split('|')[1] ?? '' : '';
