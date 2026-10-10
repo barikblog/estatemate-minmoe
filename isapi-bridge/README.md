@@ -291,7 +291,7 @@ is worth trying — see
 [`../docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md`](../docs/ISAPI-BRIDGE-AND-WINDOWS-AGENT.md#terminal-protocol-the-card-path-relies-on)
 for the behaviour the agent depends on.
 
-- `POST /ISAPI/AccessControl/UserInfo/Record?format=json` — create the PIN-only visitor account with employee ID, name, Company department, `userType: "normal"`, enabled finite `Valid`, `localUIRight: false` and a 4-to-8-digit `password`.
+- `POST /ISAPI/AccessControl/UserInfo/Record?format=json` — create the PIN-only visitor account with employee ID, name, an unassigned group (`belongGroup: ""`; Hikvision group IDs are numeric, so `Company` is not valid here), `userType: "normal"`, enabled finite `Valid`, `localUIRight: false` and a 4-to-8-digit `password`.
 - `PUT /ISAPI/AccessControl/UserInfo/Modify?format=json` — update an existing visitor account. Attempted only when `Record` reports the employee number already exists (`employeeNoAlreadyExist`); any other content rejection is reported with the terminal's own reason, never as a misleading `employeeNoNotExist` follow-up. `UserInfo/SetUp` is the combined add/edit compatibility path.
 - `PUT /ISAPI/AccessControl/UserInfoDetail/Delete?format=json` — delete the expired/revoked visitor account (`UserInfo/Delete` fallback).
 - `POST /ISAPI/AccessControl/CardInfo/Record?format=json` — add a resident/dependant card. Visitor provisioning does not call a `CardInfo` endpoint.
@@ -324,9 +324,11 @@ curl -i -X PUT --digest -u admin:password \
 ## Visitor PIN-account lifecycle
 
 The Hikvision path sends one `UserInfo` record containing only the terminal-editor
-fields: EstateMate's issued employee number, visitor name, department `Company`,
-normal-user/non-administrator settings, enabled finite start/end validity, and the
-4-to-8-digit visitor PIN in `password`. No visitor `CardInfo`, fingerprint, face,
+fields: EstateMate's issued employee number, visitor name, an unassigned group
+(`belongGroup: ""`; Hikvision group IDs are numeric, not department labels),
+normal-user/non-administrator settings, enabled finite start/end validity, and
+the 4-to-8-digit visitor PIN in `password`. The Worker's `department: "Company"`
+metadata is not sent as the terminal group. No visitor `CardInfo`, fingerprint, face,
 door-right or right-plan field is sent. At expiry or manual revocation, the bridge
 deletes the `UserInfo` account so the person slot is available again.
 

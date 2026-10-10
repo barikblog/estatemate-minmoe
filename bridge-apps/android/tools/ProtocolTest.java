@@ -286,7 +286,7 @@ public final class ProtocolTest {
         check("upsert_visitor succeeds", visitorResult.success, String.valueOf(visitorResult.error));
         check("upsert_visitor sends only the finite normal-user PIN account",
                 fake.visitorPersonRecords.size() == 1 && fake.visitorPersonRecords.get(0).contains("\"name\":\"Grace Visitor\"")
-                        && fake.visitorPersonRecords.get(0).contains("\"belongGroup\":\"Company\"")
+                        && fake.visitorPersonRecords.get(0).contains("\"belongGroup\":\"\"")
                         && fake.visitorPersonRecords.get(0).contains("\"userType\":\"normal\"")
                         && fake.visitorPersonRecords.get(0).contains("\"enable\":true")
                         && fake.visitorPersonRecords.get(0).contains("\"localUIRight\":false")
@@ -871,8 +871,13 @@ public final class ProtocolTest {
                         respond(exchange, 400, "{\"statusCode\":6,\"statusString\":\"Invalid Content\",\"subStatusCode\":\"badJsonContent\",\"errorMsg\":\"UserInfo\"}");
                         return;
                     }
+                    // ISAPI belongGroup accepts numeric IDs, not a department
+                    // display label such as "Company". Blank is unassigned.
+                    if (!body.contains("\"belongGroup\":\"\"")) {
+                        respond(exchange, 400, "{\"statusCode\":6,\"statusString\":\"Invalid Content\",\"subStatusCode\":\"badJsonContent\",\"errorMsg\":\"belongGroup\"}");
+                        return;
+                    }
                     if (!body.contains("\"userType\":\"normal\"") || !body.contains("\"Valid\"")
-                            || !body.contains("\"belongGroup\":\"Company\"")
                             || !java.util.regex.Pattern.compile("\"password\":\"\\d{4,8}\"").matcher(body).find()
                             || !body.contains("\"localUIRight\":false") || body.contains("\"doorRight\"")
                             || body.contains("\"RightPlan\"") || body.contains("\"CardInfo\"")) {

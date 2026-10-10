@@ -42,7 +42,7 @@ under EstateMate's current Employee ID policy; the terminal wire field allows
 `UserInfo` account**:
 
 - issued employee number and visitor name;
-- department `Company`;
+- no on-terminal group assignment (`belongGroup: ""`); Hikvision expects numeric group IDs, so the Worker’s `department: "Company"` metadata is not sent as a terminal group;
 - enabled finite start/end validity, not a long-term account;
 - `userType: "normal"` and `localUIRight: false`;
 - the stored pass PIN as `password`, validated as 4–8 decimal digits.

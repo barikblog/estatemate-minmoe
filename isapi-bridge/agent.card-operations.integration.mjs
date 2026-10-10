@@ -54,7 +54,12 @@ const deviceServer = createServer((req, res) => {
     if (req.url.startsWith('/ISAPI/AccessControl/UserInfo/Record')) {
       if (!json) return reject('badXmlContent', 'unsupported on this firmware');
       const info = JSON.parse(body).UserInfo || {};
-      if (!info.employeeNo || !info.Valid || info.userType !== 'normal' || info.belongGroup !== 'Company'
+      // ISAPI belongGroup is a comma-separated list of numeric IDs, not a
+      // department label. Empty means the person has no group assignment.
+      if (typeof info.belongGroup !== 'string' || (info.belongGroup !== '' && !/^\d+(,\d+)*$/.test(info.belongGroup))) {
+        return reject('badJsonContent', 'belongGroup');
+      }
+      if (!info.employeeNo || !info.Valid || info.userType !== 'normal'
         || info.localUIRight !== false || !/^\d{4,8}$/.test(String(info.password || ''))
         || 'doorRight' in info || 'RightPlan' in info || 'gender' in info) {
         return reject('badJsonContent', 'UserInfo');
@@ -293,7 +298,7 @@ try {
     assert.deepEqual(person, {
       employeeNo: 'VIS55443322',
       name: 'Grace Visitor',
-      belongGroup: 'Company',
+      belongGroup: '',
       userType: 'normal',
       Valid: {
         enable: true,
@@ -334,7 +339,7 @@ try {
     assert.deepEqual(persons.get('VIS55443321'), {
       employeeNo: 'VIS55443321',
       name: 'Grace Visitor',
-      belongGroup: 'Company',
+      belongGroup: '',
       userType: 'normal',
       Valid: {
         enable: true,

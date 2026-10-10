@@ -74,8 +74,10 @@ receives under the tag `EstateMateBridge`.
   card number), `disable_card` / `delete_card` (PUT `CardInfo/Delete` with the
   `CardInfoDelCond` condition), and the remote door commands. `upsert_visitor`
   adds/updates only the finite `UserInfo` account shown in the terminal editor:
-  employee ID, name, Company department, normal-user/non-administrator settings,
-  validity window and a 4-to-8-digit PIN. The validity window is stated in the
+  employee ID, name, an unassigned group (`belongGroup: ""`; Hikvision group IDs
+  are numeric, so a department label such as `Company` is invalid), normal-user/
+  non-administrator settings, validity window and a 4-to-8-digit PIN. The
+  validity window is stated in the
   estate's local time (`YYYY-MM-DDTHH:mm:ss`, `timeType: "local"`) using the
   timezone the Worker sends with the operation — the same format the Node bridge
   writes. `UserInfo/Modify` is attempted only when `Record` reports the employee

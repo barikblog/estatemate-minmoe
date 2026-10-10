@@ -661,7 +661,12 @@ public final class IsapiClient {
         Map<String, Object> info = new LinkedHashMap<String, Object>();
         info.put("employeeNo", employeeNo);
         info.put("name", name);
-        info.put("belongGroup", "Company");
+        // Hikvision ISAPI belongGroup is a comma-separated list of numeric group
+        // IDs (e.g. "1", "1,3"), not a department display name. Sending the
+        // literal "Company" triggers badJsonContent / belongGroup on real
+        // firmware. Visitors are not assigned to any on-terminal group, which
+        // matches what the Node bridge and the residents' person body send.
+        info.put("belongGroup", "");
         info.put("userType", "normal");
         info.put("Valid", valid);
         info.put("localUIRight", Boolean.FALSE);
@@ -696,7 +701,7 @@ public final class IsapiClient {
 
         String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<UserInfo " + XML_NS + ">\n"
                 + "  <employeeNo>" + employeeNo + "</employeeNo>\n  <name>" + xmlText(name) + "</name>\n"
-                + "  <belongGroup>Company</belongGroup>\n  <userType>normal</userType>\n"
+                + "  <belongGroup></belongGroup>\n  <userType>normal</userType>\n"
                 + "  <Valid><enable>true</enable><beginTime>" + valid.get("beginTime") + "</beginTime>"
                 + "<endTime>" + valid.get("endTime") + "</endTime><timeType>" + timeType + "</timeType></Valid>\n"
                 + "  <localUIRight>false</localUIRight>\n  <password>" + pin + "</password>\n</UserInfo>";

@@ -1359,8 +1359,10 @@ function formatEstateLocalTime(instant, timeZone) {
 
 /**
  * Build only the temporary terminal account shown in the device's person UI:
- * employee ID, name, Company department, finite validity, non-administrator
- * normal-user role, and PIN. Visitor provisioning intentionally sends no card,
+ * employee ID, name, an unassigned group (`belongGroup: ""`), finite validity,
+ * non-administrator normal-user role, and PIN. Hikvision group IDs are numeric;
+ * a display label such as `Company` is not a valid `belongGroup`. Visitor
+ * provisioning intentionally sends no card,
  * fingerprint, face, door-right, or right-plan record.
  */
 function visitorPersonInfo(payload, employeeNo) {
@@ -1380,7 +1382,13 @@ function visitorPersonInfo(payload, employeeNo) {
   return {
     employeeNo: String(employeeNo),
     name: String(payload.visitorName || 'Visitor').trim().slice(0, 32) || 'Visitor',
-    belongGroup: 'Company',
+    // Hikvision ISAPI `belongGroup` is a comma-separated list of numeric group
+    // IDs (e.g. "1", "1,3"), not a department display name. The terminal returns
+    // "" for users with no group assignment, and sending the literal "Company"
+    // triggers `badJsonContent / belongGroup` on real firmware. Visitors are not
+    // assigned to any on-terminal group, which matches what residents use
+    // (personBody omits belongGroup entirely and the device stores it as "").
+    belongGroup: '',
     userType: 'normal',
     Valid: { enable: true, beginTime, endTime, timeType: timeZone ? 'local' : 'UTC' },
     localUIRight: false,
@@ -1440,7 +1448,7 @@ async function writeTerminalVisitorPerson(device, payload, employeeNo) {
 <UserInfo ${ISAPI_XML_NS}>
   <employeeNo>${info.employeeNo}</employeeNo>
   <name>${xmlText(info.name)}</name>
-  <belongGroup>Company</belongGroup>
+  <belongGroup></belongGroup>
   <userType>normal</userType>
   <Valid><enable>true</enable><beginTime>${info.Valid.beginTime}</beginTime><endTime>${info.Valid.endTime}</endTime><timeType>${info.Valid.timeType}</timeType></Valid>
   <localUIRight>false</localUIRight>

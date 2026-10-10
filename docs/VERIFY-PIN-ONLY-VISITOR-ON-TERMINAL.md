@@ -19,13 +19,16 @@ A visitor used to be provisioned on the terminal as a **card** record
 (`CardInfo`, card type `normalCard`). Real terminals rejected that body with
 `Invalid Content` / `badJsonContent` / `employeeNo`. From 0.4.1 a visitor is a
 **finite `UserInfo` account and nothing else**: employee number, name,
-department `Company`, `userType: normal`, `localUIRight: false`, an enabled
-start/end validity window, and the pass PIN as `password` (4–8 digits; the
-portal always generates 6). Both the Node and the Android bridge stopped
-writing visitor `CardInfo`, fingerprint, face, door-right and right-plan
-records. `revoke_visitor` now deletes the **person** account
-(`UserInfoDetail/Delete`, `UserInfo/Delete` fallback) instead of a card, which
-is what frees the terminal slot.
+unassigned group (`belongGroup: ""`), `userType: normal`,
+`localUIRight: false`, an enabled start/end validity window, and the pass PIN
+as `password` (4–8 digits; the portal always generates 6). Hikvision
+`belongGroup` takes numeric group IDs, not a department label; the initial
+implementation's `Company` value caused real terminals to reject the account
+with `badJsonContent / belongGroup` and has been corrected in both bridges.
+Both the Node and Android bridge stopped writing visitor `CardInfo`, fingerprint,
+face, door-right and right-plan records. `revoke_visitor` deletes the **person**
+account (`UserInfoDetail/Delete`, `UserInfo/Delete` fallback) instead of a card,
+which is what frees the terminal slot.
 
 ## Before you go on site
 
@@ -139,7 +142,7 @@ On the terminal's own menu (or its web client), find the person record for
 employee number **`visitor<credential number>`** (passes issued before the alphanumeric-only rule show the legacy `visitor-<credential number>` shape) and confirm:
 
 - [ ] name = the visitor's name;
-- [ ] department = `Company`;
+- [ ] group is blank/unassigned (`belongGroup: ""`); `Company` is not a valid ISAPI group ID;
 - [ ] user type = **normal** (not administrator);
 - [ ] validity start/end match the pass window (finite, not long-term);
 - [ ] local UI right = off;
@@ -196,7 +199,7 @@ model's `docs/device-profiles/` file.
 |---|---|---|
 | `visitor PIN must contain 4 to 8 digits` | the operation payload carried no usable PIN | Worker → operation payload; the pass row's `pin` column |
 | `visitor validUntil must be after validFrom` | pass window is empty or inverted | the pass's validity columns |
-| `Invalid Content` / `badJsonContent` | the terminal rejected the `UserInfo` body — the exact failure this release was meant to fix | bridge log; the operation result quotes the terminal's `statusString` verbatim |
+| `Invalid Content` / `badJsonContent` | the terminal rejected a `UserInfo` field; `badJsonContent / belongGroup` specifically means an invalid group value (the bridge must send `""`, not `Company`) | bridge log; the operation result quotes the terminal's `statusString`, `subStatusCode` and `errorMsg` |
 | `notSupport` on all three JSON URLs, then XML also refused | firmware does not implement `UserInfo/Record` at all | the model's device profile; fall back to the terminal's own menu until evidence exists |
 | Operation stays `pending` | the agent is not polling | portal agent row (offline after 3 minutes without a heartbeat) |
 | A **Hardware actions** row instead | no live agent linked to that terminal | link the device to an agent, or apply the instruction by hand |
