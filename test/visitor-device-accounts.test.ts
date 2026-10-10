@@ -124,7 +124,7 @@ describe('visitor device-account lifecycle', () => {
     expect(operation?.status).toBe('pending');
   });
 
-  it('reconciliation restores the stored PIN and Company department to a failed account operation', async () => {
+  it('reconciliation restores the stored PIN and Company department metadata to a failed account operation', async () => {
     addDevice();
     const now = Date.now();
     const pass = await issuePass(new Date(now - 60_000), new Date(now + 60 * 60_000));

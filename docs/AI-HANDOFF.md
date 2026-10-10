@@ -1,5 +1,24 @@
 # AI handoff — EstateMate
 
+## Hikvision visitor `belongGroup` correction (2026-10-10)
+
+A real terminal reported `Invalid Content / badJsonContent / belongGroup` while
+applying a visitor account. The bridge had sent the display label `Company` in
+ISAPI's `belongGroup` field. Hikvision uses this field for numeric group IDs;
+`Company` is not a valid value. Both the Node and Android bridges now send an
+empty group (`belongGroup: ""`) to leave the visitor unassigned, in both JSON
+and XML bodies. The Worker may continue carrying `department: "Company"` as
+visitor-operation metadata, but the bridges do not map that display label to an
+ISAPI group.
+
+- Regression coverage makes the simulated terminals reject non-numeric group
+  values specifically as `badJsonContent / belongGroup` and accepts the empty
+  unassigned value. The Node and Android visitor account checks assert the new
+  body. No real-device verification has been performed after this change.
+- This corrects the original 2026-10-05 implementation documented below; the
+  old `Company` wire value is superseded. Deploy a bridge build containing this
+  fix to terminals that are still reporting the rejection.
+
 ## Time-zone chooser and synchronisation button on the bridge app (2026-10-07)
 
 Windows/Node bridge only — the Android bridge does not run clock sync at all
@@ -224,7 +243,8 @@ The terminal wire limit remains 32; EstateMate's limit for new or changed IDs is
 
 - The terminal person-editor screenshot is the Hikvision visitor provisioning
   contract. `upsert_visitor` sends only `UserInfo`: issued employee ID, visitor
-  name, `belongGroup: "Company"`, `userType: "normal"`, finite UTC `Valid`,
+  name, `belongGroup: ""` (unassigned; the original `Company` value was invalid
+  and was corrected on 2026-10-10), `userType: "normal"`, finite UTC `Valid`,
   `localUIRight: false`, and the pass PIN as `password`. PINs must be 4–8 digits.
 - No visitor `CardInfo`, fingerprint, face, door-right or right-plan request is
   made. This removes the card-linking `badJsonContent / employeeNo` path and
@@ -429,9 +449,11 @@ migration `0021`, so `migrations/` now ends at `0021`).
 `bridge-0.4.1` changes **how a visitor is provisioned on a Hikvision ISAPI
 terminal** — the one path every estate on 0.2.x–0.4.0 could hit. A visitor is now
 a finite **PIN-only `UserInfo` account** and nothing else: employee number, name,
-department `Company`, `userType: normal`, `localUIRight: false`, an enabled
-start/end validity window, and the pass PIN as `password` (validated as 4–8
-decimal digits; the portal always generates 6). Both the Node and the Android
+`userType: normal`, `localUIRight: false`, an enabled start/end validity window,
+and the pass PIN as `password` (validated as 4–8 decimal digits; the portal
+always generates 6). The original 0.4.1 bridge sent `belongGroup: "Company"`,
+which real firmware can reject; the 2026-10-10 correction sends an empty,
+unassigned group instead. Both the Node and the Android
 bridge stopped creating or deleting visitor `CardInfo`, fingerprint, face,
 door-right and right-plan records, and `revoke_visitor` now deletes the **person**
 (`UserInfoDetail/Delete`, with a `UserInfo/Delete` fallback) instead of a card —
