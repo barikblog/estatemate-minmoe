@@ -23,8 +23,7 @@
 
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser"
              Description="EstateMate desktop app" />
-    <MajorUpgrade AllowSameVersionUpgrades="yes"
-                  DowngradeErrorMessage="A newer version of EstateMate is already installed. Uninstall it in Settings - Apps and try again." />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of EstateMate is already installed. Uninstall it in Settings - Apps and try again." />
     <MediaTemplate EmbedCab="yes" />
 
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/barikblog/estatemate-minmoe" />
@@ -43,9 +42,13 @@
 
     <DirectoryRef Id="INSTALLFOLDER">
       <Component Id="ProgramFiles" Guid="2B9D4F10-6E7A-4C3B-8F21-7A1E5C9D0B63">
-        <File Id="EstateMateLauncher" Name="EstateMate.vbs" Source="$(var.LauncherSource)" KeyPath="yes" />
+        <File Id="EstateMateLauncher" Name="EstateMate.vbs" Source="$(var.LauncherSource)" />
         <File Id="EstateMateUrl" Name="estatemate-url.txt" Source="$(var.UrlSource)" />
         <File Id="EstateMateReadme" Name="README.txt" Source="$(var.ReadmeSource)" />
+        <RegistryValue Root="HKCU" Key="Software\EstateMate\DesktopApp" Name="ProgramFiles"
+                       Type="integer" Value="1" KeyPath="yes" />
+        <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+        <RemoveFolder Id="RemoveProgramsLocalFolder" Directory="ProgramsLocalFolder" On="uninstall" />
       </Component>
     </DirectoryRef>
 
