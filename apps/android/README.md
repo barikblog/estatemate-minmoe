@@ -5,9 +5,9 @@ client for the same Worker API the web portal uses. It is not the bridge (that i
 `bridge-apps/android`, the app that talks to the Hikvision terminals) — this is
 the app a person signs into.
 
-* Installable artifact: `sornix-estateos-android-<tag>-debug.apk`, built and
+* Installable artifact: `sornix-estateos-android-<version>-debug.apk`, built and
   published by `.github/workflows/bridge.yml` (`android-apk` job) on `bridge-*`
-  tags. A signed `-release.apk` is produced when the `ANDROID_KEYSTORE_*`
+  tags (tag `bridge-0.5.0` → `sornix-estateos-android-0.5.0-debug.apk`). A signed `-release.apk` is produced when the `ANDROID_KEYSTORE_*`
   secrets are configured.
 * Application id `com.estatemate.app` and the Kotlin package are deliberately
   unchanged, so an installed copy updates in place. The name under the icon is

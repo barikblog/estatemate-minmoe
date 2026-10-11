@@ -12,7 +12,8 @@ The whole contract (the table, the kept names, the rule for the next rename) is
 `docs/APP-ARTIFACTS-AND-NAMING.md`, referenced from `README.md` and `AGENTS.md`.
 
 **What changed.** Artifact names — Android client
-`sornix-estateos-android-<ref>-debug.apk` / `-release.apk`, desktop app
+`sornix-estateos-android-<version>-debug.apk` / `-release.apk` (the version,
+not the tag: `bridge-0.5.0` yields `…-android-0.5.0-debug.apk`), desktop app
 `sornix-estateos-desktop-<version>.msi`, bridge APK
 `sornix-estateos-bridge-<version>.apk`, bridge exe
 `sornix-estateos-bridge-win-x64.exe`, bridge MSI and installer kit
