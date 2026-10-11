@@ -1,0 +1,15 @@
+services:
+  sornix-estateos:
+    build: .
+    container_name: sornix-estateos
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8787}:8787"
+    environment:
+      - NODE_ENV=production
+      - PORT=8787
+    volumes:
+      - sornix_d1_data:/data
+
+volumes:
+  sornix_d1_data:

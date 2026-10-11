@@ -1,5 +1,5 @@
 import { CSSProperties, FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ApiError, ListResponse, User, api, money, readableDate } from './api';
+import { ApiError, ListResponse, User, api, clearApiCache, money, peekApiCache, readableDate } from './api';
 import type { PassShareSource } from './pass-export';
 import { exportRecordsToExcel, exportRecordsToPdf } from './records-export';
 
@@ -22,13 +22,53 @@ type NavGroup = { id: string; label: string; items: NavItem[] };
 interface NavItem { id: Section; label: string; roles?: User['role'][]; badge?: string }
 type PortalConfig = Record<string,string>;
 const defaultPortalConfig: PortalConfig = {
-  portal_name:'EstateMate',estate_name:'EstateMate Estate',portal_short_name:'EM',portal_tagline:'One estate. One secure view.',
+  portal_name:'Sornix EstateOS',estate_name:'Sornix Estate',portal_short_name:'SE',portal_tagline:'Smart estate operations & gate access by Sornix.',
   portal_welcome_text:'Manage residents, visitors, accounts and gate access from a single, secure workspace.',theme_mode:'light',
   theme_primary_color:'#1769e0',theme_accent_color:'#35d07f',theme_navigation_color:'#0d1b37',theme_surface_color:'#ffffff',
   theme_corner_style:'comfortable',currency:'NGN',estate_timezone:'Africa/Lagos',visitor_default_duration_hours:'8',visitor_gate_policy:'security_approval',
   visitor_default_validity_days:'1',visitor_max_validity_days:'7',visitor_person_type:'visitor',
   portal_gate_image_key:'',portal_gate_image_caption:'',portal_gate_image_enabled:'false',
 };
+
+const PORTAL_CONFIG_STORAGE_KEY = 'sornix_portal_config_v1';
+const SESSION_USER_STORAGE_KEY = 'sornix_session_user_v1';
+
+function readCachedPortalConfig(): PortalConfig {
+  try {
+    const raw = localStorage.getItem(PORTAL_CONFIG_STORAGE_KEY);
+    if (!raw) return defaultPortalConfig;
+    const parsed = JSON.parse(raw) as PortalConfig;
+    const merged: PortalConfig = { ...defaultPortalConfig, ...parsed };
+    if (merged.portal_name === 'EstateMate') merged.portal_name = 'Sornix EstateOS';
+    if (merged.estate_name === 'EstateMate Estate') merged.estate_name = 'Sornix Estate';
+    if (merged.portal_short_name === 'EM') merged.portal_short_name = 'SE';
+    return merged;
+  } catch {
+    return defaultPortalConfig;
+  }
+}
+
+function writeCachedPortalConfig(config: PortalConfig): void {
+  try { localStorage.setItem(PORTAL_CONFIG_STORAGE_KEY, JSON.stringify(config)); } catch { /* ignore quota */ }
+}
+
+function readCachedSession(): { user: User; gate: Row | null } | null {
+  try {
+    const raw = sessionStorage.getItem(SESSION_USER_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { user?: User; gate?: Row | null };
+    return parsed?.user?.id ? { user: parsed.user, gate: parsed.gate ?? null } : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedSession(user: User | null, gate: Row | null = null): void {
+  try {
+    if (!user) sessionStorage.removeItem(SESSION_USER_STORAGE_KEY);
+    else sessionStorage.setItem(SESSION_USER_STORAGE_KEY, JSON.stringify({ user, gate }));
+  } catch { /* ignore */ }
+}
 
 /**
  * Visitor account options.
@@ -135,54 +175,128 @@ function applyPortalTheme(config: PortalConfig) {
   root.dataset.theme=mode || 'light';
 }
 
+/**
+ * Consolidated sidebar navigation: related features are merged into unified
+ * tabbed hubs so operators and mobile users can reach every module with minimal
+ * scrolling while keeping deep-linkable section IDs intact.
+ */
 const navGroups: NavGroup[] = [
   { id: 'overview', label: 'Overview', items: [
     { id: 'dashboard', label: 'Dashboard' },
+    { id: 'visitors', label: 'Visitor passes' },
   ]},
-  { id: 'access', label: 'Access control', items: [
-    { id: 'cards', label: 'Cards & fingerprints', roles: ['admin','manager','cashier','resident'] },
+  { id: 'access', label: 'Access & gates', items: [
     { id: 'events', label: 'Gate activity', roles: ['admin','manager','security','resident'] },
-    { id: 'devices', label: 'Terminals & devices', roles: ['admin','manager','security'] },
-    { id: 'remote', label: 'Remote door control', roles: ['admin'] },
-    { id: 'sync', label: 'Person sync', roles: ['admin','manager'] },
-    { id: 'isapi', label: 'Device agent', roles: ['admin','manager'] },
-    { id: 'operations', label: 'Hardware actions', roles: ['admin','manager'] },
+    { id: 'cards', label: 'Cards & person sync', roles: ['admin','manager','cashier','resident'] },
+    { id: 'devices', label: 'Terminals & bridge', roles: ['admin','manager','security'] },
   ]},
-  { id: 'people', label: 'Residents & staff', items: [
-    { id: 'residents', label: 'Resident manager', roles: ['admin','manager','cashier','security'] },
-    { id: 'residency', label: 'Tenancy & household', roles: ['admin','manager','resident'] },
-    { id: 'dependants', label: 'Dependants manager', roles: ['admin','manager','cashier','resident'] },
-    { id: 'staff', label: 'Staff management', roles: ['admin','manager'] },
-  ]},
-  { id: 'estate', label: 'Estate management', items: [
-    { id: 'properties', label: 'Property administration', roles: ['admin','manager','cashier','security','resident'] },
+  { id: 'people', label: 'People & estate', items: [
+    { id: 'residents', label: 'Residents & households', roles: ['admin','manager','cashier','security','resident'] },
+    { id: 'staff', label: 'Staff & shifts', roles: ['admin','manager'] },
+    { id: 'properties', label: 'Properties & units', roles: ['admin','manager','cashier','security','resident'] },
     { id: 'bills', label: 'Bills & payments', roles: ['admin','cashier','resident'] },
-    { id: 'maintenance', label: 'Service operations', roles: ['admin','manager','resident'] },
-    { id: 'notices', label: 'Estate notices' },
-    { id: 'emergency', label: 'Emergency contacts' },
+    { id: 'maintenance', label: 'Maintenance & bookings', roles: ['admin','manager','cashier','security','resident'] },
   ]},
-  { id: 'visitors', label: 'Visitors', items: [
-    { id: 'visitors', label: 'Visitor management' },
-  ]},
-  { id: 'info', label: 'Information resources', items: [
-    { id: 'information', label: 'Information hub' },
-  ]},
-  { id: 'admin', label: 'Administration', items: [
-    { id: 'imports', label: 'Import centre', roles: ['admin','manager'] },
-    { id: 'settings', label: 'Settings', roles: ['admin'] },
+  { id: 'community', label: 'Community & admin', items: [
+    { id: 'notices', label: 'Notices, docs & SOS' },
+    { id: 'settings', label: 'Settings & imports', roles: ['admin','manager'] },
   ]},
 ];
 
-const allNavItems: NavItem[] = navGroups.flatMap((g) => g.items);
+function canonicalNavSection(section: Section): Section {
+  switch (section) {
+    case 'cards':
+    case 'sync':
+      return 'cards';
+    case 'devices':
+    case 'isapi':
+    case 'operations':
+    case 'remote':
+      return 'devices';
+    case 'residents':
+    case 'residency':
+    case 'dependants':
+      return 'residents';
+    case 'maintenance':
+    case 'bookings':
+      return 'maintenance';
+    case 'notices':
+    case 'emergency':
+    case 'information':
+    case 'legal':
+      return 'notices';
+    case 'settings':
+    case 'imports':
+      return 'settings';
+    default:
+      return section;
+  }
+}
 
-function useAsync<T>(loader: () => Promise<T>, dependencies: unknown[]) {
-  const [data, setData] = useState<T | null>(null);
+interface HubTab {
+  id: Section;
+  label: string;
+  roles?: User['role'][];
+}
+
+function HubSubtabs({
+  tabs,
+  active,
+  role,
+  onSelect,
+}: {
+  tabs: HubTab[];
+  active: Section;
+  role: User['role'];
+  onSelect: (section: Section) => void;
+}) {
+  const allowed = tabs.filter((t) => !t.roles || t.roles.includes(role));
+  if (allowed.length <= 1) return null;
+  const resolved = allowed.some((t) => t.id === active) ? active : allowed[0]!.id;
+  return (
+    <div className="hub-subtabs no-print" role="tablist" aria-label="Module sections">
+      {allowed.map((tab) => (
+        <button
+          key={tab.id}
+          type="button"
+          role="tab"
+          aria-selected={resolved === tab.id}
+          className={resolved === tab.id ? 'hub-subtab active' : 'hub-subtab'}
+          onClick={() => onSelect(tab.id)}
+        >
+          <span className="hub-subtab-icon">{navIcon(tab.id)}</span>
+          <span>{tab.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function resolveHubSection(tabs: HubTab[], active: Section, role: User['role']): Section {
+  const allowed = tabs.filter((t) => !t.roles || t.roles.includes(role));
+  if (!allowed.length) return active;
+  return allowed.some((t) => t.id === active) ? active : allowed[0]!.id;
+}
+
+function useAsync<T>(loader: () => Promise<T>, dependencies: unknown[], cacheKey?: string) {
+  const [data, setData] = useState<T | null>(() => (cacheKey ? (peekApiCache<T>(cacheKey) ?? null) : null));
   const [error, setError] = useState('');
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState<boolean>(() => (cacheKey ? peekApiCache<T>(cacheKey) === undefined : true));
   const reload = useCallback(() => {
-    setLoading(true);
+    const cached = cacheKey ? peekApiCache<T>(cacheKey) : undefined;
+    if (cached !== undefined) {
+      setData(cached);
+      setLoading(false);
+    } else {
+      setLoading((prev) => (data === null ? true : prev));
+    }
     setError('');
-    loader().then(setData).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason))).finally(() => setLoading(false));
+    loader()
+      .then((fresh) => {
+        setData(fresh);
+      })
+      .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)))
+      .finally(() => setLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, dependencies);
   useEffect(reload, [reload]);
@@ -394,21 +508,104 @@ function SwitchGateDialog({ current, onSwitched, onClose }: { current: Row | nul
   </div>;
 }
 
+function MobileBottomNav({
+  role,
+  activeSection,
+  menuOpen,
+  onNavigate,
+  onToggleMenu,
+}: {
+  role: User['role'];
+  activeSection: Section;
+  menuOpen: boolean;
+  onNavigate: (section: Section) => void;
+  onToggleMenu: () => void;
+}) {
+  const canonical = canonicalNavSection(activeSection);
+  const items: Array<{ id: Section; label: string }> = [
+    { id: 'dashboard', label: 'Home' },
+    { id: 'visitors', label: 'Visitors' },
+    role === 'cashier' ? { id: 'cards', label: 'Cards' } : { id: 'events', label: 'Gates' },
+    role === 'manager' || role === 'security' ? { id: 'residents', label: 'People' } : { id: 'bills', label: 'Bills' },
+  ];
+  return (
+    <nav className="mobile-bottom-nav no-print" aria-label="Quick mobile navigation">
+      {items.map((item) => {
+        const isActive = !menuOpen && canonical === canonicalNavSection(item.id);
+        return (
+          <button
+            key={item.id}
+            type="button"
+            className={isActive ? 'mobile-bottom-item active' : 'mobile-bottom-item'}
+            onClick={() => onNavigate(item.id)}
+          >
+            <span className="mobile-bottom-icon">{navIcon(item.id)}</span>
+            <span className="mobile-bottom-label">{item.label}</span>
+          </button>
+        );
+      })}
+      <button
+        type="button"
+        className={menuOpen ? 'mobile-bottom-item active' : 'mobile-bottom-item'}
+        onClick={onToggleMenu}
+        aria-expanded={menuOpen}
+      >
+        <span className="mobile-bottom-icon">☰</span>
+        <span className="mobile-bottom-label">Menus</span>
+      </button>
+    </nav>
+  );
+}
+
 function App() {
-  const [user, setUser] = useState<User | null>(null);
-  const [gate, setGate] = useState<Row | null>(null);
+  const cachedSession = useMemo(() => readCachedSession(), []);
+  const [user, setUser] = useState<User | null>(() => cachedSession?.user ?? null);
+  const [gate, setGate] = useState<Row | null>(() => cachedSession?.gate ?? null);
   const [switchingGate, setSwitchingGate] = useState(false);
   const [section, setSection] = useState<Section>('dashboard');
-  const [checking, setChecking] = useState(true);
+  const [checking, setChecking] = useState<boolean>(() => !cachedSession?.user);
   const [menuOpen, setMenuOpen] = useState(false);
   const [popupNotices, setPopupNotices] = useState<Row[]>([]);
-  const [portalConfig,setPortalConfig]=useState<PortalConfig>(defaultPortalConfig);
+  const [portalConfig, setPortalConfig] = useState<PortalConfig>(() => {
+    const initial = readCachedPortalConfig();
+    applyPortalTheme(initial);
+    return initial;
+  });
+
+  const navigateTo = useCallback((nextSection: Section) => {
+    setSection(nextSection);
+    setMenuOpen(false);
+    try { window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior }); } catch { window.scrollTo(0, 0); }
+  }, []);
 
   useEffect(() => {
-    api<PortalConfig>('/api/portal-config').then((value) => { const merged={ ...defaultPortalConfig,...value };setPortalConfig(merged);applyPortalTheme(merged); }).catch(() => applyPortalTheme(defaultPortalConfig));
+    api<PortalConfig>('/api/portal-config')
+      .then((value) => {
+        const merged = { ...defaultPortalConfig, ...value };
+        if (merged.portal_name === 'EstateMate') merged.portal_name = 'Sornix EstateOS';
+        if (merged.estate_name === 'EstateMate Estate') merged.estate_name = 'Sornix Estate';
+        if (merged.portal_short_name === 'EM') merged.portal_short_name = 'SE';
+        setPortalConfig(merged);
+        writeCachedPortalConfig(merged);
+        applyPortalTheme(merged);
+        document.title = merged.portal_name || 'Sornix EstateOS';
+      })
+      .catch(() => applyPortalTheme(portalConfig));
     // A refreshed Security session keeps its selected gate because the gate is a
     // claim on the session token, echoed back here.
-    api<{ user: User; gate?: Row | null }>('/api/auth/me').then((result) => { setUser(result.user); setGate(result.gate ?? null); }).catch(() => setUser(null)).finally(() => setChecking(false));
+    api<{ user: User; gate?: Row | null }>('/api/auth/me')
+      .then((result) => {
+        setUser(result.user);
+        setGate(result.gate ?? null);
+        writeCachedSession(result.user, result.gate ?? null);
+      })
+      .catch(() => {
+        setUser(null);
+        setGate(null);
+        writeCachedSession(null);
+      })
+      .finally(() => setChecking(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -427,15 +624,20 @@ function App() {
     api<{ openMaintenance?: { count: number } }>('/api/dashboard')
       .then((res) => setOpenMaintCount(Number(res.openMaintenance?.count ?? 0)))
       .catch(() => {});
-  }, [user?.id, isOperator, section]);
+  }, [user?.id, isOperator]);
 
   async function logout() {
-    await api('/api/auth/logout', { method: 'POST' });
-    setUser(null);
-    setGate(null);
-    setSwitchingGate(false);
-    setSection('dashboard');
-    setMenuOpen(false);
+    try {
+      await api('/api/auth/logout', { method: 'POST' });
+    } finally {
+      clearApiCache();
+      writeCachedSession(null);
+      setUser(null);
+      setGate(null);
+      setSwitchingGate(false);
+      setSection('dashboard');
+      setMenuOpen(false);
+    }
   }
 
   async function acknowledgePopup() {
@@ -447,17 +649,18 @@ function App() {
   }
 
   if (checking) return <div className="splash"><div className="brand-mark">{portalConfig.portal_short_name}</div><span>Loading {portalConfig.portal_name}…</span></div>;
-  if (!user) return <Login config={portalConfig} onLogin={(nextUser, nextGate) => { setUser(nextUser); setGate(nextGate ?? null); }} />;
+  if (!user) return <Login config={portalConfig} onLogin={(nextUser, nextGate) => { setUser(nextUser); setGate(nextGate ?? null); writeCachedSession(nextUser, nextGate ?? null); }} />;
 
   const visibleGroups: NavGroup[] = navGroups
     .map((g) => ({ ...g, items: g.items.filter((item) => !item.roles || item.roles.includes(user.role)) }))
     .filter((g) => g.items.length > 0);
   const flatAvailable = visibleGroups.flatMap((g) => g.items);
-  const current = flatAvailable.find((item) => item.id === section) ?? flatAvailable[0]!;
+  const parentNavId = canonicalNavSection(section);
+  const current = flatAvailable.find((item) => item.id === parentNavId) ?? flatAvailable[0]!;
 
   return <div className="app-shell">
     <aside className={menuOpen ? 'sidebar open' : 'sidebar'}>
-      <header className="side-brand"><span className="mini-logo">{portalConfig.portal_short_name}</span><strong>{portalConfig.portal_name}</strong><button className="icon-button close-menu" onClick={() => setMenuOpen(false)}>×</button></header>
+      <header className="side-brand"><span className="mini-logo">{portalConfig.portal_short_name}</span><strong>{portalConfig.portal_name}</strong><button className="icon-button close-menu" aria-label="Close navigation menu" onClick={() => setMenuOpen(false)}>×</button></header>
       <nav className="nav-groups">
         {visibleGroups.map((group) => (
           <section className="nav-group" key={group.id}>
@@ -467,7 +670,7 @@ function App() {
                 <button
                   key={item.id}
                   className={current.id === item.id ? 'nav-active' : ''}
-                  onClick={() => { setSection(item.id); setMenuOpen(false); }}
+                  onClick={() => navigateTo(item.id)}
                   title={item.label}
                 >
                   <span className="nav-icon">{navIcon(item.id)}</span>
@@ -479,44 +682,142 @@ function App() {
           </section>
         ))}
       </nav>
-      <footer className="user-card"><span className="avatar">{initials(user.name)}</span><span><strong>{user.name}</strong><small>{user.role}</small></span><button className="icon-button" title="Sign out" onClick={logout}>↗</button></footer>
+      <footer className="user-card">
+        <span className="avatar">{initials(user.name)}</span>
+        <span className="user-card-meta"><strong>{user.name}</strong><small>{user.role}</small></span>
+        <button type="button" className="logout-button" title="Log out of your account" onClick={logout}>
+          <span aria-hidden="true">↪</span>
+          <span>Log out</span>
+        </button>
+      </footer>
     </aside>
     {menuOpen && <button className="scrim" aria-label="Close menu" onClick={() => setMenuOpen(false)} />}
     <main className="workspace">
-      <header className="topbar"><button className="icon-button mobile-menu" onClick={() => setMenuOpen(true)}>☰</button><div><p className="eyebrow">{user.role} workspace</p><h1>{current.label}</h1></div>
-        {user.role === 'security' && gate && <button type="button" className="gate-chip" title="Change the gate you are posted at" onClick={() => setSwitchingGate(true)}>🚪 {String(gate.gate_name || gate.name)}<span>switch</span></button>}
-        <div className="top-status"><span className="pulse-dot" /> System online</div></header>
-      <div className="content"><SectionView section={current.id} user={user} config={portalConfig} gate={gate} onNavigate={setSection} /><PortalFooter portalName={portalConfig.portal_name} /></div>
+      <header className="topbar">
+        <button className="icon-button mobile-menu" aria-label="Open menu" onClick={() => setMenuOpen(true)}>☰</button>
+        <div className="topbar-title"><p className="eyebrow">{user.role} workspace</p><h1>{current.label}</h1></div>
+        <div className="topbar-actions">
+          {user.role === 'security' && gate && <button type="button" className="gate-chip" title="Change the gate you are posted at" onClick={() => setSwitchingGate(true)}>🚪 {String(gate.gate_name || gate.name)}<span>switch</span></button>}
+          <div className="top-status"><span className="pulse-dot" /> <span className="status-text">System online</span></div>
+          <button type="button" className="topbar-logout" title="Log out of your account" onClick={logout}>
+            <span aria-hidden="true">↪</span>
+            <span>Log out</span>
+          </button>
+        </div>
+      </header>
+      <div className="content"><SectionView section={section} user={user} config={portalConfig} gate={gate} onNavigate={navigateTo} /><PortalFooter portalName={portalConfig.portal_name} /></div>
     </main>
+    <MobileBottomNav role={user.role} activeSection={section} menuOpen={menuOpen} onNavigate={navigateTo} onToggleMenu={() => setMenuOpen((open) => !open)} />
     {popupNotices[0] && <EstateNoticePopup notice={popupNotices[0]} remaining={popupNotices.length - 1} onAcknowledge={acknowledgePopup} />}
-    {switchingGate && <SwitchGateDialog current={gate} onSwitched={(next) => { setGate(next); setSwitchingGate(false); setSection('dashboard'); }} onClose={() => setSwitchingGate(false)} />}
+    {switchingGate && <SwitchGateDialog current={gate} onSwitched={(next) => { setGate(next); writeCachedSession(user, next); setSwitchingGate(false); navigateTo('dashboard'); }} onClose={() => setSwitchingGate(false)} />}
   </div>;
 }
 
+const CARDS_AND_SYNC_TABS: HubTab[] = [
+  { id: 'cards', label: 'Cards & fingerprints', roles: ['admin', 'manager', 'cashier', 'resident'] },
+  { id: 'sync', label: 'Person sync to terminals', roles: ['admin', 'manager'] },
+];
+
+const TERMINALS_AND_BRIDGE_TABS: HubTab[] = [
+  { id: 'devices', label: 'Terminals & devices', roles: ['admin', 'manager', 'security'] },
+  { id: 'isapi', label: 'Device agent & controllers', roles: ['admin', 'manager'] },
+  { id: 'operations', label: 'Hardware actions queue', roles: ['admin', 'manager'] },
+  { id: 'remote', label: 'Remote door control', roles: ['admin'] },
+];
+
+const RESIDENTS_AND_HOUSEHOLDS_TABS: HubTab[] = [
+  { id: 'residents', label: 'People & accounts', roles: ['admin', 'manager', 'cashier', 'security'] },
+  { id: 'residency', label: 'Tenancy & household', roles: ['admin', 'manager', 'resident'] },
+  { id: 'dependants', label: 'Dependants roster', roles: ['admin', 'manager', 'cashier', 'resident'] },
+];
+
+const MAINTENANCE_AND_BOOKINGS_TABS: HubTab[] = [
+  { id: 'maintenance', label: 'Maintenance & service', roles: ['admin', 'manager', 'resident'] },
+  { id: 'bookings', label: 'Facility bookings', roles: ['admin', 'manager', 'cashier', 'security', 'resident'] },
+];
+
+const COMMUNITY_AND_DOCS_TABS: HubTab[] = [
+  { id: 'notices', label: 'Estate notices' },
+  { id: 'emergency', label: 'Emergency contacts' },
+  { id: 'information', label: 'Information hub' },
+  { id: 'legal', label: 'Legal & governance' },
+];
+
+const SETTINGS_AND_IMPORTS_TABS: HubTab[] = [
+  { id: 'settings', label: 'Portal & estate settings', roles: ['admin'] },
+  { id: 'imports', label: 'CSV import centre', roles: ['admin', 'manager'] },
+];
+
 function SectionView({ section, user, config, gate, onNavigate }: { section: Section; user: User; config: PortalConfig; gate: Row | null; onNavigate?: (s: Section) => void }) {
+  const select = onNavigate ?? (() => {});
   switch (section) {
     case 'dashboard': return <Dashboard user={user} config={config} gate={gate} onNavigate={onNavigate} />;
-    case 'residents': return <People user={user} />;
-    case 'properties': return <Properties user={user} />;
-    case 'residency': return <Residency user={user} />;
-    case 'imports': return <ImportCentre />;
-    case 'bills': return <Bills user={user} />;
-    case 'visitors': return <Visitors user={user} />;
-    case 'maintenance': return <Maintenance user={user} />;
-    case 'notices': return <EstateNotices user={user} />;
-    case 'cards': return <Cards user={user} />;
+    case 'visitors': return <Visitors user={user} config={config} />;
     case 'events': return <AccessEvents user={user} />;
-    case 'devices': return <Devices user={user} />;
-    case 'remote': return <RemoteAccess onNavigate={onNavigate} />;
-    case 'sync': return <PersonSync />;
-    case 'isapi': return <IsapiBridge user={user} />;
-    case 'operations': return <Operations />;
-    case 'settings': return <Settings />;
-    // New module pages (placeholder/information surfaces; backend wiring to follow):
-    case 'dependants': return <DependantsManager user={user} onNavigate={onNavigate} />;
+    case 'cards':
+    case 'sync': {
+      const resolved = resolveHubSection(CARDS_AND_SYNC_TABS, section, user.role);
+      return <>
+        <HubSubtabs tabs={CARDS_AND_SYNC_TABS} active={resolved} role={user.role} onSelect={select} />
+        {resolved === 'sync' ? <PersonSync /> : <Cards user={user} />}
+      </>;
+    }
+    case 'devices':
+    case 'isapi':
+    case 'operations':
+    case 'remote': {
+      const resolved = resolveHubSection(TERMINALS_AND_BRIDGE_TABS, section, user.role);
+      return <>
+        <HubSubtabs tabs={TERMINALS_AND_BRIDGE_TABS} active={resolved} role={user.role} onSelect={select} />
+        {resolved === 'isapi' ? <IsapiBridge user={user} />
+          : resolved === 'operations' ? <Operations />
+          : resolved === 'remote' ? <RemoteAccess onNavigate={onNavigate} />
+          : <Devices user={user} />}
+      </>;
+    }
+    case 'residents':
+    case 'residency':
+    case 'dependants': {
+      const resolved = resolveHubSection(RESIDENTS_AND_HOUSEHOLDS_TABS, section, user.role);
+      return <>
+        <HubSubtabs tabs={RESIDENTS_AND_HOUSEHOLDS_TABS} active={resolved} role={user.role} onSelect={select} />
+        {resolved === 'residency' ? <Residency user={user} />
+          : resolved === 'dependants' ? <DependantsManager user={user} onNavigate={onNavigate} />
+          : <People user={user} />}
+      </>;
+    }
     case 'staff': return <StaffManagement user={user} />;
-    case 'emergency': return <EmergencyContacts user={user} />;
-    case 'information': return <InformationHub user={user} onNavigate={onNavigate} />;
+    case 'properties': return <Properties user={user} />;
+    case 'bills': return <Bills user={user} />;
+    case 'maintenance':
+    case 'bookings': {
+      const resolved = resolveHubSection(MAINTENANCE_AND_BOOKINGS_TABS, section, user.role);
+      return <>
+        <HubSubtabs tabs={MAINTENANCE_AND_BOOKINGS_TABS} active={resolved} role={user.role} onSelect={select} />
+        {resolved === 'bookings' ? <FacilityBookings user={user} /> : <Maintenance user={user} />}
+      </>;
+    }
+    case 'notices':
+    case 'emergency':
+    case 'information':
+    case 'legal': {
+      const resolved = resolveHubSection(COMMUNITY_AND_DOCS_TABS, section, user.role);
+      return <>
+        <HubSubtabs tabs={COMMUNITY_AND_DOCS_TABS} active={resolved} role={user.role} onSelect={select} />
+        {resolved === 'emergency' ? <EmergencyContacts user={user} />
+          : resolved === 'information' ? <InformationHub user={user} onNavigate={onNavigate} />
+          : resolved === 'legal' ? <LegalGovernance user={user} />
+          : <EstateNotices user={user} />}
+      </>;
+    }
+    case 'settings':
+    case 'imports': {
+      const resolved = resolveHubSection(SETTINGS_AND_IMPORTS_TABS, section, user.role);
+      return <>
+        <HubSubtabs tabs={SETTINGS_AND_IMPORTS_TABS} active={resolved} role={user.role} onSelect={select} />
+        {resolved === 'imports' ? <ImportCentre /> : <Settings />}
+      </>;
+    }
   }
 }
 
@@ -554,7 +855,7 @@ function AccessTerminationGuide({ onNavigate }: { onNavigate?: (s: Section) => v
 }
 
 function Dashboard({ user, config, gate, onNavigate }: { user: User; config: PortalConfig; gate: Row | null; onNavigate?: (s: Section) => void }) {
-  const { data, error, loading } = useAsync<Row>(() => api('/api/dashboard'), [user.id]);
+  const { data, error, loading } = useAsync<Row>(() => api('/api/dashboard'), [user.id], '/api/dashboard');
   if (loading) return <Loading />;
   if (error) return <Notice tone="error">{error}</Notice>;
   const isOperator = user.role === 'admin' || user.role === 'manager';
@@ -589,7 +890,7 @@ function Dashboard({ user, config, gate, onNavigate }: { user: User; config: Por
         <h2>Welcome, {user.name.split(' ')[0]}.</h2>
         {image && config.portal_gate_image_caption && <p className="gate-image-caption">{config.portal_gate_image_caption}</p>}
       </div>
-      <div className="hero-orb"><span>{config.portal_short_name || 'EM'}</span></div>
+      <div className="hero-orb"><span>{config.portal_short_name || 'SE'}</span></div>
     </section>
     <section className="stat-grid">{cards.map(([label, value, detail]) => <article className="stat-card" key={String(label)}><p>{label}</p><strong>{String(value ?? 0)}</strong><small>{detail}</small></article>)}</section>
 
@@ -656,7 +957,7 @@ function People({ user }: { user: User }) {
     catch(reason){setMessage(reason instanceof Error?reason.message:'Account status update failed');}
   }
   async function remove(row:Row) {
-    if(!confirm(`Delete ${String(row.name)}? EstateMate uses a safe soft delete so billing, access and audit history remains.`))return;
+    if(!confirm(`Delete ${String(row.name)}? Sornix EstateOS uses a safe soft delete so billing, access and audit history remains.`))return;
     try { await api(`/api/users/${row.id}`,{ method:'DELETE' });setMessage('Account deleted safely; historical records were preserved.');refresh(); }
     catch(reason){setMessage(reason instanceof Error?reason.message:'Could not delete account');}
   }
@@ -703,7 +1004,7 @@ function UserAccountForm({ actorRole,user,properties,onDone,onCancel }: { actorR
   }
   return <FormCard title={user?`Edit ${String(user.name)}`:'New account'} onSubmit={submit} message={message}>
     <label>Name<input name="name" defaultValue={String(user?.name ?? '')} required /></label><label>Email<input name="email" type="email" defaultValue={String(user?.email ?? '')} required /></label><label>Phone<input name="phone" defaultValue={String(user?.phone ?? '')} /></label>
-    <label>Employee ID<input name="employeeId" defaultValue={existingEmployeeId} maxLength={hasLegacyEmployeeId?existingEmployeeId.length:30} pattern={hasLegacyEmployeeId?'[A-Za-z0-9]{1,32}':'[A-Za-z0-9]{1,30}'} placeholder="Auto-generated" /><small>{hasLegacyEmployeeId?'This existing ID is over the new 30-character limit and will be kept unless replaced. New IDs must use letters and numbers only, up to 30 characters.':'Letters and numbers only, up to 30 characters. Leave blank on a new account and EstateMate generates an ID.'}</small></label>
+    <label>Employee ID<input name="employeeId" defaultValue={existingEmployeeId} maxLength={hasLegacyEmployeeId?existingEmployeeId.length:30} pattern={hasLegacyEmployeeId?'[A-Za-z0-9]{1,32}':'[A-Za-z0-9]{1,30}'} placeholder="Auto-generated" /><small>{hasLegacyEmployeeId?'This existing ID is over the new 30-character limit and will be kept unless replaced. New IDs must use letters and numbers only, up to 30 characters.':'Letters and numbers only, up to 30 characters. Leave blank on a new account and Sornix EstateOS generates an ID.'}</small></label>
     <label>Role<select name="role" value={role} onChange={(event)=>setRole(event.target.value)}><option value="resident">Resident</option><option value="security">Security</option><option value="cashier">Cashier</option>{actorRole==='admin'&&<><option value="manager">Manager</option><option value="admin">Administrator</option></>}</select></label>
     {user&&<label>Status<select name="status" defaultValue={String(user.status ?? 'active')}><option value="active">Active</option><option value="inactive">Inactive</option></select></label>}
     {role==='resident'&&<label>{user?'Assign another available property (optional)':'Available property (optional)'}<select name="propertyId"><option value="">No property assignment</option>{properties.map((property)=><option key={String(property.id)} value={String(property.id)}>{String(property.unit_number)} — {String(property.street)} — {String(property.address)}</option>)}</select><small>Only properties without an approved owner are listed. Existing ownership is not replaced.</small></label>}
@@ -743,7 +1044,7 @@ function PeopleBulkTools({ onDone }: { onDone:()=>void }) {
   }
   async function bulkDelete() {
     const ids=parseIds(deleteIds);if(!ids.length){setOtherResult('Paste at least one Employee ID to delete.');return;}
-    if(!confirm(`Delete ${ids.length} person(s)? EstateMate uses a safe soft delete: access stops everywhere, history is preserved.`))return;
+    if(!confirm(`Delete ${ids.length} person(s)? Sornix EstateOS uses a safe soft delete: access stops everywhere, history is preserved.`))return;
     setBusy(true);setOtherResult('');
     try {
       const response=await api<{ totalRows:number;successfulRows:number;errorRows:number;errors:Array<{row:number;error:string}>;notice:string }>('/api/people/bulk-delete',{method:'POST',body:JSON.stringify({confirm:'DELETE_PEOPLE',employeeIds:ids})});
@@ -785,7 +1086,7 @@ function UsersCsvImporter({ onDone }: { onDone:()=>void }) {
     catch(reason){setResult(reason instanceof Error?reason.message:'User import failed');}
     finally{setBusy(false);}
   }
-  return <form className="form-card import-card" onSubmit={upload}><h3>Bulk user registration</h3><p>Upload up to 25 residents or staff per CSV. Use an available property unit number only for residents. Passwords are generated and returned once; they are never stored in the archived source CSV.</p><input name="file" type="file" accept=".csv,text/csv" required /><div className="row-actions"><button type="button" className="secondary" onClick={()=>download('users-import-template.csv',template)}>Download template</button><button className="primary" disabled={busy}>{busy?'Importing…':'Upload users'}</button>{credentials.length>0&&<button type="button" className="secondary" onClick={downloadCredentials}>Download temporary passwords</button>}</div>{result&&<Notice tone={result.includes('0 row error')?'success':'warning'}>{result}</Notice>}{credentials.length>0&&<Notice tone="warning">Download the temporary-password file now. EstateMate will not show these generated passwords again.</Notice>}</form>;
+  return <form className="form-card import-card" onSubmit={upload}><h3>Bulk user registration</h3><p>Upload up to 25 residents or staff per CSV. Use an available property unit number only for residents. Passwords are generated and returned once; they are never stored in the archived source CSV.</p><input name="file" type="file" accept=".csv,text/csv" required /><div className="row-actions"><button type="button" className="secondary" onClick={()=>download('users-import-template.csv',template)}>Download template</button><button className="primary" disabled={busy}>{busy?'Importing…':'Upload users'}</button>{credentials.length>0&&<button type="button" className="secondary" onClick={downloadCredentials}>Download temporary passwords</button>}</div>{result&&<Notice tone={result.includes('0 row error')?'success':'warning'}>{result}</Notice>}{credentials.length>0&&<Notice tone="warning">Download the temporary-password file now. Sornix EstateOS will not show these generated passwords again.</Notice>}</form>;
 }
 
 function Properties({ user }: { user: User }) {
@@ -1178,6 +1479,11 @@ function VisitorPass({ pass,onClose,branding }: { pass:Row;onClose:()=>void;bran
   const [qr,setQr]=useState('');const barcode=useRef<SVGSVGElement>(null);
   const [shareState,setShareState]=useState('');
   const credential=String(pass.credential_number ?? pass.credentialNumber ?? pass.pin ?? '');
+  useEffect(()=>{
+    const onKeyDown=(event:KeyboardEvent)=>{ if(event.key==='Escape') onClose(); };
+    window.addEventListener('keydown',onKeyDown);
+    return ()=>window.removeEventListener('keydown',onKeyDown);
+  },[onClose]);
   useEffect(()=>{ if (!credential) return;let cancelled=false;Promise.all([import('qrcode'),import('jsbarcode')]).then(([qrModule,barcodeModule])=>{if(cancelled)return;qrModule.default.toDataURL(credential,{ width:280,margin:2,errorCorrectionLevel:'M' }).then((value)=>!cancelled&&setQr(value));if(barcode.current)barcodeModule.default(barcode.current,credential,{ format:'CODE128',displayValue:true,fontSize:16,height:64,margin:8 });});return()=>{cancelled=true;}; },[credential]);
   const host=String(pass.resident_name ?? pass.residentName ?? 'Estate resident');
   const propertyText=`${String(pass.unit_number ?? pass.propertyId ?? 'Selected property')}${pass.street?` — ${String(pass.street)}`:''}`;
@@ -1209,33 +1515,68 @@ function VisitorPass({ pass,onClose,branding }: { pass:Row;onClose:()=>void;bran
     } catch(reason) { setShareState(reason instanceof Error?reason.message:'Could not prepare the pass file'); }
   }
 
-  return <div className="modal-backdrop" role="dialog" aria-modal="true" onClick={onClose}><section className="notice-modal visitor-pass-modal" onClick={(event)=>event.stopPropagation()}><div className="pass-topbar no-print"><span>Visitor pass</span><button type="button" className="pass-close" aria-label="Close visitor pass" onClick={onClose}>×</button></div><div className="visitor-pass printable-pass"><p className="eyebrow">ESTATE VISITOR PASS</p><h2>{String(pass.visitor_name ?? pass.visitorName ?? 'Visitor')}</h2><p>Host: <strong>{host}</strong></p><p>Property: <strong>{propertyText}</strong></p>{qr&&<img className="pass-qr" src={qr} alt={`Visitor QR ${credential}`} />}<svg className="pass-barcode" ref={barcode} /><strong className="credential-number">{credential}</strong><small>Unique visitor number</small>{Boolean(pass.pin)&&<p className="pass-pin">Keypad PIN: <strong>{String(pass.pin)}</strong></p>}<div className="pass-dates"><span>From {readableDate(pass.valid_from ?? pass.validFrom)}</span><span>Until {readableDate(pass.valid_until ?? pass.validUntil)}</span></div>{Boolean(purposeText)&&<p className="pass-purpose">Purpose of visit: <strong>{purposeText}</strong></p>}{Boolean(remarkText)&&<p className="pass-remark">Remark: {remarkText}</p>}<p className="pass-visits">{visitsText}</p><p className="pass-gates">{gateText}</p><p className="pass-policy">Security must scan and review this pass before accepting entry. Device recognition requires a compatible, configured reader.</p></div>{shareState&&<p className="share-status no-print">{shareState}</p>}<div className="row-actions no-print pass-footer"><button className="primary" onClick={()=>window.print()}>Print pass</button><button className="secondary" onClick={()=>share('image')}>Share as image</button><button className="secondary" onClick={()=>share('pdf')}>Share as PDF</button><button className="secondary" onClick={onClose}>Close pass</button></div></section></div>;
+  return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="Visitor pass" onClick={onClose}>
+    <section className="notice-modal visitor-pass-modal" onClick={(event)=>event.stopPropagation()}>
+      <div className="pass-topbar no-print">
+        <span className="pass-topbar-label">Visitor pass generated</span>
+        <button type="button" className="pass-close-pill" aria-label="Close visitor pass" onClick={onClose}>
+          <span aria-hidden="true">✕</span>
+          <span>Close pass</span>
+        </button>
+      </div>
+      <div className="visitor-pass printable-pass">
+        <p className="eyebrow">ESTATE VISITOR PASS</p>
+        <h2>{String(pass.visitor_name ?? pass.visitorName ?? 'Visitor')}</h2>
+        <p>Host: <strong>{host}</strong></p>
+        <p>Property: <strong>{propertyText}</strong></p>
+        {qr&&<img className="pass-qr" src={qr} alt={`Visitor QR ${credential}`} />}
+        <svg className="pass-barcode" ref={barcode} />
+        <strong className="credential-number">{credential}</strong>
+        <small>Unique visitor number</small>
+        {Boolean(pass.pin)&&<p className="pass-pin">Keypad PIN: <strong>{String(pass.pin)}</strong></p>}
+        <div className="pass-dates"><span>From {readableDate(pass.valid_from ?? pass.validFrom)}</span><span>Until {readableDate(pass.valid_until ?? pass.validUntil)}</span></div>
+        {Boolean(purposeText)&&<p className="pass-purpose">Purpose of visit: <strong>{purposeText}</strong></p>}
+        {Boolean(remarkText)&&<p className="pass-remark">Remark: {remarkText}</p>}
+        <p className="pass-visits">{visitsText}</p>
+        <p className="pass-gates">{gateText}</p>
+        <p className="pass-policy">Security must scan and review this pass before accepting entry. Device recognition requires a compatible, configured reader.</p>
+      </div>
+      {shareState&&<p className="share-status no-print">{shareState}</p>}
+      <div className="no-print pass-footer">
+        <div className="pass-share-row">
+          <button type="button" className="secondary" onClick={()=>share('image')}>📤 Share image</button>
+          <button type="button" className="secondary" onClick={()=>share('pdf')}>📄 Share PDF</button>
+          <button type="button" className="secondary" onClick={()=>window.print()}>🖨️ Print</button>
+        </div>
+        <button type="button" className="primary wide pass-done-btn" onClick={onClose}>✕ Done — Close Visitor Pass</button>
+      </div>
+    </section>
+  </div>;
 }
 
-function Visitors({ user }: { user: User }) {
+function Visitors({ user, config }: { user: User; config?: PortalConfig }) {
   const list = useList('/api/visitors?limit=50');
   const properties = useList('/api/properties?limit=100');
-  const devices=useAsync<{ items:Row[] }>(()=>api('/api/access/device-options'),[]);
-  const portal=useAsync<PortalConfig>(()=>api('/api/portal-config'),[]);
+  const devices=useAsync<{ items:Row[] }>(()=>api('/api/access/device-options'),[], '/api/access/device-options');
+  const portalData = config ?? defaultPortalConfig;
   const defaultStart=useMemo(()=>new Date(),[]);
   // Validity period: the estate's default window in whole days, never longer
   // than the maximum an administrator set. Changing "valid from" or the number
   // of days moves "valid until" with it; the officer can still fine-tune the
   // end by hand.
-  const validity=visitorValidityDays(portal.data);
+  const validity=visitorValidityDays(portalData);
   const [fromValue,setFromValue]=useState(localDateTime(defaultStart));
   const [validityDays,setValidityDays]=useState(VISITOR_DEFAULT_VALIDITY_DAYS);
   const [untilValue,setUntilValue]=useState(localDateTime(new Date(defaultStart.valueOf()+VISITOR_DEFAULT_VALIDITY_DAYS*DAY_MS)));
   const [purpose,setPurpose]=useState('');
   const settingsApplied=useRef(false);
   useEffect(()=>{
-    if (!portal.data) return;
-    const allowed=visitorValidityDays(portal.data);
+    const allowed=visitorValidityDays(portalData);
     // Only the first load plants the estate's default; after that the officer's
     // choice wins, clamped to a maximum that may have been lowered since.
     setValidityDays((days)=>settingsApplied.current?Math.min(days,allowed.maxDays):allowed.defaultDays);
     settingsApplied.current=true;
-  },[portal.data]);
+  },[portalData]);
   useEffect(()=>{
     const start=new Date(fromValue);
     if (Number.isNaN(start.valueOf())) return;
@@ -1358,7 +1699,7 @@ function Visitors({ user }: { user: User }) {
         <small>How many times this pass may be used at the gate.</small>
       </label>
       {(user.role==='admin'||user.role==='manager')&&<label>Person type on the terminals
-        <select name="personType" defaultValue={portal.data?.visitor_person_type||'visitor'}>
+        <select name="personType" defaultValue={portalData.visitor_person_type||'visitor'}>
           {VISITOR_PERSON_TYPE_CHOICES.map(([id,label])=><option key={id} value={id}>{label}</option>)}
         </select>
         <small>Visitor is the right type for a temporary account. Choose Normal user only if a terminal rejects the visitor type.</small>
@@ -1386,7 +1727,7 @@ function Visitors({ user }: { user: User }) {
       </div>
     )}
     <ListState list={list}><DataTable exportTitle="Visitor Passes" rows={(list.data?.items ?? []).map((row)=>({ ...row,gates:String(row.gate_scope ?? 'both')==='gate'?'Selected gate only':'Every gate, entry and exit',purpose:visitorPurposeLabel(row.purpose_of_visit,row.purpose_of_visit_other) || '—',visits:`${Number(row.visits_used ?? 0)} of ${Number(row.visit_times ?? 1)}`,person_type:visitorPersonTypeLabel(row.person_type) }))} columns={[['visitor_name','Visitor'],['resident_name','Resident'],['unit_number','Unit'],['purpose','Purpose of visit'],['visits','Visits used'],['credential_number','Unique number'],...(staff?[['gates','Gates'],['person_type','Person type'],['device_name','Preferred device'],['device_account_state','Device account']] as Column[]:[]),['status','Status'],['valid_until','Valid until','date']]} action={(row)=><div className="row-actions"><button className="text" onClick={()=>setSelectedPass(row)}>View pass</button><EvidenceButton entityType="visitor_request" entityId={row.id} count={row.proof_count} /></div>} /></ListState>
-    {selectedPass&&<VisitorPass pass={selectedPass} onClose={()=>setSelectedPass(null)} branding={{ portalName:portal.data?.portal_name||'EstateMate',shortName:portal.data?.portal_short_name||'EM' }} />}
+    {selectedPass&&<VisitorPass pass={selectedPass} onClose={()=>setSelectedPass(null)} branding={{ portalName:portalData.portal_name||'Sornix EstateOS',shortName:portalData.portal_short_name||'SE' }} />}
   </PagePanel>;
 }
 
@@ -2538,7 +2879,7 @@ function PersonSync() {
   return <PagePanel title="Person sync" subtitle="Keep every person, card and fingerprint in step with every access-control terminal" action={<div className="row-actions"><button className="secondary" onClick={overview.reload}>Refresh</button><button className="primary" onClick={syncAll} disabled={busy === 'all'}>{busy === 'all' ? 'Synchronising…' : 'Synchronise everyone'}</button></div>}>
     {copyNotice && <Notice tone="info">{copyNotice}</Notice>}
     {message && <Notice tone={/failed|error|without an employee/i.test(message) ? 'warning' : 'success'}>{message}</Notice>}
-    <Notice tone="info">EstateMate writes the <strong>person record</strong> to a terminal before the card, because a card filed against a person the terminal has never seen is stored but cannot open the door. Edits to a name or Employee ID, and every new card or fingerprint, are pushed automatically. A terminal with no bridge is listed here as a task for an operator instead of a silent failure.</Notice>
+    <Notice tone="info">Sornix EstateOS writes the <strong>person record</strong> to a terminal before the card, because a card filed against a person the terminal has never seen is stored but cannot open the door. Edits to a name or Employee ID, and every new card or fingerprint, are pushed automatically. A terminal with no bridge is listed here as a task for an operator instead of a silent failure.</Notice>
     {totals && <div className="stat-row"><div className="stat-card"><span className="eyebrow">PEOPLE</span><strong>{totals.people}</strong></div><div className="stat-card"><span className="eyebrow">TERMINALS</span><strong>{totals.terminals}</strong></div><div className="stat-card"><span className="eyebrow">IN STEP</span><strong>{totals.synced}</strong></div><div className="stat-card"><span className="eyebrow">PENDING</span><strong>{totals.pending}</strong></div><div className="stat-card"><span className="eyebrow">NEEDS AN OPERATOR</span><strong>{totals.manual}</strong></div><div className="stat-card"><span className="eyebrow">NOT YET SENT</span><strong>{totals.missing}</strong></div></div>}
     <h3>Terminals</h3>
     {devices.length === 0 ? <p className="presence-hint">No access-control device is configured yet. Add one under <strong>Terminals &amp; devices</strong> and connect it to a bridge.</p> : <div className="device-sync-grid">{devices.map((device) => <article key={String(device.id)} className="form-card sync-card">
@@ -2693,9 +3034,9 @@ function SecurityGateAssignments() {
 
 function Settings() {
   const list = useList('/api/settings');
-  const storage = useAsync<Row>(() => api('/api/storage-settings'), []);
-  const portal=useAsync<PortalConfig>(()=>api('/api/portal-config'),[]);
-  const channels=useAsync<PaymentChannels>(()=>api('/api/payment-channels'),[]);
+  const storage = useAsync<Row>(() => api('/api/storage-settings'), [], '/api/storage-settings');
+  const portal=useAsync<PortalConfig>(()=>api('/api/portal-config'),[], '/api/portal-config');
+  const channels=useAsync<PaymentChannels>(()=>api('/api/payment-channels'),[], '/api/payment-channels');
   const [message, setMessage] = useState('');
   const [portalMessage,setPortalMessage]=useState('');
   const [bankMessage,setBankMessage]=useState('');
@@ -2724,8 +3065,14 @@ function Settings() {
     catch (reason) { setStorageMessage(reason instanceof Error ? reason.message : 'Storage update failed'); }
   }
   async function savePortal(event:FormEvent<HTMLFormElement>) {
-    event.preventDefault();setPortalMessage('');const values=Object.fromEntries(new FormData(event.currentTarget));
-    try { await api('/api/portal-config',{ method:'PUT',body:JSON.stringify(values) });setPortalMessage('Portal customisation saved. Reloading the theme…');portal.reload();setTimeout(()=>location.reload(),700); }
+    event.preventDefault();setPortalMessage('');const values=Object.fromEntries(new FormData(event.currentTarget)) as Record<string, string>;
+    try {
+      await api('/api/portal-config',{ method:'PUT',body:JSON.stringify(values) });
+      writeCachedPortalConfig({ ...defaultPortalConfig, ...(portal.data ?? {}), ...values });
+      setPortalMessage('Portal customisation saved. Reloading the theme…');
+      portal.reload();
+      setTimeout(()=>location.reload(),500);
+    }
     catch(reason){setPortalMessage(reason instanceof Error?reason.message:'Portal customisation failed');}
   }
   async function changePassword(event: FormEvent<HTMLFormElement>) {
@@ -2755,13 +3102,13 @@ function Settings() {
       <button className="primary">Save bank account</button>
     </FormCard>}
     {portalMessage&&<Notice tone={portalMessage.includes('saved')?'success':'error'}>{portalMessage}</Notice>}
-    {portal.data&&<FormCard title="Portal identity, theme and recommended defaults" onSubmit={savePortal}><label>Portal name<input name="portal_name" defaultValue={portal.data.portal_name||'EstateMate'} required /></label><label>Estate name<input name="estate_name" defaultValue={portal.data.estate_name||'EstateMate Estate'} required /></label><label>Short mark<input name="portal_short_name" maxLength={4} defaultValue={portal.data.portal_short_name||'EM'} required /></label><label>Tagline<input name="portal_tagline" defaultValue={portal.data.portal_tagline} /></label><label className="span-2">Welcome text<textarea name="portal_welcome_text" rows={3} defaultValue={portal.data.portal_welcome_text} /></label><label>Theme mode<select name="theme_mode" defaultValue={portal.data.theme_mode||'light'}><option value="light">Light (recommended)</option><option value="dark">Dark</option><option value="system">Follow device</option></select></label><label>Corner style<select name="theme_corner_style" defaultValue={portal.data.theme_corner_style||'comfortable'}><option value="comfortable">Comfortable (recommended)</option><option value="compact">Compact</option><option value="rounded">Rounded</option></select></label><label>Primary colour<input name="theme_primary_color" type="color" defaultValue={portal.data.theme_primary_color||'#1769e0'} /></label><label>Accent colour<input name="theme_accent_color" type="color" defaultValue={portal.data.theme_accent_color||'#35d07f'} /></label><label>Navigation colour<input name="theme_navigation_color" type="color" defaultValue={portal.data.theme_navigation_color||'#0d1b37'} /></label><label>Surface colour<input name="theme_surface_color" type="color" defaultValue={portal.data.theme_surface_color||'#ffffff'} /></label><label>Support email<input name="support_email" type="email" defaultValue={portal.data.support_email} /></label><label>Support phone<input name="support_phone" defaultValue={portal.data.support_phone} /></label><label>Timezone<input name="estate_timezone" defaultValue={portal.data.estate_timezone||'Africa/Lagos'} /></label><label>Currency<input name="currency" defaultValue={portal.data.currency||'NGN'} maxLength={3} /></label><label>Default visitor validity (days)<input name="visitor_default_validity_days" type="number" min="1" max="30" defaultValue={portal.data.visitor_default_validity_days||'1'} /><small>The window the visitor form offers for a new pass.</small></label>
+    {portal.data&&<FormCard title="Portal identity, theme and recommended defaults" onSubmit={savePortal}><label>Portal name<input name="portal_name" defaultValue={portal.data.portal_name === 'EstateMate' ? 'Sornix EstateOS' : (portal.data.portal_name||'Sornix EstateOS')} required /><small>Suggested Sornix names: Sornix EstateOS, SornixGate, Sornix EstateMate, Sornix Crest, Sornix Haven</small></label><label>Estate name<input name="estate_name" defaultValue={portal.data.estate_name === 'EstateMate Estate' ? 'Sornix Estate' : (portal.data.estate_name||'Sornix Estate')} required /></label><label>Short mark<input name="portal_short_name" maxLength={4} defaultValue={portal.data.portal_short_name === 'EM' ? 'SE' : (portal.data.portal_short_name||'SE')} required /></label><label>Tagline<input name="portal_tagline" defaultValue={portal.data.portal_tagline} /></label><label className="span-2">Welcome text<textarea name="portal_welcome_text" rows={3} defaultValue={portal.data.portal_welcome_text} /></label><label>Theme mode<select name="theme_mode" defaultValue={portal.data.theme_mode||'light'}><option value="light">Light (recommended)</option><option value="dark">Dark</option><option value="system">Follow device</option></select></label><label>Corner style<select name="theme_corner_style" defaultValue={portal.data.theme_corner_style||'comfortable'}><option value="comfortable">Comfortable (recommended)</option><option value="compact">Compact</option><option value="rounded">Rounded</option></select></label><label>Primary colour<input name="theme_primary_color" type="color" defaultValue={portal.data.theme_primary_color||'#1769e0'} /></label><label>Accent colour<input name="theme_accent_color" type="color" defaultValue={portal.data.theme_accent_color||'#35d07f'} /></label><label>Navigation colour<input name="theme_navigation_color" type="color" defaultValue={portal.data.theme_navigation_color||'#0d1b37'} /></label><label>Surface colour<input name="theme_surface_color" type="color" defaultValue={portal.data.theme_surface_color||'#ffffff'} /></label><label>Support email<input name="support_email" type="email" defaultValue={portal.data.support_email} /></label><label>Support phone<input name="support_phone" defaultValue={portal.data.support_phone} /></label><label>Timezone<input name="estate_timezone" defaultValue={portal.data.estate_timezone||'Africa/Lagos'} /></label><label>Currency<input name="currency" defaultValue={portal.data.currency||'NGN'} maxLength={3} /></label><label>Default visitor validity (days)<input name="visitor_default_validity_days" type="number" min="1" max="30" defaultValue={portal.data.visitor_default_validity_days||'1'} /><small>The window the visitor form offers for a new pass.</small></label>
 <label>Maximum visitor validity (days)<input name="visitor_max_validity_days" type="number" min="1" max="30" defaultValue={portal.data.visitor_max_validity_days||'7'} /><small>The longest window anyone may request. Residents, Managers and Administrators are all held to it — raise it here when the estate needs longer passes.</small></label>
 <label>Visitor person type on terminals<select name="visitor_person_type" defaultValue={portal.data.visitor_person_type||'visitor'}>{VISITOR_PERSON_TYPE_CHOICES.map(([id,label])=><option key={id} value={id}>{label}</option>)}</select><small>How a visitor account is filed on the access-control terminals. Choose Normal user only if your terminals reject the visitor type.</small></label><label>Gate decision policy<select name="visitor_gate_policy" defaultValue="security_approval"><option value="security_approval">Show details, then Security approves (recommended)</option></select></label><label>Visitor credential format<select name="visitor_credential_format" defaultValue="qr_code128_pin"><option value="qr_code128_pin">QR + Code 128 + PIN (recommended)</option></select></label><label>Card scan timeout (minutes)<input name="card_scan_timeout_minutes" type="number" min="1" max="30" defaultValue={portal.data.card_scan_timeout_minutes||'5'} /></label><button className="primary">Save portal customisation</button></FormCard>}
     {portal.data&&<GateImageCard config={portal.data} onSaved={portal.reload} />}
     <SecurityGateAssignments />
     {storageMessage && <Notice tone={storageMessage.includes('updated') ? 'success' : 'error'}>{storageMessage}</Notice>}
-    <Notice tone="warning"><strong>Private repository required.</strong> EstateMate encrypts the GitHub token before saving it and never displays it again. Use a fine-grained token limited to this repository’s Contents permission.</Notice>
+    <Notice tone="warning"><strong>Private repository required.</strong> Sornix EstateOS encrypts the GitHub token before saving it and never displays it again. Use a fine-grained token limited to this repository’s Contents permission.</Notice>
     {storage.data && <FormCard title="Private GitHub upload storage" onSubmit={saveStorage}>
       <label className="check"><input name="enabled" type="checkbox" defaultChecked={Boolean(storage.data.enabled)} /> Enable uploads</label>
       <label>GitHub owner<input name="owner" defaultValue={String(storage.data.owner || 'Barikblog')} required /></label>
@@ -2865,7 +3212,7 @@ function FingerprintCapture({ captureId, onFinished, onCancel }: {
 }
 
 function useList(url: string) {
-  return useAsync<ListResponse<Row>>(() => api(url), [url]);
+  return useAsync<ListResponse<Row>>(() => api(url), [url], url);
 }
 
 /**
@@ -3282,6 +3629,112 @@ function InformationHub({ user, onNavigate }: { user: User; onNavigate?: (s: Sec
     ]} />
     <InformationShortcuts onNavigate={onNavigate} />
   </>;
+}
+
+function LegalGovernance({ user }: { user: User }) {
+  return <DocumentLibrary user={user} set="legal" title="Legal & governance" subtitle="Estate constitution, bylaws, board minutes, resolutions, privacy notices and regulations" categories={[
+    ['bylaw', 'Bylaw'], ['constitution', 'Constitution'], ['minutes', 'Minutes'], ['resolution', 'Resolution'], ['policy', 'Policy'], ['regulation', 'Regulation'], ['privacy', 'Privacy'],
+  ]} />;
+}
+
+function FacilityBookings({ user }: { user: User }) {
+  const canManage = user.role === 'admin' || user.role === 'manager';
+  const facilities = useList('/api/facilities');
+  const bookings = useList('/api/facility-bookings?limit=100');
+  const [showBookingForm, setShowBookingForm] = useState(false);
+  const [showFacilityForm, setShowFacilityForm] = useState(false);
+  const [message, setMessage] = useState('');
+  function refresh() { facilities.reload(); bookings.reload(); }
+  async function createFacility(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setMessage('');
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    try {
+      await api('/api/facilities', {
+        method: 'POST',
+        body: JSON.stringify({
+          ...values,
+          capacity: values.capacity ? Number(values.capacity) : 20,
+          hourlyFee: values.hourlyFee ? Number(values.hourlyFee) : 0,
+          requiresApproval: values.requiresApproval === '1',
+        }),
+      });
+      setShowFacilityForm(false);
+      setMessage('Facility added.');
+      refresh();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not add facility'); }
+  }
+  async function submitBooking(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setMessage('');
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    try {
+      await api('/api/facility-bookings', {
+        method: 'POST',
+        body: JSON.stringify({
+          ...values,
+          attendees: values.attendees ? Number(values.attendees) : 1,
+        }),
+      });
+      setShowBookingForm(false);
+      setMessage('Facility booking submitted.');
+      refresh();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not submit booking'); }
+  }
+  async function decideBooking(row: Row, action: 'approve'|'reject'|'cancel'|'complete') {
+    const note = action === 'reject' ? prompt('Reason for rejecting this booking?') : undefined;
+    if (action === 'reject' && note === null) return;
+    try {
+      await api(`/api/facility-bookings/${row.id}`, { method: 'PATCH', body: JSON.stringify({ action, reviewNote: note || undefined }) });
+      setMessage(`Booking ${action}d.`);
+      refresh();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not update booking'); }
+  }
+  return <PagePanel title="Facility bookings" subtitle="Reserve shared estate spaces — clubhouse, gym, courts, pool and meeting rooms" action={<div className="row-actions"><button className="primary" onClick={() => setShowBookingForm(!showBookingForm)}>Book a facility</button>{canManage && <button className="secondary" onClick={() => setShowFacilityForm(!showFacilityForm)}>Add facility</button>}</div>}>
+    {message && <Notice tone={/failed|Could not/i.test(message) ? 'error' : 'success'}>{message}</Notice>}
+    {showFacilityForm && canManage && <FormCard title="Add an estate facility" onSubmit={createFacility} message="">
+      <label>Facility name<input name="name" required placeholder="Estate Clubhouse Hall" /></label>
+      <label>Category<select name="category"><option value="hall">Hall / clubhouse</option><option value="court">Sports court</option><option value="gym">Gym</option><option value="pool">Swimming pool</option><option value="lounge">Lounge</option><option value="meeting_room">Meeting room</option><option value="field">Field / garden</option><option value="other">Other</option></select></label>
+      <label>Location<input name="location" placeholder="Central Park Block B" /></label>
+      <label>Capacity<input name="capacity" type="number" min="1" max="5000" defaultValue={30} /></label>
+      <label>Open from<input name="openTime" type="time" defaultValue="07:00" /></label>
+      <label>Closes at<input name="closeTime" type="time" defaultValue="21:00" /></label>
+      <label>Hourly fee<input name="hourlyFee" type="number" min="0" step="100" defaultValue={0} /></label>
+      <label>Approval policy<select name="requiresApproval" defaultValue="1"><option value="1">Manager approval required</option><option value="0">Instant confirmation</option></select></label>
+      <label className="span-2">Rules &amp; notes<input name="rules" placeholder="Noise curfews, cleaning deposit, or guest limits" /></label>
+      <div className="row-actions"><button className="primary">Save facility</button><button type="button" className="secondary" onClick={() => setShowFacilityForm(false)}>Cancel</button></div>
+    </FormCard>}
+    {showBookingForm && <FormCard title="Reserve a facility" onSubmit={submitBooking} message="">
+      <label>Facility<select name="facilityId" required><option value="">Select facility…</option>{(facilities.data?.items ?? []).filter((f) => String(f.status) === 'open').map((f) => <option key={String(f.id)} value={String(f.id)}>{String(f.name)} ({String(f.open_time)}–{String(f.close_time)})</option>)}</select></label>
+      <label>Date<input name="bookingDate" type="date" required /></label>
+      <label>Starts at<input name="startsAt" type="time" defaultValue="10:00" required /></label>
+      <label>Ends at<input name="endsAt" type="time" defaultValue="12:00" required /></label>
+      <label>Expected attendees<input name="attendees" type="number" min="1" max="5000" defaultValue={5} /></label>
+      <label>Purpose / event title<input name="purpose" required placeholder="Family birthday / tennis match / committee meeting" /></label>
+      <div className="row-actions"><button className="primary">Submit booking</button><button type="button" className="secondary" onClick={() => setShowBookingForm(false)}>Cancel</button></div>
+    </FormCard>}
+    <h3>Shared spaces</h3>
+    <ListState list={facilities}>
+      <DataTable rows={facilities.data?.items ?? []} columns={[
+        ['name', 'Facility'], ['category', 'Category'], ['location', 'Location'],
+        ['capacity', 'Capacity'], ['open_time', 'Opens'], ['close_time', 'Closes'],
+        ['hourly_fee', 'Hourly fee', 'money'], ['upcoming_bookings', 'Upcoming'], ['status', 'Status'],
+      ]} />
+    </ListState>
+    <h3>Bookings</h3>
+    <ListState list={bookings}>
+      <DataTable exportTitle="Facility Bookings" rows={bookings.data?.items ?? []} columns={[
+        ['facility_name', 'Facility'], ['booking_date', 'Date'], ['starts_at', 'From'], ['ends_at', 'To'],
+        ['resident_name', 'Booked by'], ['unit_number', 'Unit'], ['purpose', 'Purpose'],
+        ['attendees', 'Guests'], ['fee_amount', 'Fee', 'money'], ['status', 'Status'],
+      ]} action={(row) => (
+        <div className="row-actions">
+          {canManage && String(row.status) === 'pending' && <button className="text" onClick={() => decideBooking(row, 'approve')}>Approve</button>}
+          {canManage && String(row.status) === 'pending' && <button className="text danger" onClick={() => decideBooking(row, 'reject')}>Reject</button>}
+          {canManage && String(row.status) === 'approved' && <button className="text" onClick={() => decideBooking(row, 'complete')}>Complete</button>}
+          {['pending', 'approved'].includes(String(row.status)) && <button className="text danger" onClick={() => decideBooking(row, 'cancel')}>Cancel</button>}
+        </div>
+      )} />
+    </ListState>
+  </PagePanel>;
 }
 
 /** The hub's quick-route cards remain alongside the real library. */

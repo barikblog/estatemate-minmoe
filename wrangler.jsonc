@@ -39,7 +39,7 @@
   // three-trigger limit.
   "triggers": { "crons": ["15 * * * *", "* * * * *"] },
   "vars": {
-    "APP_NAME": "EstateMate",
+    "APP_NAME": "Sornix EstateOS",
     "ALLOWED_ORIGINS": "",
     "HIKVISION_MODE": "per-device",
     "FILE_STORAGE_MODE": "github-private-configurable"
@@ -50,7 +50,7 @@
   // staging resources exist; never point a PR Preview at estate production data.
   "previews": {
     "vars": {
-      "APP_NAME": "EstateMate Preview",
+      "APP_NAME": "Sornix EstateOS Preview",
       "ALLOWED_ORIGINS": "",
       "HIKVISION_MODE": "per-device",
       "FILE_STORAGE_MODE": "disabled"

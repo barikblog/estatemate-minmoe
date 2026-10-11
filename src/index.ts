@@ -606,11 +606,12 @@ app.get('/api/health', async (c) => {
 
 app.get('/api/portal-config', async (c) => {
   const placeholders = PORTAL_SETTING_KEYS.map(() => '?').join(',');
+  c.header('Cache-Control', 'public, max-age=15, stale-while-revalidate=120');
   try {
     const rows = await c.env.DB.prepare(`SELECT key,value FROM settings WHERE key IN (${placeholders})`).bind(...PORTAL_SETTING_KEYS).all<{ key:string;value:string }>();
     return c.json(Object.fromEntries(rows.results.map((row) => [row.key,row.value])));
   } catch {
-    return c.json({ portal_name:'EstateMate',estate_name:'EstateMate Estate',portal_short_name:'EM',theme_mode:'light',theme_primary_color:'#1769e0',theme_accent_color:'#35d07f',theme_navigation_color:'#0d1b37',theme_surface_color:'#ffffff' });
+    return c.json({ portal_name:'Sornix EstateOS',estate_name:'Sornix Estate',portal_short_name:'SE',theme_mode:'light',theme_primary_color:'#1769e0',theme_accent_color:'#35d07f',theme_navigation_color:'#0d1b37',theme_surface_color:'#ffffff' });
   }
 });
 
