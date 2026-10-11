@@ -1761,7 +1761,12 @@ Options:
   const state = createGateController(config, { log });
 
   if (has('--check')) {
-    state.backend.start();
+    try {
+      state.backend.start();
+    } catch (error) {
+      process.stderr.write(`The GPIO lines could not be opened: ${error.message}\n`);
+      return 1;
+    }
     state.backend.stop();
     process.stdout.write(`Configuration OK: agent ${config.agentId}, device ${config.deviceId}, ${config.gpio.backend} GPIO backend.\n`);
     return 0;
@@ -1784,7 +1789,13 @@ Options:
 
   const once = has('--once');
   log.info(`EstateMate ${config.label} ${GATE_VERSION} starting: agent ${config.agentId}, device ${config.deviceId}, door ${config.doorNo}, ${config.gpio.backend} GPIO`);
-  state.start({ immediate: false });
+  try {
+    state.start({ immediate: false });
+  } catch (error) {
+    // A gate whose lines cannot be opened must not look like a running gate.
+    log.error(`[gpio] ${error.message}`);
+    return 1;
+  }
   if (!state.controller.cache.ready) log.warn('[cache] no snapshot yet: cards are denied until the first refresh');
   if (once) {
     await state.tick();
