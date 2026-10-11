@@ -48,6 +48,16 @@ function annotateError(error) {
 const SEA_RESOURCE = 'NODE_SEA_BLOB';
 const DEFAULT_NODE_VERSION = '22.22.2';
 
+/**
+ * Release artifact prefix. The product is Sornix EstateOS, so the file a person
+ * downloads is `sornix-estateos-bridge-<target><ext>`. What the executable calls
+ * itself once it runs (the console banner, the Windows service name, the
+ * installed `estatemate-bridge.exe`, the Start Menu entry) is deliberately
+ * unchanged: existing estates upgrade in place and every command in the docs,
+ * dashboard and support scripts keeps working.
+ */
+const ARTIFACT_PREFIX = 'sornix-estateos-bridge';
+
 const TARGETS = {
   'win-x64': { platform: 'win32', arch: 'x64', nodePlatform: 'win', nodeArch: 'x64', extension: '.exe', archive: 'zip' },
   'win-arm64': { platform: 'win32', arch: 'arm64', nodePlatform: 'win', nodeArch: 'arm64', extension: '.exe', archive: 'zip' },

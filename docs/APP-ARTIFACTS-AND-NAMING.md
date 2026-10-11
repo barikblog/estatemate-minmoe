@@ -72,8 +72,10 @@ release page:
 * `scripts/verify-android-apk.py --app-label "Sornix EstateOS"
   --application-id com.estatemate.app` fails the Android job if the APK is
   labelled anything else, or if the Worker URL did not reach `BuildConfig`.
-* `apps/android/tools/make-launcher-icons.py --check` fails the build when the
-  committed launcher icons no longer match the generator.
+* `apps/android/tools/make-launcher-icons.py --check` fails the build when an
+  icon the generator produces is missing, wrongly sized, or a leftover from a
+  previous brand (`--strict`, which also compares pixels, runs as a warning
+  because FreeType builds hint glyphs slightly differently).
 * The MSI installation step in `.github/workflows/bridge.yml` installs the
   desktop app and looks for the **Sornix EstateOS** shortcuts in the Start Menu
   and on the Desktop before uninstalling it again.

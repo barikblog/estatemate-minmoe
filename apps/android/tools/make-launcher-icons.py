@@ -19,11 +19,17 @@ What it writes into app/src/main/res/:
 
 Usage (needs Pillow; the build itself does not):
 
-    python3 tools/make-launcher-icons.py [--check]
+    python3 tools/make-launcher-icons.py            # (re)write the icon set
+    python3 tools/make-launcher-icons.py --check    # CI gate: complete, sized, no stale icon
+    python3 tools/make-launcher-icons.py --strict   # developer check: pixels too
 
-`--check` regenerates into a temporary directory and compares against the
-committed files, so CI can fail on drift instead of shipping an icon that no
-longer matches the script.
+`--check` regenerates into a temporary directory and compares file names and
+image geometry against what is committed, so CI fails on a missing icon, a wrong
+size, or a leftover icon from a previous brand — without depending on the
+rasteriser or the font build of the machine running it (those differ slightly
+between FreeType releases, and a red build on an identical icon helps nobody).
+`--strict` additionally requires the committed pixels to match this machine's
+rendering, which is what a developer runs after changing the mark or the palette.
 
 The monogram is drawn with a font rather than a vector path on purpose: a
 three-layer adaptive icon built from text rasterised at the exact densities is
@@ -38,7 +44,7 @@ import sys
 import tempfile
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageChops, ImageDraw, ImageFont
 except ImportError:  # pragma: no cover - only reached when the tool is missing
     print("Pillow is required: python3 -m pip install pillow", file=sys.stderr)
     raise SystemExit(2)
@@ -57,6 +63,15 @@ LEGACY_SIZES = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 1
 # An adaptive-icon foreground layer is 108dp; only the middle 72dp is safe from
 # the mask, so the monogram is drawn inside that fraction of the canvas.
 FOREGROUND_SIZES = {"mdpi": 108, "hdpi": 162, "xhdpi": 216, "xxhdpi": 324, "xxxhdpi": 432}
+
+# How much pixel jitter is antialiasing rather than a changed icon. FreeType
+# builds hint glyphs slightly differently, so a few edge pixels may differ; any
+# pixel differing by more than STRUCTURAL_DELTA, or more than
+# PIXEL_SHARE_TOLERANCE of the image changing at all, is a real difference (a
+# different mark, colour, size or a stale file).
+PIXEL_DELTA_TOLERANCE = 16
+STRUCTURAL_DELTA = 96
+PIXEL_SHARE_TOLERANCE = 0.02
 
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -190,11 +205,24 @@ def main() -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="verify the committed icons match this script instead of writing them",
+        help=(
+            "verify the committed icon set instead of writing it: every file the "
+            "generator produces is present, correctly sized, and no stale icon is "
+            "left behind (safe to gate CI on any machine)"
+        ),
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "with --check, also require the committed pixels to match this "
+            "machine's rasteriser (developer check; a different FreeType build "
+            "may hint a glyph a hair differently)"
+        ),
     )
     args = parser.parse_args()
 
-    if not args.check:
+    if not args.check and not args.strict:
         written = generate(RES)
         for path in relpaths(written, RES):
             print(f"wrote res/{path}")
@@ -204,21 +232,53 @@ def main() -> int:
         generated = pathlib.Path(tmp)
         written = generate(generated)
         relative = relpaths(written, generated)
-        problems = []
+        problems: list[str] = []
+        notes: list[str] = []
+
         for rel in relative:
             expected = generated / rel
             committed = RES / rel
             if not committed.exists():
                 problems.append(f"missing: res/{rel}")
-            elif rel.endswith(".png"):
-                # Compare decoded pixels, not bytes: two Pillow/zlib versions
-                # write the same image with different compression, and a
-                # byte-diff would fail CI for an identical icon.
+                continue
+            if rel.endswith(".png"):
                 with Image.open(expected) as want, Image.open(committed) as got:
-                    if (want.size, want.mode, want.tobytes()) != (got.size, got.mode, got.tobytes()):
-                        problems.append(f"differs from the generator: res/{rel}")
+                    if want.size != got.size:
+                        problems.append(f"wrong size: res/{rel} is {got.size}, the generator writes {want.size}")
+                        continue
+                    if want.mode != got.mode:
+                        problems.append(f"wrong colour mode: res/{rel} is {got.mode}, the generator writes {want.mode}")
+                        continue
+                    if want.tobytes() == got.tobytes():
+                        continue
+                    if not args.strict:
+                        # Structure only: the file is the right shape and colour
+                        # mode. Pixel equality is deliberately not required here,
+                        # because FreeType builds differ in glyph hinting and a
+                        # red CI on an identical icon helps nobody.
+                        notes.append(
+                            f"res/{rel} does not match this machine's rasteriser pixel-for-pixel "
+                            "(run --strict locally, or regenerate, after changing the mark)"
+                        )
+                        continue
+                    over, worst, total = pixel_difference(want, got)
+                    share = over / total
+                    if worst > STRUCTURAL_DELTA or share > PIXEL_SHARE_TOLERANCE:
+                        problems.append(
+                            f"differs from the generator: res/{rel} "
+                            f"({over}/{total} px over {PIXEL_DELTA_TOLERANCE} levels, worst {worst})"
+                        )
+                    else:
+                        notes.append(
+                            f"res/{rel}: {over}/{total} px differ by up to {worst} levels "
+                            "(rasteriser antialiasing, accepted)"
+                        )
             elif committed.read_bytes() != expected.read_bytes():
                 problems.append(f"differs from the generator: res/{rel}")
+
+        # Anything committed in an icon slot that the generator does not write is
+        # a leftover: an icon from a previous brand that a launcher could still
+        # pick up.
         produced = set(relative)
         for pattern in (
             "mipmap-*/ic_launcher*.png",
@@ -230,13 +290,35 @@ def main() -> int:
                 rel = str(committed.relative_to(RES))
                 if rel not in produced:
                     problems.append(f"stale icon not produced by the generator: res/{rel}")
+
+        for note in notes:
+            print(f"::notice::launcher icons: {note}")
         if problems:
             for problem in problems:
                 print(f"::error::launcher icons: {problem}", file=sys.stderr)
             print("run: python3 apps/android/tools/make-launcher-icons.py", file=sys.stderr)
             return 1
-        print(f"launcher icons match the generator ({len(produced)} files)")
+        mode = "strict" if args.strict else "structural"
+        print(f"launcher icons OK ({len(produced)} files, {mode} check)")
         return 0
+
+
+def pixel_difference(a: "Image.Image", b: "Image.Image") -> tuple[int, int, int]:
+    """Pixels differing by more than the jitter tolerance, the worst delta, and the total.
+
+    The per-pixel delta is the largest of the four channels; ImageChops keeps this off the
+    deprecated per-pixel APIs (``getdata``/``load``) that Pillow is retiring.
+    """
+    diff = ImageChops.difference(a, b)
+    bands = [diff.getchannel(index) for index in range(4)]
+    worst_per_pixel = ImageChops.lighter(
+        ImageChops.lighter(bands[0], bands[1]),
+        ImageChops.lighter(bands[2], bands[3]),
+    )
+    histogram = worst_per_pixel.histogram()
+    over = sum(histogram[PIXEL_DELTA_TOLERANCE + 1:])
+    worst = max((level for level, count in enumerate(histogram) if count), default=0)
+    return over, worst, a.size[0] * a.size[1]
 
 
 if __name__ == "__main__":

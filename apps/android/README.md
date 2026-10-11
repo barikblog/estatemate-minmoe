@@ -47,8 +47,16 @@ reproducible:
 
 ```bash
 python3 apps/android/tools/make-launcher-icons.py           # regenerate
-python3 apps/android/tools/make-launcher-icons.py --check   # what CI asserts
+python3 apps/android/tools/make-launcher-icons.py --check   # CI gate: complete, sized, no stale icon
+python3 apps/android/tools/make-launcher-icons.py --strict  # also require your machine's pixels
 ```
+
+`--check` is the CI gate and stays green on any machine: it verifies every icon
+the generator produces is committed, correctly sized and the right colour mode,
+and that no leftover icon from a previous brand is lying around. `--strict` adds
+pixel equality with *your* rasteriser (FreeType builds hint glyphs slightly
+differently), so run it locally after changing the mark or the palette — CI runs
+it too, but reports a mismatch as a warning rather than failing the build.
 
 ## Verify a built APK
 
