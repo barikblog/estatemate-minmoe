@@ -28,6 +28,40 @@
       "transport": "zkteco_push",
       "pushSerial": "",
       "enabled": true
+    },
+    {
+      "estateMateDeviceId": "44444444-4444-4444-8444-444444444444",
+      "name": "Gate reachable only by a public IP:port (opt-in, read docs/PUBLIC-ENDPOINT-DEVICE.md first)",
+      "isapiHost": "198.51.100.20",
+      "isapiPort": 8443,
+      "isapiUsername": "admin",
+      "isapiPassword": "device-admin-password",
+      "protocol": "https",
+      "enabled": false,
+      "eventStream": true,
+      "publicEndpoint": {
+        "acknowledged": true,
+        "acknowledgedBy": "name-of-person-accepting-the-risk",
+        "acknowledgedAt": "2026-01-01T00:00:00Z",
+        "note": "why the terminal cannot be reached on its LAN instead"
+      }
+    },
+    {
+      "estateMateDeviceId": "55555555-5555-4555-8555-555555555555",
+      "name": "Gate reachable only on the SDK port 8000 (transport: hik_sdk)",
+      "transport": "hik_sdk",
+      "sdkHost": "198.51.100.20",
+      "sdkPort": 8000,
+      "sdkUsername": "admin",
+      "sdkPassword": "device-admin-password",
+      "enabled": false,
+      "eventStream": true,
+      "publicEndpoint": {
+        "acknowledged": true,
+        "acknowledgedBy": "name-of-person-accepting-the-risk",
+        "acknowledgedAt": "2026-01-01T00:00:00Z",
+        "note": "the SDK port is the only path to this terminal; see docs/HIKVISION-SDK-TRANSPORT.md"
+      }
     }
   ]
 }

@@ -47,8 +47,11 @@ import {
   classifyAddress,
   classifyBindAddress,
   deriveInboundSources,
+  deviceIsPublicEndpoint,
   isAddressLiteral,
   parseSourceRule,
+  publicEndpointRisks,
+  readPublicEndpointAcknowledgement,
 } from '../isapi-bridge/network-access-control.mjs';
 
 const SCRIPT_NAME = 'scripts/inbound-exposure-check.mjs';
@@ -167,10 +170,19 @@ export function assessInboundPosture({ config = {}, devices = [], options = {} }
   //    exposure no allowlist on this host can fix, because the terminal answers
   //    for itself.
   for (const device of enabledDevices) {
-    const name = String(device.name || device.isapiHost || 'a terminal');
-    const host = String(device.isapiHost || '').trim();
-    const protocol = String(device.protocol || 'http').toLowerCase() === 'https' ? 'https' : 'http';
-    const report = { name, host, protocol, classification: null, findings: [] };
+    const name = String(device.name || device.isapiHost || device.sdkHost || 'a terminal');
+    // Two transports reach a terminal: ISAPI over HTTP (the default) and
+    // Hikvision's SDK/"server" port, which is what iVMS-4200 speaks. The second
+    // one is a binary protocol driven through the vendor library — there is no
+    // HTTP to reason about, and there is no card-record API at all.
+    const transport = String(device.transport || 'isapi');
+    const isSdkTransport = transport === 'hik_sdk' || transport === 'hcnetsdk';
+    const host = String(device.isapiHost || device.sdkHost || '').trim();
+    const port = Number(device.isapiPort || device.sdkPort || (isSdkTransport ? 8000 : 80));
+    const protocol = isSdkTransport
+      ? 'hik_sdk'
+      : (String(device.protocol || 'http').toLowerCase() === 'https' ? 'https' : 'http');
+    const report = { name, host, port, transport: isSdkTransport ? 'hik_sdk' : transport, protocol, classification: null, findings: [] };
     if (!host) {
       report.classification = 'dial-in';
       deviceReports.push(report);
@@ -185,16 +197,49 @@ export function assessInboundPosture({ config = {}, devices = [], options = {} }
     }
     const classification = classifyAddress(host);
     report.classification = classification;
-    if (classification === 'public') {
+    // A public endpoint is a hard error unless the devices file records an
+    // operator's acknowledgement of it — some sites cannot reach the terminal's
+    // LAN at all, and an exposure that is documented, reported and reviewed is
+    // safer than one that is silently tolerated. The acknowledgement never
+    // removes the risk; it moves it into the report. docs/PUBLIC-ENDPOINT-DEVICE.md.
+    const acknowledged = deviceIsPublicEndpoint(device)
+      ? readPublicEndpointAcknowledgement(device)
+      : { acknowledged: false, by: null, at: null, note: null };
+    report.publicEndpoint = classification === 'public' ? { acknowledged: acknowledged.acknowledged, by: acknowledged.by, at: acknowledged.at } : null;
+    if (classification === 'public' && acknowledged.acknowledged) {
+      report.findings.push('warn');
+      warnings.push(
+        `${name} is configured at the public address ${host} and that exposure is acknowledged` +
+        `${acknowledged.by ? ` by ${acknowledged.by}` : ''}${acknowledged.at ? ` on ${acknowledged.at}` : ''}` +
+        `${acknowledged.note ? ` — "${acknowledged.note}"` : ''}. The acknowledgement records the decision; it does not remove the risk: ` +
+        `${publicEndpointRisks({ protocol, host, port }).join('; ')}. ` +
+        'Re-check this every review, keep the terminal\'s admin password unique, and treat an agent on that LAN as the exit plan (docs/PUBLIC-ENDPOINT-DEVICE.md).',
+      );
+    } else if (classification === 'public') {
       report.findings.push('error');
-      errors.push(`${name} is configured at the public address ${host}. That is a terminal on the Internet, with its own admin interface answering — the exposure README.md forbids, and no setting on this host changes it. Move it to a LAN address and reach it through the Cloudflare Tunnel kit (docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md).`);
+      errors.push(`${name} is configured at the public address ${host}. That is a terminal on the Internet, with its own admin interface answering — the exposure README.md forbids, and no setting on this host changes it. Move it to a LAN address and reach it through the Cloudflare Tunnel kit (docs/CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md). If the LAN path genuinely does not exist, run "node scripts/terminal-endpoint.mjs --endpoint ${host}:${port}" and record the decision with a "publicEndpoint" acknowledgement in the devices file (docs/PUBLIC-ENDPOINT-DEVICE.md) — the agent refuses to start without one.`);
     } else if (classification === 'carrier-grade') {
       report.findings.push('warn');
       warnings.push(`${name} is configured at ${host}, which is in the carrier-grade NAT range (100.64.0.0/10). Traffic from it can arrive indistinguishable from anybody else behind the same CGNAT, so a source allowlist covering this address is weaker than it looks.`);
     }
+    if (isSdkTransport) {
+      // Stated as a note, not a finding: the transport choice is legitimate, and
+      // what it cannot do is the part an operator has to know before queuing work.
+      notes.push(`${name} is reached over Hikvision's SDK/"server" port (${host}:${port}) — the protocol iVMS-4200 uses — so live events and door control come from the vendor SDK helper, while card and person changes stay operator tasks: HCNetSDK has no card-record API (docs/HIKVISION-SDK-TRANSPORT.md).`);
+    }
+
     if (protocol === 'http' && !['private', 'loopback'].includes(classification)) {
-      report.findings.push('error');
-      errors.push(`${name} is reached over plain http at ${host} (${classification}). ISAPI Digest credentials and every card number cross that path in the clear; use https, or keep the terminal on a private LAN address.`);
+      // Cleartext ISAPI to an address off this LAN is an error, acknowledged or
+      // not — an acknowledgement can accept a public address, but it cannot make
+      // Digest credentials and card numbers private. Prefer https.
+      report.findings.push(classification === 'public' && acknowledged.acknowledged ? 'warn' : 'error');
+      const message = `${name} is reached over plain http at ${host} (${classification}). ISAPI Digest credentials and every card number cross that path in the clear; use https`;
+
+      if (classification === 'public' && acknowledged.acknowledged) {
+        warnings.push(`${message} (the acknowledgement covers the address, not the cleartext). On this endpoint prefer https with a certificate the agent host trusts: "protocol": "https" and, for a self-signed terminal, install its certificate on the agent host — see docs/PUBLIC-ENDPOINT-DEVICE.md.`);
+      } else {
+        errors.push(`${message}, or keep the terminal on a private LAN address.`);
+      }
     }
     deviceReports.push(report);
   }

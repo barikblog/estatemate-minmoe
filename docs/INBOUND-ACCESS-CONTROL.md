@@ -283,6 +283,8 @@ that traffic is readable there.
 
 ## Related
 
+- [`PUBLIC-ENDPOINT-DEVICE.md`](PUBLIC-ENDPOINT-DEVICE.md) — the one case where this layer cannot help: a *terminal* already published at `<public-ip>:<port>` that no local control can protect, and the recorded acknowledgement that integrating it requires
+- [`PUBLIC-IP-AND-PORT-FORWARDING.md`](PUBLIC-IP-AND-PORT-FORWARDING.md) — what a public IP and a forward should point at, and what to do when one already points at a terminal
 - [`CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md`](CLOUDFLARE-TUNNEL-REMOTE-ACCESS.md) — private remote access for administrators
 - [`REMOTE-NETWORK-VERIFICATION.md`](REMOTE-NETWORK-VERIFICATION.md) — why an accepted event can be a door decision
 - [`ISAPI-BRIDGE-AND-WINDOWS-AGENT.md`](ISAPI-BRIDGE-AND-WINDOWS-AGENT.md) — installing the agent, and the firewall rule an operator needs

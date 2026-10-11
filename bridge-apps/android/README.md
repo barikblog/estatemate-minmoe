@@ -105,6 +105,19 @@ listener and ZKTeco PUSH have. If an estate needs terminal clock correction and
 runs only Android bridges, it should set each terminal's time and timezone in
 the terminal's own setup menu.
 
+**Node/Android deviation — Hikvision SDK transport:** a terminal that answers
+only on Hikvision's SDK/"server" port (8000 — the port iVMS-4200 uses) is
+reached by the Windows/Node bridge through a small helper that links Hikvision's
+own `HCNetSDK` (see `docs/HIKVISION-SDK-TRANSPORT.md`). That is **not ported**
+to this APK, and cannot be: the helper is a native process beside the bridge
+holding a vendor library for one architecture, which is not something an APK
+carries. Keep SDK-transport devices out of this app's `isapi-devices.json`:
+such an entry has no `isapiHost`, so the bridge refuses to start with the
+problem *"a terminal has no ISAPI host"* (BridgeConfig.problems → BridgeService)
+rather than dialling the wrong port. An estate whose only
+path to a terminal is the SDK port needs the Windows/Node bridge (Android
+bridges can serve the estate's other devices).
+
 The app is deliberately plain Java against the platform APIs only (no Kotlin, no
 AndroidX, no native code, no Gradle). That is what makes the APK reproducible
 without Android Studio, and it keeps the APK at a few tens of kilobytes.

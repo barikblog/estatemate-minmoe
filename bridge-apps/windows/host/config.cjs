@@ -291,21 +291,43 @@ function validateDevicesConfig(devicesFile) {
     }
     const id = String(entry.estateMateDeviceId || '').trim();
     const host = String(entry.isapiHost || '').trim();
+    // A terminal reached over Hikvision's SDK/"server" port (8000 — what
+    // iVMS-4200 speaks) has no ISAPI address at all: it is validated on its own
+    // fields, or every SDK device would be reported as a broken ISAPI one.
+    // docs/HIKVISION-SDK-TRANSPORT.md.
+    const transport = String(entry.transport || '').trim().toLowerCase();
+    const isSdk = transport === 'hik_sdk' || transport === 'hcnetsdk';
+    const sdkHost = String(entry.sdkHost || entry.sdk_host || '').trim();
     // The EstateMate device id is optional: it is a UUID that lives in the
     // portal, so a terminal may be configured by LAN address alone and the
     // agent looks the id up from its own linked devices at startup. A malformed
     // one is dropped rather than fatal for the same reason — the portal match
     // is authoritative, and it is reported by `check`.
     if (id && !isUuid(id)) warnings.push(`${label} estateMateDeviceId "${id}" is not a UUID and will be replaced by the portal match at startup`);
-    if (!id) warnings.push(`${label} (${entry.name || host || 'unnamed'}) has no estateMateDeviceId; it is resolved from the portal by LAN address at startup`);
-    if (!host) errors.push(`${label} (${id || 'unnamed'}) has no isapiHost`);
+    if (!id) {
+      warnings.push(isSdk
+        // The agent matches an SDK terminal to a portal row only at the same
+        // host and port (agent.mjs resolveDeviceIds), so the warning must say
+        // what will actually happen rather than "by LAN address".
+        ? `${label} (${entry.name || sdkHost || 'unnamed'}) has no estateMateDeviceId; the agent resolves it from the portal at sdkHost:sdkPort (${sdkHost || 'no host'}:${Number(entry.sdkPort ?? entry.sdk_port ?? 8000)}), or will refuse to start if the portal has no row there`
+        : `${label} (${entry.name || host || 'unnamed'}) has no estateMateDeviceId; it is resolved from the portal by LAN address at startup`);
+    }
+    if (isSdk) {
+      if (!sdkHost) errors.push(`${label} (${id || 'unnamed'}) is on the "hik_sdk" transport but has no sdkHost`);
+      const sdkPort = Number(entry.sdkPort ?? entry.sdk_port ?? 8000);
+      if (!Number.isInteger(sdkPort) || sdkPort < 1 || sdkPort > 65535) errors.push(`${label} sdkPort "${entry.sdkPort}" is not a valid TCP port`);
+      if (!String(entry.sdkUsername || entry.sdk_username || '').trim()) warnings.push(`${label} has no sdkUsername; the Hikvision default is usually admin`);
+      if (!String(entry.sdkPassword || entry.sdk_password || '')) warnings.push(`${label} has no sdkPassword; the SDK login will fail`);
+    } else {
+      if (!host) errors.push(`${label} (${id || 'unnamed'}) has no isapiHost`);
+      const port = Number(entry.isapiPort ?? 80);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) errors.push(`${label} isapiPort "${entry.isapiPort}" is not a valid TCP port`);
+      if (!String(entry.isapiUsername || '').trim()) warnings.push(`${label} has no isapiUsername; the device default is usually admin`);
+      if (!String(entry.isapiPassword || '')) warnings.push(`${label} has no isapiPassword; ISAPI authentication will fail`);
+      if (entry.protocol && !['http', 'https'].includes(String(entry.protocol))) errors.push(`${label} protocol "${entry.protocol}" must be http or https`);
+    }
     if (id && seen.has(id)) warnings.push(`${label} repeats estateMateDeviceId ${id}; the later entry wins`);
     if (id) seen.add(id);
-    const port = Number(entry.isapiPort ?? 80);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) errors.push(`${label} isapiPort "${entry.isapiPort}" is not a valid TCP port`);
-    if (!String(entry.isapiUsername || '').trim()) warnings.push(`${label} has no isapiUsername; the device default is usually admin`);
-    if (!String(entry.isapiPassword || '')) warnings.push(`${label} has no isapiPassword; ISAPI authentication will fail`);
-    if (entry.protocol && !['http', 'https'].includes(String(entry.protocol))) errors.push(`${label} protocol "${entry.protocol}" must be http or https`);
     if (entry.enabled === false) warnings.push(`${label} (${entry.name || host}) is disabled and will be skipped`);
   });
 

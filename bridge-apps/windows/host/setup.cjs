@@ -315,13 +315,21 @@ async function runSetup({ ctx, logger, options }) {
     // working site — `lanEvents`/`zktecoPush` carry the inbound source allowlist
     // that refuses traffic a router forwards inward (see
     // docs/INBOUND-ACCESS-CONTROL.md), and `remoteVerify` is the switch that
-    // makes an accepted upload a door decision.
+    // makes an accepted upload a door decision. `hikSdk` is dropped here for a
+    // different but worse reason: on a site whose terminal is only reachable at
+    // Hikvision's SDK port (docs/HIKVISION-SDK-TRANSPORT.md) it is the switch
+    // that makes the gate's events arrive at all, and this wizard cannot
+    // rediscover the helper path or the operator's decision to reach a public
+    // address. Add every new block to this list when it is introduced.
     const previous = ctx.config && typeof ctx.config === 'object' ? ctx.config : {};
-    for (const key of ['lanEvents', 'zktecoPush', 'remoteVerify']) {
+    for (const key of ['lanEvents', 'zktecoPush', 'remoteVerify', 'hikSdk']) {
       if (previous[key] !== undefined && config[key] === undefined) config[key] = previous[key];
     }
     if (previous.lanEvents || previous.zktecoPush) {
       logger.info('Kept the existing listener settings (ports, bind address, inbound source allowlist) — this wizard does not change them');
+    }
+    if (previous.hikSdk) {
+      logger.info(`Kept the Hikvision SDK settings (helper path, event stream) — this wizard does not change them${previous.hikSdk.enabled === true ? '; the SDK transport stays enabled' : ''}`);
     }
 
     const configValidation = validateAgentConfig(config);

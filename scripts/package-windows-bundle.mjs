@@ -173,12 +173,28 @@ copyRepo('isapi-bridge/lan-event-listener.mjs', 'lan-event-listener.mjs');
 // secret and the rate limit they apply. Same rule as the modules above — omit it
 // and the bridge exits at import time on every machine that installs the bundle.
 copyRepo('isapi-bridge/network-access-control.mjs', 'network-access-control.mjs');
+// The Hikvision SDK transport: the module the core agent imports for a terminal
+// that is only reachable on the SDK/"server" port (iVMS-4200's port). The helper
+// it drives is built from the C# source staged below, on the machine, because
+// Hikvision's vendor library may not be redistributed here.
+copyRepo('isapi-bridge/hik-sdk-transport.mjs', 'hik-sdk-transport.mjs');
 copyRepo('windows-agent/agent.mjs', 'agent.mjs');
 copyRepo('windows-agent/install-windows.mjs', 'install-windows.mjs');
 copyRepo('windows-agent/agent-config.example.json', 'agent-config.example.json');
 copyRepo('isapi-bridge/isapi-devices.example.json', 'isapi-devices.example.json');
 copyRepo('windows-agent/README.md', 'docs/windows-agent-README.md');
 copyRepo('isapi-bridge/README.md', 'docs/isapi-bridge-README.md');
+copyRepo('docs/HIKVISION-SDK-TRANSPORT.md', 'docs/HIKVISION-SDK-TRANSPORT.md');
+// The SDK helper: source, build scripts and the note about Hikvision's licence.
+// It builds with the compiler Windows already has, so the agent can offer the
+// SDK transport on a machine that has never had a development toolchain.
+copyRepo('bridge-apps/windows/hcnetsdk/README.md', 'hcnetsdk/README.md');
+copyRepo('bridge-apps/windows/hcnetsdk/EstateMateHikSdk.cs', 'hcnetsdk/EstateMateHikSdk.cs');
+copyRepo('bridge-apps/windows/hcnetsdk/NativeHikSdk.cs', 'hcnetsdk/NativeHikSdk.cs');
+copyRepo('bridge-apps/windows/hcnetsdk/Json.cs', 'hcnetsdk/Json.cs');
+copyRepo('bridge-apps/windows/hcnetsdk/EstateMateHikSdk.csproj', 'hcnetsdk/EstateMateHikSdk.csproj');
+copyRepo('bridge-apps/windows/hcnetsdk/build-hcnetsdk-helper.cmd', 'hcnetsdk/build-hcnetsdk-helper.cmd');
+copyRepo('bridge-apps/windows/hcnetsdk/build-hcnetsdk-helper.sh', 'hcnetsdk/build-hcnetsdk-helper.sh');
 
 
 // ------------------------------------------------------ import resolution ---
@@ -426,6 +442,24 @@ Then edit the device mapping:
 Fill in estateMateDeviceId (from the portal device list), isapiHost,
 isapiUsername and isapiPassword for each Hikvision device.
 
+A terminal that answers only on Hikvision's SDK/"server" port (8000 - the port
+iVMS-4200 uses) needs three different fields instead:
+
+    "transport": "hik_sdk", "sdkHost": "<address>", "sdkPort": 8000,
+    "sdkUsername": "admin", "sdkPassword": "..."
+
+and a helper built from the C# in this bundle:
+
+    hcnetsdk\\build-hcnetsdk-helper.cmd
+    rem then copy Hikvision's Device Network SDK (HCNetSDK.dll + HCNetSDKCom)
+    rem next to build\\EstateMateHikSdk.exe - it is not redistributed here
+    build\\EstateMateHikSdk.exe --selftest <address>:8000 admin <password>
+
+Turn it on in agent-config.json with "hikSdk": { "enabled": true }. If sdkHost is
+a public address, the agent refuses to start until the device carries a
+"publicEndpoint" acknowledgement - that is deliberate, and both settings are
+documented in docs\\HIKVISION-SDK-TRANSPORT.md (with hcnetsdk\\README.md).
+
 Run in the foreground (debugging)
 ---------------------------------
     .\\estatemate-isapi-agent.cmd
@@ -440,6 +474,8 @@ Files
     install-windows.mjs          config writer helper (node install-windows.mjs --help)
     agent-config.example.json    agent identity + Worker URL template
     isapi-devices.example.json   device mapping template
+    hcnetsdk\\                    Hikvision SDK transport: helper C# source,
+                                 build script, and the vendor-SDK instructions
     VERSION                      build metadata and node.exe sha256
     docs\\                       full agent documentation
 
@@ -460,6 +496,9 @@ Security
     * agent-config.json holds the agent secret; its ACL is restricted to
       Administrators and SYSTEM by the installer.
     * Keep ISAPI devices and this host on the same VLAN. Never port-forward ISAPI.
+    * Reaching a terminal on the Internet at its SDK port is an operator decision
+      that must be recorded in isapi-devices.json ("publicEndpoint"), and the
+      risks it accepts are printed at every start (docs\\HIKVISION-SDK-TRANSPORT.md).
     * Rotate the agent secret in the portal periodically.
 `,
 );
