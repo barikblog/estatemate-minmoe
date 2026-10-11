@@ -1,5 +1,90 @@
 # AI handoff — EstateMate
 
+## Inbound access control for the site whose router cannot be changed (2026-10-11)
+
+The question this answers: an estate's router already has **inbound Internet
+access** or a **port-forwarding** rule configured, and **nobody can alter it** —
+ISP-managed CPE, a rule a previous installer left, a login that belongs to a
+managing agent. The rule cannot be deleted, so access control moved to the two
+things that are still the estate's: the address the rule points at, and the
+socket that answers. Documented in `docs/INBOUND-ACCESS-CONTROL.md`; the rule is
+in `AGENTS.md`.
+
+**What changed in code.** The agent has exactly two places that accept a
+connection — the LAN event listener (`isapi-bridge/lan-event-listener.mjs`) and
+the ZKTeco PUSH listener (`isapi-bridge/zkteco-push-server.mjs`) — and both now
+share one controller, `isapi-bridge/network-access-control.mjs`:
+
+- **Source allowlist**, applied before a request body is read, in the order
+  source → secret → rate. Entries are IPv4/IPv6 literals and CIDR ranges; a
+  hostname is refused as an entry (resolving one at decision time hands the
+  policy to DNS) and a `/0` is refused because "allow everything" is the
+  `allowUnknownSources` switch, so choosing it is a logged act.
+- **The allowlist is derived**, which is what makes deny-by-default safe to ship:
+  every terminal in `isapi-devices.json` with an address becomes a rule for the
+  LAN listener, so an existing install gets it without an installer writing
+  anything. Derivation that is *incomplete* (a terminal named by hostname) stays
+  **advisory and loud** rather than enforced — refusing the estate's own gates
+  over a devices-file typo is a worse failure than an open LAN listener. The PUSH
+  listener never derives from ISAPI hosts: a PUSH terminal dials in and has no
+  address, so a derived list would be non-empty and every PUSH terminal would be
+  missing from it.
+- **Shared secret** compared in constant time (sha256 both sides, then
+  `timingSafeEqual`, so a length difference cannot throw or leak), and **a
+  per-source rate limit** (600/min default, `maxRequestsPerMinute`) so a
+  forwarded port cannot be used to flood the bridge.
+- **Identity is the socket, not the body — this was a real hole.** The LAN
+  listener mapped an upload by preferring `event.deviceIp`, a field *inside the
+  request body*, over the socket's source address. On a port a router forwards
+  inward, a caller could name any configured terminal and any card number; with
+  Remote Network Verification switched on for that terminal, an accepted event is
+  a door decision, so that was an unlocked gate. `resolveLanEventDevice()` now
+  maps by the socket only, logs and counts a body that claims a different
+  terminal, and consults the claimed address solely under
+  `"trustReportedDeviceIp": true` (a relay that genuinely rewrites sources).
+- **Refusals are visible.** `deniedSource` / `rejected` (secret, unchanged key) /
+  `throttled` counters, a ring buffer of the last 50 refusals (source, code,
+  path — never a body, because a body can carry a card number), and
+  `stats.inbound` on the heartbeat. The Worker does not persist `stats`, so this
+  is agent-side and Windows-`check`-side visibility today; persisting it would
+  need a schema change and was deliberately not done.
+
+**New verifier**: `scripts/inbound-exposure-check.mjs` (`npm run inbound:check`),
+the same shape as the tunnel checker — exit 0 clean, 1 findings, 2 usage error.
+It reads `agent-config.json` + `isapi-devices.json` and reports listeners beyond
+loopback with no enforced allowlist (an error, and a louder one when Remote
+Network Verification is on), `trustReportedDeviceIp` on a reachable listener,
+terminals configured at a public address or over plain `http`, a secret required
+but unset, advisory lists, 0600 on the two secret-bearing files, and a `workerUrl`
+that is not https. `--listen-scan` crosses the host's real sockets (`ss`/`netstat`,
+Windows column layout included) against the ports the config names; `--probe
+host:port` tries to reach an address from here and, on a refusal, prints the
+hairpin-NAT caveat instead of claiming the port is closed.
+
+**Windows**: `EstateMateBridge.exe check` prints an `Inbound` section and a
+warning for a reachable listener with no enforced allowlist, resolved by asking
+the *agent* for its policy (`describeInbound()` in
+`bridge-apps/windows/host/diagnostics.cjs`) so `check` cannot disagree with
+`run`. `setup` now carries `lanEvents`, `zktecoPush` and `remoteVerify` forward
+untouched, exactly as it already preserved the clock-sync thresholds — the
+dashboard's "Save all settings" and a wizard re-run were silently dropping
+hand-written listener blocks, which after this change would have meant dropping
+an allowlist.
+
+**Validation.** `npm run test:isapi-bridge` gained
+`agent.inbound-access-control.integration.mjs` (85 checks: real sockets for both
+listeners, the spoofed-`ipAddress` cases, the agent's resolved policy from real
+config files, the heartbeat surface, and the Windows `describeInbound` path
+exercised on Linux), and `npm test` gained `npm run test:inbound-check` (56
+checks over the verifier, its probes against a live and a dead port, its socket
+scan and its exit codes). One existing check changed meaning and was rewritten,
+not weakened: the LAN listener's GET probe used to assert 405 for any caller, and
+access control now runs *before* the method check, so an unauthenticated probe
+gets 401 and learns nothing — the 405 assertion is kept for an authorised caller
+and a second check asserts the new ordering. `scripts/bridge-exe-smoke-test.mjs`
+was **not** run here (it needs the packaged Windows exe); the diagnostics and
+setup changes are covered by the Linux-side integration checks only.
+
 ## Raspberry Pi agents: a Pi bridge, and a Pi that is the gate (2026-10-11)
 
 "Runs on" gained two choices. Both are stored without widening any CHECK

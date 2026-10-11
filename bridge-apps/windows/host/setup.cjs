@@ -308,6 +308,22 @@ async function runSetup({ ctx, logger, options }) {
     };
     logger.info(`Terminal clock sync ${config.timeSync.enabled ? 'on' : 'off'} (set when off by more than ${config.timeSync.maxDriftMs} ms, checked every ${config.timeSync.checkIntervalMinutes} min${config.timeSync.timeZone ? `, terminals in ${config.timeSync.timeZone}` : ', terminals in this PC\'s zone'})`);
 
+    // The blocks this wizard does not ask about are carried forward untouched,
+    // for the same reason the clock-sync thresholds are: "Save all settings" on
+    // the dashboard and a re-run of `setup` must never reset a setting an
+    // administrator chose. Dropping them would be a silent security change on a
+    // working site — `lanEvents`/`zktecoPush` carry the inbound source allowlist
+    // that refuses traffic a router forwards inward (see
+    // docs/INBOUND-ACCESS-CONTROL.md), and `remoteVerify` is the switch that
+    // makes an accepted upload a door decision.
+    const previous = ctx.config && typeof ctx.config === 'object' ? ctx.config : {};
+    for (const key of ['lanEvents', 'zktecoPush', 'remoteVerify']) {
+      if (previous[key] !== undefined && config[key] === undefined) config[key] = previous[key];
+    }
+    if (previous.lanEvents || previous.zktecoPush) {
+      logger.info('Kept the existing listener settings (ports, bind address, inbound source allowlist) — this wizard does not change them');
+    }
+
     const configValidation = validateAgentConfig(config);
     if (configValidation.errors.length) {
       for (const error of configValidation.errors) logger.error(error);

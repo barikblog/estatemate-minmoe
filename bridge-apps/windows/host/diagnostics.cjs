@@ -306,6 +306,28 @@ function printReport(report, logger) {
   }
   line('');
 
+  const inbound = report.inbound;
+  if (inbound) {
+    const open = (inbound.listeners || []).filter((entry) => entry.enabled);
+    if (!open.length) {
+      line('  Inbound         no listening port — every connection this bridge makes is outbound, so a router port-forwarding rule has nothing to hand traffic to');
+    }
+    for (const entry of open) {
+      const reach = entry.reachableBeyondHost ? 'reachable beyond this PC' : 'loopback only';
+      const policy = entry.enforcing
+        ? `source allowlist enforced (${entry.sources.length} rule(s): ${entry.sources.join(', ')})`
+        : 'NO source allowlist enforced';
+      line(`  Inbound         ${entry.label} on ${entry.bindAddress}:${entry.port} — ${reach}, ${policy}`);
+    }
+    // The agent's own warnings about the policy, with its log prefixes stripped
+    // so they read as part of this report.
+    for (const note of inbound.notes || []) {
+      const text = String(note).replace(/^(\[[^\]]*\]\s*)+/, '').trim();
+      if (text) line(`                  ${text}`);
+    }
+    line('');
+  }
+
   for (const warning of report.warnings) line(`  WARN  ${warning}`);
   for (const error of report.errors) line(`  ERROR ${error}`);
   if (report.errors.length === 0 && report.devices.every((d) => d.ok) && report.worker.status === 200) {
@@ -316,6 +338,87 @@ function printReport(report, logger) {
     line('  Fix the configuration errors above, then run the check again.');
   }
   line('');
+}
+
+/**
+ * What this PC accepts inbound, and whether it decides who gets in.
+ *
+ * Read from the agent's own resolved policy — the same function the running
+ * bridge calls before it opens a port — rather than a second reading of the same
+ * files, so `check` cannot disagree with `run`. The agent logs its warnings
+ * through console.log, which would land above this report, so they are captured
+ * and reported as part of it instead.
+ *
+ * Never throws: a site with a terminal that will not answer still needs the rest
+ * of the check.
+ */
+function describeInbound(agent, config, devicesFile) {
+  const listeners = [];
+  if (typeof agent?.inboundPolicyFor !== 'function') {
+    return { available: false, listeners, notes: ['this bridge build does not report its inbound surface'] };
+  }
+  const captured = [];
+  const original = console.log;
+  console.log = (...args) => { captured.push(args.map(String).join(' ')); };
+
+  const lanEvents = config && typeof config.lanEvents === 'object' && config.lanEvents ? config.lanEvents : {};
+  const pushRaw = config ? config.zktecoPush : null;
+  const push = pushRaw && typeof pushRaw === 'object' ? pushRaw : {};
+  const specs = [
+    {
+      key: 'lanEvents',
+      label: 'LAN event listener',
+      enabled: lanEvents.enabled === true,
+      bindAddress: String(lanEvents.bindAddress || '127.0.0.1'),
+      port: Number.isInteger(lanEvents.port) ? lanEvents.port : 8080,
+      explicit: lanEvents.allowedSources,
+      deriveFromDevices: true,
+    },
+    {
+      key: 'zktecoPush',
+      label: 'ZKTeco PUSH listener',
+      enabled: pushRaw === true || Boolean(pushRaw && typeof pushRaw === 'object' && push.enabled !== false),
+      bindAddress: String(push.bindAddress || '127.0.0.1'),
+      port: Number.isInteger(push.port) ? push.port : 8089,
+      explicit: push.allowedSources,
+      // PUSH terminals dial in and have no address in the devices file, so this
+      // listener's allowlist is only ever what an administrator wrote.
+      deriveFromDevices: false,
+    },
+  ];
+
+  try {
+    for (const spec of specs) {
+      const loopback = ['127.0.0.1', '::1', 'localhost'].includes(spec.bindAddress.trim().toLowerCase());
+      const entry = {
+        key: spec.key,
+        label: spec.label,
+        enabled: spec.enabled,
+        bindAddress: spec.bindAddress,
+        port: spec.port,
+        reachableBeyondHost: !loopback,
+        enforcing: false,
+        sources: [],
+      };
+      if (spec.enabled) {
+        const explicit = Array.isArray(spec.explicit) ? spec.explicit : typeof spec.explicit === 'string' ? spec.explicit.split(/[,\s]+/).filter(Boolean) : [];
+        const policy = agent.inboundPolicyFor({
+          name: spec.label,
+          explicit,
+          deriveFromDevices: spec.deriveFromDevices,
+          bindAddress: spec.bindAddress,
+        });
+        entry.enforcing = Boolean(policy?.enforcing);
+        entry.sources = Array.isArray(policy?.allowedSources) ? policy.allowedSources : [];
+      }
+      listeners.push(entry);
+    }
+  } catch (error) {
+    return { available: false, listeners, notes: [`the inbound policy could not be resolved: ${error?.message ?? error}`] };
+  } finally {
+    console.log = original;
+  }
+  return { available: true, listeners, notes: captured, devices: (devicesFile?.devices || []).length };
 }
 
 async function runCheck({ ctx, logger, json = false }) {
@@ -336,6 +439,10 @@ async function runCheck({ ctx, logger, json = false }) {
     devicesFile: { path: paths.devicesPath, source: paths.devicesSource, count: (devicesValidation.devices || []).length },
     worker: { ok: false, status: 0, linkedDevices: [], linkedDeviceCount: 0, durationMs: 0, error: 'not attempted', networkError: false },
     devices: [],
+    // What this PC listens on, and whether it decides who gets in. Filled once
+    // the agent is loaded; null in the JSON report when the configuration is
+    // unusable and the check exits before that point.
+    inbound: null,
     eventStreamDisabled: Boolean(config && config.eventStream === false),
     errors: [...configValidation.errors, ...devicesValidation.errors],
     warnings: [...configValidation.warnings, ...devicesValidation.warnings],
@@ -350,6 +457,21 @@ async function runCheck({ ctx, logger, json = false }) {
   }
 
   const agent = await loadAgent({ agentEntry, configPath: paths.configPath, devicesPath: paths.devicesPath, standby: true, logger });
+
+  // The inbound surface, so an installer standing on a site whose router they
+  // cannot change can see in one line whether this PC accepts anything at all,
+  // and whether it decides who gets in. A listener with no allowlist is a posture
+  // to fix rather than a reason to call the terminals unhealthy, so this joins
+  // the warnings and never changes the exit code.
+  report.inbound = describeInbound(agent, config, devicesFile);
+  for (const entry of report.inbound.listeners || []) {
+    if (entry.enabled && entry.reachableBeyondHost && !entry.enforcing) {
+      report.warnings.push(
+        `${entry.label} listens on ${entry.bindAddress}:${entry.port}, reachable beyond this PC, and enforces no source allowlist — anything that can reach the port is accepted, including whatever a router forwards inward. `
+        + `Set "${entry.key}": { "allowedSources": ["<device VLAN>/24"] } in agent-config.json (docs/INBOUND-ACCESS-CONTROL.md).`,
+      );
+    }
+  }
 
   const workerUrl = String(config.workerUrl || '').trim() || 'https://estatemate.estatemate.workers.dev';
   const identity = {
@@ -492,4 +614,4 @@ async function runSyncClocks({ ctx, logger, json = false }) {
   return report.exitCode;
 }
 
-module.exports = { parseDeviceInfo, parseCardCount, probeEventStream, runCheck, runSyncClocks };
+module.exports = { parseDeviceInfo, parseCardCount, probeEventStream, describeInbound, runCheck, runSyncClocks };

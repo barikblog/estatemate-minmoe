@@ -350,15 +350,24 @@ const oversized = await post('/events', 'x'.repeat(300 * 1024), { 'X-EstateMate-
 check('an oversized upload is rejected', oversized.status === 413, `status=${oversized.status}`);
 
 const { default: http } = await import('node:http');
-const getProbe = await new Promise((resolve) => {
-  const r = http.request({ host: '127.0.0.1', port: listener.port, path: '/events', method: 'GET', agent: false }, (res) => {
+const probe = (method, headers = {}) => new Promise((resolve) => {
+  const r = http.request({ host: '127.0.0.1', port: listener.port, path: '/events', method, headers, agent: false }, (res) => {
     res.resume();
-    res.on('end', () => resolve({ status: res.statusCode }));
+    res.on('end', () => resolve({ status: res.statusCode, allow: res.headers.allow ?? null }));
   });
   r.on('error', (error) => resolve({ status: null, error: String(error?.code ?? error) }));
   r.end();
 });
+// An authorised caller is told the listener ingests and nothing else. The GET is
+// answered by the method check, not by access control, because the key is right.
+const getProbe = await probe('GET', { 'X-EstateMate-Terminal-Key': 'terminal-shared-secret' });
 check('the listener accepts POST only - it is ingest, never an API', getProbe.status === 405, JSON.stringify(getProbe));
+// Access control runs *before* the method check: a caller with no key learns
+// nothing at all about what this port is, not even that it speaks POST. That
+// ordering is the point on a site where a router rule nobody can delete points
+// at this port.
+const unauthenticatedProbe = await probe('GET');
+check('an unauthenticated probe is refused before it is told anything', unauthenticatedProbe.status === 401, JSON.stringify(unauthenticatedProbe));
 
 // A pushed event must reach the same decision path as a streamed one.
 await new Promise((done) => setTimeout(done, 50));

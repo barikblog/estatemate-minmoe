@@ -22,6 +22,7 @@ import { applyPushOperation, startZktecoPushServer } from './zkteco-push-server.
 import { pinPolicy } from './zkteco-push.mjs';
 import { CredentialCache, CooldownTracker, cooldownKey, decideCredential, parseTerminalEvent } from './remote-verify.mjs';
 import { startLanEventListener } from './lan-event-listener.mjs';
+import { bindIsReachableBeyondHost, deriveInboundSources, normalizeSourceAddress } from './network-access-control.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -139,6 +140,33 @@ const lanEventsPort = Number.isInteger(config.lanEvents?.port) ? config.lanEvent
 const lanEventsBindAddress = String(config.lanEvents?.bindAddress || '127.0.0.1');
 const lanEventsRequireKey = Boolean(config.lanEvents?.requireTerminalKey);
 const lanEventsTerminalKey = String(config.lanEvents?.terminalKey || '').trim();
+
+// Inbound access control for the two listeners this agent can open (the LAN
+// event listener and the ZKTeco PUSH listener). Everything else here is an
+// outbound connection and needs no rule at all.
+//
+// This exists for the site that cannot fix its router: an ISP-managed box, a
+// port-forwarding rule from a previous installation, an "inbound Internet
+// access" setting somebody else owns. When the rule cannot be deleted, the only
+// place left to decide who gets in is the socket that answers, so the decision
+// is made here — an allowlist of source addresses, a shared secret layered on
+// top of it, and a per-source rate limit. The allowlist is derived from the
+// terminals this agent is configured to serve, which is what makes deny-by-
+// default safe to have on: an installer does not have to remember to write it.
+// `allowedSources` adds ranges (a device VLAN, a second subnet, a relay) and
+// `allowUnknownSources` switches the list back to advisory.
+const lanEventsAllowedSources = readSourceList(config.lanEvents?.allowedSources);
+const lanEventsAllowUnknownSources = Boolean(config.lanEvents?.allowUnknownSources);
+const lanEventsMaxRequestsPerMinute = readRateLimit(config.lanEvents?.maxRequestsPerMinute);
+// An event body names the terminal it came from (`ipAddress`). That field is
+// written by whoever sent the upload, so it is never an identity — the socket a
+// request arrived on is. Trusting the body is opt-in for a site whose terminals
+// push through a relay, and it is refused by default for exactly that reason:
+// with Remote Network Verification on, an accepted event is a door decision.
+const lanEventsTrustReportedDeviceIp = Boolean(config.lanEvents?.trustReportedDeviceIp);
+const pushAllowedSources = readSourceList(config.zktecoPush?.allowedSources);
+const pushAllowUnknownSources = Boolean(config.zktecoPush?.allowUnknownSources);
+const pushMaxRequestsPerMinute = readRateLimit(config.zktecoPush?.maxRequestsPerMinute);
 
 if (!/^[0-9a-f-]{36}$/i.test(agentId)) {
   console.error('Invalid agentId, must be UUID');
@@ -301,12 +329,27 @@ function resolvePushDevice(serial, reportedOptions = {}) {
 
 function startPushListener() {
   if (!pushEnabled || pushState.listener) return pushState.listener;
+  // PUSH terminals dial in and have no address in the devices file, so nothing
+  // can be derived for them: the allowlist here is exactly what the operator
+  // wrote. Deriving from the *ISAPI* terminals instead would be worse than
+  // useless — it would produce a non-empty list that every PUSH terminal is
+  // missing from, and refuse the estate's own gates.
+  const policy = inboundPolicyFor({
+    name: 'ZKTeco PUSH listener',
+    explicit: pushAllowedSources,
+    deriveFromDevices: false,
+    bindAddress: pushBindAddress,
+  });
+  pushState.inboundPolicy = policy;
   pushState.listener = startZktecoPushServer({
     port: pushPort,
     bindAddress: pushBindAddress,
     log,
     requireAgentKey: pushRequireAgentKey,
     agentKey: pushAgentKey,
+    allowedSources: policy.allowedSources,
+    allowUnknownSources: policy.allowUnknownSources,
+    maxRequestsPerMinutePerSource: pushMaxRequestsPerMinute,
     ackTimeoutMs: pushAckTimeoutMs,
     resolveDevice: (serial, reportedOptions) => resolvePushDevice(serial, reportedOptions),
     onEvent: (deviceId, document) => {
@@ -420,6 +463,9 @@ async function probeCapabilities() {
 
 async function heartbeat() {
   try {
+    // Computed once, and only when this agent actually opens a port: an agent
+    // with no listener reports no inbound surface at all.
+    const inbound = inboundAccessHeartbeat();
     const { res, json } = await apiFetch(`/api/isapi/v1/agents/${agentId}/heartbeat`, {
       method: 'POST',
       body: JSON.stringify({
@@ -431,6 +477,7 @@ async function heartbeat() {
           eventsDropped: eventStats.dropped,
           eventsPending: pendingEvents.length,
           eventStream: eventStreamEnabled,
+          ...(inbound ? { inbound } : {}),
           ...(pushEnabled ? {
             pushTransport: {
               registered: pushState.registered,
@@ -1328,6 +1375,110 @@ function readTimeZone(value) {
 }
 
 /**
+ * An allowlist from config: an array, or one comma/space-separated string,
+ * because `agent-config.json` is edited by hand on a machine in a gatehouse.
+ */
+function readSourceList(value) {
+  if (Array.isArray(value)) return value.map((entry) => String(entry ?? '').trim()).filter(Boolean);
+  if (typeof value === 'string') return value.split(/[,\s]+/).map((entry) => entry.trim()).filter(Boolean);
+  return [];
+}
+
+/**
+ * The per-source rate limit from config.
+ *
+ * `undefined` means "not configured", so the controller's default of 600
+ * requests/minute per source applies; an explicit `0` means an operator switched
+ * the limit off, and the controller honours that. Collapsing the two would
+ * silently reinstate a limit somebody deliberately removed — and
+ * `scripts/inbound-exposure-check.mjs` reports the removal as a finding, so the
+ * choice is at least visible.
+ */
+function readRateLimit(value) {
+  if (value === undefined || value === null || value === '') return undefined;
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, Math.trunc(number)) : undefined;
+}
+
+/**
+ * The source allowlist for one listener: the ranges configured for it, plus
+ * every terminal this agent serves that has an address literal to allow.
+ *
+ * Returns `{ sources, missing, complete }`. `missing` is the part that matters
+ * for not breaking a working site — a terminal configured by hostname has no
+ * address to derive, and a listener that quietly started refusing it would look
+ * exactly like a broken bridge, so the caller says so out loud.
+ */
+function inboundSourcesFor(explicit) {
+  const every = new Set([...devices.values(), ...unresolvedDevices]);
+  return deriveInboundSources({ devices: [...every], explicit });
+}
+
+/**
+ * Resolves one listener's inbound access-control policy and says what it is.
+ *
+ * The list is enforced when it can be trusted to be complete: either the
+ * operator wrote ranges explicitly, or every terminal this agent serves
+ * contributed an address. Anything less stays advisory — refusing the estate's
+ * own terminals because a devices file names one by hostname is a worse failure
+ * than an open LAN listener, and the warning below is what an installer acts on.
+ */
+function inboundPolicyFor({ name, explicit, deriveFromDevices = true, bindAddress }) {
+  const derived = deriveFromDevices
+    ? inboundSourcesFor(explicit)
+    : deriveInboundSources({ devices: [], explicit });
+  const enforce = derived.sources.length > 0 && (explicit.length > 0 || derived.complete);
+
+  if (derived.sources.length && !enforce) {
+    const gaps = derived.missing.map((entry) => `${entry.name} (${entry.host})`).join(', ');
+    log('warn', `${name}: the inbound source allowlist is advisory, not enforced — ${gaps || 'no terminal contributed an address'} cannot be allowlisted automatically. Either give those terminals an address in isapi-devices.json, or list the device VLAN in "allowedSources" (e.g. ["192.168.88.0/24"]), and everything outside it will be refused.`);
+  }
+  if (!derived.sources.length && bindIsReachableBeyondHost(bindAddress)) {
+    log('warn', `${name}: no inbound source allowlist is configured and this port is reachable beyond this host, so any address that can reach it is accepted. On a network whose router you cannot change, that includes anything the router forwards inward — set "allowedSources" to the device VLAN.`);
+  }
+  for (const invalid of derived.invalid) {
+    log('warn', `${name}: ignoring the configured inbound source "${invalid.entry}" — ${invalid.reason}`);
+  }
+
+  return {
+    allowedSources: derived.sources,
+    allowUnknownSources: !enforce,
+    enforcing: enforce,
+    missing: derived.missing,
+    bindAddress,
+  };
+}
+
+/**
+ * Which of this agent's terminals an inbound upload came from.
+ *
+ * The socket the request arrived on is the identity, full stop. `event.deviceIp`
+ * is a field inside the request body — whoever sent the upload chose what it
+ * says — so on a port that a router forwards inward it is an invitation: name a
+ * real terminal, upload a real card number, and with Remote Network
+ * Verification switched on for that terminal the bridge opens its door. The body
+ * field is therefore only consulted when an operator has explicitly switched
+ * `trustReportedDeviceIp` on for a site whose terminals push through a relay,
+ * and a body naming a different terminal than the socket is always logged and
+ * counted, because it is either a mis-set device or somebody probing the port.
+ */
+function resolveLanEventDevice({ ip, event }) {
+  const source = normalizeSourceAddress(ip);
+  const reported = normalizeSourceAddress(event?.deviceIp);
+  if (reported && reported !== source) {
+    lanEventsIdentityMismatches += 1;
+    log('warn', `LAN event listener: an upload from ${source || 'an unknown source'} claimed to be from ${reported}. The socket address decides which terminal this is${lanEventsTrustReportedDeviceIp ? '' : ', and the claimed address is ignored (set "trustReportedDeviceIp": true only for a site whose terminals push through a relay)'}.`);
+  }
+  const candidates = lanEventsTrustReportedDeviceIp && reported && reported !== source ? [source, reported] : [source];
+  for (const address of candidates) {
+    if (!address) continue;
+    const hit = [...devices.values()].find((device) => normalizeSourceAddress(device.isapiHost) === address);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/**
  * The estate zone the Worker sends with every visitor operation. A terminal
  * checks the pass window against its own clock, and Hikvision's schema accepts
  * the window either as UTC (`…Z`, `timeType: "UTC"`) or as the terminal's local
@@ -2045,6 +2196,43 @@ const clampDoorNo = (value) => {
 const remoteVerifyActive = (device) => remoteVerifyEnabled && Boolean(device?.remoteVerify?.enabled);
 /** The LAN event listener, when one is running. Never opens a port unless configured. */
 let lanEventsListener = null;
+/** The resolved inbound policy per listener, for the startup log and heartbeat. */
+let lanEventsPolicy = null;
+/** Uploads whose body named a different terminal than the socket they came from. */
+let lanEventsIdentityMismatches = 0;
+
+/**
+ * What the agent's inbound surface currently is, for the heartbeat.
+ *
+ * Only present when a listener is actually running: an agent that opens no port
+ * reports nothing, which is the honest answer and the one an operator wants to
+ * see. Refusals are reported as counts and as the last few sources, never with a
+ * request body — a body can carry a card number.
+ */
+function inboundAccessHeartbeat() {
+  const listeners = [];
+  if (lanEventsListener?.accessControl) {
+    listeners.push({
+      listener: 'lan_events',
+      bindAddress: lanEventsBindAddress,
+      port: lanEventsListener.port,
+      policy: lanEventsPolicy ? { enforcing: lanEventsPolicy.enforcing, sources: lanEventsPolicy.allowedSources } : null,
+      identityMismatches: lanEventsIdentityMismatches,
+      ...lanEventsListener.accessControl.summary(),
+    });
+  }
+  if (pushState.listener?.handler?.accessControl) {
+    listeners.push({
+      listener: 'zkteco_push',
+      bindAddress: pushBindAddress,
+      port: pushState.listener.address()?.port ?? pushPort,
+      policy: pushState.inboundPolicy ? { enforcing: pushState.inboundPolicy.enforcing, sources: pushState.inboundPolicy.allowedSources } : null,
+      ...pushState.listener.handler.accessControl.summary(),
+    });
+  }
+  if (!listeners.length) return null;
+  return { listeners, denied: listeners.reduce((total, entry) => total + (entry.deniedSource ?? 0) + (entry.deniedSecret ?? 0) + (entry.throttled ?? 0), 0) };
+}
 
 /** Re-reads each terminal's remote-verification settings from the portal. */
 async function refreshRemoteVerifyConfig() {
@@ -2221,6 +2409,14 @@ async function main() {
   const streamDevices = [...devices.values()].filter((device) => device.eventStream !== false);
   log('info', `Agent: ${agentId}, Worker: ${workerUrl}, Devices: ${devices.size}, Interval: ${syncInterval}s, EventStream: ${eventStreamEnabled ? `on (${streamDevices.length} device(s))` : 'off'}`);
 
+  // Said once, before any listener starts, because it is the first question an
+  // operator asks on a site whose router they cannot change: does this agent
+  // accept connections at all? With both listeners off the honest answer is no,
+  // and a port-forwarding rule then has nothing to hand traffic to.
+  if (!pushEnabled && !lanEventsEnabled) {
+    log('info', 'Inbound access control: this agent opens no listening port — every connection it makes is outbound (Worker over HTTPS, terminals over ISAPI), so an inbound router rule cannot reach it. Run `node scripts/inbound-exposure-check.mjs` to verify that from outside.');
+  }
+
   // Remote verification has to have its snapshot before the first event arrives:
   // a cold cache denies everything, which is the correct failure mode but a
   // useless one if it is only because we started in the wrong order.
@@ -2264,25 +2460,26 @@ async function main() {
   // remote verification is on, because the history is useful either way - only
   // the decision needs the feature switched on.
   if (lanEventsEnabled) {
+    // Every terminal this agent serves is allowed to push to it, and that is the
+    // whole allowlist unless an operator added ranges. This is the control that
+    // still works when a router rule pointing at this port cannot be removed.
+    const policy = inboundPolicyFor({
+      name: 'LAN event listener',
+      explicit: lanEventsAllowedSources,
+      bindAddress: lanEventsBindAddress,
+    });
+    lanEventsPolicy = policy;
     try {
       lanEventsListener = await startLanEventListener({
         port: lanEventsPort,
         bindAddress: lanEventsBindAddress,
         requireKey: lanEventsRequireKey,
         agentKey: lanEventsTerminalKey,
+        allowedSources: policy.allowedSources,
+        allowUnknownSources: policy.allowUnknownSources,
+        maxRequestsPerMinutePerSource: lanEventsMaxRequestsPerMinute,
         log,
-        resolveDevice: ({ ip, event }) => {
-          // The terminal's own reported address is the better identifier; the
-          // socket address is the fallback for firmware that omits it.
-          const candidates = [event?.deviceIp, ip]
-            .map((value) => String(value ?? '').trim().replace(/^::ffff:/, ''))
-            .filter(Boolean);
-          for (const address of candidates) {
-            const hit = [...devices.values()].find((device) => String(device.isapiHost).trim() === address);
-            if (hit) return hit;
-          }
-          return null;
-        },
+        resolveDevice: resolveLanEventDevice,
         onEvent: ({ device, raw }) => {
           if (!device?.estateMateDeviceId) return;
           queueEvent(device.estateMateDeviceId, raw);
@@ -2394,6 +2591,13 @@ export {
   streamStates,
   setStreamState,
   heartbeatDeviceStates,
+  // Inbound access control. Exported so the integration checks can assert the
+  // policy the agent actually resolved from a real config and devices file —
+  // a rule that only exists in a unit test protects no gate.
+  inboundPolicyFor,
+  inboundSourcesFor,
+  inboundAccessHeartbeat,
+  resolveLanEventDevice,
   // Exported for sibling hosts that need to talk to a device without starting
   // the main loops: bridge-apps/windows runs `bridge check` in standby mode and
   // reuses the digest/basic ISAPI client instead of reimplementing it, so there
