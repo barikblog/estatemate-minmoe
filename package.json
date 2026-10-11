@@ -24,6 +24,8 @@
     "inbound:check": "node scripts/inbound-exposure-check.mjs",
     "db:migrate:local": "wrangler d1 migrations apply estatemate-db --local",
     "db:migrate:remote": "wrangler d1 migrations apply estatemate-db --remote",
+    "setup:platform": "node scripts/setup-platform.mjs",
+    "package:white-label": "node scripts/setup-platform.mjs --target white-label",
     "deploy": "npm run build && wrangler deploy",
     "cf:types": "wrangler types"
   },

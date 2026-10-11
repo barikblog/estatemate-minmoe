@@ -345,4 +345,26 @@ describe('portal UX: gate image, card-holder picker, Security gate sessions', ()
       expect((login.json.gates as Array<Record<string, string>>).map((gate) => gate.id)).toEqual(['device-b']);
     });
   });
+
+  describe('Sornix EstateOS branding, mobile UX, visitor pass close, logout & multi-platform kit', () => {
+    it('defaults portal configuration to Sornix EstateOS', async () => {
+      const config = await call(env, 'GET', '/api/portal-config');
+      expect(config.status).toBe(200);
+      expect(config.json.portal_name).toBe('Sornix EstateOS');
+      expect(config.json.estate_name).toBe('Sornix Estate');
+      expect(config.json.portal_short_name).toBe('SE');
+    });
+
+    it('generates multi-platform installer and white-label artifacts for Sornix EstateOS', async () => {
+      const { buildPlatformArtifacts, parseArgs } = await import('../scripts/setup-platform.mjs');
+      const parsed = parseArgs(['--portal', 'Sornix EstateOS', '--estate', 'Royal Palm Estate', '--short', 'RP']);
+      const artifacts = buildPlatformArtifacts(parsed);
+      expect(artifacts.slug).toBe('royal-palm-estate');
+      expect(artifacts.brandingSql).toContain("'Sornix EstateOS'");
+      expect(artifacts.brandingSql).toContain("'Royal Palm Estate'");
+      expect(artifacts.whiteLabelManifest.product).toBe('Sornix EstateOS');
+      expect(artifacts.whiteLabelManifest.vendor).toBe('Sornix');
+      expect(artifacts.secrets.SESSION_SECRET.length).toBeGreaterThanOrEqual(64);
+    });
+  });
 });

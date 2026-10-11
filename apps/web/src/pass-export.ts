@@ -159,9 +159,9 @@ export async function renderVisitorPassCanvas(source: PassShareSource): Promise<
   // Header: portal mark, pass type and portal name.
   const markSize = 74;
   panel(PAD, y, markSize, markSize, BLUE);
-  text(source.shortName || 'EM', PAD + markSize / 2, y + markSize / 2 + 9, `800 26px ${FONT}`, '#ffffff', 'center');
+  text(source.shortName || 'SE', PAD + markSize / 2, y + markSize / 2 + 9, `800 26px ${FONT}`, '#ffffff', 'center');
   text('ESTATE VISITOR PASS', PAD + markSize + 24, y + 32, `800 15px ${FONT}`, BLUE);
-  text(source.portalName || 'EstateMate', PAD + markSize + 24, y + 62, `700 26px ${FONT}`, INK);
+  text(source.portalName || 'Sornix EstateOS', PAD + markSize + 24, y + 62, `700 26px ${FONT}`, INK);
   y += headerHeight + gaps.afterHeader;
 
   // Visitor and host.
