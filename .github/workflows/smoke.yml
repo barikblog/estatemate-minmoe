@@ -55,7 +55,7 @@ jobs:
           set -euo pipefail
           body="$(curl -sS --fail-with-body --max-time 30 "$BASE_URL/")"
           grep -q '<div id="root">' <<<"$body"
-          grep -q '<title>EstateMate</title>' <<<"$body"
+          grep -qE '<title>(Sornix EstateOS|EstateMate)</title>' <<<"$body"
 
       - name: Login endpoint answers JSON for dummy credentials (never "Failed to fetch")
         shell: bash
