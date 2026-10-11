@@ -2095,7 +2095,7 @@ async function syncCredentialSnapshot() {
   if (result.ok) {
     log('debug', `Credential snapshot: ${result.count} credential(s) in ${result.pages} page(s), version ${result.version ?? 'unknown'}`);
   } else {
-    log('warn', `Credential snapshot sync failed: ${result.error}. Keeping the previous snapshot of ${result.count} credential(s); the next attempt asks for a full one.`);
+    log('warn', `Credential snapshot sync failed: ${result.error}. Keeping the previous snapshot of ${result.count} credential(s), still deciding from it; the next attempt asks for a full one.`);
   }
   return result;
 }

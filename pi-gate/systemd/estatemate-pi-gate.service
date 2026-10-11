@@ -1,0 +1,26 @@
+[Unit]
+Description=EstateMate Raspberry Pi gate controller
+# The gate keeps working while the estate's internet is down: nothing here
+# needs the network to make a decision.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /opt/estatemate/pi-gate/EstateMateGate.mjs --config /etc/estatemate/pi-gate.json
+Restart=always
+RestartSec=5
+# The relay line is held by this process through libgpiod, which is why it runs
+# as root. A dedicated user works too: add SupplementaryGroups=gpio and make
+# sure it can open /dev/gpiochip0.
+User=root
+WorkingDirectory=/opt/estatemate/pi-gate
+# The agent's network path is outbound only; it never listens on a port.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=estatemate-pi-gate
+
+[Install]
+WantedBy=multi-user.target

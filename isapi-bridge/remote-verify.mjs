@@ -189,8 +189,10 @@ export class CredentialCache {
     this.cardFormats = options.cardFormats ?? DEFAULT_CARD_FORMATS;
     this.version = null;
     this.lastSyncAt = null;
+    this.lastSyncFailedAt = null;
     this.lastSyncError = null;
     this.lastSyncLatencyMs = null;
+    this.needsFullSync = false;
     this.syncCount = 0;
     this.removedApplied = 0;
   }
@@ -243,12 +245,16 @@ export class CredentialCache {
    *
    * `fetchPage(cursor)` must resolve to one snapshot page or throw; the caller
    * supplies it so this module stays free of fetch, auth and configuration. A
-   * failed sync leaves the previous snapshot in place: a stale list that still
-   * opens the right doors is far safer than an empty one that opens none.
+   * failed sync leaves the previous snapshot in place - and *ready*: a stale
+   * list that still opens the right doors is far safer than an empty one that
+   * opens none.
    */
   async sync(fetchPage, { maxPages = 500, now = Date.now() } = {}) {
     const startedAt = Date.now();
-    this.pendingSince = this.lastSyncAt ? new Date(this.lastSyncAt).toISOString() : null;
+    // A cold cache and one whose last attempt failed both need the whole set: a
+    // delta that threw half-way may have applied only part of its window.
+    const full = this.needsFullSync || !this.lastSyncAt;
+    this.pendingSince = full ? null : new Date(this.lastSyncAt).toISOString();
     let cursor = null;
     let pages = 0;
     try {
@@ -263,6 +269,7 @@ export class CredentialCache {
         if (!page.nextCursor) break;
         cursor = page.nextCursor;
       }
+      this.needsFullSync = false;
       this.lastSyncAt = Date.now();
       this.lastSyncLatencyMs = Date.now() - startedAt;
       this.lastSyncError = null;
@@ -270,9 +277,13 @@ export class CredentialCache {
       return { ok: true, pages, count: this.count, version: this.version };
     } catch (error) {
       this.lastSyncError = String(error?.message ?? error);
-      // A delta that failed half-way leaves the cache possibly incomplete, so the
-      // next attempt asks for a full snapshot rather than continuing the delta.
-      this.lastSyncAt = null;
+      this.lastSyncFailedAt = Date.now();
+      // Deliberately *not* `lastSyncAt = null`: that is what `ready` is keyed on,
+      // and clearing it made one failed refresh deny everyone - a card that was in
+      // the snapshot a second earlier stopped opening the gate until some later
+      // sync happened to succeed. The cache keeps its last good state instead, and
+      // the next attempt reloads fully in case the failed delta was half-applied.
+      this.needsFullSync = true;
       return { ok: false, error: this.lastSyncError, pages, count: this.count };
     }
   }
@@ -308,8 +319,12 @@ export class CredentialCache {
       cacheVersion: this.version,
       cacheAgeSeconds: this.ageSeconds(now),
       lastSyncAt: this.lastSyncAt ? new Date(this.lastSyncAt).toISOString() : null,
+      lastSyncFailedAt: this.lastSyncFailedAt ? new Date(this.lastSyncFailedAt).toISOString() : null,
       lastSyncLatencyMs: this.lastSyncLatencyMs,
       lastSyncError: this.lastSyncError,
+      // True after a failed refresh: the loaded snapshot is still in use, and the
+      // next attempt downloads the whole set instead of a delta.
+      needsFullSync: this.needsFullSync,
       syncCount: this.syncCount,
       removedApplied: this.removedApplied,
     };

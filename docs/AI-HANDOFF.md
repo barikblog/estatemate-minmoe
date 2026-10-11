@@ -1,5 +1,67 @@
 # AI handoff — EstateMate
 
+## Raspberry Pi agents: a Pi bridge, and a Pi that is the gate (2026-10-11)
+
+"Runs on" gained two choices. Both are stored without widening any CHECK
+(`migrations/0027_raspberry_pi_agents.sql` adds `agent_kind_ext`, because SQLite
+cannot widen 0026's `agent_kind CHECK` and rebuilding `isapi_agents` would fire
+the foreign keys that keep terminals, installer keys and queued operations
+linked). `src/agent-kinds.ts` owns the mapping and `agentKindSql()` is the only
+way anything reads a kind:
+
+| "Runs on" | platform | agent_kind | agent_kind_ext |
+| --- | --- | --- | --- |
+| Windows / Linux / macOS / Android or other | as before | `bridge` | NULL |
+| ESP32 gate controller | `other` | `esp32` | NULL |
+| Raspberry Pi (bridge) | `linux` | `bridge` | `pi_bridge` |
+| Raspberry Pi gate controller | `other` | `bridge` | `pi_gate` |
+
+Two families, and every rule must treat all kinds in a family the same:
+**bridge hosts** (`bridge`, `pi_bridge`) run the LAN bridge and get a setup file
+that rotates the secret; **gate controllers** (`esp32`, `pi_gate`) are the gate,
+serve exactly one terminal, never dial a terminal, and get their own two
+downloads. The bridge-installer endpoint refuses every controller kind before
+rotating anything, the ESP32 routes refuse a Pi controller (and vice versa), and
+the one-terminal link rule now covers all controller kinds.
+
+- **Pi bridge**: `Download setup` on a `pi_bridge` agent serves
+  `src/pi-bridge-setup.ts` instead of the generic Linux script — Node 22 for
+  arm64/armv7l if needed, the bridge from the public repository tarball
+  (`ESTATEMATE_BRIDGE_REPO`/`ESTATEMATE_BRIDGE_REF` override), the 0600
+  `agent-config.json`, and a systemd unit that starts on boot.
+- **Pi gate controller**: `src/pi-gate.ts` (banner, config, problem file) over
+  the generated `src/pi-gate-program.ts`. `pi-gate/EstateMateGate.mjs` is the
+  canonical program (Node 22, no dependencies), the Raspberry Pi twin of the
+  ESP32 sketch: same Wiegand decoding, same fail-closed decisions, same door
+  modes, same events byte for byte, same intervals. Its downloads are
+  `pi-gate-program` (no secret → Administrator and Manager) and `pi-gate-config`
+  (Administrator only; rotates that agent's secret, and only with exactly one
+  linked terminal — otherwise the file is an `error` document with
+  `secretRotated: false` and nothing is rotated). GPIO is driven through the
+  libgpiod tools (`gpiomon`/`gpioset`, v1 and v2 both probed for), which is the
+  only hardware difference that matters; `gpio.backend: "fake"` runs the whole
+  controller with no hardware.
+- **Tests**: `npm run test:pi-gate` (part of `npm test`) runs the real program
+  against a stub Worker and the fake GPIO backend — 101 checks, and a final one
+  spawns the program as a child process so the real timers, the real HTTP and the
+  real decisions are exercised. The event documents are compared byte for byte
+  with `esp32-gate/host-test/fixtures/`: one gate controller may not speak a
+  different protocol from the other. `test/raspberry-pi.test.ts` covers the
+  Worker side (kind storage, both downloads, rotation rules, the one-terminal
+  rule, the Pi setup script, and the ESP32 fixtures accepted for a Pi agent), and
+  fails if `src/pi-gate-program.ts` or the systemd unit drifts from the program.
+  User-facing guide: `pi-gate/README.md`.
+- **Bridge bug fixed with it**: `CredentialCache.sync()` in
+  `isapi-bridge/remote-verify.mjs` no longer clears `lastSyncAt` on failure. A
+  Pi (or PC) running the bridge with Remote Network Verification used to deny
+  every credential after a single failed snapshot refresh; it now keeps the last
+  good snapshot, stays `ready`, reports `lastSyncError` and `needsFullSync` on
+  the heartbeat, and asks for a full snapshot next time. Covered by section 3b of
+  `isapi-bridge/agent.remote-verify.integration.mjs`.
+- **Not verified**: no Raspberry Pi was reachable from the build sandbox, so the
+  level shifting, the relay wiring and the libgpiod paths have not been exercised
+  on hardware. `pi-gate/README.md` says so too.
+
 ## ESP32 gate controller: sketch + secrets.h downloads (2026-10-10)
 
 An ESP32 with a Wiegand reader and a relay can now *be* a gate. It is a
@@ -46,10 +108,13 @@ single-transport rule holds. User-facing guide: `esp32-gate/README.md`.
   normalises `since` to the stored format; an unreadable value gives a full
   snapshot. This affected the Node/Android bridges too. Covered by
   `test/credential-snapshot-since.test.ts`.
-- **Known, not changed**: the Node bridge's `CredentialCache` clears
-  `lastSyncAt` after a failed sync, so one failed refresh makes it deny
-  everyone until the next success. The ESP32 keeps its previous snapshot
-  instead.
+- **Fixed on the way (2026-10-11)**: the Node bridge's `CredentialCache`
+  cleared `lastSyncAt` after a failed sync, and `ready` is keyed on it — so one
+  failed refresh denied every credential until a later sync happened to succeed.
+  It now keeps the last good snapshot, stays ready, reports
+  `lastSyncError`/`needsFullSync` on the heartbeat and reloads the whole set on
+  the next attempt. See the Raspberry Pi section below; the ESP32 and Pi gate
+  controllers already behaved this way.
 - **Not verified**: no Xtensa toolchain was reachable from the build sandbox,
   so the sketch has not been compiled for, or run on, an ESP32. Flash a bench
   board before relying on it.

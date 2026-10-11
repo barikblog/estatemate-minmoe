@@ -1,0 +1,36 @@
+-- Raspberry Pi agents: a bridge that runs on a Pi, and a Pi gate controller.
+--
+-- `agent_kind` (migration 0026) carries the CHECK `IN ('bridge','esp32')`, and
+-- SQLite cannot widen a CHECK in place. Rebuilding `isapi_agents` is not safe
+-- here: `isapi_device_configs.agent_id`, `isapi_agent_installers.agent_id`,
+-- `isapi_sync_logs.agent_id`, `hikvision_devices.isapi_agent_id`,
+-- `device_operations.agent_id` and `visitor_device_operations.agent_id` all
+-- reference `isapi_agents(id)` (ON DELETE SET NULL / CASCADE), and SQLite runs
+-- an implicit DELETE FROM when a referenced table is dropped — which would
+-- fire those foreign-key actions and silently unlink every terminal, installer
+-- key and queued operation in the estate.
+--
+-- So the kinds added after 0026 live in their own column. The *effective* kind
+-- every reader uses is `COALESCE(agent_kind_ext, agent_kind)`:
+--
+--   agent_kind      agent_kind_ext   effective kind
+--   --------------  ---------------  ----------------
+--   'bridge'        NULL             bridge       (Windows/Linux/macOS/Android)
+--   'esp32'         NULL             esp32        (ESP32 gate controller)
+--   'bridge'        'pi_bridge'      pi_bridge    (Raspberry Pi bridge host)
+--   'bridge'        'pi_gate'        pi_gate      (Raspberry Pi gate controller)
+--
+-- A Pi gate controller keeps `agent_kind='bridge'` in the old column for the
+-- same reason an ESP32 keeps `platform='other'`: the legacy column's CHECK is
+-- immutable, so the new value cannot be written there; the effective kind is
+-- what the portal, the installer endpoints and the download routes branch on.
+--
+-- Controller kinds (`esp32`, `pi_gate`) are the ones a bridge installer must
+-- never be produced for, and the ones that serve exactly one terminal. Bridge
+-- kinds (`bridge`, `pi_bridge`) are ordinary bridge hosts; the Pi one only
+-- changes which setup script Download setup hands out.
+ALTER TABLE isapi_agents ADD COLUMN agent_kind_ext TEXT CHECK (agent_kind_ext IN ('pi_bridge','pi_gate'));
+
+-- The portal lists agents and filters them by kind; the expression is a plain
+-- column read, so no index is needed for these small tables.
+CREATE INDEX idx_isapi_agents_kind_ext ON isapi_agents(agent_kind_ext) WHERE agent_kind_ext IS NOT NULL;
