@@ -90,6 +90,9 @@ let snapshotPages = [
   { items: [{ kind: 'card', value: '0007654321', personId: 'p2', employeeNo: 'EMP2', status: 'active', validUntil: null }] },
 ];
 let remoteVerifyEnabled = true;
+// When set, the snapshot endpoint answers this status instead of a page, which
+// is how the "one failed refresh" behaviour is exercised.
+let snapshotFailure = null;
 
 const worker = createServer((req, res) => {
   let body = '';
@@ -115,6 +118,7 @@ const worker = createServer((req, res) => {
     }
     if (url.pathname === `/api/isapi/v1/agents/${AGENT_ID}/credential-snapshot`) {
       published.snapshotRequests.push({ since: url.searchParams.get('since'), cursor: url.searchParams.get('cursor') });
+      if (snapshotFailure) return json(snapshotFailure, { error: 'the snapshot cannot be served right now' });
       const cursorIndex = Number(url.searchParams.get('cursor') ?? 0);
       const since = url.searchParams.get('since');
       // A delta carries only what moved. Serving the full pages again here would
@@ -202,6 +206,26 @@ check('the portal says this terminal is a reader', agent.remoteVerifyHeartbeat()
 await agent.syncCredentialSnapshot();
 check('a revocation between syncs leaves the cache', cold.lookup({ cardNo: '0007654321' }) === null, `count=${cold.count}`);
 check('the credential that was not revoked stays', cold.lookup({ cardNo: '0001234567' }) !== null);
+
+// ── 3b. A failed refresh keeps the loaded snapshot, and says so ──────────────
+// This used to clear `lastSyncAt`, which made `ready` false: one failed page
+// denied every credential until a later sync happened to succeed, so a gate
+// refused everyone after a single hiccup.
+snapshotFailure = 503;
+const failedSync = await agent.syncCredentialSnapshot();
+check('a failed refresh is reported as a failure', failedSync.ok === false && /503/.test(String(failedSync.error)), JSON.stringify(failedSync));
+check('a failed refresh leaves the cache ready', cold.ready === true);
+check('a credential held before the failure still decides', cold.lookup({ cardNo: '0001234567' }) !== null);
+const failedHeartbeat = agent.remoteVerifyHeartbeat();
+check('the heartbeat reports the failure', typeof failedHeartbeat.cache.lastSyncError === 'string' && failedHeartbeat.cache.lastSyncError.length > 0, JSON.stringify(failedHeartbeat.cache));
+check('the heartbeat asks for a full reload next', failedHeartbeat.cache.needsFullSync === true, JSON.stringify(failedHeartbeat.cache));
+snapshotFailure = null;
+const recovered = await agent.syncCredentialSnapshot();
+check('the next refresh succeeds and reloads the whole set', recovered.ok === true);
+check('a successful refresh clears the error and the full-reload flag', (() => {
+  const hb = agent.remoteVerifyHeartbeat();
+  return hb.cache.lastSyncError === null && hb.cache.needsFullSync === false;
+})(), JSON.stringify(agent.remoteVerifyHeartbeat().cache));
 
 // ── 4. A known card opens the door, once ─────────────────────────────────────
 const grantedDoc = `<?xml version="1.0" encoding="UTF-8"?>

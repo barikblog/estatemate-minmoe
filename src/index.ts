@@ -22,6 +22,17 @@ import { EMPLOYEE_ID_MAX, deviceEmployeeNo, employeeIdFromUuid, readEmployeeId }
 import { cardNumberValidationError, isDigitsOnlyCardNumber } from './card-number';
 import { AccessLiveFeed } from './live-feed';
 import { ESP32_CONFIG_FILENAME, ESP32_SKETCH_FILENAME, renderEsp32Config, renderEsp32ConfigProblem, renderEsp32Sketch } from './esp32-gate';
+import {
+  REQUESTED_AGENT_PLATFORMS,
+  agentKindExtFor,
+  agentKindLabel,
+  agentKindSql,
+  isControllerKind,
+  normalizeAgentKind,
+  resolveRequestedAgentKind,
+} from './agent-kinds';
+import { renderPiBridgeSetupScript } from './pi-bridge-setup';
+import { PI_GATE_CONFIG_FILENAME, PI_GATE_PROGRAM_FILENAME, renderPiGateConfig, renderPiGateConfigProblem, renderPiGateProgram } from './pi-gate';
 import { evaluateVisitorPass } from './visitor-pass';
 import {
   VISITOR_DEFAULT_MAX_VALIDITY_DAYS,
@@ -5375,7 +5386,7 @@ app.patch('/api/access/operations/:id', requireRoles('admin','manager'), async (
 
 app.get('/api/isapi/agents', requireRoles('admin','manager'), async (c) => {
   const agents = await c.env.DB.prepare(
-    `SELECT a.id,a.name,a.hostname,a.platform,a.agent_kind,a.version,${agentEffectiveStatus('a')} AS status,a.status AS stored_status,a.last_seen_at,a.last_ip,a.created_at,a.updated_at,
+    `SELECT a.id,a.name,a.hostname,a.platform,${agentKindSql('a')} AS agent_kind,a.version,${agentEffectiveStatus('a')} AS status,a.status AS stored_status,a.last_seen_at,a.last_ip,a.created_at,a.updated_at,
        (SELECT COUNT(*) FROM isapi_device_configs cfg WHERE cfg.agent_id=a.id AND cfg.sync_enabled=1) AS linked_devices,
        (SELECT COUNT(*) FROM device_operations o JOIN isapi_device_configs cfg ON cfg.device_id=o.device_id WHERE cfg.agent_id=a.id AND o.status IN ('pending','sent','failed')) +
        (SELECT COUNT(*) FROM visitor_device_operations vo JOIN isapi_device_configs cfg ON cfg.device_id=vo.device_id WHERE cfg.agent_id=a.id AND vo.status IN ('pending','sent','failed')) AS pending_operations
@@ -5387,32 +5398,39 @@ app.get('/api/isapi/agents', requireRoles('admin','manager'), async (c) => {
 app.post('/api/isapi/agents', requireRoles('admin'), async (c) => {
   const body = await c.req.json<{ name?: string; hostname?: string; platform?: string; version?: string }>();
   if (!body.name?.trim()) return jsonError(c, 400, 'Agent name is required');
-  const requested = body.platform?.trim().toLowerCase() || 'windows';
-  if (!['windows','linux','darwin','other','esp32'].includes(requested)) return jsonError(c, 400, 'platform must be windows, linux, darwin, other or esp32');
-  // An ESP32 gate controller is its own agent (migration 0026): its config
-  // download rotates the secret, which must never knock a PC bridge offline.
-  // `platform` keeps its original CHECK list, so the controller is stored as
-  // 'other' and told apart by agent_kind.
-  const agentKind = requested === 'esp32' ? 'esp32' : 'bridge';
-  const platform = (requested === 'esp32' ? 'other' : requested) as 'windows'|'linux'|'darwin'|'other';
+  // "Runs on" is what the person picked, not a database platform: an ESP32 and a
+  // Raspberry Pi gate controller are not any of the four platforms, and a Pi
+  // bridge is a Linux host. platform keeps its original CHECK list; the kind is
+  // what tells them apart (see src/agent-kinds.ts).
+  const choice = resolveRequestedAgentKind(body.platform);
+  if (!choice) return jsonError(c, 400, `platform must be ${REQUESTED_AGENT_PLATFORMS.join(', ')}`);
+  const agentKind = choice.kind;
+  const platform = choice.platform;
+  // Migration 0026's CHECK only knows 'bridge' and 'esp32', so the kinds added
+  // later live in agent_kind_ext and keep the legacy column at 'bridge'.
+  const legacyKind = agentKind === 'esp32' ? 'esp32' : 'bridge';
   const id = crypto.randomUUID();
   const secret = randomToken(32);
   const secretHash = await sha256(`${secret}:${c.env.DEVICE_INGEST_PEPPER}`);
   await c.env.DB.prepare(
-    `INSERT INTO isapi_agents(id,name,hostname,platform,agent_kind,version,status,secret_hash,created_by) VALUES (?,?,?,?,?,?,?,?,?)`,
-  ).bind(id, body.name.trim(), body.hostname?.trim() || null, platform, agentKind, body.version?.trim() || null, 'pending', secretHash, c.get('user').id).run();
+    `INSERT INTO isapi_agents(id,name,hostname,platform,agent_kind,agent_kind_ext,version,status,secret_hash,created_by) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+  ).bind(id, body.name.trim(), body.hostname?.trim() || null, platform, legacyKind, agentKindExtFor(agentKind), body.version?.trim() || null, 'pending', secretHash, c.get('user').id).run();
   await audit(c, 'create', 'isapi_agent', id, { name: body.name.trim(), platform, agentKind, hostname: body.hostname?.trim() });
   return c.json({
     id, name: body.name.trim(), hostname: body.hostname?.trim() || null, platform, agentKind, secret,
     warning: agentKind === 'esp32'
       ? 'Secret is shown once. You do not need to copy it: connect the gate terminal to this agent, then use Download ESP32 config, which writes a fresh secret into secrets.h.'
-      : 'Secret is shown once. Store it securely on the Windows agent host.',
+      : agentKind === 'pi_gate'
+        ? 'Secret is shown once. You do not need to copy it: connect the gate terminal to this agent, then use Download Pi gate config, which writes a fresh secret into estatemate-gate.json.'
+        : agentKind === 'pi_bridge'
+          ? 'Secret is shown once. You do not need to copy it: Download setup installs the bridge on the Pi and writes this agent into its config file.'
+          : 'Secret is shown once. Store it securely on the Windows agent host.',
   }, 201);
 });
 
 app.get('/api/isapi/agents/:id', requireRoles('admin','manager'), async (c) => {
   const agent = await c.env.DB.prepare(
-    `SELECT id,name,hostname,platform,agent_kind,version,${agentEffectiveStatus('isapi_agents')} AS status,last_seen_at,last_ip,created_at,updated_at FROM isapi_agents WHERE id=? AND deleted_at IS NULL`,
+    `SELECT id,name,hostname,platform,${agentKindSql()} AS agent_kind,version,${agentEffectiveStatus('isapi_agents')} AS status,last_seen_at,last_ip,created_at,updated_at FROM isapi_agents WHERE id=? AND deleted_at IS NULL`,
   ).bind(c.req.param('id')).first();
   if (!agent) return jsonError(c, 404, 'ISAPI agent not found');
   const configs = await c.env.DB.prepare(
@@ -5473,11 +5491,13 @@ app.post('/api/isapi/agents/:id/rotate-secret', requireRoles('admin'), async (c)
 // Administrator-only just like explicit secret rotation; Managers may link and
 // monitor devices but must not gain credential-control permissions.
 app.post('/api/isapi/agents/:id/installer', requireRoles('admin'), async (c) => {
-  const agent = await c.env.DB.prepare(`SELECT id,name,platform,agent_kind FROM isapi_agents WHERE id=? AND deleted_at IS NULL`).bind(c.req.param('id')).first<{ id:string;name:string;platform:string;agent_kind:string }>();
+  const agent = await c.env.DB.prepare(`SELECT id,name,platform,${agentKindSql()} AS agent_kind FROM isapi_agents WHERE id=? AND deleted_at IS NULL`).bind(c.req.param('id')).first<{ id:string;name:string;platform:string;agent_kind:string }>();
   if (!agent) return jsonError(c, 404, 'ISAPI agent not found');
-  // Checked before anything is rotated: a bridge script is useless to a
-  // microcontroller, and rotating its secret would only disconnect the gate.
-  if (agent.agent_kind === 'esp32') return jsonError(c, 409, 'This is an ESP32 gate controller. Use Download ESP32 sketch and Download ESP32 config instead of a bridge setup file.');
+  // Checked before anything is rotated: a bridge script is useless to a gate
+  // controller (there is no LAN bridge to install - the gate *is* the agent),
+  // and rotating its secret would only disconnect the gate. Every controller
+  // kind is refused the same way, whatever hardware it runs on.
+  if (isControllerKind(agent.agent_kind)) return jsonError(c, 409, controllerInstallerRefusal(agent.agent_kind));
   const secret = randomToken(32);
   const secretHash = await sha256(`${secret}:${c.env.DEVICE_INGEST_PEPPER}`);
   const installerKey = randomToken(32);
@@ -5630,10 +5650,26 @@ NEXT
 echo "Installer completed for ${agent.name}"
 `;
 
-  const installerContent = agent.platform === 'windows' ? psScript : shScript;
-  const contentType = agent.platform === 'windows' ? 'application/x-powershell' : 'text/x-shellscript; charset=utf-8';
-  const ext = agent.platform === 'windows' ? 'ps1' : 'sh';
-  await audit(c, 'generate_installer', 'isapi_agent', agent.id, { platform: agent.platform });
+  // A Raspberry Pi is a headless box that usually has nothing on it: its setup
+  // file installs Node, the bridge, the config and the systemd unit in one go.
+  // Every other Linux/macOS host keeps the generic script, which stops before
+  // the service unit and points at the agent binary in the releases.
+  const isPiBridge = normalizeAgentKind(agent.agent_kind) === 'pi_bridge';
+  const piScript = isPiBridge
+    ? renderPiBridgeSetupScript({
+      agent,
+      secret,
+      installerKey,
+      workerUrl: origin,
+      generatedAt: new Date(),
+    })
+    : null;
+  const installerContent = piScript ?? (agent.platform === 'windows' ? psScript : shScript);
+  const contentType = piScript
+    ? 'text/x-shellscript; charset=utf-8'
+    : agent.platform === 'windows' ? 'application/x-powershell' : 'text/x-shellscript; charset=utf-8';
+  const ext = piScript ? 'pi.sh' : agent.platform === 'windows' ? 'ps1' : 'sh';
+  await audit(c, 'generate_installer', 'isapi_agent', agent.id, { platform: agent.platform, agentKind: normalizeAgentKind(agent.agent_kind) });
   return new Response(installerContent, {
     status: 200,
     headers: {
@@ -5646,18 +5682,51 @@ echo "Installer completed for ${agent.name}"
 });
 
 // ---------------------------------------------------------------------------
-// ESP32 gate controller downloads (esp32-gate/, src/esp32-gate.ts)
+// Gate controller downloads (esp32-gate/, pi-gate/, src/esp32-gate.ts,
+// src/pi-gate.ts)
+//
+// A gate controller is a dedicated agent: it is the gate, it never dials a
+// terminal, and its downloads are its own. Every rule here treats all
+// controller kinds (esp32, pi_gate) the same, and every branch reads the
+// effective kind, so a Pi gate is never handed ESP32 files or a bridge script.
 // ---------------------------------------------------------------------------
 
-async function esp32AgentFor(c: AppContext): Promise<{ id: string; name: string } | Response> {
+/** What to use instead of a bridge setup file, per controller kind. */
+function controllerDownloadHint(kind: string): string {
+  return kind === 'esp32'
+    ? 'Use Download ESP32 sketch and Download ESP32 config instead of a bridge setup file.'
+    : 'Use Download Pi gate program and Download Pi gate config instead of a bridge setup file.';
+}
+
+/** "a Raspberry Pi gate controller" / "an ESP32 gate controller". */
+function agentKindWithArticle(kind: string): string {
+  const label = agentKindLabel(kind);
+  return `${/^[AEIOU]/.test(label) ? 'an' : 'a'} ${label}`;
+}
+
+/** The whole refusal a bridge installer gets for a gate controller agent. */
+function controllerInstallerRefusal(kind: string): string {
+  return `This is ${agentKindWithArticle(kind)}. ${controllerDownloadHint(kind)}`;
+}
+
+async function controllerAgentFor(c: AppContext, kind: 'esp32' | 'pi_gate'): Promise<{ id: string; name: string } | Response> {
   const agent = await c.env.DB.prepare(
-    `SELECT id,name,agent_kind FROM isapi_agents WHERE id=? AND deleted_at IS NULL`,
+    `SELECT id,name,${agentKindSql()} AS agent_kind FROM isapi_agents WHERE id=? AND deleted_at IS NULL`,
   ).bind(c.req.param('id')).first<{ id: string; name: string; agent_kind: string }>();
   if (!agent) return jsonError(c, 404, 'ISAPI agent not found');
-  if (agent.agent_kind !== 'esp32') {
-    return jsonError(c, 409, 'This agent is a bridge, not an ESP32 gate controller. Add an agent that runs on "ESP32 gate controller" so its secret is never shared with a bridge.');
+  if (normalizeAgentKind(agent.agent_kind) !== kind) {
+    return jsonError(c, 409, `This agent is not ${agentKindWithArticle(kind)}. Add an agent that runs on "${agentKindLabel(kind)}" so its secret is never shared with a bridge.`);
   }
   return { id: agent.id, name: agent.name };
+}
+
+/** The terminals one agent serves, in the order the config files name them. */
+async function linkedAgentTerminals(c: AppContext, agentId: string): Promise<{ deviceId: string; name: string; gateName: string | null }[]> {
+  const linked = await c.env.DB.prepare(
+    `SELECT cfg.device_id,d.name,d.gate_name FROM isapi_device_configs cfg JOIN hikvision_devices d ON d.id=cfg.device_id
+      WHERE cfg.agent_id=? AND cfg.sync_enabled=1 AND d.deleted_at IS NULL ORDER BY d.gate_name,d.name`,
+  ).bind(agentId).all<{ device_id: string; name: string; gate_name: string | null }>();
+  return linked.results.map((row) => ({ deviceId: row.device_id, name: row.name, gateName: row.gate_name }));
 }
 
 function fileDownload(content: string, filename: string, contentType: string): Response {
@@ -5675,7 +5744,7 @@ function fileDownload(content: string, filename: string, contentType: string): R
 // The sketch carries no secret, so a Manager (who can see the agent list) may
 // download it too. Nothing is rotated.
 app.get('/api/isapi/agents/:id/esp32-sketch', requireRoles('admin','manager'), async (c) => {
-  const agent = await esp32AgentFor(c);
+  const agent = await controllerAgentFor(c, 'esp32');
   if (agent instanceof Response) return agent;
   await audit(c, 'download_esp32_sketch', 'isapi_agent', agent.id);
   return fileDownload(renderEsp32Sketch(agent, new Date()), ESP32_SKETCH_FILENAME, 'text/x-arduino; charset=utf-8');
@@ -5686,13 +5755,9 @@ app.get('/api/isapi/agents/:id/esp32-sketch', requireRoles('admin','manager'), a
 // with no linked terminal (or several) the download explains what to do and the
 // controller already in the field keeps working.
 app.post('/api/isapi/agents/:id/esp32-config', requireRoles('admin'), async (c) => {
-  const agent = await esp32AgentFor(c);
+  const agent = await controllerAgentFor(c, 'esp32');
   if (agent instanceof Response) return agent;
-  const linked = await c.env.DB.prepare(
-    `SELECT cfg.device_id,d.name,d.gate_name FROM isapi_device_configs cfg JOIN hikvision_devices d ON d.id=cfg.device_id
-      WHERE cfg.agent_id=? AND cfg.sync_enabled=1 AND d.deleted_at IS NULL ORDER BY d.gate_name,d.name`,
-  ).bind(agent.id).all<{ device_id: string; name: string; gate_name: string | null }>();
-  const terminals = linked.results.map((row) => ({ deviceId: row.device_id, name: row.name, gateName: row.gate_name }));
+  const terminals = await linkedAgentTerminals(c, agent.id);
   const generatedAt = new Date();
   if (terminals.length !== 1) {
     const problem = renderEsp32ConfigProblem(agent, terminals, generatedAt);
@@ -5705,6 +5770,36 @@ app.post('/api/isapi/agents/:id/esp32-config', requireRoles('admin'), async (c) 
   const config = renderEsp32Config(agent, terminals[0]!, new URL(c.req.url).origin, secret, generatedAt);
   await audit(c, 'generate_esp32_config', 'isapi_agent', agent.id, { ready: true, deviceId: terminals[0]!.deviceId });
   return fileDownload(config.content, ESP32_CONFIG_FILENAME, 'text/x-c; charset=utf-8');
+});
+
+// The Pi gate program is the whole controller and holds no secret (the secret
+// lives in estatemate-gate.json), so a Manager may download it. Nothing is
+// rotated: the file is the same for every agent, only the banner differs.
+app.get('/api/isapi/agents/:id/pi-gate-program', requireRoles('admin','manager'), async (c) => {
+  const agent = await controllerAgentFor(c, 'pi_gate');
+  if (agent instanceof Response) return agent;
+  await audit(c, 'download_pi_gate_program', 'isapi_agent', agent.id);
+  return fileDownload(renderPiGateProgram(agent, new Date()), PI_GATE_PROGRAM_FILENAME, 'text/javascript; charset=utf-8');
+});
+
+// The config carries the agent secret, so it is Administrator-only and rotates
+// - and, like the ESP32 config, only when exactly one terminal is linked.
+app.post('/api/isapi/agents/:id/pi-gate-config', requireRoles('admin'), async (c) => {
+  const agent = await controllerAgentFor(c, 'pi_gate');
+  if (agent instanceof Response) return agent;
+  const terminals = await linkedAgentTerminals(c, agent.id);
+  const generatedAt = new Date();
+  if (terminals.length !== 1) {
+    const problem = renderPiGateConfigProblem(agent, terminals, generatedAt);
+    await audit(c, 'generate_pi_gate_config', 'isapi_agent', agent.id, { ready: false, terminals: terminals.length });
+    return fileDownload(problem.content, PI_GATE_CONFIG_FILENAME, 'application/json; charset=utf-8');
+  }
+  const secret = randomToken(32);
+  const secretHash = await sha256(`${secret}:${c.env.DEVICE_INGEST_PEPPER}`);
+  await c.env.DB.prepare(`UPDATE isapi_agents SET secret_hash=?,updated_at=datetime('now') WHERE id=?`).bind(secretHash, agent.id).run();
+  const config = renderPiGateConfig(agent, terminals[0]!, new URL(c.req.url).origin, secret, generatedAt);
+  await audit(c, 'generate_pi_gate_config', 'isapi_agent', agent.id, { ready: true, deviceId: terminals[0]!.deviceId });
+  return fileDownload(config.content, PI_GATE_CONFIG_FILENAME, 'application/json; charset=utf-8');
 });
 
 app.get('/api/isapi/device-configs', requireRoles('admin','manager'), async (c) => {
@@ -5735,16 +5830,18 @@ app.post('/api/isapi/device-configs', requireRoles('admin','manager'), async (c)
   const device = await c.env.DB.prepare(`SELECT id,connection_pattern FROM hikvision_devices WHERE id=? AND deleted_at IS NULL`).bind(body.deviceId).first<{ id:string;connection_pattern:string }>();
   if (!device) return jsonError(c, 404, 'Device not found');
   if (body.agentId) {
-    const agent = await c.env.DB.prepare(`SELECT id,agent_kind FROM isapi_agents WHERE id=? AND deleted_at IS NULL`).bind(body.agentId).first<{ id: string; agent_kind: string }>();
+    const agent = await c.env.DB.prepare(`SELECT id,${agentKindSql()} AS agent_kind FROM isapi_agents WHERE id=? AND deleted_at IS NULL`).bind(body.agentId).first<{ id: string; agent_kind: string }>();
     if (!agent) return jsonError(c, 404, 'ISAPI agent not found');
-    if (agent.agent_kind === 'esp32') {
-      // An ESP32 drives one relay at one gate. A second terminal would receive
-      // door and visitor work that no hardware can carry out.
+    if (isControllerKind(agent.agent_kind)) {
+      // A gate controller drives one relay at one gate, whatever hardware it
+      // runs on. A second terminal would receive door and visitor work that no
+      // hardware can carry out.
+      const noun = agentKindLabel(agent.agent_kind);
       const other = await c.env.DB.prepare(
         `SELECT d.name FROM isapi_device_configs cfg JOIN hikvision_devices d ON d.id=cfg.device_id
           WHERE cfg.agent_id=? AND cfg.device_id<>? AND cfg.sync_enabled=1 AND d.deleted_at IS NULL LIMIT 1`,
       ).bind(agent.id, body.deviceId).first<{ name: string }>();
-      if (other) return jsonError(c, 409, `This ESP32 gate controller already serves ${other.name}. An ESP32 controls one gate: disconnect that terminal first, or add another ESP32 agent.`);
+      if (other) return jsonError(c, 409, `This ${noun} already serves ${other.name}. A gate controller drives one gate: disconnect that terminal first, or add another agent of the same kind.`);
     }
   }
   const port = Number(body.isapiPort ?? 80);

@@ -2093,9 +2093,21 @@ function IsapiBridge({ user }: { user: User }) {
   const [error, setError] = useState('');
   const [copyNotice, copy] = useCopy();
   const [linkAgentId, setLinkAgentId] = useState('');
-  const isEsp32 = (row: Row | undefined | null) => String(row?.agent_kind ?? '') === 'esp32';
-  const linkToEsp32 = isEsp32(agents.data?.items.find((agent) => String(agent.id) === linkAgentId));
-  const agentRows = (agents.data?.items ?? []).map((row) => isEsp32(row) ? { ...row, platform: 'ESP32 gate controller' } : row);
+  // "Runs on" is the effective agent kind, not the stored platform: a Pi bridge
+  // is a Linux host, and both gate controllers are stored as 'other'.
+  const agentKind = (row: Row | undefined | null) => String(row?.agent_kind ?? '');
+  const isEsp32 = (row: Row | undefined | null) => agentKind(row) === 'esp32';
+  const isPiGate = (row: Row | undefined | null) => agentKind(row) === 'pi_gate';
+  const isPiBridge = (row: Row | undefined | null) => agentKind(row) === 'pi_bridge';
+  // A gate controller is the gate itself: it reads a reader, decides on the Pi
+  // and drives the relay, so it never dials the terminal it is linked to.
+  const isController = (row: Row | undefined | null) => isEsp32(row) || isPiGate(row);
+  const kindLabel = (row: Row | undefined | null) => isEsp32(row) ? 'ESP32 gate controller'
+    : isPiGate(row) ? 'Raspberry Pi gate controller'
+      : isPiBridge(row) ? 'Raspberry Pi (bridge)'
+        : String(row?.platform ?? '');
+  const linkToController = isController(agents.data?.items.find((agent) => String(agent.id) === linkAgentId));
+  const agentRows = (agents.data?.items ?? []).map((row) => isController(row) || isPiBridge(row) ? { ...row, platform: kindLabel(row) } : row);
 
   async function submitAgent(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setError('');
@@ -2159,6 +2171,17 @@ function IsapiBridge({ user }: { user: User }) {
     void saveDownload(`/api/isapi/agents/${String(row.id)}/esp32-config`, 'POST', 'secrets.h');
   }
 
+  function downloadPiGateProgram(row: Row) {
+    // The program holds no secret, so this is safe for both roles and changes
+    // nothing on the gate.
+    void saveDownload(`/api/isapi/agents/${String(row.id)}/pi-gate-program`, 'GET', 'EstateMateGate.mjs');
+  }
+
+  function downloadPiGateConfig(row: Row) {
+    if (Number(row.linked_devices ?? 0) === 1 && !confirm(`Create a new Pi gate config for ${String(row.name)}? It carries a new secret: a Pi still running the older estatemate-gate.json stops being accepted until it is updated.`)) return;
+    void saveDownload(`/api/isapi/agents/${String(row.id)}/pi-gate-config`, 'POST', 'estatemate-gate.json');
+  }
+
   async function removeAgent(row: Row) {
     if (!confirm(`Delete agent ${String(row.name)}? Linked devices will be unlinked.`)) return;
     try { await api(`/api/isapi/agents/${row.id}`, { method: 'DELETE' }); agents.reload(); deviceConfigs.reload(); }
@@ -2217,6 +2240,15 @@ function IsapiBridge({ user }: { user: User }) {
           <li>On the agent row, <strong>Download ESP32 sketch</strong> and <strong>Download ESP32 config</strong>. Put both files in one folder named <code>EstateMateGate</code>, fill in the Wi-Fi name and password in <code>secrets.h</code>, and flash it with the Arduino IDE (esp32 core and the ArduinoJson library).</li>
           <li>The agent turns <strong>online</strong> within a minute. Cards are checked against the controller's own copy of the estate, so the gate keeps working when the internet drops; the exit button always opens the door.</li>
         </ol>
+        <p><strong>Raspberry Pi gate controller</strong> (the Pi wiring a Wiegand reader, a door relay and an exit button):</p>
+        <ol>
+          <li>Add an agent that runs on <strong>Raspberry Pi gate controller</strong> — one per gate, never shared with a bridge.</li>
+          <li>Register the gate under <strong>Terminals &amp; devices</strong>, then <strong>Connect terminal</strong> here with that agent. Any LAN address will do: the Pi never dials it. This is what gives the gate its EstateMate device ID.</li>
+          <li>On the agent row, <strong>Download Pi gate program</strong> (no secret, either role may take it) and <strong>Download Pi gate config</strong> (Administrators; it writes the agent secret). Put both files on the Pi, then follow <code>pi-gate/README.md</code> for the wiring: the reader's D0/D1 data lines are 5&nbsp;V and need level shifting to the Pi's 3.3&nbsp;V GPIO, the relay goes on a separate 5&nbsp;V supply with a common ground, and the exit button wires to a GPIO with its internal pull-up.</li>
+          <li>Install the service: <code>sudo node EstateMateGate.mjs --install-service</code> (or copy <code>pi-gate/systemd/estatemate-pi-gate.service</code> into place). Check the wiring first with <code>--check</code>, which opens the lines and exits.</li>
+          <li>The agent turns <strong>online</strong> within a minute. Cards and visitor PINs are checked against the Pi's own copy of the estate, so the gate keeps working when the internet drops; the exit button always opens the door.</li>
+        </ol>
+        <p><strong>Raspberry Pi (bridge)</strong>: a Pi that stays on the gate network and talks to Hikvision terminals over ISAPI. Add the agent, connect its terminals, then <strong>Download setup</strong> — the file installs Node, the bridge and a systemd service on the Pi in one go.</p>
       </details>
     </div>
 
@@ -2236,18 +2268,18 @@ function IsapiBridge({ user }: { user: User }) {
     {showAgent && administrator && <FormCard title="Add device agent" onSubmit={submitAgent}>
       <label>Agent name<input name="name" placeholder="Estate office PC" required /></label>
       <label>Computer name (optional)<input name="hostname" placeholder="OFFICE-PC" /></label>
-      <label>Runs on<select name="platform"><option value="windows">Windows</option><option value="linux">Linux</option><option value="darwin">macOS</option><option value="other">Android or other</option><option value="esp32">ESP32 gate controller</option></select><small>Choose ESP32 gate controller for a microcontroller at the gate. It gets an agent of its own, because its config download replaces the secret.</small></label>
+      <label>Runs on<select name="platform"><option value="windows">Windows</option><option value="linux">Linux</option><option value="darwin">macOS</option><option value="other">Android or other</option><option value="esp32">ESP32 gate controller</option><option value="pi_bridge">Raspberry Pi (bridge)</option><option value="pi_gate">Raspberry Pi gate controller</option></select><small>An ESP32 or Raspberry Pi gate controller <strong>is</strong> the gate: it reads the card reader, checks a copy of the estate and opens the relay itself. Each gets an agent of its own, because its config download replaces the secret. Choose Raspberry Pi (bridge) for a Pi that only runs the bridge to Hikvision terminals.</small></label>
       <button className="primary">Add agent</button>
     </FormCard>}
 
     {showLink && <FormCard title="Connect a gate terminal" onSubmit={submitLink}>
       <label>Terminal<select name="deviceId" required><option value="">Select terminal</option>{devices.data?.items.map((device) => <option key={String(device.id)} value={String(device.id)}>{String(device.gate_name)} — {String(device.name)} ({String(device.model)})</option>)}</select></label>
-      <label>Agent<select name="agentId" required value={linkAgentId} onChange={(event) => setLinkAgentId(event.currentTarget.value)}><option value="">Select agent</option>{agents.data?.items.map((agent) => <option key={String(agent.id)} value={String(agent.id)}>{String(agent.name)} — {isEsp32(agent) ? 'ESP32 gate controller' : String(agent.platform)} ({String(agent.status)})</option>)}</select></label>
-      {linkToEsp32 && <Notice tone="info">An ESP32 gate controller <strong>is</strong> the gate: it never contacts this address or logs in to a terminal. Enter any LAN address (for example the ESP32's own) and leave the password empty. One ESP32 serves one terminal.</Notice>}
+      <label>Agent<select name="agentId" required value={linkAgentId} onChange={(event) => setLinkAgentId(event.currentTarget.value)}><option value="">Select agent</option>{agents.data?.items.map((agent) => <option key={String(agent.id)} value={String(agent.id)}>{String(agent.name)} — {kindLabel(agent)} ({String(agent.status)})</option>)}</select></label>
+      {linkToController && <Notice tone="info">A gate controller (ESP32 or Raspberry Pi) <strong>is</strong> the gate: it never contacts this address or logs in to a terminal. Enter any LAN address (for example the controller's own) and leave the password empty. One controller serves one terminal.</Notice>}
       <label>Terminal LAN address<input name="isapiHost" placeholder="192.168.1.100" required /></label>
       <label>Port<input name="isapiPort" type="number" min={1} max={65535} defaultValue={80} /></label>
       <label>Terminal username<input name="isapiUsername" defaultValue="admin" /></label>
-      <label>Terminal password<input name="isapiPassword" type="password" placeholder={linkToEsp32 ? 'Not used by an ESP32 controller' : 'Device administrator password'} required={!linkToEsp32} /><small>Encrypted at rest and never displayed again.</small></label>
+      <label>Terminal password<input name="isapiPassword" type="password" placeholder={linkToController ? 'Not used by a gate controller' : 'Device administrator password'} required={!linkToController} /><small>Encrypted at rest and never displayed again.</small></label>
       <label>Connection<select name="protocol"><option value="http">HTTP on the private LAN</option><option value="https">HTTPS</option></select></label>
       <label className="check"><input name="syncEnabled" type="checkbox" defaultChecked /> Enable automatic updates</label>
       <button className="primary">Connect terminal</button>
@@ -2262,7 +2294,12 @@ function IsapiBridge({ user }: { user: User }) {
             <button className="text" onClick={() => downloadEsp32Sketch(row)}>Download ESP32 sketch</button>
             {administrator && <button className="text" onClick={() => downloadEsp32Config(row)}>Download ESP32 config</button>}
           </>
-          : administrator && <button className="text" onClick={() => downloadInstaller(row)}>Download setup</button>}
+          : isPiGate(row)
+            ? <>
+              <button className="text" onClick={() => downloadPiGateProgram(row)}>Download Pi gate program</button>
+              {administrator && <button className="text" onClick={() => downloadPiGateConfig(row)}>Download Pi gate config</button>}
+            </>
+            : administrator && <button className="text" onClick={() => downloadInstaller(row)}>Download setup</button>}
         {administrator && <button className="text" onClick={() => rotateAgent(row)}>Rotate secret</button>}
         {administrator && <button className="text danger" onClick={() => removeAgent(row)}>Delete</button>}
       </div> : undefined} /></ListState>
