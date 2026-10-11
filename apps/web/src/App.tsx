@@ -2478,7 +2478,7 @@ function IsapiBridge({ user }: { user: User }) {
       const link = document.createElement('a');
       link.href = url;
       const ext = String(row.platform) === 'windows' ? 'ps1' : 'sh';
-      link.download = `estatemate-isapi-agent-${String(row.id).slice(0,8)}.${ext}`;
+      link.download = `sornix-estateos-isapi-agent-${String(row.id).slice(0,8)}.${ext}`;
       link.click();
       URL.revokeObjectURL(url);
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not generate installer'); }

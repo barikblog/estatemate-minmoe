@@ -311,7 +311,7 @@ def verify_apk(apk: pathlib.Path) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build the EstateMate Bridge APK without Gradle")
     parser.add_argument("--out", default=str(ROOT / "dist" / "android"), help="directory for the APK and its checksum file")
-    parser.add_argument("--name", default=None, help="APK file name (default estatemate-bridge-<version>.apk)")
+    parser.add_argument("--name", default=None, help="APK file name (default sornix-estateos-bridge-<version>.apk)")
     parser.add_argument("--version-name", default="0.2.0")
     parser.add_argument("--version-code", type=int, default=1)
     parser.add_argument("--min-sdk", type=int, default=26)
@@ -358,7 +358,11 @@ def main() -> int:
             return 0
 
     version_name = args.version_name
-    apk_name = args.name or f"estatemate-bridge-{version_name}.apk"
+    # The release artifact carries the product name (Sornix EstateOS). What the
+    # installed app calls itself is unchanged: the launcher label, the classes and
+    # the foreground service keep their EstateMate names so an existing phone
+    # upgrades in place. See docs/APP-ARTIFACTS-AND-NAMING.md.
+    apk_name = args.name or f"sornix-estateos-bridge-{version_name}.apk"
     out_dir = pathlib.Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 

@@ -49,18 +49,22 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.estatemate.app.data.EstateRepository
+import com.estatemate.app.data.LoginOutcome
 import com.estatemate.app.data.local.CachedAccessEvent
 import com.estatemate.app.data.remote.DashboardResponse
+import com.estatemate.app.data.remote.GateDto
 import com.estatemate.app.data.remote.HouseholdMemberDto
 import com.estatemate.app.data.remote.HouseholdRequestBody
 import com.estatemate.app.data.remote.OwnershipRequestBody
@@ -77,6 +81,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import retrofit2.HttpException
 import java.text.NumberFormat
 import java.time.Instant
 import java.time.ZoneId
@@ -115,6 +120,14 @@ data class AppState(
     val ownershipRequests: List<OwnershipRequestDto> = emptyList(),
     val tenancies: List<TenancyDto> = emptyList(),
     val householdMembers: List<HouseholdMemberDto> = emptyList(),
+    /** A Security officer's gate for this session, shown under the app name. */
+    val gateName: String? = null,
+    /**
+     * Set only between a multi-gate sign-in and the officer's choice: the gates
+     * they may work, plus the short-lived token that authorises the exchange.
+     */
+    val gateOptions: List<GateDto> = emptyList(),
+    val gateSelectionToken: String? = null,
     val busy: Boolean = false,
     val error: String? = null,
 )
@@ -126,6 +139,7 @@ private data class RefreshPayload(
     val ownershipRequests: List<OwnershipRequestDto>,
     val tenancies: List<TenancyDto>,
     val householdMembers: List<HouseholdMemberDto>,
+    val gateName: String?,
 )
 
 @HiltViewModel
@@ -145,8 +159,51 @@ class MainViewModel @Inject constructor(private val repository: EstateRepository
     fun login(email: String, password: String) = viewModelScope.launch {
         _state.value = _state.value.copy(busy = true, error = null)
         runCatching { repository.login(email, password) }
-            .onSuccess { user -> _state.value = _state.value.copy(user = user, busy = false); refresh() }
-            .onFailure { error -> _state.value = _state.value.copy(busy = false, error = error.message ?: "Login failed") }
+            .onSuccess { outcome ->
+                when (outcome) {
+                    is LoginOutcome.SignedIn -> {
+                        _state.value = _state.value.copy(
+                            user = outcome.user,
+                            gateOptions = emptyList(),
+                            gateSelectionToken = null,
+                            busy = false,
+                        )
+                        refresh()
+                    }
+                    // Not an error: the officer exists and their password was
+                    // right; the estate just needs to know which post they are on.
+                    is LoginOutcome.GateSelectionRequired -> _state.value = _state.value.copy(
+                        busy = false,
+                        error = null,
+                        gateOptions = outcome.gates,
+                        gateSelectionToken = outcome.selectionToken,
+                    )
+                }
+            }
+            .onFailure { error -> _state.value = _state.value.copy(busy = false, error = message(error, "Login failed")) }
+    }
+
+    /** Exchanges the chosen gate for a session, then loads that gate's data. */
+    fun chooseGate(deviceId: String) = viewModelScope.launch {
+        val selectionToken = _state.value.gateSelectionToken ?: return@launch
+        _state.value = _state.value.copy(busy = true, error = null)
+        runCatching { repository.selectGate(selectionToken, deviceId) }
+            .onSuccess { user ->
+                _state.value = _state.value.copy(
+                    user = user,
+                    gateOptions = emptyList(),
+                    gateSelectionToken = null,
+                    busy = false,
+                )
+                refresh()
+            }
+            .onFailure { error -> _state.value = _state.value.copy(busy = false, error = message(error, "Gate selection failed")) }
+    }
+
+    /** Backs out of the gate picker to the sign-in form. */
+    fun cancelGateSelection() = viewModelScope.launch {
+        repository.logout()
+        _state.value = AppState(checkingSession = false)
     }
 
     fun refresh() = viewModelScope.launch {
@@ -159,8 +216,9 @@ class MainViewModel @Inject constructor(private val repository: EstateRepository
             val requests = if (role == "resident" || role == "admin" || role == "manager") repository.ownershipRequests() else emptyList()
             val tenancies = if (role == "resident" || role == "admin" || role == "manager") repository.tenancies() else emptyList()
             val household = if (role == "resident" || role == "admin" || role == "manager") repository.householdMembers() else emptyList()
+            val gateName = if (role == "security") repository.currentGateName() else null
             repository.refreshEvents()
-            RefreshPayload(dashboard,properties,available,requests,tenancies,household)
+            RefreshPayload(dashboard,properties,available,requests,tenancies,household,gateName)
         }.onSuccess { payload ->
             _state.value = _state.value.copy(
                 dashboard = payload.dashboard,
@@ -169,53 +227,71 @@ class MainViewModel @Inject constructor(private val repository: EstateRepository
                 ownershipRequests = payload.ownershipRequests,
                 tenancies = payload.tenancies,
                 householdMembers = payload.householdMembers,
+                gateName = payload.gateName,
                 busy = false,
             )
-        }.onFailure { error -> _state.value = _state.value.copy(busy = false, error = error.message ?: "Unable to refresh") }
+        }.onFailure { error -> fail(error, "Unable to refresh") }
     }
 
     fun requestOwnership(request: OwnershipRequestBody) = viewModelScope.launch {
         _state.value = _state.value.copy(busy = true, error = null)
         runCatching { repository.requestOwnership(request) }
             .onSuccess { refresh() }
-            .onFailure { error -> _state.value = _state.value.copy(busy = false, error = error.message ?: "Ownership request failed") }
+            .onFailure { error -> fail(error, "Ownership request failed") }
     }
 
     fun reviewOwnership(id: String, approved: Boolean) = viewModelScope.launch {
         _state.value = _state.value.copy(busy = true, error = null)
         runCatching { repository.reviewOwnership(id, approved) }
             .onSuccess { refresh() }
-            .onFailure { error -> _state.value = _state.value.copy(busy = false, error = error.message ?: "Ownership review failed") }
+            .onFailure { error -> fail(error, "Ownership review failed") }
     }
 
     fun createTenancy(request: TenancyRequestBody) = viewModelScope.launch {
         _state.value = _state.value.copy(busy = true,error = null)
         runCatching { repository.createTenancy(request) }.onSuccess { refresh() }
-            .onFailure { error -> _state.value = _state.value.copy(busy = false,error = error.message ?: "Tenancy request failed") }
+            .onFailure { error -> fail(error, "Tenancy request failed") }
     }
 
     fun tenancyAction(id: String, action: String, billing: String? = null) = viewModelScope.launch {
         _state.value = _state.value.copy(busy = true,error = null)
         runCatching { repository.tenancyAction(id,action,billing) }.onSuccess { refresh() }
-            .onFailure { error -> _state.value = _state.value.copy(busy = false,error = error.message ?: "Tenancy action failed") }
+            .onFailure { error -> fail(error, "Tenancy action failed") }
     }
 
     fun createHouseholdMember(request: HouseholdRequestBody) = viewModelScope.launch {
         _state.value = _state.value.copy(busy = true,error = null)
         runCatching { repository.createHouseholdMember(request) }.onSuccess { refresh() }
-            .onFailure { error -> _state.value = _state.value.copy(busy = false,error = error.message ?: "Household request failed") }
+            .onFailure { error -> fail(error, "Household request failed") }
     }
 
     fun householdAction(id: String, action: String, visitors: Boolean? = null, bills: Boolean? = null) = viewModelScope.launch {
         _state.value = _state.value.copy(busy = true,error = null)
         runCatching { repository.householdAction(id,action,visitors,bills) }.onSuccess { refresh() }
-            .onFailure { error -> _state.value = _state.value.copy(busy = false,error = error.message ?: "Household action failed") }
+            .onFailure { error -> fail(error, "Household action failed") }
     }
 
     fun logout() = viewModelScope.launch {
         repository.logout()
         _state.value = AppState(checkingSession = false)
     }
+
+    /**
+     * A 401 means the session is gone (it expired, or the account was
+     * deactivated): clear it and return to the sign-in screen with an
+     * explanation, instead of leaving every later screen failing silently.
+     */
+    private fun fail(error: Throwable, fallback: String) {
+        if (error is HttpException && error.code() == 401) {
+            viewModelScope.launch { repository.logout() }
+            _state.value = AppState(checkingSession = false, error = "Your session expired. Please sign in again.")
+            return
+        }
+        _state.value = _state.value.copy(busy = false, error = message(error, fallback))
+    }
+
+    private fun message(error: Throwable, fallback: String): String =
+        error.message?.takeIf { it.isNotBlank() } ?: fallback
 }
 
 @Composable
@@ -224,8 +300,12 @@ fun EstateMateApp(viewModel: MainViewModel = hiltViewModel()) {
     val events by viewModel.events.collectAsState()
     when {
         state.checkingSession -> FullScreenLoading()
-        state.user == null -> LoginScreen(state.busy, state.error, viewModel::login)
-        else -> HomeScreen(state,events,viewModel::refresh,viewModel::requestOwnership,viewModel::reviewOwnership,viewModel::createTenancy,viewModel::tenancyAction,viewModel::createHouseholdMember,viewModel::householdAction,viewModel::logout)
+        state.user != null -> HomeScreen(state,events,viewModel::refresh,viewModel::requestOwnership,viewModel::reviewOwnership,viewModel::createTenancy,viewModel::tenancyAction,viewModel::createHouseholdMember,viewModel::householdAction,viewModel::logout)
+        // A Security officer with several posts: the session does not exist until
+        // one is chosen, so this is a step of signing in, not an error screen.
+        state.gateSelectionToken != null && state.gateOptions.isNotEmpty() ->
+            GatePickerScreen(state.gateOptions,state.busy,state.error,viewModel::chooseGate,viewModel::cancelGateSelection)
+        else -> LoginScreen(state.busy, state.error, viewModel::login)
     }
 }
 
@@ -242,7 +322,7 @@ private fun FullScreenLoading() {
 @Composable
 private fun Logo() {
     Box(Modifier.background(EstateBlue, RoundedCornerShape(16.dp)).padding(17.dp), contentAlignment = Alignment.Center) {
-        Text("EM", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Black)
+        Text(stringResource(R.string.app_mark), color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Black)
     }
 }
 
@@ -255,8 +335,9 @@ private fun LoginScreen(busy: Boolean, error: String?, onLogin: (String, String)
             Column(Modifier.padding(28.dp), verticalArrangement = Arrangement.spacedBy(17.dp)) {
                 Logo()
                 Column {
+                    Text(stringResource(R.string.app_name), color = EstateBlue, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold)
                     Text("Welcome back", fontSize = 30.sp, fontWeight = FontWeight.ExtraBold, color = EstateNavy)
-                    Text("Sign in to your estate workspace", color = Color(0xFF68748A))
+                    Text(stringResource(R.string.sign_in_subtitle), color = Color(0xFF68748A))
                 }
                 if (error != null) Text(error, color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
                 OutlinedTextField(value = email, onValueChange = { email = it }, label = { Text("Email address") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email, imeAction = ImeAction.Next), modifier = Modifier.fillMaxWidth())
@@ -270,6 +351,43 @@ private fun LoginScreen(busy: Boolean, error: String?, onLogin: (String, String)
 }
 
 private enum class HomeTab(val label: String) { Overview("Overview"), Properties("Properties"), Activity("Gate activity"), Account("Account") }
+
+/**
+ * Shown to a Security officer who is posted at more than one gate: the Worker
+ * issues no session until one is chosen, and every gate-scoped read (activity,
+ * the live feed, visitor checks) follows the choice.
+ */
+@Composable
+private fun GatePickerScreen(
+    gates: List<GateDto>,
+    busy: Boolean,
+    error: String?,
+    onChoose: (String) -> Unit,
+    onCancel: () -> Unit,
+) {
+    Column(Modifier.fillMaxSize().background(EstateBackground).padding(22.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Logo()
+        Text("Which gate are you working?", fontSize = 26.sp, fontWeight = FontWeight.ExtraBold, color = EstateNavy)
+        Text("You are posted at more than one gate. Your shift is recorded against the one you choose.", color = Color(0xFF68748A), fontSize = 13.sp)
+        if (error != null) Text(error, color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
+        LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            items(gates, key = { it.id }) { gate ->
+                val label = gate.gateName ?: gate.name ?: "Gate"
+                Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(14.dp)) {
+                    Row(Modifier.fillMaxWidth().padding(17.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Column(Modifier.weight(1f)) {
+                            Text(label, fontWeight = FontWeight.Bold, color = EstateNavy)
+                            if (gate.direction != null) Text("Direction: ${gate.direction}", fontSize = 11.sp, color = Color(0xFF68748A))
+                        }
+                        Button(onClick = { onChoose(gate.id) }, enabled = !busy) { Text("Start shift") }
+                    }
+                }
+            }
+        }
+        Button(onClick = onCancel, enabled = !busy, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = EstateNavy)) { Text("Back to sign in") }
+        if (busy) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -290,7 +408,16 @@ private fun HomeScreen(
         containerColor = EstateBackground,
         topBar = {
             TopAppBar(
-                title = { Column { Text("EstateMate", fontWeight = FontWeight.ExtraBold); Text(state.user?.role.orEmpty().replaceFirstChar(Char::uppercase), fontSize = 11.sp, color = Color(0xFF6A7790)) } },
+                title = {
+                    val subtitle = listOfNotNull(
+                        state.user?.role?.takeIf { it.isNotBlank() }?.replaceFirstChar(Char::uppercase),
+                        state.gateName,
+                    ).joinToString(" · ")
+                    Column {
+                        Text(stringResource(R.string.app_name), fontWeight = FontWeight.ExtraBold)
+                        Text(subtitle, fontSize = 11.sp, color = Color(0xFF6A7790))
+                    }
+                },
                 actions = {
                     IconButton(onClick = refresh) { Icon(Icons.Outlined.Refresh, "Refresh") }
                     IconButton(onClick = logout) { Icon(Icons.Outlined.Logout, "Sign out") }
@@ -316,7 +443,7 @@ private fun HomeScreen(
                 HomeTab.Overview -> Overview(state)
                 HomeTab.Properties -> Properties(state,requestOwnership,reviewOwnership,createTenancy,tenancyAction,createHouseholdMember,householdAction)
                 HomeTab.Activity -> Activity(events)
-                HomeTab.Account -> Account(state.user!!, logout)
+                HomeTab.Account -> Account(state.user!!, state.gateName, logout)
             }
             if (state.busy) CircularProgressIndicator(Modifier.align(Alignment.TopCenter).padding(8.dp))
         }
@@ -340,6 +467,18 @@ private fun Overview(state: AppState) {
         }
         if (state.error != null) item { Text(state.error, color = MaterialTheme.colorScheme.error) }
         if (user.role == "resident") {
+            dashboard?.latestNotice?.let { notice ->
+                item {
+                    Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(15.dp)) {
+                        Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text("ESTATE NOTICE", color = EstateBlue, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold)
+                            Text(notice.title, fontWeight = FontWeight.Bold, color = EstateNavy)
+                            Text(notice.body, color = Color(0xFF68748A), fontSize = 12.sp, maxLines = 4, overflow = TextOverflow.Ellipsis)
+                            if (notice.acknowledged == 0) Text("Not yet acknowledged", color = Color(0xFFA52B36), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
             item { MetricCard("Outstanding bills", dashboard?.outstandingBills?.count ?: 0, formatNaira(dashboard?.outstandingBills?.amount ?: 0)) }
             item { MetricCard("Active visitors", dashboard?.activeVisitors?.count ?: 0, "Current passes") }
             item { MetricCard("Active access cards", dashboard?.activeCards?.count ?: 0, "Ready at the gate") }
@@ -530,12 +669,17 @@ private fun Activity(events: List<CachedAccessEvent>) {
 }
 
 @Composable
-private fun Account(user: UserDto, logout: () -> Unit) {
+private fun Account(user: UserDto, gateName: String?, logout: () -> Unit) {
     Column(Modifier.fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Logo()
         Text(user.name, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold)
         Text(user.email, color = Color(0xFF68748A))
         Text("Role: ${user.role.replaceFirstChar(Char::uppercase)}", color = EstateBlue, fontWeight = FontWeight.Bold)
+        if (gateName != null) Text("Gate: $gateName", color = EstateNavy, fontWeight = FontWeight.SemiBold)
+        // The address the app talks to is baked in at build time; showing it here
+        // is what support asks for first, and what proves a build points at the
+        // estate's own Worker rather than a placeholder.
+        Text("${stringResource(R.string.server_label)}: ${BuildConfig.API_BASE_URL}", color = Color(0xFF98A2B2), fontSize = 11.sp)
         Spacer(Modifier.weight(1f))
         Button(onClick = logout, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = EstateNavy)) { Icon(Icons.Outlined.Logout, null); Spacer(Modifier.padding(4.dp)); Text("Sign out") }
     }

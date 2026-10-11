@@ -1,19 +1,21 @@
-# EstateMate desktop app (Windows)
+# Sornix EstateOS desktop app (Windows)
 
-`estatemate-client-<version>.msi` is the Windows app for residents, staff and
-administrators. It opens the EstateMate portal in its own window, with a Start
-Menu and a Desktop shortcut and the same sign-in as the website.
+`sornix-estateos-desktop-<version>.msi` is the Windows app for residents, staff
+and administrators. It opens the Sornix EstateOS portal in its own window, with
+a Start Menu and a Desktop shortcut and the same sign-in as the website.
 
 ## Install
 
-1. Double-click `estatemate-client-<version>.msi`.
-2. Open **EstateMate** from the Start Menu or the Desktop.
+1. Double-click `sornix-estateos-desktop-<version>.msi`.
+2. Open **Sornix EstateOS** from the Start Menu or the Desktop.
 3. Sign in with your portal email and password.
 
 It installs for the signed-in user only, so no administrator rights are needed.
-Files go to `%LOCALAPPDATA%\Programs\EstateMate`. The app window keeps its own
-browser profile under `%LOCALAPPDATA%\EstateMate\Window`. Uninstalling removes
-the program and the shortcuts, but leaves that profile in place.
+Files go to `%LOCALAPPDATA%\Programs\Sornix EstateOS`. The app window keeps its
+own browser profile under `%LOCALAPPDATA%\EstateMate\Window` (the directory name
+is unchanged from the EstateMate releases so an upgrade keeps the sign-in).
+Uninstalling removes the program and the shortcuts, but leaves that profile in
+place.
 
 ## How it works
 
@@ -38,3 +40,9 @@ tags.
 
 Note: the app is an app-style window around the web portal, not a separate
 native client. Browser updates and portal updates apply without reinstalling.
+
+Naming: the file a person downloads is named for the product (Sornix EstateOS),
+while the launcher script, the portal-address file and the browser-profile
+directory keep their original `EstateMate`/`estatemate` names so an installed
+copy upgrades in place. See
+[`docs/APP-ARTIFACTS-AND-NAMING.md`](../../docs/APP-ARTIFACTS-AND-NAMING.md).

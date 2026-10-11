@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Verify a built EstateMate Android APK.
+"""Verify a built Sornix EstateOS Android APK.
 
 Checks that the Worker base URL really reached BuildConfig, that the old
-placeholder host is gone, and that the APK identity matches what CI intended.
+placeholder host is gone, and that the APK identity matches what CI intended -
+including the name a person sees under the icon, so a release can never ship an
+APK labelled EstateMate after the product was renamed.
 
 Usage:
     python3 scripts/verify-android-apk.py APK --api-base-url URL \
-        [--version-name NAME] [--build-tools DIR]
+        [--version-name NAME] [--build-tools DIR] \
+        [--app-label "Sornix EstateOS"] [--application-id com.estatemate.app]
 
 Exits non-zero with a clear message on any failure, so CI can treat it as a gate.
 """
@@ -70,6 +73,14 @@ def main() -> None:
     parser.add_argument("--api-base-url", required=True)
     parser.add_argument("--version-name")
     parser.add_argument("--build-tools", help="directory containing aapt2")
+    parser.add_argument(
+        "--app-label",
+        help="the launcher name the APK must carry (asserted when aapt2 is available)",
+    )
+    parser.add_argument(
+        "--application-id",
+        help="the package/application id the APK must carry (asserted when aapt2 is available)",
+    )
     args = parser.parse_args()
 
     if not os.path.isfile(args.apk):
@@ -124,11 +135,28 @@ def main() -> None:
         except OSError as exc:
             print(f"::warning::could not run aapt2: {exc}")
         else:
+            badging = {}
             for line in out.stdout.splitlines():
                 if line.startswith(("package:", "application-label:", "sdkVersion:", "targetSdkVersion:")):
                     print(line)
+                # aapt2 prints the default label as `application-label:'X'` and any
+                # localised one as `application-label-en:'X'`.
+                if line.startswith("application-label") and ":" in line:
+                    key, _, value = line.partition(":")
+                    badging[key.strip()] = value.strip().strip("'")
             if args.version_name and f"versionName='{args.version_name}'" not in out.stdout:
                 fail(f"expected versionName '{args.version_name}' not reported by aapt2")
+            if args.application_id and f"name='{args.application_id}'" not in out.stdout:
+                fail(f"expected applicationId '{args.application_id}' not reported by aapt2")
+            if args.app_label:
+                labels = {value for key, value in badging.items() if key.startswith("application-label")}
+                if args.app_label not in labels:
+                    fail(
+                        f"the APK is labelled {sorted(labels) or ['(none)']}, not "
+                        f"{args.app_label!r} - the client was renamed and its "
+                        "android:label must follow"
+                    )
+                print(f"launcher label is {args.app_label!r}")
     else:
         print("::warning::aapt2 not found; skipped badging/versionName assertions")
 

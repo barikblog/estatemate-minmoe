@@ -3,7 +3,8 @@
  * EstateMate Bridge — single-executable entry point.
  *
  * This file is the `main` of the Node.js single executable (SEA) that ships as
- * `estatemate-bridge-win-x64.exe`. It is deliberately tiny and dependency-free:
+ * `sornix-estateos-bridge-win-x64.exe` (the installed copy is still
+ * `estatemate-bridge.exe`). It is deliberately tiny and dependency-free:
  * it unpacks the embedded bridge sources next to nothing else, then hands over
  * to `host/cli.cjs`.
  *

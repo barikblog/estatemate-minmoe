@@ -22,7 +22,7 @@ Many estates already have a Windows PC for CCTV (iVMS-4200) or accounting. This 
 
 1. **Portal:** Register agent in EstateMate → **ISAPI Bridge & Windows Agent** → **Register agent** → platform `windows` → copy the one-time secret → **Download installer** (`.ps1`).
 
-2. **Windows host:** download `estatemate-isapi-agent-win-x64-<version>.zip` from the
+2. **Windows host:** download `sornix-estateos-isapi-agent-win-x64-<version>.zip` from the
    [repository releases](https://github.com/barikblog/estatemate-minmoe/releases) and unzip it to
    `C:\EstateMate\ISAPI-Agent`. The bundle includes its own Node.js runtime, so the host
    needs no Node.js install.
@@ -127,7 +127,7 @@ node agent.mjs --config C:\EstateMate\ISAPI-Agent\agent-config.json --devices C:
 
 Use the portable bundle produced by the `Build EstateMate Bridge` workflow
 (`.github/workflows/bridge.yml`), published on every `bridge-*` tag as
-`estatemate-isapi-agent-win-x64-<version>.zip`.
+`sornix-estateos-isapi-agent-win-x64-<version>.zip`.
 
 The bundle ships the **official Node.js Windows x64 runtime** alongside the agent,
 so the target PC needs no Node.js install and no Internet access beyond the

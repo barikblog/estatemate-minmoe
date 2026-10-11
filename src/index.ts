@@ -5555,7 +5555,7 @@ Write-Host "Configuration saved to $configPath (restricted)" -ForegroundColor Gr
 
 # The agent itself ships in the portable bundle, not over the Worker API.
 # The "Build EstateMate Bridge" workflow publishes it as a GitHub Release asset:
-#   estatemate-isapi-agent-win-x64-<version>.zip
+#   sornix-estateos-isapi-agent-win-x64-<version>.zip
 # Unzip that bundle into $installDir so these files are present:
 #   runtime\\node.exe, agent.mjs, agent-core.mjs, estatemate-isapi-agent.cmd,
 #   install-service.ps1
@@ -5563,7 +5563,7 @@ $bundleRuntime = Join-Path $installDir "runtime\\node.exe"
 $bundleLauncher = Join-Path $installDir "estatemate-isapi-agent.cmd"
 if (-not (Test-Path $bundleLauncher)) {
   Write-Warning "estatemate-isapi-agent.cmd not found in $installDir."
-  Write-Warning "Download estatemate-isapi-agent-win-x64-*.zip from the repository releases and unzip it here, then re-run this installer."
+  Write-Warning "Download sornix-estateos-isapi-agent-win-x64-*.zip from the repository releases and unzip it here, then re-run this installer."
 }
 
 # Create example device mapping file
@@ -5587,7 +5587,7 @@ Write-Host "Example device mapping created at $devicesPath - EDIT IT!" -Foregrou
 # Start-at-boot registration.
 Write-Host @"
 Next steps:
-1. Unzip estatemate-isapi-agent-win-x64-*.zip (from the repository releases) into:
+1. Unzip sornix-estateos-isapi-agent-win-x64-*.zip (from the repository releases) into:
    $installDir
 2. Edit $devicesPath with your Hikvision device ISAPI details (host, port, credentials).
 3. Register the agent to start automatically:
@@ -5675,7 +5675,11 @@ echo "Installer completed for ${agent.name}"
     status: 200,
     headers: {
       'Content-Type': contentType,
-      'Content-Disposition': `attachment; filename="estatemate-isapi-agent-${agent.id.slice(0,8)}.${ext}"`,
+      // Named for the product (Sornix EstateOS). The bridge self-names it
+      // downloads keep - estatemate-isapi-agent.cmd, the
+      // estatemate-isapi-agent systemd unit - are unchanged, so an estate's
+      // existing install and its service name upgrade in place.
+      'Content-Disposition': `attachment; filename="sornix-estateos-isapi-agent-${agent.id.slice(0,8)}.${ext}"`,
       'Cache-Control': 'no-store',
       'X-Content-Type-Options': 'nosniff',
     },

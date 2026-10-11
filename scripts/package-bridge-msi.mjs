@@ -3,7 +3,7 @@
  * Packages the EstateMate bridge executable as an MSI installer.
  *
  *   node scripts/package-bridge-msi.mjs \
- *     --exe dist/bridge/estatemate-bridge-win-x64.exe \
+ *     --exe dist/bridge/sornix-estateos-bridge-win-x64.exe \
  *     --out dist/bridge-msi --version 0.2.0 --commit <sha>
  *
  * Why an MSI: the single-file executable is a console tool, not an installer —
@@ -24,7 +24,7 @@
  * double-click (Install-EstateMate-Bridge.cmd), the script behind it
  * (install-bridge.ps1), the checksums the script verifies the MSI against, a
  * one-page READ-ME-FIRST.txt, and all of it zipped as
- * estatemate-bridge-<version>-win-x64-installer-kit.zip. On a real PC an MSI
+ * sornix-estateos-bridge-<version>-win-x64-installer-kit.zip. On a real PC an MSI
  * can stop at "Gathering information..." with no message - security software,
  * a policy, a broken Windows Installer, a half-finished download - and the
  * launcher turns that silence into a named cause, a log kept beside the MSI
@@ -49,6 +49,17 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 
 const DEFAULT_WXS = path.join(repoRoot, 'bridge-apps', 'windows', 'msi', 'estatemate-bridge.wxs');
+
+/**
+ * Release artifact prefix: the product is Sornix EstateOS, so the files a person
+ * downloads are `sornix-estateos-bridge-*`. What the install calls itself once it
+ * is on the PC is deliberately unchanged - the installed `estatemate-bridge.exe`,
+ * C:\\Program Files\\EstateMate Bridge, the Windows service/task names and the
+ * Start Menu entry "EstateMate Bridge" - because every existing estate upgrades
+ * in place and every command in this repository, the dashboard and the support
+ * scripts keeps working. See docs/APP-ARTIFACTS-AND-NAMING.md.
+ */
+const ARTIFACT_PREFIX = 'sornix-estateos-bridge';
 
 /** Shipped next to the MSI so a double-click install can explain itself. */
 const KIT_SCRIPTS = [
@@ -121,12 +132,13 @@ Options
   --quiet                 only print the summary line
 
 Output in --out
-  <name>-win-x64.msi              the installer itself
+  sornix-estateos-bridge-<version>-win-x64.msi   the installer itself
   Install-EstateMate-Bridge.cmd   the launcher people double-click
   install-bridge.ps1              its logic: verify, log, explain, fall back
   SHA256SUMS.txt                  what the launcher verifies the MSI against
   READ-ME-FIRST.txt               one page for the person who unzipped the kit
-  <name>-win-x64-installer-kit.zip   everything above, ready to download
+  sornix-estateos-bridge-<version>-win-x64-installer-kit.zip
+                                  everything above, ready to download
 `;
   process.stdout.write(text);
 }
@@ -320,7 +332,7 @@ function readmeText(version) {
     'completely. Nothing is installed in that case, and Windows shows no error.',
     '',
     'The release also carries an installer kit',
-    '(estatemate-bridge-<version>-win-x64-installer-kit.zip). Unzip it and',
+    '(sornix-estateos-bridge-<version>-win-x64-installer-kit.zip). Unzip it and',
     'double-click Install-EstateMate-Bridge.cmd: it verifies this MSI against its',
     'checksum, keeps a verbose log, says in plain English what the exit code',
     'means, and - if the MSI still cannot complete - installs the bridge for the',
@@ -376,7 +388,7 @@ function kitReadmeText(version) {
     '  SHA256SUMS.txt                  checksums the script verifies',
     '',
     'Prefer no installer at all? The release also carries',
-    'estatemate-bridge-win-x64.exe - one file, no install, no administrator',
+    'sornix-estateos-bridge-win-x64.exe - one file, no install, no administrator',
     'rights, no Windows Installer. Copy it anywhere and run it.',
     '',
     'The build is unsigned (this project uses no code-signing certificate).',
@@ -385,7 +397,7 @@ function kitReadmeText(version) {
 }
 
 function kitNameFor(version) {
-  return `estatemate-bridge-${version}-win-x64-installer-kit.zip`;
+  return `${ARTIFACT_PREFIX}-${version}-win-x64-installer-kit.zip`;
 }
 
 /**
@@ -550,7 +562,7 @@ function main() {
       compiled: !flags.dryRun,
     };
 
-    const msiName = `estatemate-bridge-${version}-win-x64.msi`;
+    const msiName = `${ARTIFACT_PREFIX}-${version}-win-x64.msi`;
     const msiPath = path.join(outDir, msiName);
     const wixobjPath = path.join(buildDir, 'estatemate-bridge.wixobj');
 

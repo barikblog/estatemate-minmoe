@@ -1,6 +1,6 @@
 # EstateMate Bridge (single executable)
 
-`estatemate-bridge-win-x64.exe` is the EstateMate access-device agent packaged as
+`sornix-estateos-bridge-win-x64.exe` is the Sornix EstateOS access-device agent packaged as
 **one file** for a Windows PC on the same LAN as the Hikvision terminals. It needs
 no Node.js installation, no SDK, no installer and no administrator rights to
 *run* — only to register it as a start-at-boot task.
@@ -43,9 +43,9 @@ Three shapes, same agent:
 
 | | How | Best for |
 |---|---|---|
-| **Installer kit** (`estatemate-bridge-<version>-win-x64-installer-kit.zip`) | Unzip it and double-click `Install-EstateMate-Bridge.cmd`. | The normal case, and any PC where the MSI has ever refused to finish. |
-| **MSI installer** (`estatemate-bridge-<version>-win-x64.msi`) | Double-click it, or `msiexec /i <file>`. Installs to `C:\Program Files\EstateMate Bridge`, adds **Start Menu → EstateMate Bridge**, which opens the dashboard window, and puts `estatemate-bridge` on the PATH and in *Settings → Apps* for upgrades and uninstall. | A PC an administrator manages directly. |
-| **Portable exe** (`estatemate-bridge-win-x64.exe`) | Copy it anywhere and run it; no install, no administrator rights. | USB sticks, testing, machines you may not install on. |
+| **Installer kit** (`sornix-estateos-bridge-<version>-win-x64-installer-kit.zip`) | Unzip it and double-click `Install-EstateMate-Bridge.cmd`. | The normal case, and any PC where the MSI has ever refused to finish. |
+| **MSI installer** (`sornix-estateos-bridge-<version>-win-x64.msi`) | Double-click it, or `msiexec /i <file>`. Installs to `C:\Program Files\EstateMate Bridge`, adds **Start Menu → EstateMate Bridge**, which opens the dashboard window, and puts `estatemate-bridge` on the PATH and in *Settings → Apps* for upgrades and uninstall. | A PC an administrator manages directly. |
+| **Portable exe** (`sornix-estateos-bridge-win-x64.exe`) | Copy it anywhere and run it; no install, no administrator rights. | USB sticks, testing, machines you may not install on. |
 
 If double-clicking the **exe** seemed to do nothing: it is a console tool, not an
 installer — the window opens, prints and closes.
@@ -275,7 +275,7 @@ Logs: `<data-dir>\logs\bridge.log` (rotated at 5 MB to `bridge.log.1`).
 Every release ships `SHA256SUMS.txt` and `BUILD-INFO.json`. The build info lists
 the Node.js runtime that was wrapped, the SHA-256 of the executable and of the
 SEA blob, and the SHA-256 of every file embedded inside the executable — so an
-operator can confirm with `certutil -hashfile estatemate-bridge-win-x64.exe SHA256`
+operator can confirm with `certutil -hashfile sornix-estateos-bridge-win-x64.exe SHA256`
 that the artifact is the one the repository's CI produced, and that the agent
 source inside it is the reviewed one.
 
@@ -296,7 +296,7 @@ node scripts/package-bridge-exe.mjs \
 
 # Prove the artifact works before shipping it (fake Worker + fake terminal,
 # Digest challenge, alertStream, queued card operation):
-node scripts/bridge-exe-smoke-test.mjs --exe dist/bridge/estatemate-bridge-win-x64.exe
+node scripts/bridge-exe-smoke-test.mjs --exe dist/bridge/sornix-estateos-bridge-win-x64.exe
 ```
 
 Targets: `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `darwin-x64`,

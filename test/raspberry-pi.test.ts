@@ -231,7 +231,7 @@ describe('Raspberry Pi agents', () => {
     const { agentId, secret: oldSecret } = await createAgent('pi_bridge', 'Gate Pi bridge');
     const res = await download(env, 'POST', `/api/isapi/agents/${agentId}/installer`, adminToken);
     expect(res.status).toBe(200);
-    expect(res.disposition).toBe(`attachment; filename="estatemate-isapi-agent-${agentId.slice(0,8)}.pi.sh"`);
+    expect(res.disposition).toBe(`attachment; filename="sornix-estateos-isapi-agent-${agentId.slice(0,8)}.pi.sh"`);
     expect(res.text).toMatch(/^#!\/bin\/bash/);
     expect(res.text).toContain('Installing Node $NODE_MAJOR for $NODE_ARCH');       // Node 22, arm64/armv7l
     expect(res.text).toContain('aarch64|arm64) NODE_ARCH="arm64"');
@@ -250,7 +250,7 @@ describe('Raspberry Pi agents', () => {
     // service unit and points at the released agent binary.
     const generic = await createAgent('linux', 'Shop PC');
     const genericRes = await download(env, 'POST', `/api/isapi/agents/${generic.agentId}/installer`, adminToken);
-    expect(genericRes.disposition).toBe(`attachment; filename="estatemate-isapi-agent-${generic.agentId.slice(0,8)}.sh"`);
+    expect(genericRes.disposition).toBe(`attachment; filename="sornix-estateos-isapi-agent-${generic.agentId.slice(0,8)}.sh"`);
     expect(genericRes.text).toContain('EstateMate ISAPI Bridge Agent Installer (Linux/macOS)');
     expect(genericRes.text).toContain('Download the agent binary');
   });

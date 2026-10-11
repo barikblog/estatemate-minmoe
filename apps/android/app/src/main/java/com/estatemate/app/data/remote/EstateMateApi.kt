@@ -47,7 +47,12 @@ data class UserDto(
     val role: String,
     @SerializedName("property_id") val propertyId: String?,
 )
-data class MeResponse(val user: UserDto)
+/**
+ * The signed-in user, plus the gate a Security officer's session is scoped to.
+ * The gate is absent for every other role (and for an officer on an estate with
+ * no active gate device), so it is nullable rather than defaulted.
+ */
+data class MeResponse(val user: UserDto, val gate: GateDto? = null)
 data class AccessEventDto(
     val id: String,
     @SerializedName("person_name") val personName: String?,
@@ -76,6 +81,17 @@ data class DashboardResponse(
     val outstandingBills: MoneyCountDto?,
     val activeVisitors: CountDto?,
     val activeCards: CountDto?,
+    /** Residents only: the newest active estate notice, shown on the dashboard. */
+    val latestNotice: NoticeDto? = null,
+)
+data class NoticeDto(
+    val id: String,
+    val title: String,
+    val body: String,
+    val severity: String?,
+    @SerializedName("created_at") val createdAt: String?,
+    /** 0/1 from the Worker, so the app can mark a notice the resident has read. */
+    val acknowledged: Int? = null,
 )
 data class CountDto(val count: Int)
 data class MoneyCountDto(val count: Int, val amount: Long)
