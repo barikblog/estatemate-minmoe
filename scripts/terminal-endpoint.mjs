@@ -551,6 +551,22 @@ export function buildPlan(result, endpoint, { acknowledged = false, acknowledged
 
 // ---------------------------------------------------------------------- CLI ---
 
+/**
+ * Why `--emit` will not write an entry, or `null` when it may.
+ *
+ * A pure function on purpose: the first refusal is about what the probe found,
+ * the second is about the operator's decision to record a public endpoint, and
+ * both are policy — they must be checkable without depending on how the address
+ * happens to answer on the network the check is running from.
+ */
+export function emitRefusal({ integrable, endpoint, acknowledge = false }) {
+  if (!integrable) return 'terminal-endpoint: not emitting a device entry for an endpoint that is not integrable';
+  if (!acknowledge && endpointIsPublic(endpoint)) {
+    return 'terminal-endpoint: refusing to emit a public endpoint without --acknowledge (the agent would refuse to start on it)';
+  }
+  return null;
+}
+
 function parseArgs(argv) {
   const flags = { _: [] };
   for (let index = 0; index < argv.length; index += 1) {
@@ -657,12 +673,9 @@ async function main(argv = process.argv.slice(2)) {
   }
 
   if (flags.emit) {
-    if (!integrable) {
-      process.stderr.write('terminal-endpoint: not emitting a device entry for an endpoint that is not integrable\n');
-      return 1;
-    }
-    if (!flags.acknowledge && endpointIsPublic(endpoint)) {
-      process.stderr.write('terminal-endpoint: refusing to emit a public endpoint without --acknowledge (the agent would refuse to start on it)\n');
+    const refusal = emitRefusal({ integrable, endpoint, acknowledge: Boolean(flags.acknowledge) });
+    if (refusal) {
+      process.stderr.write(`${refusal}\n`);
       return 1;
     }
     const block = buildDeviceBlock(endpoint, {

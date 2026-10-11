@@ -29,7 +29,7 @@ import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -40,6 +40,7 @@ import {
   classifyHttpResponse,
   describeEndpoint,
   digestHeader,
+  emitRefusal,
   endpointIsPublic,
   parseEndpoint,
   probeEndpoint,
@@ -396,11 +397,25 @@ console.log('Terminal endpoint probe checks');
     JSON.stringify(sdkEntry));
 
   // --emit is the one thing that writes; it must not write a public entry the
-  // agent would refuse to start on.
+  // agent would refuse to start on. The rule itself is pure, so it is checked
+  // here without depending on how a TEST-NET address answers on this machine's
+  // network — the probe below is the end-to-end half of the same rule.
+  check('a public endpoint without --acknowledge is refused by name',
+    emitRefusal({ integrable: true, endpoint: publicEndpoint, acknowledge: false })?.includes('--acknowledge') === true);
+  check('and with it there is nothing to refuse',
+    emitRefusal({ integrable: true, endpoint: publicEndpoint, acknowledge: true }) === null);
+  check('a private endpoint needs no acknowledgement to be written',
+    emitRefusal({ integrable: true, endpoint: { ...parseEndpoint('192.168.88.60:8000') }, acknowledge: false }) === null);
+  check('and a probe that found nothing integrable is refused for that reason first, not for the missing acknowledgement',
+    emitRefusal({ integrable: false, endpoint: publicEndpoint, acknowledge: false })?.includes('not integrable') === true);
+
   const outFile = join(dir, 'devices.json');
   const refused = await runCli(['--endpoint', '203.0.113.9:8000', '--emit', outFile, '--json', '--timeout', '300']);
-  check('--emit refuses a public endpoint without --acknowledge',
-    refused.status === 1 && refused.stderr.includes('--acknowledge'), `status=${refused.status} stderr=${refused.stderr.trim()}`);
+  const refusedReport = JSON.parse(refused.stdout);
+  check('--emit writes nothing for a public endpoint without --acknowledge, whatever the probe found',
+    refused.status === 1 && !existsSync(outFile)
+      && refused.stderr.trim() === emitRefusal({ integrable: refusedReport.integrable, endpoint: publicEndpoint, acknowledge: false }),
+    `status=${refused.status} verdict=${refusedReport.probe.verdict} stderr=${refused.stderr.trim()}`);
 
   // And a private address emits without an acknowledgement, which is the path an
   // installer on the estate LAN takes.
