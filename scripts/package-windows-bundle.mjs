@@ -184,7 +184,11 @@ copyRepo('windows-agent/agent-config.example.json', 'agent-config.example.json')
 copyRepo('isapi-bridge/isapi-devices.example.json', 'isapi-devices.example.json');
 copyRepo('windows-agent/README.md', 'docs/windows-agent-README.md');
 copyRepo('isapi-bridge/README.md', 'docs/isapi-bridge-README.md');
+// hcnetsdk/README.md points a bundle reader at both of these as docs\ files, so
+// both have to ship - a README that names a file the bundle does not contain is
+// worse than no README on a PC that is offline by definition.
 copyRepo('docs/HIKVISION-SDK-TRANSPORT.md', 'docs/HIKVISION-SDK-TRANSPORT.md');
+copyRepo('docs/PUBLIC-ENDPOINT-DEVICE.md', 'docs/PUBLIC-ENDPOINT-DEVICE.md');
 // The SDK helper: source, build scripts and the note about Hikvision's licence.
 // It builds with the compiler Windows already has, so the agent can offer the
 // SDK transport on a machine that has never had a development toolchain.

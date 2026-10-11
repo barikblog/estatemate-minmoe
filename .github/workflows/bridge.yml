@@ -1187,7 +1187,7 @@ jobs:
             echo "- **Windows bridge MSI** (\`estatemate-bridge-*-win-x64.msi\`) - the all-users installer on its own: double-click it, and the bridge lands in Program Files with **Start Menu -> EstateMate Bridge**, which opens the dashboard - a normal window for the agent id/secret, the terminals, the check and \"Start at boot\". No console, nothing to type. \`estatemate-bridge\` still goes on the PATH, and the uninstaller is in Settings -> Apps."
             echo "- **Windows bridge exe** (\`estatemate-bridge-win-x64.exe\`) - one file: no Node.js install and nothing to unzip. Run \`estatemate-bridge-win-x64.exe setup\`, then \`check\`, then \`install-service\`."
             echo "- **Android bridge APK** (\`estatemate-bridge-*.apk\`) - install on a phone or tablet on the same LAN as the terminals; the bridge runs in a foreground service and restarts after a reboot."
-            echo "- **Windows agent bundle** (\`estatemate-isapi-agent-win-x64-*.zip\`) - self-contained; ships its own Node.js runtime, so the estate PC needs no Node.js install."
+            echo "- **Windows agent bundle** (\`estatemate-isapi-agent-win-x64-*.zip\`) - self-contained; ships its own Node.js runtime, so the estate PC needs no Node.js install. It also carries the **Hikvision SDK transport** - \`hik-sdk-transport.mjs\` plus the \`hcnetsdk\\\` helper source and build scripts - for terminals that answer only on the SDK port (see below)."
             echo "- **Windows desktop app** (\`estatemate-client-*.msi\`) - the EstateMate app for residents and staff: install it, open **EstateMate** from the Start Menu or Desktop, and sign in. It installs for you alone, with no administrator rights, and opens the portal in its own window."
             echo "- **Android APK** (\`estatemate-android-*-debug.apk\`, plus \`-release.apk\` when signing secrets are configured)."
             echo "- Checksums for each artifact family, as \`SHA256SUMS.txt\` - qualified with the family name where two would otherwise collide, since release asset names are flat."
@@ -1214,6 +1214,20 @@ jobs:
             echo '```'
             echo
             echo "Then edit \`isapi-devices.json\` with each Hikvision device's ISAPI host and credentials."
+            echo
+            echo "### Hikvision SDK transport (the port iVMS-4200 uses)"
+            echo "A terminal that answers only on Hikvision's SDK/\"server\" port - 8000 by default, the port iVMS-4200 and Hik-Connect speak - is not reachable over ISAPI at all. The agent bundle ships the transport for it: \`hik-sdk-transport.mjs\` in the agent, and a \`hcnetsdk\\\` folder holding the C# source of \`EstateMateHikSdk\`, its \`.csproj\`, and build scripts for Windows (\`build-hcnetsdk-helper.cmd\`) and Linux (\`build-hcnetsdk-helper.sh\`)."
+            echo
+            echo "The helper links **your** copy of Hikvision's Device Network SDK and talks to the agent in JSON lines over stdin/stdout; EstateMate does not reimplement that binary protocol. Build it once on the host that will run it, then prove it before anything depends on it:"
+            echo
+            echo '```'
+            echo 'hcnetsdk\build-hcnetsdk-helper.cmd'
+            echo 'build\EstateMateHikSdk.exe --selftest <address>:8000 <username> <password>'
+            echo '```'
+            echo
+            echo "\`--selftest\` prints what your SDK build actually exports and whether it can reach the terminal, with no agent involved. Then switch the transport on in \`agent-config.json\` with \`\"hikSdk\": { \"enabled\": true }\`, and describe the device in \`isapi-devices.json\` with \`\"transport\": \"hik_sdk\"\`, \`\"sdkHost\"\`, \`\"sdkPort\"\`, \`\"sdkUsername\"\` and \`\"sdkPassword\"\`. If \`sdkHost\` is a public address the agent refuses to start until the device carries a \`\"publicEndpoint\"\` acknowledgement - deliberate, and documented."
+            echo
+            echo "The full procedure is \`docs\\HIKVISION-SDK-TRANSPORT.md\` in the bundle (\`docs/HIKVISION-SDK-TRANSPORT.md\` in this repository), with the public-endpoint rules in \`docs\\PUBLIC-ENDPOINT-DEVICE.md\`."
             echo
             echo "### Signing status"
             # Resolve by name, not by a hard-coded path: upload-artifact lays files
