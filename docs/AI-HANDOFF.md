@@ -1,5 +1,67 @@
 # AI handoff — EstateMate
 
+## The SDK/"server" port transport — iVMS-4200's own protocol (2026-10-11)
+
+The question this answers: iVMS-4200 reaches the terminal on **port 8000**, and the
+estate asks why EstateMate cannot. It can — as of this round — and the shape is
+deliberate: the agent drives **Hikvision's own `HCNetSDK`** through a small helper
+process, because port 8000 is a proprietary binary protocol that no public
+implementation speaks without that library, and the library is **proprietary and
+non-redistributable**. So the site downloads it and builds the helper; this
+repository never ships it. Documented in `docs/HIKVISION-SDK-TRANSPORT.md` (with
+`bridge-apps/windows/hcnetsdk/README.md` for the build).
+
+**What changed in code.** `isapi-bridge/hik-sdk-transport.mjs` (JSON-lines over
+pipes to the helper: `probe`/`login`/`logout`/`events`/`door`/`clock`/`shutdown`,
+events normalised into the same document an ISAPI alertStream produces, vendored
+code-table deliberately empty so an undecoded event is filed marked `unmapped`
+rather than guessed) plus `scripts/hcnetsdk-simulator.mjs` as the executable
+reference for what the real helper must print. `agent.mjs` gained the `hik_sdk`
+device transport (`transport`/`sdkHost`/`sdkPort`/`sdkUsername`/`sdkPassword`), the
+`hikSdk` config block (`enabled` off by default, `helperPath`, `helperArgs`,
+`eventStream`, `reconnectSeconds`), a capability report taken from the vendor
+build's own exports (events/door/clock only — HCNetSDK has no card-record API, so
+card and person writes are refused with that sentence), a transport-aware public
+endpoint rule, and SDK device-id resolution that matches a portal row only at the
+same host **and** SDK port. `bridge-apps/windows/hcnetsdk/EstateMateHikSdk.cs` (+
+`NativeHikSdk.cs`, `Json.cs`, the build scripts) is the helper itself: C# 5 so the
+compiler Windows already has can build it, `--selftest` to prove login and live
+events against a real terminal before anything is configured. Tests:
+`npm run test:hik-sdk` → 48 transport + 30 agent + 15 Windows-host checks against
+the simulator, and `scripts/terminal-endpoint.mjs` is SDK-aware (it emits the
+`hik_sdk` entry for a `sdk_port` verdict, with the LAN-first alternative and the
+manual-sync interim printed before it). The Windows host tooling (`config.cjs`
+validation, `diagnostics.cjs` `check`, `setup.cjs` preservation) understands the
+new transport rather than reporting it as a broken ISAPI device.
+
+## A terminal reachable only at a public `ip:port` (the iVMS-4200 case) (2026-10-11)
+
+The question this answers: a Hikvision terminal is reachable the way iVMS-4200
+reaches it — a router rule at `<public-ip>:<port>` (live case: `102.211.122.35:8000`)
+— the LAN address is unknown, the router cannot be edited, and integration is asked
+for anyway. Two facts decide it: **port 8000 is Hikvision's SDK/"server" port, not
+ISAPI** (the SDK transport above is what speaks it — this entry is the ISAPI half of
+the same problem), and an unacknowledged public device address is an error in
+`npm run inbound:check`. Documented in `docs/PUBLIC-ENDPOINT-DEVICE.md`.
+
+**What changed in code.** `scripts/terminal-endpoint.mjs` (+ `.integration.mjs`,
+`npm run terminal:endpoint` / `npm run test:terminal-endpoint`) is the new probe: TCP,
+ISAPI `deviceInfo` anonymously and over one HTTP Digest challenge, TLS fingerprint
+with `--tls`, and a verdict per reality (`isapi`, `isapi_auth_needed`,
+`isapi_auth_failed`, `web_ui`, `sdk_port`, `http_other`, `closed`) with the plan and
+the ready-to-paste `isapi-devices.json` entry. The opt-in itself is a per-device
+`publicEndpoint` acknowledgement read by `readPublicEndpointAcknowledgement` /
+`deviceIsPublicEndpoint` in `isapi-bridge/network-access-control.mjs`:
+`agent.mjs` **refuses to start** (`exit 1`, printing the LAN-first remedy) for a
+public address without it, logs every acknowledged endpoint's risks at each start,
+and reports them on the heartbeat (`publicEndpoints` + `publicEndpoint: true`);
+`scripts/inbound-exposure-check.mjs` reports an acknowledged endpoint as a named
+warning instead of an error (and keeps plain `http` to it a warning that says the
+acknowledgement covers the address, not the cleartext). Nothing else moved: no
+inbound listener, allowlist or firewall behaviour changed, and an acknowledged
+endpoint is never a substitute for the LAN-address remedy in
+`docs/PUBLIC-IP-AND-PORT-FORWARDING.md` §6.
+
 ## Inbound access control for the site whose router cannot be changed (2026-10-11)
 
 The question this answers: an estate's router already has **inbound Internet

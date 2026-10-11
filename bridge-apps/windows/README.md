@@ -213,6 +213,7 @@ wherever `--config`/`--data-dir` says).
 | `eventBufferLimit` | events buffered while the Worker is unreachable (500) |
 | `logLevel` | `debug` \| `info` \| `warn` \| `error` |
 | `isapiTimeoutMs` | per-request device timeout (15000) |
+| `hikSdk` | opt-in Hikvision SDK transport for a terminal reachable only on the SDK/"server" port 8000 — `{ "enabled": true, "helperPath": "C:\\EstateMate\\ISAPI-Agent\\hcnetsdk\\EstateMateHikSdk.exe" }`; see [`docs/HIKVISION-SDK-TRANSPORT.md`](../../docs/HIKVISION-SDK-TRANSPORT.md) |
 
 `isapi-devices.json`
 
@@ -241,6 +242,17 @@ port) against the devices the portal has linked to this agent — `check` prints
 explicitly when one address has several terminals behind it. A terminal the
 portal has not linked, or a mistyped id, is reported by `check` and refused at
 startup rather than silently dropping the events it reads.
+
+A terminal that answers only on Hikvision's SDK/"server" port takes a different
+entry — `"transport": "hik_sdk"` with `sdkHost`, `sdkPort` (8000), `sdkUsername`
+and `sdkPassword` — and needs a helper built from the C# in
+[`bridge-apps/windows/hcnetsdk/`](hcnetsdk/README.md) plus Hikvision's own
+Device Network SDK next to it. If `sdkHost` is a public address the bridge
+refuses to start until that device carries a `publicEndpoint` acknowledgement.
+`setup` and the dashboard never touch the `hikSdk` block, and `check` reports
+each device's transport, so a working SDK terminal is not silently switched
+back to ISAPI. Both paths are described in
+[`docs/HIKVISION-SDK-TRANSPORT.md`](../../docs/HIKVISION-SDK-TRANSPORT.md).
 
 ## Troubleshooting
 

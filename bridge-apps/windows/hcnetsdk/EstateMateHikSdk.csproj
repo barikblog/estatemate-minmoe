@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    The Linux/macOS build of the Hikvision SDK helper (and a second way to build it
+    on Windows). `dotnet build -c Release` writes build/EstateMateHikSdk, which is
+    what the agent runs when "hikSdk": { "helperPath": "..." } points at it.
+
+    On Windows, build-hcnetsdk-helper.cmd is the shorter path: it needs no .NET
+    SDK, only the compiler every Windows already has.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>EstateMateHikSdk</AssemblyName>
+    <RootNamespace>EstateMate.HikSdk</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <LangVersion>5</LangVersion>
+    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>build</OutputPath>
+  </PropertyGroup>
+</Project>

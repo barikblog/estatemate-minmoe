@@ -180,6 +180,81 @@ export function isNonPublicAddress(raw) {
   return ['loopback', 'private', 'link-local', 'carrier-grade'].includes(classifyAddress(raw));
 }
 
+// -------------------------------------------------------- public endpoints ---
+
+/**
+ * Reads a device's acknowledgement that its address is on the public Internet.
+ *
+ * A terminal whose *own* address is public is the one exposure no allowlist on
+ * the agent host can fix — the terminal answers for itself. EstateMate's posture
+ * is still "never do this", so the mode exists only as an explicit, recorded
+ * decision an operator can make about a site whose router rule they cannot
+ * remove:
+ *
+ *   "publicEndpoint": {
+ *     "acknowledged": true,
+ *     "acknowledgedBy": "admin@royalpalm",
+ *     "acknowledgedAt": "2026-10-11T09:00:00Z",
+ *     "note": "contractor's rule on the ISP router; no LAN access to the terminal"
+ *   }
+ *
+ * The agent refuses to dial such a device without it, and the exposure checker
+ * turns its hard error into a named warning so the residual risk travels with
+ * the decision instead of disappearing. See `docs/PUBLIC-ENDPOINT-DEVICE.md`.
+ */
+export function readPublicEndpointAcknowledgement(device = {}) {
+  const raw = device && typeof device === 'object' ? (device.publicEndpoint ?? device.public_endpoint) : null;
+  const empty = { acknowledged: false, by: null, at: null, note: null };
+  if (!raw || typeof raw !== 'object') return empty;
+  const text = (value) => (typeof value === 'string' && value.trim() ? value.trim() : null);
+  return {
+    acknowledged: raw.acknowledged === true,
+    by: text(raw.acknowledgedBy ?? raw.by),
+    at: text(raw.acknowledgedAt ?? raw.at),
+    note: text(raw.note ?? raw.reason),
+  };
+}
+
+/**
+ * True when any address the device is configured at is a public address literal.
+ *
+ * Both transports are considered: `isapiHost` (HTTP/ISAPI, the default) and
+ * `sdkHost` (Hikvision's SDK/"server" port, the transport iVMS-4200 uses). A
+ * device that answers on the open Internet at either address is the same
+ * exposure, so it needs the same acknowledgement.
+ */
+export function deviceIsPublicEndpoint(device = {}) {
+  for (const candidate of [device?.isapiHost, device?.sdkHost, device?.sdk_host]) {
+    const host = String(candidate || '').trim();
+    if (!host || !isAddressLiteral(host)) continue;
+    if (classifyAddress(host) === 'public') return true;
+  }
+  return false;
+}
+
+/**
+ * The residual risks a public endpoint carries, in the order an operator should
+ * read them. Shared by the agent's startup log, the exposure checker and
+ * `scripts/terminal-endpoint.mjs` so the sentence is never softened by being
+ * rewritten.
+ */
+export function publicEndpointRisks({ protocol = 'http', host = '', port = 8000 } = {}) {
+  const scheme = String(protocol).toLowerCase();
+  const risks = [
+    `the terminal answers for itself at ${host}:${port} — no allowlist, shared secret or rate limit on the agent host can limit who reaches it`,
+    'the terminal\'s admin interface is on the same address: a firmware default or a reused password is a gate opening',
+  ];
+  if (scheme === 'hik_sdk' || scheme === 'sdk') {
+    risks.push('the SDK protocol is not TLS: the vendor library protects the password with its own challenge/response, but card numbers and events travel in Hikvision\'s binary framing across a network nobody here controls');
+  } else if (scheme !== 'https') {
+    risks.push('ISAPI Digest credentials and every card number cross the public Internet in cleartext');
+  } else {
+    risks.push('TLS protects the path, but the terminal\'s certificate must be trusted on the agent host or the connection is unauthenticated');
+  }
+  risks.push('the estate\'s uptime now depends on somebody else\'s router rule: keep an agent on the LAN as the exit plan');
+  return risks;
+}
+
 // -------------------------------------------------------------------- rules ---
 
 /**

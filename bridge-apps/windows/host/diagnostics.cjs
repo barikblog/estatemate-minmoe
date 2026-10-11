@@ -87,15 +87,30 @@ function parseCardCount(body) {
 }
 
 function deviceFromEntry(entry) {
+  const transport = String(entry.transport || '').trim().toLowerCase();
+  const isSdk = transport === 'hik_sdk' || transport === 'hcnetsdk';
   return {
     estateMateDeviceId: String(entry.estateMateDeviceId || '').trim(),
-    name: String(entry.name || entry.isapiHost || 'device'),
+    name: String(entry.name || entry.isapiHost || entry.sdkHost || 'device'),
+    transport: isSdk ? 'hik_sdk' : 'isapi',
     isapiHost: String(entry.isapiHost || '').trim(),
     isapiPort: Number(entry.isapiPort || 80),
     isapiUsername: String(entry.isapiUsername || 'admin'),
     isapiPassword: String(entry.isapiPassword || ''),
     protocol: entry.protocol === 'https' ? 'https' : 'http',
+    // Present on the SDK transport only: this host cannot speak Hikvision's SDK
+    // protocol (that is the helper's job), so it reports the address and says so
+    // instead of pretending an ISAPI probe of an empty host meant something.
+    sdkHost: String(entry.sdkHost || entry.sdk_host || '').trim(),
+    sdkPort: Number(entry.sdkPort ?? entry.sdk_port ?? 8000),
+    sdkUsername: String(entry.sdkUsername || entry.sdk_username || 'admin'),
   };
+}
+
+/** True for a devices-file entry on Hikvision's SDK/"server" transport. */
+function isSdkEntry(entry) {
+  const transport = String(entry && entry.transport || '').trim().toLowerCase();
+  return transport === 'hik_sdk' || transport === 'hcnetsdk';
 }
 
 /**
@@ -175,19 +190,35 @@ async function checkDevice(entry, { agent, alertStreamPath, timeoutMs, logger })
   const result = {
     id: device.estateMateDeviceId,
     name: device.name,
-    host: device.isapiHost,
-    port: device.isapiPort,
-    protocol: device.protocol,
-    username: device.isapiUsername,
+    transport: device.transport,
+    host: device.transport === 'hik_sdk' ? device.sdkHost : device.isapiHost,
+    port: device.transport === 'hik_sdk' ? device.sdkPort : device.isapiPort,
+    protocol: device.transport === 'hik_sdk' ? 'hik_sdk' : device.protocol,
+    username: device.transport === 'hik_sdk' ? device.sdkUsername : device.isapiUsername,
     deviceInfo: null,
     cardApi: null,
     eventStream: null,
     ok: false,
+    // True when this check deliberately did not probe the terminal: it is on the
+    // SDK transport, which this host has no client for. Kept apart from `ok` so a
+    // terminal nobody verified is never counted as a terminal that answered.
+    skipped: device.transport === 'hik_sdk',
     problems: [],
   };
 
   if (entry.enabled === false) {
     result.problems.push('disabled in isapi-devices.json');
+    return result;
+  }
+
+  if (device.transport === 'hik_sdk') {
+    // The evidence for an SDK terminal is the helper's own self-test and the
+    // agent's sdkTransport heartbeat — `check` must not claim more than that,
+    // and must not fail a working terminal for having no ISAPI endpoint.
+    result.ok = true;
+    result.note = `not probed here: this terminal is reached over Hikvision's SDK port (${device.sdkHost}:${device.sdkPort}), not ISAPI.`
+      + ' Verify it with "hcnetsdk\\EstateMateHikSdk.exe --selftest ' + device.sdkHost + ':' + device.sdkPort + ' ' + device.sdkUsername + ' <password>"'
+      + ' (build it per docs\\HIKVISION-SDK-TRANSPORT.md), then watch the agent\'s sdkTransport heartbeat in the portal.';
     return result;
   }
 
@@ -287,8 +318,10 @@ function printReport(report, logger) {
   line('');
 
   for (const device of report.devices) {
-    const status = device.ok ? 'OK  ' : 'FAIL';
-    line(`  [${status}] ${device.name} — ${device.protocol}://${device.host}:${device.port} (${device.id || (device.resolvedPortalId ? `portal id ${device.resolvedPortalId}` : 'no device id')})`);
+    const status = device.skipped ? 'SKIP' : (device.ok ? 'OK  ' : 'FAIL');
+    const address = device.transport === 'hik_sdk' ? `hik_sdk://${device.host}:${device.port}` : `${device.protocol}://${device.host}:${device.port}`;
+    line(`  [${status}] ${device.name} — ${address} (${device.id || (device.resolvedPortalId ? `portal id ${device.resolvedPortalId}` : 'no device id')})`);
+    if (device.note) line(`         ${device.note}`);
     if (device.deviceInfo) {
       const bits = [device.deviceInfo.model, device.deviceInfo.deviceName, device.deviceInfo.firmwareVersion, device.deviceInfo.serialNumber].filter(Boolean);
       if (bits.length) line(`         device: ${bits.join(' | ')}`);
@@ -330,7 +363,11 @@ function printReport(report, logger) {
 
   for (const warning of report.warnings) line(`  WARN  ${warning}`);
   for (const error of report.errors) line(`  ERROR ${error}`);
-  if (report.errors.length === 0 && report.devices.every((d) => d.ok) && report.worker.status === 200) {
+  const skipped = report.devices.filter((device) => device.skipped);
+  if (skipped.length) {
+    line(`  NOTE  ${skipped.length} terminal(s) on the Hikvision SDK transport were not probed here (${skipped.map((d) => d.name).join(', ')}) — this host has no SDK client. Verify each with its helper's --selftest, and check sdkTransport on the portal's agent row.`);
+  }
+  if (report.errors.length === 0 && report.devices.every((d) => d.ok) && report.worker.status === 200 && !skipped.length) {
     line('  All checks passed. Start the bridge with: ' + (report.platform === 'win32' ? '"estatemate-bridge.exe" run' : '"estatemate-bridge" run'));
   } else if (report.exitCode === 1) {
     line('  Some checks failed — see the entries marked FAIL above.');
@@ -498,17 +535,22 @@ async function runCheck({ ctx, logger, json = false }) {
   // A terminal needs a LAN address to be checkable. Its EstateMate device id is
   // optional: the agent resolves that from the portal at startup, so `check`
   // reports what it will resolve to rather than refusing to look.
-  const entries = (devicesFile.devices || []).filter((d) => d && d.isapiHost && d.enabled !== false);
-  const portalMatchFor = (host, port) => (report.worker.linkedDevices || []).find(
+  const entries = (devicesFile.devices || []).filter((d) => d && (d.isapiHost || isSdkEntry(d)) && d.enabled !== false);
+  // Mirrors the agent's own resolution rules: an ISAPI terminal matches a portal
+  // row by host (its port is a preference), while an SDK terminal matches only at
+  // the same host *and* port — one public address can front several terminals.
+  const portalMatchFor = (host, port, { strictPort = false } = {}) => (report.worker.linkedDevices || []).find(
     (item) => String(item.isapi_host || '').trim().toLowerCase() === String(host || '').trim().toLowerCase()
-      && (!item.isapi_port || port === undefined || Number(item.isapi_port) === Number(port)),
+      && (strictPort
+        ? Number(item.isapi_port) === Number(port)
+        : (!item.isapi_port || port === undefined || Number(item.isapi_port) === Number(port))),
   );
   for (const entry of entries) {
     // eslint-disable-next-line no-await-in-loop -- devices are checked one at a
     // time on purpose: a hung terminal must not starve the others.
     const result = await checkDevice(entry, { agent, alertStreamPath, timeoutMs, logger });
     if (!String(result.id || '').trim()) {
-      const match = portalMatchFor(result.host, result.port);
+      const match = portalMatchFor(result.host, result.port, { strictPort: result.transport === 'hik_sdk' });
       if (match && match.device_id) {
         result.resolvedPortalId = String(match.device_id);
         result.resolvedPortalName = match.device_name ? String(match.device_name) : null;

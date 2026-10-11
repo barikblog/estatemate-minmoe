@@ -11,6 +11,13 @@
   "logLevel": "info",
   "isapiTimeoutMs": 15000,
   "maxRetries": 3,
+  "hikSdk": {
+    "enabled": false,
+    "helperPath": "",
+    "helperArgs": [],
+    "eventStream": true,
+    "reconnectSeconds": 30
+  },
   "zktecoPush": {
     "enabled": false,
     "port": 8089,

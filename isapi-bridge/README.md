@@ -60,6 +60,103 @@ Config knobs (`agent-config.json`):
 
 Per-device `"eventStream": false` in `isapi-devices.json` disables streaming for that terminal only.
 
+### Terminals that are only reachable at a public `ip:port`
+
+A few sites cannot reach the terminal's LAN at all — an installer's router rule is
+the only path, and it is not ours to remove. That pattern is supported, but only as
+an explicit, recorded decision on the device:
+
+```json
+"publicEndpoint": {
+  "acknowledged": true,
+  "acknowledgedBy": "your name",
+  "acknowledgedAt": "2026-10-11T09:00:00Z",
+  "note": "contractor rule on the ISP router; no LAN path to the terminal"
+}
+```
+
+- `isapiHost` must be the public **address literal** (a hostname is never judged,
+  because DNS could resolve it privately today and publicly tomorrow).
+- Without `"acknowledged": true` the agent **refuses to start** and prints the
+  LAN-first remedy; with it, the endpoint is logged at every start, marked
+  `publicEndpoint: true` on the heartbeat, and reported by
+  `npm run inbound:check` as a named warning instead of an error.
+- Prefer `https` on such a device: over `http` every Digest response and card
+  number crosses a network nobody here controls.
+- Hikvision's **SDK/"server" port (8000)** is what iVMS-4200 uses and is *not*
+  ISAPI — probe the address before configuring it:
+
+```bash
+npm run terminal:endpoint -- --endpoint <public-ip>:<port> --username admin --password '<device password>'
+```
+
+Full procedure, the verdict table, the hardening steps and the exit plan:
+[`../docs/PUBLIC-ENDPOINT-DEVICE.md`](../docs/PUBLIC-ENDPOINT-DEVICE.md).
+
+## Terminals that only answer on Hikvision's SDK port (8000)
+
+iVMS-4200 does not use ISAPI: it loads Hikvision's **Device Network SDK
+(HCNetSDK)** and speaks its private protocol to the terminal's **SDK/"server"
+port, 8000**. A terminal whose only reachable address is `<public-ip>:8000` is
+therefore reachable this way and not over HTTP, and the bridge supports it as a
+third transport:
+
+```
+agent.mjs  ──JSON lines over stdin/stdout──▶  EstateMateHikSdk(.exe)
+                                                   │  HCNetSDK (the site's copy)
+                                                   ▼  terminal SDK port 8000
+```
+
+```jsonc
+// agent-config.json
+{
+  "hikSdk": {
+    "enabled": true,                              // off by default: needs a helper build
+    "helperPath": "C:\\EstateMate\\hcnetsdk\\EstateMateHikSdk.exe", // optional if bundled
+    "eventStream": true,
+    "reconnectSeconds": 30
+  }
+}
+```
+
+```jsonc
+// isapi-devices.json
+{
+  "estateMateDeviceId": "<from the portal>",
+  "name": "Main Gate (SDK)",
+  "transport": "hik_sdk",
+  "sdkHost": "102.211.122.35",
+  "sdkPort": 8000,
+  "sdkUsername": "admin",
+  "sdkPassword": "<device admin password>",
+  "enabled": true,
+  "publicEndpoint": { "acknowledged": true, "acknowledgedBy": "…", "acknowledgedAt": "…", "note": "…" }
+}
+```
+
+- **The vendor SDK is never shipped here.** Hikvision's library is proprietary,
+  so the site builds the helper
+  ([`../bridge-apps/windows/hcnetsdk/`](../bridge-apps/windows/hcnetsdk/README.md))
+  and drops its own copy of `HCNetSDK.dll` / `libhcnetsdk.so` beside it. Without
+  the helper the transport reports itself as absent, by name, and every other
+  transport keeps working.
+- **What it carries:** live access events (when the vendor build exports the alarm
+  callback) and door control (`remote_open`/`close`/`always_open`/`always_close`/
+  `resume`) and terminal clock read/set. **Not** card or person writes —
+  HCNetSDK has no card-record API, and iVMS-4200 provisions cards over ISAPI
+  itself; those operations are refused with that sentence and stay operator tasks.
+- **No verdict is invented.** Events arrive as the same normalised document an
+  ISAPI alertStream produces, with the vendor's own major/minor numbers, marked
+  `unmapped` while no code table is verified against a terminal
+  (`SDK_MINOR_DESCRIPTIONS` in `hik-sdk-transport.mjs` ships empty).
+- **A public `sdkHost` needs the same acknowledgement as a public `isapiHost`**,
+  and `npm run inbound:check` reports it the same way. The SDK protocol is not
+  TLS, and the terminal answers for itself.
+- Verification: `npm run test:hik-sdk` (48 transport + 30 agent + 15 Windows-host
+  checks, all against `scripts/hcnetsdk-simulator.mjs`), and
+  `EstateMateHikSdk --selftest <host>:<port> admin <password>` on the gate PC.
+  Full procedure: [`../docs/HIKVISION-SDK-TRANSPORT.md`](../docs/HIKVISION-SDK-TRANSPORT.md).
+
 
 ## People and fingerprints (bridge 0.3.0+)
 

@@ -29,3 +29,10 @@ __pycache__/
 
 # ESP32 gate: a downloaded secrets.h carries the agent secret (esp32-gate/README.md)
 esp32-gate/EstateMateGate/secrets.h
+
+# Hikvision's Device Network SDK is proprietary and not redistributable: it is
+# supplied by the operator, never committed (bridge-apps/windows/hcnetsdk/README.md).
+*.dll
+*.so
+*.dylib
+bridge-apps/windows/hcnetsdk/HCNetSDKCom/

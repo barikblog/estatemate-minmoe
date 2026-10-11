@@ -34,6 +34,7 @@
  * Exit code 0 = all checks passed. Run by `npm run test:isapi-bridge`.
  */
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import http from 'node:http';
@@ -414,6 +415,69 @@ check('and says why that leaves the port open', pushPolicyLogs.some((line) => li
   const after = agent.inboundAccessHeartbeat().listeners[0];
   check('a request is counted on the reported surface', after.requests === before + 1, JSON.stringify({ before, after: after.requests }));
   await listener.close();
+}
+
+// ── 11b. A public endpoint is a recorded decision, and the agent enforces it ──
+// The live case this exists for: a router rule from someone else already
+// publishes a terminal at <public-ip>:<port>, the LAN address is unknown and the
+// router cannot be edited. Integration is then possible, but only as an explicit
+// acknowledgement in the devices file — never because an address was typed in.
+// Driven through real child processes, because the refusal happens at startup.
+{
+  const rootDir = new URL('..', import.meta.url);
+  const childScript = `
+    process.env.ESTATEMATE_AGENT_STANDBY = '1';
+    const agent = await import('./isapi-bridge/agent.mjs');
+    console.log('IMPORTED ' + JSON.stringify(agent.publicEndpointStatus()));
+  `;
+  const runAgent = (devices) => {
+    const file = join(dir, `public-endpoint-${Math.random().toString(16).slice(2)}.json`);
+    writeFileSync(file, JSON.stringify({ devices }));
+    return spawnSync(process.execPath, ['--input-type=module', '-e', childScript], {
+      cwd: new URL('.', rootDir).pathname,
+      env: { ...process.env, AGENT_CONFIG: configPath, DEVICES_FILE: file },
+      encoding: 'utf8',
+    });
+  };
+
+  const refused = runAgent([
+    { name: 'Exposed Gate', estateMateDeviceId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', isapiHost: '203.0.113.40', isapiPort: 8000, protocol: 'http' },
+  ]);
+  check('a public endpoint with no acknowledgement stops the agent',
+    refused.status === 1 && !refused.stdout.includes('IMPORTED'), `status=${refused.status} stdout=${refused.stdout.trim()}`);
+  check('and the refusal says which terminal, and why this host cannot fix it',
+    refused.stderr.includes('Exposed Gate') && refused.stderr.includes('203.0.113.40:8000') && refused.stderr.includes('answers for itself'), refused.stderr.trim());
+  check('and it names the LAN path first, the acknowledgement second, manual sync third',
+    refused.stderr.includes('SADP') && refused.stderr.includes('publicEndpoint') && refused.stderr.includes('manual synchronization'), refused.stderr.trim());
+  check('and it hands the operator the exact command to see what is really answering',
+    refused.stderr.includes('scripts/terminal-endpoint.mjs --endpoint 203.0.113.40:8000'), refused.stderr.trim());
+
+  const accepted = runAgent([
+    {
+      name: 'Exposed Gate',
+      estateMateDeviceId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      isapiHost: '203.0.113.40',
+      isapiPort: 8000,
+      protocol: 'http',
+      publicEndpoint: {
+        acknowledged: true,
+        acknowledgedBy: 'admin@royalpalm',
+        acknowledgedAt: '2026-10-11T09:00:00Z',
+        note: 'contractor rule on the ISP router; no LAN path to the terminal',
+      },
+    },
+  ]);
+  check('an acknowledged public endpoint starts, and the agent reports it rather than hiding it',
+    accepted.status === 0 && accepted.stdout.includes('IMPORTED'), `status=${accepted.status} stderr=${accepted.stderr.trim()}`);
+  const status = JSON.parse((accepted.stdout.match(/IMPORTED (.*)/) || [])[1] || 'null');
+  check('the report carries the address, the protocol and who accepted it',
+    status?.[0]?.host === '203.0.113.40' && status?.[0]?.protocol === 'http' && status?.[0]?.acknowledgedBy === 'admin@royalpalm', JSON.stringify(status));
+
+  const privateDevice = runAgent([
+    { name: 'Main Gate', estateMateDeviceId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', isapiHost: '192.168.88.12', isapiPort: 80 },
+  ]);
+  check('a private address needs no acknowledgement and produces no report',
+    privateDevice.status === 0 && privateDevice.stdout.includes('IMPORTED []'), privateDevice.stdout.trim());
 }
 
 // ── 12. The Windows bridge's `check` reports the same policy ─────────────────

@@ -142,10 +142,106 @@ const DEVICES = [
   check('a public terminal address is an error', result.ok === false);
   check('plain http to a public terminal is its own error',
     result.errors.filter((error) => error.includes('Exposed Gate')).length === 2, JSON.stringify(result.errors));
+  check('the error names the way out instead of only the problem',
+    result.errors.some((error) => error.includes('terminal-endpoint.mjs') && error.includes('publicEndpoint')), JSON.stringify(result.errors));
   check('a CGNAT address is called out as a weak allowlist entry',
     result.warnings.some((warning) => warning.includes('carrier-grade')), JSON.stringify(result.warnings));
   check('a dial-in PUSH terminal has no address to judge',
     result.devices.find((device) => device.name === 'Dial-in gate').classification === 'dial-in');
+}
+
+// ── 5b. A public endpoint the operator has acknowledged is reported, not hidden ─
+// The live case: a router rule nobody here can edit already publishes a terminal,
+// so integration has to be possible — but only as a recorded decision, and only
+// with the risk still in the report.
+{
+  const acknowledgement = {
+    acknowledged: true,
+    acknowledgedBy: 'admin@royalpalm',
+    acknowledgedAt: '2026-10-11T09:00:00Z',
+    note: 'contractor rule on the ISP router; no LAN path to the terminal',
+  };
+
+  const acknowledged = assessInboundPosture({
+    config: {},
+    devices: [{ name: 'Exposed Gate', isapiHost: '203.0.113.40', isapiPort: 8000, protocol: 'https', publicEndpoint: acknowledgement }],
+  });
+  check('an acknowledged public endpoint is not an error', acknowledged.ok === true, JSON.stringify(acknowledged.errors));
+  check('but it is still a finding, and the finding names who accepted it',
+    acknowledged.warnings.some((warning) => warning.includes('acknowledged by admin@royalpalm') && warning.includes('does not remove the risk')), JSON.stringify(acknowledged.warnings));
+  check('the report carries the acknowledgement itself, so a later review sees it',
+    acknowledged.devices[0].publicEndpoint?.acknowledged === true && acknowledged.devices[0].publicEndpoint.by === 'admin@royalpalm', JSON.stringify(acknowledged.devices[0]));
+  check('the residual risks are read out, not summarised away',
+    acknowledged.warnings.some((warning) => warning.includes('answers for itself') && warning.includes('admin interface is on the same address')), JSON.stringify(acknowledged.warnings));
+
+  const partial = assessInboundPosture({
+    config: {},
+    devices: [{ name: 'Half Acked Gate', isapiHost: '203.0.113.41', isapiPort: 8000, protocol: 'https', publicEndpoint: { acknowledgedBy: 'someone' } }],
+  });
+  check('an acknowledgement without "acknowledged": true is not an acknowledgement',
+    partial.ok === false && partial.errors.some((error) => error.includes('Half Acked Gate')), JSON.stringify(partial.errors));
+
+  const cleartext = assessInboundPosture({
+    config: {},
+    devices: [{ name: 'Exposed Gate', isapiHost: '203.0.113.40', isapiPort: 8000, protocol: 'http', publicEndpoint: acknowledgement }],
+  });
+  check('an acknowledgement covers the address, never the cleartext: no error, but the warning says how to fix it',
+    cleartext.ok === true && cleartext.warnings.some((warning) => warning.includes('acknowledgement covers the address, not the cleartext')), JSON.stringify({ errors: cleartext.errors, warnings: cleartext.warnings }));
+
+  const stillAnError = assessInboundPosture({
+    config: {},
+    devices: [{ name: 'Unauthorized Gate', isapiHost: '203.0.113.42', isapiPort: 8000, protocol: 'http' }],
+  });
+  check('without the block, the same address is still a hard error — nothing was relaxed',
+    stillAnError.ok === false && stillAnError.errors.filter((error) => error.includes('Unauthorized Gate')).length === 2, JSON.stringify(stillAnError.errors));
+}
+
+// ── 5c. A terminal reached over Hikvision's SDK port (iVMS-4200's transport) ──
+// The live case: the only path to the terminal is a router rule on port 8000,
+// which is Hikvision's SDK/"server" port — not HTTP. The agent drives the vendor
+// library through a helper. The posture rules are exactly the same, and what the
+// transport cannot do has to be visible rather than discovered later.
+{
+  const acknowledgement = {
+    acknowledged: true,
+    acknowledgedBy: 'admin@royalpalm',
+    acknowledgedAt: '2026-10-11T09:00:00Z',
+    note: 'contractor rule on the ISP router; the SDK port is the only path to this terminal',
+  };
+
+  const privateSdk = assessInboundPosture({
+    config: {},
+    devices: [
+      { name: 'SDK Gate', transport: 'hik_sdk', sdkHost: '192.168.88.60', sdkPort: 8000 },
+      { name: 'PUSH Gate', transport: 'zkteco_push', pushSerial: 'ZK1' },
+    ],
+  });
+  check('a private SDK endpoint is clean', privateSdk.ok === true, JSON.stringify(privateSdk.errors));
+  check('and its transport is reported as the SDK transport',
+    privateSdk.devices.find((device) => device.name === 'SDK Gate')?.transport === 'hik_sdk', JSON.stringify(privateSdk.devices));
+  check('the SDK port is not judged as cleartext HTTP: it is not HTTP at all',
+    !privateSdk.errors.some((error) => error.includes('SDK Gate')), JSON.stringify(privateSdk.errors));
+  check('but what the transport cannot do is said out loud',
+    privateSdk.notes.some((note) => note.includes('SDK Gate') && note.includes('card and person changes stay operator tasks')), JSON.stringify(privateSdk.notes));
+
+  const publicSdk = assessInboundPosture({
+    config: {},
+    devices: [{ name: 'SDK Gate', transport: 'hik_sdk', sdkHost: '102.211.122.35', sdkPort: 8000 }],
+  });
+  check('an SDK endpoint on the public Internet is an error, exactly like an ISAPI one',
+    publicSdk.ok === false && publicSdk.errors.some((error) => error.includes('SDK Gate')), JSON.stringify(publicSdk.errors));
+  check('and the error carries the address and port the agent would dial',
+    publicSdk.errors.some((error) => error.includes('102.211.122.35') && error.includes('terminal-endpoint.mjs')), JSON.stringify(publicSdk.errors));
+
+  const acknowledgedSdk = assessInboundPosture({
+    config: {},
+    devices: [{ name: 'SDK Gate', transport: 'hik_sdk', sdkHost: '102.211.122.35', sdkPort: 8000, publicEndpoint: acknowledgement }],
+  });
+  check('a recorded acknowledgement turns it into a named warning', acknowledgedSdk.ok === true && acknowledgedSdk.warnings.some((warning) => warning.includes('acknowledged by admin@royalpalm')), JSON.stringify(acknowledgedSdk.warnings));
+  check('the SDK transport\'s own risk — no TLS on that protocol — is stated',
+    acknowledgedSdk.warnings.some((warning) => warning.includes('the SDK protocol is not TLS')), JSON.stringify(acknowledgedSdk.warnings));
+  check('and the report carries the acknowledgement for a later review',
+    acknowledgedSdk.devices[0].publicEndpoint?.acknowledged === true && acknowledgedSdk.devices[0].port === 8000, JSON.stringify(acknowledgedSdk.devices[0]));
 }
 
 // ── 6. The switches that weaken the control are findings in their own right ──

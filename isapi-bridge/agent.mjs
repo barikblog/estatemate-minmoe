@@ -22,7 +22,22 @@ import { applyPushOperation, startZktecoPushServer } from './zkteco-push-server.
 import { pinPolicy } from './zkteco-push.mjs';
 import { CredentialCache, CooldownTracker, cooldownKey, decideCredential, parseTerminalEvent } from './remote-verify.mjs';
 import { startLanEventListener } from './lan-event-listener.mjs';
-import { bindIsReachableBeyondHost, deriveInboundSources, normalizeSourceAddress } from './network-access-control.mjs';
+import {
+  bindIsReachableBeyondHost,
+  deriveInboundSources,
+  deviceIsPublicEndpoint,
+  normalizeSourceAddress,
+  publicEndpointRisks,
+  readPublicEndpointAcknowledgement,
+} from './network-access-control.mjs';
+import {
+  DEFAULT_SDK_PORT,
+  createHikSdkTransport,
+  describeHelperAbsence,
+  hikAcsEventDocument,
+  resolveHelperPath,
+  sdkEndpointFor,
+} from './hik-sdk-transport.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -64,6 +79,171 @@ const heartbeatInterval = Math.max(15, Number(config.heartbeatIntervalSeconds ||
 const isapiTimeout = Math.max(2000, Number(config.isapiTimeoutMs || 15000));
 const logLevel = String(config.logLevel || 'info');
 
+// Hikvision SDK transport (the terminal's SDK/"server" port — iVMS-4200's port)
+//
+// iVMS-4200 reaches a terminal over port 8000 with Hikvision's own Device
+// Network SDK (HCNetSDK). EstateMate does the same thing here: a helper process
+// links that vendor library and the agent drives the helper, so a terminal that
+// is only reachable on the SDK port — the site whose router rule nobody can edit
+// — still yields live gate events and door control.
+//
+// What it cannot do is write cards or people: HCNetSDK has no card-record API,
+// and iVMS-4200 provisions cards over HTTP/ISAPI itself. So a terminal on this
+// transport keeps card and visitor changes as operator tasks. Saying that once,
+// here, is better than a queue of operations that can never succeed.
+// ---------------------------------------------------------------------------
+
+const sdkState = {
+  transport: null,
+  helper: null,
+  probe: null,
+  started: false,
+  lastError: null,
+};
+
+/** The terminals this agent serves over the SDK transport. */
+function sdkDevicesFor() {
+  return [...devices.values()].filter((device) => device.transport === 'hik_sdk');
+}
+
+/**
+ * Where the helper binary is. A configured path wins; otherwise the bundled
+ * layout next to the agent is used, so a standard install needs no setting.
+ */
+function locateSdkHelper() {
+  return resolveHelperPath({ configured: sdkHelperPath, execDir: __dirname });
+}
+
+/**
+ * Starts the helper and reads what its SDK build can do. Never fatal: a bridge
+ * with ISAPI terminals and one SDK terminal whose helper is missing must keep
+ * serving the ISAPI half, and the SDK half reports why it is down.
+ */
+async function startSdkTransport() {
+  if (sdkState.started) return sdkState;
+  sdkState.started = true;
+  const located = locateSdkHelper();
+  if (!located.path) {
+    sdkState.lastError = describeHelperAbsence(located);
+    log('warn', sdkState.lastError);
+    return sdkState;
+  }
+  sdkState.helper = located.path;
+  const transport = createHikSdkTransport({ helperPath: located.path, helperArgs: sdkHelperArgs, log });
+  sdkState.transport = transport;
+  transport.onEvent((event) => {
+    const device = sdkDevicesFor().find((entry) => entry.sdkEndpoint?.host === event.host)
+      ?? sdkDevicesFor()[0];
+    if (!device) {
+      log('warn', 'The Hikvision SDK helper sent an event but no SDK terminal is configured for it');
+      return;
+    }
+    const forwarded = transport.stats().eventsForwarded + 1;
+    if (event.minorDescription || Number.isFinite(Number(event.minor))) {
+      // A code that has been verified against a terminal would arrive as
+      // minorDescription and carry the verdict; an undecoded one is filed with
+      // its number in sight, never guessed at (see hik-sdk-transport.mjs).
+      log('info', `SDK event from ${device.name}: major=${event.major ?? '?'} minor=${event.minor ?? '?'}${event.cardNo ? ` card=${event.cardNo.slice(-4).padStart(event.cardNo.length, '*')}` : ''}`);
+    }
+    queueEvent(device.estateMateDeviceId, hikAcsEventDocument(event, device));
+  });
+  const probe = await transport.start();
+  sdkState.probe = probe;
+  const capabilities = transport.capabilityReport();
+  if (!probe || capabilities.present === false) {
+    sdkState.lastError = capabilities.error || 'the Hikvision SDK helper did not start';
+    log('warn', `Hikvision SDK transport unavailable: ${sdkState.lastError}`);
+    return sdkState;
+  }
+  log('info',
+    `Hikvision SDK transport: helper ${capabilities.helperVersion || '?'} on ${capabilities.platform || process.platform}, `
+    + `SDK ${capabilities.sdkVersion || 'unknown version'}, events ${capabilities.events ? 'on' : 'unavailable'}, `
+    + `door ${capabilities.door ? 'on' : 'unavailable'}, clock ${capabilities.clock ? 'on' : 'unavailable'}, `
+    + 'cards/people never (HCNetSDK has no card-record API — those stay operator tasks)');
+  return sdkState;
+}
+
+/**
+ * One terminal on the SDK transport: log in, open the vendor alarm channel, and
+ * keep the session alive. The helper streams events to the transport, which
+ * turns them into the same documents an alertStream would have produced.
+ *
+ * The vendor protocol has no HTTP-style heartbeat, so liveness is the login
+ * session itself: a drop is reported to the portal immediately (so a gate never
+ * looks online while nobody is watching it) and re-established with backoff.
+ */
+async function sdkDeviceLoop(device) {
+  let backoffMs = 5000;
+  for (;;) {
+    if (shutdownRequested) break;
+    const transport = sdkState.transport;
+    if (!transport) {
+      setStreamState(device.estateMateDeviceId, 'down', sdkState.lastError || 'the Hikvision SDK helper is not running');
+      await sleep(backoffMs);
+      backoffMs = Math.min(backoffMs * 2, sdkReconnectSeconds * 1000);
+      continue;
+    }
+    const login = await transport.login(device);
+    if (!login.ok) {
+      log('warn', `Hikvision SDK login failed for ${device.name} (${device.sdkEndpoint.host}:${device.sdkEndpoint.port}): ${login.error}`);
+      setStreamState(device.estateMateDeviceId, 'down', login.error);
+      await sleep(backoffMs);
+      backoffMs = Math.min(backoffMs * 2, sdkReconnectSeconds * 1000);
+      continue;
+    }
+    const info = login.session.deviceInfo || {};
+    log('info', `Hikvision SDK session for ${device.name}: ${[info.deviceName, info.model, info.serialNumber].filter(Boolean).join(' · ') || 'device info not reported'}`);
+    backoffMs = 5000;
+    if (sdkEventStreamEnabled) {
+      const subscribed = await transport.subscribe(device);
+      if (!subscribed.ok) {
+        log('warn', `Live events unavailable for ${device.name}: ${subscribed.error}`);
+        setStreamState(device.estateMateDeviceId, 'down', subscribed.error);
+      } else {
+        setStreamState(device.estateMateDeviceId, 'up');
+      }
+    }
+    // Hold the session open. The transport drops it when the helper exits, and
+    // the next pass logs in again; polling here keeps a silent terminal from
+    // looking like a healthy one.
+    while (!shutdownRequested && transport.sessionFor(device.estateMateDeviceId)) {
+      await sleep(5000);
+    }
+    if (shutdownRequested) break;
+    setStreamState(device.estateMateDeviceId, 'down', transport.stats().lastError || 'the SDK session ended');
+    log('warn', `Hikvision SDK session for ${device.name} ended; reconnecting`);
+  }
+}
+
+/** What the heartbeat reports about the SDK transport. */
+function sdkTransportHeartbeat() {
+  const devices = sdkDevicesFor();
+  if (!devices.length) return null;
+  const stats = sdkState.transport?.stats() || {};
+  return {
+    enabled: sdkEnabled,
+    helper: sdkState.helper || null,
+    helperInstalled: Boolean(sdkState.helper),
+    sdkVersion: sdkState.probe?.version || null,
+    platform: sdkState.probe?.platform || null,
+    events: Boolean(sdkState.transport?.capabilityReport().events),
+    door: Boolean(sdkState.transport?.capabilityReport().door),
+    clock: Boolean(sdkState.transport?.capabilityReport().clock),
+    sessions: stats.sessions ?? 0,
+    devices: devices.map((device) => ({
+      deviceId: device.estateMateDeviceId,
+      name: device.name,
+      host: device.sdkEndpoint?.host || null,
+      port: device.sdkEndpoint?.port || DEFAULT_SDK_PORT,
+      session: Boolean(sdkState.transport?.sessionFor(device.estateMateDeviceId)),
+    })),
+    eventsReceived: stats.eventsReceived ?? 0,
+    doorCommands: stats.doorCommands ?? 0,
+    restarts: stats.restarts ?? 0,
+    lastError: sdkState.lastError || stats.lastError || null,
+  };
+}
+
 // Real-time event streaming (ISAPI alertStream). Enabled by default; set
 // "eventStream": false in agent-config.json (global) or per device to disable.
 const eventStreamEnabled = config.eventStream !== false;
@@ -71,6 +251,25 @@ const eventFlushCount = Math.max(1, Math.min(50, Number(config.eventFlushCount |
 const eventFlushSeconds = Math.max(1, Number(config.eventFlushSeconds || 5));
 const eventBufferLimit = Math.max(eventFlushCount * 4, Number(config.eventBufferLimit || 500));
 const alertStreamPath = String(config.alertStreamPath || '/ISAPI/Event/notification/alertStream?format=json');
+
+// Hikvision SDK transport (the terminal's SDK/"server" port, 8000 by default).
+//
+// This is the port iVMS-4200 speaks. It carries a proprietary binary protocol,
+// so the agent does not implement it: it drives a helper process that links
+// Hikvision's own HCNetSDK, exactly as iVMS-4200 does, and that helper is the
+// only thing that talks to the port. Off by default, because it needs vendor
+// library files the operator downloads and installs locally.
+const hikSdkConfig = config.hikSdk || {};
+const sdkEnabled = hikSdkConfig.enabled === true;
+const sdkHelperPath = String(hikSdkConfig.helperPath || '').trim();
+// Extra argv for the helper. Two real uses: running the helper through an
+// interpreter on Linux/macOS (`dotnet EstateMateHikSdk.dll`, `mono …`), and a
+// test harness that points the same protocol at a simulated helper.
+const sdkHelperArgs = Array.isArray(hikSdkConfig.helperArgs) ? hikSdkConfig.helperArgs.map(String) : [];
+const sdkEventStreamEnabled = hikSdkConfig.eventStream !== false;
+const sdkReconnectSeconds = Number.isFinite(Number(hikSdkConfig.reconnectSeconds)) && Number(hikSdkConfig.reconnectSeconds) >= 5
+  ? Number(hikSdkConfig.reconnectSeconds)
+  : 30;
 
 // ZKTeco PUSH (ADMS) transport.
 //
@@ -187,24 +386,102 @@ const isUuid = (value) => UUID_PATTERN.test(String(value || '').trim());
 
 const devices = new Map();
 const unresolvedDevices = [];
+
+/**
+ * How a device's address is written in a message to an operator. One terminal
+ * has one address, and which one it is depends on the transport: ISAPI is HTTP
+ * on the terminal's own port, the SDK transport is Hikvision's binary protocol
+ * on the SDK port. Printing `http://:80` for an SDK device (every ISAPI field
+ * empty) tells an installer nothing and looks like a bug in the portal.
+ */
+function endpointLabel(device) {
+  return device.transport === 'hik_sdk'
+    ? `${device.sdkHost}:${device.sdkPort} (Hikvision SDK port)`
+    : `${device.protocol}://${device.isapiHost}:${device.isapiPort}`;
+}
+/**
+ * Terminals this agent dials at a public address, with the recorded
+ * acknowledgement that allowed it. Reported on the heartbeat and repeated at
+ * startup so the posture is never discovered during an incident.
+ */
+const publicEndpointDevices = [];
 for (const d of devicesConfig.devices || []) {
   if (d.enabled === false) continue;
   // A ZKTeco terminal on the PUSH transport is not polled over ISAPI at all: the
   // terminal calls us, so it has no isapiHost and must not be skipped for that.
   const isPushDevice = d.transport === 'zkteco_push' || (pushEnabled && !d.isapiHost && d.pushSerial);
-  if (!d.isapiHost && !isPushDevice) continue;
+  // A terminal on the Hikvision SDK transport has no ISAPI endpoint either: the
+  // SDK/"server" port (8000) is what iVMS-4200 speaks, and it is not HTTP. The
+  // helper process links the vendor library that speaks it.
+  const isSdkDevice = d.transport === 'hik_sdk' || d.transport === 'hcnetsdk';
+  if (!d.isapiHost && !isPushDevice && !isSdkDevice) continue;
+  const sdkEndpoint = isSdkDevice ? sdkEndpointFor(d) : null;
+  if (isSdkDevice && !sdkEndpoint) {
+    console.error(
+      `Refusing to start: terminal "${String(d.name || 'unnamed')}" is on the Hikvision SDK transport but has no "sdkHost". ` +
+      'Give it the terminal\'s SDK/"server" address, exactly as iVMS-4200 is configured:\n' +
+      '  "transport": "hik_sdk",\n' +
+      '  "sdkHost": "<device address>",\n' +
+      '  "sdkPort": 8000,\n' +
+      '  "sdkUsername": "admin",\n' +
+      '  "sdkPassword": "<device admin password>"\n' +
+      'Use scripts/terminal-endpoint.mjs to confirm what answers on that address, and see docs/HIKVISION-SDK-TRANSPORT.md.',
+    );
+    process.exit(1);
+  }
   const device = {
     estateMateDeviceId: String(d.estateMateDeviceId || '').trim(),
-    name: String(d.name || d.isapiHost),
-    isapiHost: String(d.isapiHost).trim(),
+    name: String(d.name || d.isapiHost || d.sdkHost),
+    isapiHost: String(d.isapiHost || '').trim(),
     isapiPort: Number(d.isapiPort || 80),
     isapiUsername: String(d.isapiUsername || 'admin'),
     isapiPassword: String(d.isapiPassword || ''),
     protocol: d.protocol === 'https' ? 'https' : 'http',
     eventStream: d.eventStream !== false,
-    transport: isPushDevice ? 'zkteco_push' : 'isapi',
+    transport: isPushDevice ? 'zkteco_push' : (isSdkDevice ? 'hik_sdk' : 'isapi'),
     pushSerial: String(d.pushSerial || '').trim() || null,
+    // Present on SDK-transport devices only. Also exposed as sdkHost/sdkPort so
+    // the readers that judge an address (the public-endpoint rule, the exposure
+    // checker, the heartbeat) see the same fields as the devices file does; they
+    // are never copied into isapiHost/isapiPort, because one is HTTP/ISAPI and
+    // the other is a binary protocol on a different port.
+    sdkEndpoint,
+    sdkHost: sdkEndpoint?.host ?? '',
+    sdkPort: sdkEndpoint?.port ?? null,
   };
+
+  // A terminal whose own address is on the public Internet answers for itself:
+  // no allowlist, secret or firewall rule on this host limits who reaches it.
+  // The mode exists only because some sites cannot reach the terminal's LAN (a
+  // rule left by an installer, an ISP-managed router), so it must be an explicit
+  // decision recorded in the devices file — not something that happens because
+  // an address was typed in. docs/PUBLIC-ENDPOINT-DEVICE.md.
+  if (deviceIsPublicEndpoint(device)) {
+    const acknowledgement = readPublicEndpointAcknowledgement(d);
+    if (!acknowledgement.acknowledged) {
+      const endpointAddress = device.transport === 'hik_sdk'
+        ? `${device.sdkEndpoint.host}:${device.sdkEndpoint.port}`
+        : `${device.isapiHost}:${device.isapiPort}`;
+      console.error(
+        `Refusing to start: terminal "${device.name}" is configured at the public address ${endpointAddress} ` +
+        'with no acknowledgement. That resolves this device by an address on the open Internet, where it answers for itself — ' +
+        'no setting on this host limits who reaches it, and every credential, card number and event would cross a network nobody here controls.\n' +
+        'Do one of these, then start the agent again:\n' +
+        '  1. Give the terminal its LAN address (SADP on the site LAN, or iVMS-4200 → Device Management → Remote Configuration → Network → TCP/IP)\n' +
+        '     and run this agent on that LAN. That is the posture everything else in this repository assumes.\n' +
+        `  2. If the LAN path genuinely does not exist and the exposure is already there, run\n` +
+        `     "node scripts/terminal-endpoint.mjs --endpoint ${endpointAddress}" to see what answers, then add this to the\n` +
+        '     device in the devices file and accept that the risk is recorded, not removed:\n' +
+        '       "publicEndpoint": { "acknowledged": true, "acknowledgedBy": "<your name>", "acknowledgedAt": "<ISO date>", "note": "<why>" }\n' +
+        '  3. Keep the terminal on manual synchronization instead: gate history stops being live and card/visitor changes stay operator tasks in Hardware actions.\n' +
+        'See docs/PUBLIC-ENDPOINT-DEVICE.md' + (device.transport === 'hik_sdk' ? ' and docs/HIKVISION-SDK-TRANSPORT.md.' : '.'),
+      );
+      process.exit(1);
+    }
+    device.publicEndpoint = acknowledgement;
+    publicEndpointDevices.push(device);
+  }
+
   if (isUuid(device.estateMateDeviceId)) devices.set(device.estateMateDeviceId, device);
   else unresolvedDevices.push(device);
 }
@@ -239,6 +516,29 @@ async function resolveDeviceIds() {
   const matched = new Set();
   for (const device of unresolvedDevices) {
     if (device.transport === 'zkteco_push') continue; // bound by its own serial, at registration
+    // An SDK terminal has no ISAPI address to match on, and matching it loosely is
+    // how it would be bound to the wrong row: the old code compared
+    // `'' === item.isapi_host`, which is true for every portal device recorded
+    // without a host, and one public address can front several terminals on
+    // different ports. The gate's events and door commands would then be applied
+    // to another terminal. So the match is exact — the portal row has to carry
+    // the SDK host *and* the SDK port — and a device that does not match is
+    // refused with what to do about it (below), never guessed.
+    if (device.transport === 'hik_sdk') {
+      const sdkHost = String(device.sdkHost || '').trim().toLowerCase();
+      if (!sdkHost) continue;
+      const chosen = linked.find((item) => String(item.isapi_host || '').trim().toLowerCase() === sdkHost
+        && Number(item.isapi_port) === Number(device.sdkPort)
+        && !devices.has(String(item.device_id || '').trim()));
+      const chosenId = chosen && String(chosen.device_id || '').trim();
+      if (chosenId && isUuid(chosenId)) {
+        device.estateMateDeviceId = chosenId;
+        devices.set(chosenId, device);
+        matched.add(chosenId);
+        log('info', `Resolved EstateMate device id for "${device.name}" from the portal: ${chosenId} (matched at its SDK address ${sdkHost}:${device.sdkPort})`);
+      }
+      continue;
+    }
     const host = device.isapiHost.toLowerCase();
     const candidates = linked.filter((item) => String(item.isapi_host || '').trim().toLowerCase() === host);
     const exact = candidates.filter((item) => !item.isapi_port || Number(item.isapi_port) === device.isapiPort);
@@ -255,13 +555,20 @@ async function resolveDeviceIds() {
   const unresolved = unresolvedDevices.filter((device) => !devices.has(device.estateMateDeviceId));
   if (unresolved.length) {
     const known = linked.length
-      ? linked.map((item) => `${item.device_name || item.device_id} (${item.isapi_host}${item.isapi_port ? `:${item.isapi_port}` : ''})`).join(', ')
+      ? linked.map((item) => `${item.device_name || item.device_id} (${item.isapi_host || 'no address'}${item.isapi_port ? `:${item.isapi_port}` : ''})`).join(', ')
       : 'none';
     for (const device of unresolved.filter((entry) => entry.transport !== 'zkteco_push')) {
       console.error(
-        `Terminal "${device.name}" (${device.protocol}://${device.isapiHost}:${device.isapiPort}) has no EstateMate device id and the portal does not list it` +
+        `Terminal "${device.name}" (${endpointLabel(device)}) has no EstateMate device id and the portal does not list it` +
           ` — link it to this agent (Device agent → Connect terminal), or paste the terminal's EstateMate device ID from Connected terminals.`,
       );
+      if (device.transport === 'hik_sdk') {
+        console.error(
+          `  This terminal is reached over Hikvision's SDK port, so it is matched to a portal device only at the same host and port.` +
+            ` Give it "estateMateDeviceId" in the devices file, or record the terminal in the portal at ${device.sdkHost}:${device.sdkPort} ` +
+            `(docs/HIKVISION-SDK-TRANSPORT.md §3.3).`,
+        );
+      }
     }
     console.error(`Devices linked to this agent in the portal: ${known}`);
     process.exit(1);
@@ -417,6 +724,26 @@ const BASELINE_CAPABILITIES = ['card', 'door'];
 const capabilityCache = { at: 0, value: null };
 let capabilityRefresh = null;
 
+/**
+ * What to advertise before the first probe finishes, derived from the transports
+ * this bridge actually serves. 'card' is an ISAPI capability: Hikvision's SDK has
+ * no card-record API at all, so a bridge whose only terminal is on the SDK port
+ * must not advertise it — the Worker would queue card work that can never be
+ * applied, and the operator would see a failure instead of a task.
+ */
+function baselineCapabilities() {
+  const found = new Set();
+  if ([...devices.values()].some((device) => device.transport === 'isapi')) {
+    found.add('card');
+    found.add('door');
+  }
+  if (pushEnabled && pushState.registered > 0) found.add('person');
+  // A helper that started means the SDK transport exists; whether its build
+  // exports door control is what the probe settles, at the first heartbeat.
+  if (sdkState.transport) found.add('door');
+  return [...found];
+}
+
 /** What to put in a heartbeat right now, refreshing the answer in the background. */
 function capabilitiesForHeartbeat() {
   if (!capabilityCache.value || Date.now() - capabilityCache.at >= CAPABILITY_TTL_MS) {
@@ -426,12 +753,22 @@ function capabilitiesForHeartbeat() {
         .finally(() => { capabilityRefresh = null; });
     }
   }
-  return capabilityCache.value ?? BASELINE_CAPABILITIES;
+  return capabilityCache.value ?? baselineCapabilities();
 }
 
 async function probeCapabilities() {
   if (capabilityCache.value && Date.now() - capabilityCache.at < CAPABILITY_TTL_MS) return capabilityCache.value;
-  const found = new Set(['card', 'door']);
+  const found = new Set();
+  // 'card' and 'door' are the ISAPI terminal's own endpoints: they are advertised
+  // because at least one terminal is reached over ISAPI, not because the bridge
+  // once spoke to something.
+  if ([...devices.values()].some((device) => device.transport === 'isapi')) {
+    found.add('card');
+    found.add('door');
+  }
+  // The SDK transport can open a door when the vendor library exports the call,
+  // and can never write a card (HCNetSDK has no card-record API).
+  if (sdkState.transport?.capabilityReport().door) found.add('door');
   // The PUSH transport writes a person a person with `DATA UPDATE USERINFO`, which is the
   // same unit of work the Worker gates behind 'person'. It is advertised only for
   // a terminal that has actually registered: the capability is the terminal's,
@@ -439,10 +776,10 @@ async function probeCapabilities() {
   // refuses it, and the portal keeps the manual instruction (see the profile doc).
   if (pushEnabled && pushState.registered > 0) found.add('person');
   for (const device of devices.values()) {
-    // A terminal on the PUSH transport has no ISAPI to ask; it advertises its own
-    // parameters when it registers, and probing it over HTTP would burn the probe
-    // timeout on every refresh for a device that answers no ISAPI at all.
-    if (device.transport === 'zkteco_push') continue;
+    // Only an ISAPI terminal has HTTP endpoints to ask. A PUSH terminal
+    // advertises its own parameters when it registers, and an SDK terminal has no
+    // HTTP at all — probing either would burn the probe timeout on every refresh.
+    if (device.transport !== 'isapi') continue;
     try {
       const person = await isapiRequest(device, 'GET', '/ISAPI/AccessControl/UserInfo/capabilities?format=json', null, false);
       if (isapiOk(person) || (!isapiUnsupported(person) && person.status >= 200 && person.status < 300)) found.add('person');
@@ -498,6 +835,13 @@ async function heartbeat() {
         // Per-terminal liveness: 'down' retires the terminal in the portal at
         // once rather than waiting for the hourly offline sweep.
         devices: heartbeatDeviceStates(),
+        // Terminals reached over Hikvision's SDK port (iVMS-4200's port), with
+        // whether the vendor helper is installed and whether a session is up.
+        ...(sdkDevicesFor().length ? { sdkTransport: sdkTransportHeartbeat() } : {}),
+        // Terminals whose own address is on the public Internet, with the
+        // acknowledgement that allowed them. Reported so the portal and support
+        // can see the posture rather than discovering it during an incident.
+        ...(publicEndpointDevices.length ? { publicEndpoints: publicEndpointSummary() } : {}),
         // Remote verification is the one feature where the portal has to be able
         // to see the agent's own state - how fresh the snapshot is, how many
         // decisions it made, whether the door actually answered - because none of
@@ -670,6 +1014,30 @@ function setStreamState(deviceId, stream, lastError = null) {
   });
 }
 
+/**
+ * The public-endpoint posture, for the heartbeat. Named by device rather than
+ * summarised, because "one terminal is on the Internet" is only actionable with
+ * the address and the name of whoever accepted it.
+ */
+function publicEndpointSummary() {
+  return publicEndpointDevices.map((device) => ({
+    deviceId: device.estateMateDeviceId,
+    name: device.name,
+    transport: device.transport,
+    host: device.transport === 'hik_sdk' ? device.sdkHost : device.isapiHost,
+    port: device.transport === 'hik_sdk' ? device.sdkPort : device.isapiPort,
+    protocol: device.transport === 'hik_sdk' ? 'hik_sdk' : device.protocol,
+    acknowledgedBy: device.publicEndpoint?.by || null,
+    acknowledgedAt: device.publicEndpoint?.at || null,
+    note: device.publicEndpoint?.note || null,
+  }));
+}
+
+/** The acknowledged public endpoints, as the heartbeat reports them. */
+function publicEndpointStatus() {
+  return publicEndpointSummary();
+}
+
 function heartbeatDeviceStates() {
   // Union, not intersection: a terminal whose event stream is switched off
   // (or that is not streamed at all) still gets its clock reported, and the
@@ -681,6 +1049,9 @@ function heartbeatDeviceStates() {
     return {
       deviceId,
       ...(stream ? { stream: stream.stream, lastError: stream.lastError } : {}),
+      // The portal shows this next to the terminal: it is the difference
+      // between a device on the estate VLAN and one the Internet can reach.
+      ...(publicEndpointDevices.some((device) => device.estateMateDeviceId === deviceId) ? { publicEndpoint: true } : {}),
       ...(clock ? {
         clock: {
           terminalTime: clock.terminalTime,
@@ -1990,6 +2361,47 @@ async function applyCardOperation(device, operation) {
     });
   }
 
+  // A terminal on the Hikvision SDK transport takes exactly what the vendor SDK
+  // exposes — door control, and events — and nothing else. HCNetSDK has no
+  // card-record or person API: iVMS-4200 provisions cards over HTTP/ISAPI itself.
+  // An operation that needs one is refused here with that reason, so the portable
+  // answer is "operator task", not a queue entry that can never succeed.
+  if (device.transport === 'hik_sdk') {
+    const doorCmd = {
+      remote_open: 'open',
+      remote_close: 'close',
+      remote_always_open: 'alwaysOpen',
+      remote_always_close: 'alwaysClose',
+      remote_resume: 'resume',
+    }[op];
+    if (!doorCmd) {
+      return {
+        success: false,
+        error: `this terminal is on the Hikvision SDK transport, which cannot apply "${op}": Hikvision's SDK has no card or person API `
+          + '(iVMS-4200 writes cards over HTTP/ISAPI itself). Give the terminal an ISAPI path, or keep this as a manual task in Hardware actions '
+          + '— see docs/HIKVISION-SDK-TRANSPORT.md.',
+      };
+    }
+    if (!sdkState.transport) {
+      return { success: false, error: sdkState.lastError || 'the Hikvision SDK helper is not running on this host' };
+    }
+    const doorNo = Number(payload.doorNo || 1);
+    if (!Number.isInteger(doorNo) || doorNo < 1 || doorNo > 8) return { success: false, error: 'doorNo must be 1-8' };
+    log('info', `Applying ${op} over the Hikvision SDK transport for ${device.name} (door ${doorNo}) opId=${operation.id}`);
+    try {
+      const sent = await sdkState.transport.door(device, { action: doorCmd, doorNo });
+      if (sent.ok) {
+        // The vendor's own reply is recorded, never assumed: no device profile in
+        // this repository has a verified SDK door response yet.
+        log('info', `SDK door ${doorCmd} accepted by ${device.name}${sent.deviceReply ? ` (${JSON.stringify(sent.deviceReply).slice(0, 120)})` : ''}`);
+        return { success: true };
+      }
+      return { success: false, error: `Door ${sent.error}` };
+    } catch (err) {
+      return { success: false, error: `Hikvision SDK transport error: ${err.message}` };
+    }
+  }
+
   const cardLog = isCardOperation ? (cardUid ? 'present' : 'missing') : 'n/a';
   log('info', `Applying ${op} for device ${device.name} (${device.estateMateDeviceId}) card=${cardLog} opId=${operation.id}`);
 
@@ -2406,8 +2818,21 @@ function remoteVerifyHeartbeat() {
 async function main() {
   log('info', `EstateMate ISAPI Bridge starting...`);
   await resolveDeviceIds();
-  const streamDevices = [...devices.values()].filter((device) => device.eventStream !== false);
+  // An alertStream is an ISAPI endpoint: a PUSH terminal calls us, and an SDK
+  // terminal's events arrive through the helper, so neither is opened here.
+  const streamDevices = [...devices.values()].filter((device) => device.transport === 'isapi' && device.eventStream !== false);
   log('info', `Agent: ${agentId}, Worker: ${workerUrl}, Devices: ${devices.size}, Interval: ${syncInterval}s, EventStream: ${eventStreamEnabled ? `on (${streamDevices.length} device(s))` : 'off'}`);
+
+  // Acknowledged public endpoints are logged in full at every start: the risk is
+  // accepted, not mitigated, and the operator should have to read it again after
+  // every upgrade rather than once when they wrote the devices file.
+  for (const device of publicEndpointDevices) {
+    const endpointHost = device.transport === 'hik_sdk' ? device.sdkHost : device.isapiHost;
+    const endpointPort = device.transport === 'hik_sdk' ? device.sdkPort : device.isapiPort;
+    const endpointProtocol = device.transport === 'hik_sdk' ? 'hik_sdk' : device.protocol;
+    const risks = publicEndpointRisks({ protocol: endpointProtocol, host: endpointHost, port: endpointPort });
+    log('warn', `Public endpoint: "${device.name}" is dialled at ${endpointProtocol}${endpointHost}:${endpointPort}, acknowledged by ${device.publicEndpoint.by || 'an unnamed operator'}${device.publicEndpoint.at ? ` on ${device.publicEndpoint.at}` : ''}${device.publicEndpoint.note ? ` — ${device.publicEndpoint.note}` : ''}. This is a recorded decision, not a safe posture: ${risks.join('; ')}. See docs/PUBLIC-ENDPOINT-DEVICE.md.`);
+  }
 
   // Said once, before any listener starts, because it is the first question an
   // operator asks on a site whose router they cannot change: does this agent
@@ -2430,6 +2855,29 @@ async function main() {
     }
     if (!credentialCache.ready) {
       log('warn', 'Remote verification started without a credential snapshot. Every decision denies until the first sync succeeds; check that the Worker is reachable.');
+    }
+  }
+
+  // The SDK transport starts before the loops so the first heartbeat can say
+  // whether the vendor helper is installed, and so a session exists before the
+  // first operation poll claims work for an SDK terminal.
+  const sdkDevices = sdkDevicesFor();
+  if (sdkDevices.length && !sdkEnabled) {
+    log('warn', `${sdkDevices.length} device(s) are on the Hikvision SDK transport but hikSdk is disabled — nothing can reach them. `
+      + 'Set "hikSdk": {"enabled": true} in agent-config.json, install the helper (docs/HIKVISION-SDK-TRANSPORT.md), and restart the agent.');
+  }
+  if (sdkEnabled && !sdkDevices.length) {
+    log('warn', 'hikSdk is enabled but no device uses it — add "transport": "hik_sdk" with "sdkHost"/"sdkPort" to a device entry, or turn hikSdk off.');
+  }
+  if (sdkEnabled && sdkDevices.length) {
+    await startSdkTransport();
+    // The helper's answer decides whether 'door' is real (the vendor build may
+    // not export the call), so the next heartbeat must not use a stale probe.
+    capabilityCache.value = null;
+    for (const device of sdkDevices) {
+      const acknowledgement = device.publicEndpoint;
+      log('info', `Hikvision SDK terminal "${device.name}" → ${device.sdkEndpoint.host}:${device.sdkEndpoint.port}`
+        + `${acknowledgement ? ` (public endpoint acknowledged by ${acknowledgement.by || 'an unnamed operator'})` : ''}`);
     }
   }
 
@@ -2510,6 +2958,15 @@ async function main() {
     }
   }
 
+  // One session loop per SDK terminal: login, vendor alarm channel, reconnect.
+  // They run whether or not the ISAPI event stream is switched on, because this
+  // is the only path by which an SDK-only terminal reports anything at all.
+  if (sdkEnabled) {
+    for (const device of sdkDevices) {
+      sdkDeviceLoop(device).catch((err) => log('error', `Hikvision SDK session crashed for ${device.name}`, err.message));
+    }
+  }
+
   setInterval(heartbeat, heartbeatInterval * 1000);
   setInterval(pollAndApply, syncInterval * 1000);
   if (timeSyncEnabled) {
@@ -2546,9 +3003,14 @@ async function main() {
     if (lanEventsListener) {
       lanEventsListener.close().catch(() => undefined);
     }
+    // The SDK transport is stopped after the other listeners: its events still
+    // belong in the buffer that flushEvents() is about to send, and a logout
+    // releases the terminal's session rather than leaving it until it times out.
+    const sdkStop = sdkState.transport ? sdkState.transport.stop().catch(() => undefined) : Promise.resolve();
     heartbeat()
       .catch(() => undefined)
       .then(() => flushEvents())
+      .then(() => sdkStop)
       .finally(() => process.exit(0));
     setTimeout(() => process.exit(0), 8000).unref();
   };
@@ -2598,6 +3060,14 @@ export {
   inboundSourcesFor,
   inboundAccessHeartbeat,
   resolveLanEventDevice,
+  // Hikvision SDK transport (the SDK/"server" port, iVMS-4200's port). Exported
+  // so the integration checks drive the real agent: a helper that answers a
+  // module-level test but is never wired into the agent protects no gate.
+  sdkDevicesFor,
+  startSdkTransport,
+  sdkDeviceLoop,
+  sdkTransportHeartbeat,
+  sdkState,
   // Exported for sibling hosts that need to talk to a device without starting
   // the main loops: bridge-apps/windows runs `bridge check` in standby mode and
   // reuses the digest/basic ISAPI client instead of reimplementing it, so there
@@ -2623,6 +3093,10 @@ export {
   terminalEmployeeNo,
   resolveDeviceIds,
   isUuid,
+  // The public-endpoint posture, exported so the integration checks can prove a
+  // public address without an acknowledgement stops the agent, and that an
+  // acknowledged one is reported rather than hidden.
+  publicEndpointStatus,
   buildDigestAuthHeader,
   basicAuthHeader,
   alertStreamPath,
