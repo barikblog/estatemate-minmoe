@@ -5,7 +5,7 @@ so the terminals never have to be reachable from the Internet:
 
 | | Windows | Android |
 |---|---|---|
-| File | `estatemate-bridge-win-x64.exe` | `estatemate-bridge-<version>.apk` |
+| File | `sornix-estateos-bridge-win-x64.exe` | `sornix-estateos-bridge-<version>.apk` |
 | Runs on | the estate PC in the office | a phone or tablet left on site |
 | Sources | [`windows/`](windows/) | [`android/`](android/) |
 | Agent code | the repository's `isapi-bridge/agent.mjs`, embedded and hash-verified | the same protocol, ported to Java (`app/src/main/java/`) |
@@ -17,6 +17,11 @@ Built files are published as release assets by
 tags (`bridge-exe`, `bridge-apk`, plus the older `windows-agent-bundle` and the
 EstateMate client APK). When the files were built locally they sit in
 `artifacts/windows/` and `artifacts/android/`, which is not committed to git.
+
+Inside the installed product the executable and its service keep the name
+`estatemate-bridge(.exe)` — the MSI's upgrade path, the boot task and every
+command in the documentation depend on it. Only the *download* is named for the
+product. See [`docs/APP-ARTIFACTS-AND-NAMING.md`](../docs/APP-ARTIFACTS-AND-NAMING.md).
 
 Both hosts speak to the Worker with the same agent key and the same three
 endpoints, so the portal cannot tell them apart:

@@ -1,9 +1,11 @@
-' EstateMate desktop app (Windows). Opens the estate portal in its own
+' Sornix EstateOS desktop app (Windows). Opens the estate portal in its own
 ' application window: no address bar or tabs, and a separate browser profile
 ' so the sign-in is kept apart from everyday browsing. Uses Microsoft Edge
 ' (installed with Windows 10/11), then Google Chrome, and finally the default
 ' browser when neither is present. The portal address is read from
-' estatemate-url.txt, which the installer writes next to this file.
+' estatemate-url.txt, which the installer writes next to this file (the file
+' name is unchanged from the EstateMate releases on purpose: an in-place
+' upgrade keeps working, and this script is what reads it).
 Option Explicit
 
 Dim sh, fso, here, url, profile, candidates, i
@@ -14,10 +16,12 @@ here = fso.GetParentFolderName(WScript.ScriptFullName)
 
 url = Trim(ReadFirstLine(here & "\estatemate-url.txt"))
 If url = "" Then
-  MsgBox "EstateMate is not configured: estatemate-url.txt is missing. Reinstall the EstateMate app.", 16, "EstateMate"
+  MsgBox "Sornix EstateOS is not configured: estatemate-url.txt is missing. Reinstall the Sornix EstateOS app.", 16, "Sornix EstateOS"
   WScript.Quit 1
 End If
 
+' The profile directory keeps its original name, so an in-place upgrade keeps
+' the sign-in; only the visible product name changed.
 profile = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\EstateMate\Window"
 
 candidates = Array( _

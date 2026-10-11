@@ -2,7 +2,7 @@
 /**
  * End-to-end smoke test for a built bridge executable.
  *
- *   node scripts/bridge-exe-smoke-test.mjs --exe dist/bridge/estatemate-bridge-win-x64.exe
+ *   node scripts/bridge-exe-smoke-test.mjs --exe dist/bridge/sornix-estateos-bridge-win-x64.exe
  *
  * It builds no mocks of the bridge: the executable under test is started for
  * real against a fake Worker and a fake Hikvision terminal, and the test asserts

@@ -136,8 +136,16 @@ function Find-Msi {
     if (-not (Test-Path -LiteralPath $MsiPath)) { throw "the MSI was not found: $MsiPath" }
     return (Resolve-Path -LiteralPath $MsiPath).Path
   }
-  $candidates = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter 'estatemate-bridge-*.msi' -File -ErrorAction SilentlyContinue)
-  if ($candidates.Count -eq 0) { throw "no estatemate-bridge-*.msi beside this script ($PSScriptRoot); pass -MsiPath" }
+  # The release artifact is sornix-estateos-bridge-<version>-win-x64.msi (the
+  # product was renamed from EstateMate to Sornix EstateOS). The older filename
+  # is still accepted, so a kit downloaded before the rename and a kit built
+  # after it both install from this one script.
+  $patterns = @('sornix-estateos-bridge-*.msi', 'estatemate-bridge-*.msi')
+  $candidates = @()
+  foreach ($pattern in $patterns) {
+    $candidates += @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter $pattern -File -ErrorAction SilentlyContinue)
+  }
+  if ($candidates.Count -eq 0) { throw "no sornix-estateos-bridge-*.msi beside this script ($PSScriptRoot); pass -MsiPath" }
   if ($candidates.Count -gt 1) {
     $newest = $candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1
     Write-Warn "several MSIs are present; using $($newest.Name)"
@@ -265,7 +273,12 @@ function Get-PayloadExecutable($msi) {
   # an install. Preferred order: the portable exe shipped in the same kit, then
   # an administrative extraction (msiexec /a), which unpacks the MSI's own
   # payload into a folder and changes nothing else on the machine.
-  $portable = Join-Path $PSScriptRoot 'estatemate-bridge-win-x64.exe'
+  # The release artifact is sornix-estateos-bridge-win-x64.exe; the pre-rename
+  # name stays accepted so either kit shape works.
+  $portable = Join-Path $PSScriptRoot 'sornix-estateos-bridge-win-x64.exe'
+  if (-not (Test-Path -LiteralPath $portable)) {
+    $portable = Join-Path $PSScriptRoot 'estatemate-bridge-win-x64.exe'
+  }
   if (Test-Path -LiteralPath $portable) {
     Write-Ok 'using the portable executable from this folder'
     return $portable

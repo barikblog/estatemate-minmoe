@@ -8,7 +8,7 @@ rem  needs no administrator rights and no Windows Installer.  See the script's
 rem  header for the whole story.
 rem
 rem  Keep this file, install-bridge.ps1, the MSI and SHA256SUMS.txt together in
-rem  one folder - that is what "estatemate-bridge-*-installer-kit.zip" is.
+rem  one folder - that is what "sornix-estateos-bridge-*-installer-kit.zip" is.
 rem ===========================================================================
 setlocal
 set "SCRIPT=%~dp0install-bridge.ps1"

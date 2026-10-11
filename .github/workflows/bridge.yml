@@ -153,14 +153,14 @@ jobs:
           import json, sys, zipfile
           from pathlib import Path
           temp = Path(sys.argv[1])
-          built = sorted(temp.glob('estatemate-bridge-msi-dry-*/estatemate-bridge-0.0.1-win-x64-installer-kit.zip'))
+          built = sorted(temp.glob('estatemate-bridge-msi-dry-*/sornix-estateos-bridge-0.0.1-win-x64-installer-kit.zip'))
           if not built:
               raise SystemExit('the MSI dry-run produced no installer kit')
           kit = built[-1]
           with zipfile.ZipFile(kit) as archive:
               names = archive.namelist()
           expected = {
-              'estatemate-bridge-0.0.1-win-x64.msi',
+              'sornix-estateos-bridge-0.0.1-win-x64.msi',
               'Install-EstateMate-Bridge.cmd',
               'install-bridge.ps1',
               'dashboard/EstateMateBridge.exe',
@@ -416,7 +416,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $name = "estatemate-isapi-agent-win-x64-$($env:GITHUB_REF_NAME -replace '[^A-Za-z0-9._-]','-')"
+          $name = "sornix-estateos-isapi-agent-win-x64-$($env:GITHUB_REF_NAME -replace '[^A-Za-z0-9._-]','-')"
           Compress-Archive -Path bundle/* -DestinationPath "$name.zip" -Force
           $sha = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
           # LF-only and two-space separated, so `sha256sum -c` works on Linux too.
@@ -541,6 +541,28 @@ jobs:
           "$sm" --sdk_root="${{ steps.sdk.outputs.root }}" \
             'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
 
+      # The launcher icons are generated from apps/android/tools/make-launcher-icons.py,
+      # so a brand or palette change cannot leave a stale PNG behind: this fails
+      # the build instead of shipping an icon nobody can reproduce.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check the launcher icons match their generator
+        run: |
+          set -euo pipefail
+          # The generator rasterises a bold monogram with a system font; the
+          # runner images carry DejaVu, but say so here rather than failing with
+          # a font lookup error if an image ever drops it.
+          if [ ! -f /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq fonts-dejavu-core
+          fi
+          python3 -m pip install --quiet pillow
+          # Compares decoded pixels and the generated XML, so a different
+          # Pillow/zlib compression level cannot fail an identical icon.
+          python3 apps/android/tools/make-launcher-icons.py --check
+
       - name: Decode the release keystore (optional)
         run: |
           if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ]; then
@@ -623,7 +645,9 @@ jobs:
           python3 scripts/verify-android-apk.py "$debug" \
             --api-base-url "${{ steps.api.outputs.url }}" \
             --version-name "${{ steps.version.outputs.version_name }}" \
-            --build-tools "$ANDROID_HOME/build-tools/35.0.0"
+            --build-tools "$ANDROID_HOME/build-tools/35.0.0" \
+            --app-label "Sornix EstateOS" \
+            --application-id com.estatemate.app
 
           echo "::notice::Debug APK verified against ${{ steps.api.outputs.url }}."
 
@@ -638,7 +662,9 @@ jobs:
             python3 scripts/verify-android-apk.py "$rel" \
               --api-base-url "${{ steps.api.outputs.url }}" \
               --version-name "${{ steps.version.outputs.version_name }}" \
-              --build-tools "$ANDROID_HOME/build-tools/35.0.0"
+              --build-tools "$ANDROID_HOME/build-tools/35.0.0" \
+              --app-label "Sornix EstateOS" \
+              --application-id com.estatemate.app
             echo "::notice::Signed release APK verified."
           fi
 
@@ -651,13 +677,13 @@ jobs:
           mkdir -p dist
           name="${GITHUB_REF_NAME//[^A-Za-z0-9._-]/-}"
           cp apps/android/app/build/outputs/apk/debug/*.apk \
-             "dist/estatemate-android-$name-debug.apk"
+             "dist/sornix-estateos-android-$name-debug.apk"
           # Deliberately app-release.apk only: app-release-unsigned.apk cannot be
           # installed and must never be published as if it were a release.
           if [ -n "${ANDROID_KEYSTORE_PATH:-}" ] && \
              [ -f apps/android/app/build/outputs/apk/release/app-release.apk ]; then
             cp apps/android/app/build/outputs/apk/release/app-release.apk \
-               "dist/estatemate-android-$name-release.apk"
+               "dist/sornix-estateos-android-$name-release.apk"
           fi
           ( cd dist && sha256sum *.apk ) | tee dist/SHA256SUMS.txt
           ls -la dist
@@ -717,7 +743,7 @@ jobs:
 
       - name: Smoke-test the executable
         shell: bash
-        run: node scripts/bridge-exe-smoke-test.mjs --exe exe/estatemate-bridge-win-x64.exe
+        run: node scripts/bridge-exe-smoke-test.mjs --exe exe/sornix-estateos-bridge-win-x64.exe
 
       # The exe is a console tool, not an installer: double-clicking it flashes
       # a window and closes, which reads as "it is not installing". The MSI is
@@ -732,7 +758,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME}"
           case "$VERSION" in bridge-*) VERSION="${VERSION#bridge-}" ;; *) VERSION="0.2.0" ;; esac
           node scripts/package-bridge-msi.mjs \
-            --exe exe/estatemate-bridge-win-x64.exe \
+            --exe exe/sornix-estateos-bridge-win-x64.exe \
             --out msi \
             --version "$VERSION" \
             --commit "$GITHUB_SHA"
@@ -934,7 +960,7 @@ jobs:
           name: bridge-exe
           if-no-files-found: error
           path: |
-            exe/estatemate-bridge-win-x64.exe
+            exe/sornix-estateos-bridge-win-x64.exe
             exe/SHA256SUMS.txt
             exe/BUILD-INFO.json
             exe/README.txt
@@ -1069,7 +1095,7 @@ jobs:
           name: bridge-apk
           if-no-files-found: error
           path: |
-            apk/estatemate-bridge-*.apk
+            apk/sornix-estateos-bridge-*.apk
             apk/SHA256SUMS.txt
 
   # --------------------------------------------------------------------------
@@ -1111,12 +1137,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $msi = Get-ChildItem msi -Filter 'estatemate-client-*.msi' | Select-Object -First 1
+          $msi = Get-ChildItem msi -Filter 'sornix-estateos-desktop-*.msi' | Select-Object -First 1
           if (-not $msi) { throw 'the client MSI was not built' }
           $log = Join-Path $env:RUNNER_TEMP 'client-install.log'
-          $dir = Join-Path $env:LOCALAPPDATA 'Programs\EstateMate'
-          $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\EstateMate\EstateMate.lnk'
-          $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'EstateMate.lnk'
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\Sornix EstateOS'
+          $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Sornix EstateOS\Sornix EstateOS.lnk'
+          $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Sornix EstateOS.lnk'
 
           $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', "`"$($msi.FullName)`"", '/qn', '/norestart', '/l*v', "`"$log`"")
           if ($install.ExitCode -ne 0) { Get-Content $log -Tail 80; throw "msiexec install exited $($install.ExitCode)" }
@@ -1140,7 +1166,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: client-msi
-          path: msi/estatemate-client-*.msi
+          path: msi/sornix-estateos-desktop-*.msi
           if-no-files-found: error
 
   publish-release:
@@ -1178,18 +1204,20 @@ jobs:
           version="${tag#bridge-}"
           notes_file="$(mktemp)"
           {
-            echo "EstateMate Bridge $version"
+            echo "Sornix EstateOS Bridge $version"
             echo
             echo "Built from commit \`${GITHUB_SHA}\`."
             echo
+            echo "Every download below is named for the product, **Sornix EstateOS**. What an installed bridge calls itself is deliberately unchanged - \`estatemate-bridge.exe\`, the \`EstateMate Bridge\` install folder and Start Menu entry, the boot task/service names and the dashboard - so an estate that already runs the agent upgrades in place and every command in the documentation, dashboard and support scripts keeps working. The resident-facing apps (the Windows desktop app and the Android app) are branded **Sornix EstateOS**, with their old launcher, config and browser-profile file names kept for in-place upgrades. See \`docs/APP-ARTIFACTS-AND-NAMING.md\`."
+            echo
             echo "### Artifacts"
-            echo "- **Windows installer kit** (\`estatemate-bridge-*-win-x64-installer-kit.zip\`) - unzip it and double-click **Install-EstateMate-Bridge.cmd**. That is the recommended install: it checks the MSI against its checksum, keeps a verbose installer log, says in plain English what an exit code means, and - if Windows will not let the MSI finish - installs the bridge for the current user under \`%LOCALAPPDATA%\\Programs\\EstateMate Bridge\` without using Windows Installer and without needing administrator rights."
-            echo "- **Windows bridge MSI** (\`estatemate-bridge-*-win-x64.msi\`) - the all-users installer on its own: double-click it, and the bridge lands in Program Files with **Start Menu -> EstateMate Bridge**, which opens the dashboard - a normal window for the agent id/secret, the terminals, the check and \"Start at boot\". No console, nothing to type. \`estatemate-bridge\` still goes on the PATH, and the uninstaller is in Settings -> Apps."
-            echo "- **Windows bridge exe** (\`estatemate-bridge-win-x64.exe\`) - one file: no Node.js install and nothing to unzip. Run \`estatemate-bridge-win-x64.exe setup\`, then \`check\`, then \`install-service\`."
-            echo "- **Android bridge APK** (\`estatemate-bridge-*.apk\`) - install on a phone or tablet on the same LAN as the terminals; the bridge runs in a foreground service and restarts after a reboot."
-            echo "- **Windows agent bundle** (\`estatemate-isapi-agent-win-x64-*.zip\`) - self-contained; ships its own Node.js runtime, so the estate PC needs no Node.js install. It also carries the **Hikvision SDK transport** - \`hik-sdk-transport.mjs\` plus the \`hcnetsdk\\\` helper source and build scripts - for terminals that answer only on the SDK port (see below)."
-            echo "- **Windows desktop app** (\`estatemate-client-*.msi\`) - the EstateMate app for residents and staff: install it, open **EstateMate** from the Start Menu or Desktop, and sign in. It installs for you alone, with no administrator rights, and opens the portal in its own window."
-            echo "- **Android APK** (\`estatemate-android-*-debug.apk\`, plus \`-release.apk\` when signing secrets are configured)."
+            echo "- **Windows installer kit** (\`sornix-estateos-bridge-*-win-x64-installer-kit.zip\`) - unzip it and double-click **Install-EstateMate-Bridge.cmd**. That is the recommended install: it checks the MSI against its checksum, keeps a verbose installer log, says in plain English what an exit code means, and - if Windows will not let the MSI finish - installs the bridge for the current user under \`%LOCALAPPDATA%\\Programs\\EstateMate Bridge\` without using Windows Installer and without needing administrator rights."
+            echo "- **Windows bridge MSI** (\`sornix-estateos-bridge-*-win-x64.msi\`) - the all-users installer on its own: double-click it, and the bridge lands in Program Files with **Start Menu -> EstateMate Bridge**, which opens the dashboard - a normal window for the agent id/secret, the terminals, the check and \"Start at boot\". No console, nothing to type. \`estatemate-bridge\` still goes on the PATH, and the uninstaller is in Settings -> Apps."
+            echo "- **Windows bridge exe** (\`sornix-estateos-bridge-win-x64.exe\`) - one file: no Node.js install and nothing to unzip. Run \`sornix-estateos-bridge-win-x64.exe setup\`, then \`check\`, then \`install-service\`."
+            echo "- **Android bridge APK** (\`sornix-estateos-bridge-*.apk\`) - install on a phone or tablet on the same LAN as the terminals; the bridge runs in a foreground service and restarts after a reboot."
+            echo "- **Windows agent bundle** (\`sornix-estateos-isapi-agent-win-x64-*.zip\`) - self-contained; ships its own Node.js runtime, so the estate PC needs no Node.js install. It also carries the **Hikvision SDK transport** - \`hik-sdk-transport.mjs\` plus the \`hcnetsdk\\\` helper source and build scripts - for terminals that answer only on the SDK port (see below)."
+            echo "- **Windows desktop app** (\`sornix-estateos-desktop-*.msi\`) - the **Sornix EstateOS** app for residents and staff: install it, open **Sornix EstateOS** from the Start Menu or Desktop, and sign in. It installs for you alone, with no administrator rights, and opens the portal in its own window."
+            echo "- **Android client APK** (\`sornix-estateos-android-*-debug.apk\`, plus \`-release.apk\` when signing secrets are configured) - the **Sornix EstateOS** app for residents and staff: install it on the phone, open it and sign in with the same portal account. The debug APK is installable (debug-signed) and is the one to use when no release keystore is configured - when a keystore is added later, uninstall the debug copy before installing the signed release, because Android only updates an app whose signing key matches."
             echo "- Checksums for each artifact family, as \`SHA256SUMS.txt\` - qualified with the family name where two would otherwise collide, since release asset names are flat."
             echo
             echo "### Two ways to configure, same commands"
@@ -1279,7 +1307,7 @@ jobs:
           # Capture gh's own output and re-emit it as annotations instead.
           set +e
           gh_out="$(gh release create "$tag" \
-            --title "EstateMate Bridge $version" \
+            --title "Sornix EstateOS Bridge $version" \
             --notes-file "$notes_file" \
             --verify-tag \
             "${files[@]}" 2>&1)"

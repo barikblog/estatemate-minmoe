@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  User-visible names for the Android client. The application id stays
+  com.estatemate.app so an installed copy updates in place; the name a person
+  sees is the product's. Keep app_name in step with the label
+  scripts/verify-android-apk.py asserts at release time.
+-->
+<resources>
+    <string name="app_name">Sornix EstateOS</string>
+    <string name="app_mark">SE</string>
+    <string name="sign_in_subtitle">Sign in to your estate workspace</string>
+    <string name="server_label">Server</string>
+</resources>

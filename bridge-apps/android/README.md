@@ -1,8 +1,8 @@
 # EstateMate Bridge for Android
 
-`estatemate-bridge-<version>.apk` turns a phone or tablet on the estate LAN into
+`sornix-estateos-bridge-<version>.apk` turns a phone or tablet on the estate LAN into
 the bridge between the Hikvision access-control terminals and the EstateMate
-Worker. It is the Android twin of `estatemate-bridge-win-x64.exe`: same agent
+Worker. It is the Android twin of `sornix-estateos-bridge-win-x64.exe`: same agent
 key, same Worker endpoints, same ISAPI requests, so the portal shows the estate
 online either way.
 

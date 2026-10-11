@@ -7,7 +7,7 @@
 
       candle -arch x64 -dVersion=<x.y.z> -dExeSource=<staged exe> \
              -dReadmeSource=<staged readme> estatemate-bridge.wxs -out <obj>
-      light  -sice:ICE43 -sice:ICE57 <obj> -out estatemate-bridge-<x.y.z>-win-x64.msi
+      light  -sice:ICE43 -sice:ICE57 <obj> -out sornix-estateos-bridge-<x.y.z>-win-x64.msi
 
   What the installer deliberately IS:
 
@@ -71,7 +71,7 @@
          1633 and nothing else. A launch condition replaces that dead end with
          a sentence that names the problem. (True on ARM64 Windows too, where
          the x64 package runs under emulation.) -->
-    <Condition Message="EstateMate Bridge needs 64-bit Windows 10 or 11; this PC is running 32-bit Windows. Use the portable estatemate-bridge-win-x64.exe on a 64-bit PC instead.">
+    <Condition Message="EstateMate Bridge needs 64-bit Windows 10 or 11; this PC is running 32-bit Windows. Use the portable sornix-estateos-bridge-win-x64.exe on a 64-bit PC instead.">
       <![CDATA[VersionNT64]]>
     </Condition>
 

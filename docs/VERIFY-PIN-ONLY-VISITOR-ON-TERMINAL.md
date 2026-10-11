@@ -50,11 +50,14 @@ Download the release assets from
 
 | Asset | Use |
 |---|---|
-| `estatemate-bridge-0.4.1-win-x64-installer-kit.zip` | **Recommended Windows install.** Unzip, double-click `Install-EstateMate-Bridge.cmd`. |
-| `estatemate-bridge-0.4.1-win-x64.msi` | All-users Windows installer; adds *Start Menu → EstateMate Bridge* (the dashboard). |
-| `estatemate-bridge-win-x64.exe` | Portable single file — no install, no Node.js. |
-| `estatemate-bridge-0.4.1.apk` | Android bridge. |
-| `estatemate-isapi-agent-win-x64-bridge-0.4.1.zip` | Self-contained Windows agent bundle (ships its own Node.js). |
+| `sornix-estateos-bridge-0.4.1-win-x64-installer-kit.zip` | **Recommended Windows install.** Unzip, double-click `Install-EstateMate-Bridge.cmd`. |
+| `sornix-estateos-bridge-0.4.1-win-x64.msi` | All-users Windows installer; adds *Start Menu → EstateMate Bridge* (the dashboard). |
+| `sornix-estateos-bridge-win-x64.exe` | Portable single file — no install, no Node.js. |
+| `sornix-estateos-bridge-0.4.1.apk` | Android bridge. |
+| `sornix-estateos-isapi-agent-win-x64-bridge-0.4.1.zip` | Self-contained Windows agent bundle (ships its own Node.js). |
+
+> Downloads are named `sornix-estateos-*` (the product); what installs itself keeps the
+> name `estatemate-bridge` — see [`APP-ARTIFACTS-AND-NAMING.md`](APP-ARTIFACTS-AND-NAMING.md).
 
 Verify the download against the matching `SHA256SUMS.txt` before running it.
 
@@ -92,7 +95,7 @@ terminal fails here, stop — nothing downstream will work either.
 
 ### Android
 
-1. Install `estatemate-bridge-0.4.1.apk` (allow unknown sources for the
+1. Install `sornix-estateos-bridge-0.4.1.apk` (allow unknown sources for the
    installer).
 2. Open **EstateMate Bridge** → **Paste installer** → paste the setup script
    text (agent id, secret, Worker URL fill in).

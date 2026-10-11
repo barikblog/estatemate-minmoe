@@ -4,6 +4,7 @@ import com.estatemate.app.data.local.AccessEventDao
 import com.estatemate.app.data.local.CachedAccessEvent
 import com.estatemate.app.data.remote.DashboardResponse
 import com.estatemate.app.data.remote.EstateMateApi
+import com.estatemate.app.data.remote.GateDto
 import com.estatemate.app.data.remote.HouseholdActionBody
 import com.estatemate.app.data.remote.HouseholdMemberDto
 import com.estatemate.app.data.remote.HouseholdRequestBody
@@ -21,6 +22,22 @@ import kotlinx.coroutines.flow.Flow
 import javax.inject.Inject
 import javax.inject.Singleton
 
+/**
+ * The two ways a sign-in can end.
+ *
+ * A Security officer posted at exactly one gate is scoped to that gate
+ * automatically. An officer with several posts has to say which one they are
+ * working before a session exists at all: the Worker answers with a short-lived
+ * selection token and the gates they may pick from, and the client shows that
+ * list and exchanges the choice through /api/auth/select-gate. Treating the
+ * second case as a failure (as this app used to) left every multi-gate officer
+ * unable to sign in on the phone.
+ */
+sealed interface LoginOutcome {
+    data class SignedIn(val user: UserDto) : LoginOutcome
+    data class GateSelectionRequired(val selectionToken: String, val gates: List<GateDto>) : LoginOutcome
+}
+
 @Singleton
 class EstateRepository @Inject constructor(
     private val api: EstateMateApi,
@@ -29,33 +46,37 @@ class EstateRepository @Inject constructor(
 ) {
     val recentEvents: Flow<List<CachedAccessEvent>> = eventDao.observeRecent()
 
-    /**
-     * Signs in and stores the session token.
-     *
-     * An officer posted at exactly one gate is scoped to it automatically. An
-     * officer with several posts must choose one, and this client has no
-     * gate-picker screen yet, so sign-in fails with [GateSelectionRequired] rather
-     * than storing no token at all — which would leave every later call failing
-     * with 401 and no explanation.
-     */
-    suspend fun login(email: String, password: String): UserDto {
+    /** Signs in, storing the session token before returning the signed-in user. */
+    suspend fun login(email: String, password: String): LoginOutcome {
         val response = api.login(LoginRequest(email.trim(), password))
         response.token?.let {
             authStore.token = it
-            return response.user
+            return LoginOutcome.SignedIn(response.user)
         }
         val selectionToken = response.selectionToken
         val gates = response.gates.orEmpty()
-        if (response.requiresGateSelection == true && selectionToken != null) {
+        if (response.requiresGateSelection == true && selectionToken != null && gates.isNotEmpty()) {
             val onlyGate = gates.singleOrNull()
             if (onlyGate != null) {
-                val selected = api.selectGate(SelectGateRequest(selectionToken, onlyGate.id))
-                authStore.token = selected.token
-                return selected.user
+                // One post: nothing to choose, so do not make the officer choose.
+                return LoginOutcome.SignedIn(selectGate(selectionToken, onlyGate.id))
             }
-            throw GateSelectionRequired(gates.mapNotNull { it.gateName ?: it.name }.joinToString(", "))
+            return LoginOutcome.GateSelectionRequired(selectionToken, gates)
         }
         throw IllegalStateException("Sign-in did not return a session. Please try again.")
+    }
+
+    /** Exchanges a gate choice for a session scoped to that gate. */
+    suspend fun selectGate(selectionToken: String, deviceId: String): UserDto {
+        val selected = api.selectGate(SelectGateRequest(selectionToken, deviceId))
+        authStore.token = selected.token
+        return selected.user
+    }
+
+    /** The gate this session is scoped to, when it is scoped to one. */
+    suspend fun currentGateName(): String? {
+        val gate = api.me().gate ?: return null
+        return gate.gateName ?: gate.name
     }
 
     suspend fun restore(): UserDto? = if (authStore.token == null) null else runCatching { api.me().user }.getOrElse {
@@ -88,12 +109,3 @@ class EstateRepository @Inject constructor(
         eventDao.clear()
     }
 }
-
-/**
- * Raised when a Security officer has more than one assigned gate and must pick
- * the post they are working. Surfaced to the user as the sign-in error message.
- */
-class GateSelectionRequired(gates: String) : IllegalStateException(
-    "Select the gate you are working for this shift ($gates). " +
-        "Gate selection is available in the EstateMate web portal; this app does not offer it yet."
-)

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Builds the EstateMate desktop app MSI (client-apps/windows).
+// Builds the Sornix EstateOS desktop app MSI (client-apps/windows).
 //
 //   node scripts/package-client-msi.mjs --out artifacts/client --version 0.4.6 \
 //        [--url https://estatemate.estatemate.workers.dev/] [--commit <sha>]
@@ -19,6 +19,16 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
 const appDir = path.join(root, 'client-apps', 'windows');
 export const DEFAULT_PORTAL_URL = 'https://estatemate.estatemate.workers.dev/';
+
+/**
+ * Release artifact name: the product is Sornix EstateOS, so the file a person
+ * downloads is `sornix-estateos-desktop-<version>.msi`. The launcher file
+ * (EstateMate.vbs), the portal-address file and the per-user registry key keep
+ * their original names: an existing install upgrades in place under the same
+ * UpgradeCode, and the VBScript that reads them is unchanged. See
+ * docs/APP-ARTIFACTS-AND-NAMING.md.
+ */
+export const DESKTOP_ARTIFACT_PREFIX = 'sornix-estateos-desktop';
 
 const WIX_INSTALL_DIRS = [
   process.env.WIX ? path.join(process.env.WIX, 'bin') : null,
@@ -113,9 +123,9 @@ export function stagePayload(stageDir, { url, commit, version }) {
   fs.writeFileSync(
     readme,
     [
-      `EstateMate desktop app ${version}`,
+      `Sornix EstateOS desktop app ${version}`,
       '',
-      'Open EstateMate from the Start Menu or the Desktop, then sign in with your portal email and password.',
+      'Open Sornix EstateOS from the Start Menu or the Desktop, then sign in with your portal email and password.',
       `Portal address: ${url}`,
       'The app runs in its own window using Microsoft Edge (or Google Chrome).',
       `Built from commit ${commit || 'unknown'}.`,
@@ -135,11 +145,11 @@ function main() {
   }
 
   const out = path.resolve(flags.out);
-  const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'estatemate-client-msi-'));
+  const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'sornix-estateos-desktop-msi-'));
   const payload = stagePayload(stage, { url: flags.url, commit: flags.commit, version: flags.version });
   const wxs = path.join(appDir, 'estatemate-client.wxs');
   const obj = path.join(stage, 'estatemate-client.wixobj');
-  const msi = path.join(out, `estatemate-client-${flags.version}.msi`);
+  const msi = path.join(out, `${DESKTOP_ARTIFACT_PREFIX}-${flags.version}.msi`);
 
   const candleArgs = [
     '-arch', 'x86',
