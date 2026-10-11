@@ -17,7 +17,10 @@
     "bindAddress": "127.0.0.1",
     "ackTimeoutSeconds": 180,
     "requireAgentKey": false,
-    "agentKey": ""
+    "agentKey": "",
+    "allowedSources": [],
+    "allowUnknownSources": false,
+    "maxRequestsPerMinute": 600
   },
   "remoteVerify": {
     "enabled": false,
@@ -39,6 +42,10 @@
     "port": 8080,
     "bindAddress": "127.0.0.1",
     "requireTerminalKey": false,
-    "terminalKey": ""
+    "terminalKey": "",
+    "allowedSources": [],
+    "allowUnknownSources": false,
+    "maxRequestsPerMinute": 600,
+    "trustReportedDeviceIp": false
   }
 }

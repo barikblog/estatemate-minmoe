@@ -169,6 +169,10 @@ copyRepo('isapi-bridge/zkteco-push-server.mjs', 'zkteco-push-server.mjs');
 // bridge exits at import time on every machine that runs this bundle.
 copyRepo('isapi-bridge/remote-verify.mjs', 'remote-verify.mjs');
 copyRepo('isapi-bridge/lan-event-listener.mjs', 'lan-event-listener.mjs');
+// Both listeners resolve this one: it is the inbound source allowlist, the shared
+// secret and the rate limit they apply. Same rule as the modules above — omit it
+// and the bridge exits at import time on every machine that installs the bundle.
+copyRepo('isapi-bridge/network-access-control.mjs', 'network-access-control.mjs');
 copyRepo('windows-agent/agent.mjs', 'agent.mjs');
 copyRepo('windows-agent/install-windows.mjs', 'install-windows.mjs');
 copyRepo('windows-agent/agent-config.example.json', 'agent-config.example.json');

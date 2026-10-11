@@ -157,7 +157,12 @@ Consequences that shape how you use it:
     "bindAddress": "192.168.1.20", // loopback default: see the security note
     "ackTimeoutSeconds": 180,
     "requireAgentKey": false,
-    "agentKey": ""
+    "agentKey": "",
+    // Inbound access control. A PUSH terminal dials in and has no address in the
+    // devices file, so nothing can be derived here: write the device VLAN.
+    "allowedSources": ["192.168.1.0/24"],
+    "allowUnknownSources": false,   // true makes the list advisory only
+    "maxRequestsPerMinute": 600     // per source; 0 switches the limit off
   }
 }
 ```
@@ -230,10 +235,65 @@ Binding `0.0.0.0` is supported for a real gate on another host and logs a warnin
 every start; the rules in `AGENTS.md` still apply — never publish it, never put
 it behind the Cloudflare Tunnel, and treat the agent host as part of the
 access-control trust boundary. `requireAgentKey` + `agentKey` adds a shared
-secret that the bridge checks on `Key=` for firmwares that send it. A serial no
-configured device claims gets `OK` (so the terminal stops retrying in a loop) and
-**no commands at all**, and every upload it tried to make is counted in the
-heartbeat as `unmappedUploads` so the gap is visible from the portal.
+secret that the bridge checks on `Key=` for firmwares that send it, and
+`allowedSources` decides which addresses may reach the listener at all — see
+[Inbound access control](#inbound-access-control-the-router-you-cannot-change)
+below. A serial no configured device claims gets `OK` (so the terminal stops
+retrying in a loop) and **no commands at all**, and every upload it tried to make
+is counted in the heartbeat as `unmappedUploads` so the gap is visible from the
+portal.
+
+## Inbound access control (the router you cannot change)
+
+This agent makes outbound connections for everything except two optional
+listeners: the ZKTeco PUSH one above, and the LAN event listener for terminals
+that only push (`lanEvents`). Both are off by default and bound to loopback, so a
+default install opens no port and a router's port-forwarding rule has nothing to
+hand traffic to.
+
+For the site that must open one — and cannot remove the inbound rule its router
+already has, because the router belongs to an ISP or to a managing agent — both
+listeners apply the same access control, in
+[`network-access-control.mjs`](network-access-control.mjs):
+
+1. **Source allowlist**, enforced before a body is read. `allowedSources` takes
+   address literals and CIDR ranges (IPv4 and IPv6); a hostname is refused as an
+   entry and a `/0` is refused because "allow everything" is the
+   `allowUnknownSources` switch. For `lanEvents` the list is also **derived from
+   `isapi-devices.json`** — every terminal with an address becomes a rule — so an
+   existing install gets deny-by-default without an installer writing anything.
+   When a terminal is named by hostname the derivation is incomplete and the list
+   stays advisory, with a startup warning naming the terminal; refusing the
+   estate's own gates over a devices-file typo is a worse failure than an open
+   LAN listener.
+2. **Shared secret** (`requireTerminalKey`/`terminalKey`,
+   `requireAgentKey`/`agentKey`), compared in constant time.
+3. **Per-source rate limit** (`maxRequestsPerMinute`, default 600) so a forwarded
+   port cannot be used to flood the bridge.
+4. **Identity is the socket.** An event body carries an `ipAddress` written by
+   whoever sent it, so an upload is mapped to a terminal by the address its
+   connection arrived from. A body naming a different terminal is logged and
+   counted, and only `"trustReportedDeviceIp": true` — for a site whose terminals
+   push through a relay that rewrites sources — makes the body a candidate. With
+   Remote Network Verification on, an accepted event is a door decision, so this
+   is the difference between a forged upload and an opened gate.
+
+Refusals answer `403` (source), `401`/`403` (secret, per the listener's existing
+contract) or `429` (rate), with no detail about the estate; they are counted as
+`deniedSource` / `rejected` / `throttled` and the last few ride the heartbeat in
+`stats.inbound` with source and path, never a body.
+
+Verify the whole posture from the estate side:
+
+```bash
+npm run inbound:check -- --config agent-config.json --devices isapi-devices.json --listen-scan
+npm run inbound:check -- --probe <the-address-the-rule-points-at>:8080   # run from outside for a verdict
+```
+
+`docs/INBOUND-ACCESS-CONTROL.md` is the full playbook: moving the destination
+instead of the rule, the host-firewall commands that need no router access, what
+source filtering cannot do about a masquerading router, and the finding table the
+checker reports.
 
 ## Setup
 

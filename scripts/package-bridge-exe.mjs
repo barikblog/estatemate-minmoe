@@ -292,6 +292,7 @@ function collectAssets() {
     ['agent/zkteco-push-server.mjs', path.join(repoRoot, 'isapi-bridge/zkteco-push-server.mjs')],
     ['agent/remote-verify.mjs', path.join(repoRoot, 'isapi-bridge/remote-verify.mjs')],
     ['agent/lan-event-listener.mjs', path.join(repoRoot, 'isapi-bridge/lan-event-listener.mjs')],
+    ['agent/network-access-control.mjs', path.join(repoRoot, 'isapi-bridge/network-access-control.mjs')],
     ['host/agent-loader.cjs', path.join(repoRoot, 'bridge-apps/windows/host/agent-loader.cjs')],
     ['host/cli.cjs', path.join(repoRoot, 'bridge-apps/windows/host/cli.cjs')],
     ['host/config.cjs', path.join(repoRoot, 'bridge-apps/windows/host/config.cjs')],

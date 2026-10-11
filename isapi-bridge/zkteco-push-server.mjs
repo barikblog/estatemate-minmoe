@@ -11,8 +11,14 @@
  * The PUSH protocol has no authentication of its own between an unknown terminal
  * and a server. That is acceptable on a LAN and dangerous anywhere else, so:
  *   - this binds to loopback or the LAN interface, never a public address;
+ *   - `allowedSources` (see `network-access-control.mjs`) is the source-address
+ *     allowlist, and it is what protects a site whose router forwards this port
+ *     inward and whose settings nobody can change — the rule cannot be deleted,
+ *     but a caller from outside the estate is refused before its body is read;
  *   - `requireAgentKey` (below) is the one knob that adds a shared secret, for
- *     firmwares that send it;
+ *     firmwares that send it, and it is layered on the allowlist rather than
+ *     instead of it, because a router that masquerades inbound traffic makes
+ *     every caller look like it came from inside the LAN;
  *   - an unrecognised serial is never given a command, only `OK`.
  * This is the same boundary rule EstateMate already applies to ISAPI: keep the
  * access devices and the bridge on one VLAN and do not publish either.
@@ -20,6 +26,7 @@
 
 import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
+import { assessBindAddress, createInboundAccessControl, normalizeSourceAddress } from './network-access-control.mjs';
 import {
   accessEventDocument,
   buildCommandBody,
@@ -58,12 +65,27 @@ export function createZktecoPushHandler(options = {}) {
     requests: 0,
     unmapped: 0,
     rejectedKey: 0,
+    // Inbound access control. `rejectedKey` stays the shared-secret refusal it
+    // always was; these two are what a forwarded port shows up as.
+    deniedSource: 0,
+    throttled: 0,
     events: 0,
     registrations: 0,
     commandsSent: 0,
     commandsConfirmed: 0,
     commandsTimedOut: 0,
   };
+
+  const access = options.accessControl ?? createInboundAccessControl({
+    name: 'ZKTeco PUSH listener',
+    allowedSources: options.allowedSources ?? [],
+    allowUnknownSources: Boolean(options.allowUnknownSources),
+    allowLoopback: options.allowLoopback !== false,
+    requireSecret: Boolean(requireAgentKey),
+    secret: String(agentKey ?? ''),
+    maxRequestsPerMinutePerSource: options.maxRequestsPerMinutePerSource,
+    log,
+  });
 
   const newCode = () => randomBytes(16).toString('hex');
 
@@ -176,20 +198,40 @@ export function createZktecoPushHandler(options = {}) {
     const serial = (url.searchParams.get('SN') ?? url.searchParams.get('sn') ?? '').trim();
     stats.requests += 1;
 
+    // Decided before the path is matched, so a caller from outside the allowlist
+    // gets one short answer and never learns which endpoints this listener
+    // implements. PUSH firmwares carry the shared key either in the query string
+    // (`&Key=`) or in a header; the query value is offered explicitly and the
+    // controller falls back to the headers it knows.
+    const sourceIp = normalizeSourceAddress(req.socket?.remoteAddress);
+    const queryKey = url.searchParams.get('Key');
+    const decision = access.decide({
+      ip: sourceIp,
+      headers: req.headers,
+      url: req.url,
+      method: req.method,
+      presentedSecret: queryKey === null ? undefined : queryKey,
+    });
+    if (!decision.allowed) {
+      if (decision.code === 'deniedSecret') stats.rejectedKey += 1;
+      else if (decision.code === 'throttled') stats.throttled += 1;
+      else stats.deniedSource += 1;
+      if (decision.code === 'throttled') {
+        reply(res, 429, 'busy\n');
+        return;
+      }
+      // 403 for both refusals: that is the status a missing key has always
+      // answered with, and a terminal that has never seen the code we send will
+      // simply retry — which is the correct behaviour for either refusal.
+      reply(res, 403, decision.code === 'deniedSecret' ? 'unauthorized\n' : 'forbidden\n');
+      return;
+    }
+
     if (!path.startsWith('/iclock/')) {
       // Anything else is not ours. 404 (rather than a redirect or a landing
       // page) keeps a mis-typed terminal URL failing loudly in its own log.
       reply(res, 404, 'notfound\n');
       return;
-    }
-
-    if (requireAgentKey) {
-      const presented = url.searchParams.get('Key') ?? req.headers['x-estatemate-key'] ?? '';
-      if (!agentKey || String(presented).trim() !== String(agentKey).trim()) {
-        stats.rejectedKey += 1;
-        reply(res, 403, 'unauthorized\n');
-        return;
-      }
     }
 
     // Every /iclock/ call except the very first connection carries an SN.
@@ -336,6 +378,8 @@ export function createZktecoPushHandler(options = {}) {
     handle,
     stats,
     devices,
+    /** The live inbound controller, so the agent can report policy and refusals. */
+    accessControl: access,
     queue: queueForSerial,
     depth: (serial) => queue.depth(serial),
     awaitConfirm,
@@ -459,13 +503,21 @@ export function startZktecoPushServer({ port = 8089, bindAddress = '127.0.0.1', 
     handlerOptions.log?.('error', `ZKTeco push listener could not bind ${bindAddress}:${port}: ${err.code || err.message}` +
       (err.code === 'EADDRINUSE' ? ' — something else owns that port; the terminals will keep trying to reach it' : ''));
   });
+  const bind = assessBindAddress({
+    bindAddress,
+    port,
+    name: 'ZKTeco PUSH listener',
+    enforcing: handler.accessControl.enforcing,
+  });
   server.on('listening', () => {
     listening = true;
     const address = server.address();
     handlerOptions.log?.('info', `ZKTeco PUSH listener on http://${address?.address ?? bindAddress}:${address?.port ?? port}/iclock/ — point the terminal's Cloud Server / ADMS settings at this address and port`);
-    if (bindAddress === '0.0.0.0' || bindAddress === '::') {
-      handlerOptions.log?.('warn', 'ZKTeco PUSH listener is on every interface. The protocol has no authentication: keep this address inside the estate LAN and never publish it (see AGENTS.md).');
+    for (const warning of bind.warnings) handlerOptions.log?.('warn', warning);
+    if (bind.reachableBeyondHost && !handler.accessControl.enforcing) {
+      handlerOptions.log?.('warn', 'ZKTeco PUSH listener is reachable beyond this host and has no source allowlist. The protocol has no authentication of its own: set "allowedSources" to the device VLAN (e.g. ["192.168.88.0/24"]) so a router rule nobody can remove still cannot hand this port to the Internet (see AGENTS.md).');
     }
+    handlerOptions.log?.(handler.accessControl.enforcing ? 'info' : 'warn', handler.accessControl.describe());
   });
 
   server.listen(port, bindAddress);
@@ -473,6 +525,7 @@ export function startZktecoPushServer({ port = 8089, bindAddress = '127.0.0.1', 
   return {
     handler,
     server,
+    accessControl: handler.accessControl,
     isListening: () => listening,
     address: () => server.address(),
     close: () => new Promise((resolve) => server.close(resolve)),
