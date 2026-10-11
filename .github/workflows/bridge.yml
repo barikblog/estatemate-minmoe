@@ -680,7 +680,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          name="${GITHUB_REF_NAME//[^A-Za-z0-9._-]/-}"
+          # The client APK is named for the version, not for the tag: tagging
+          # bridge-0.5.0 must not produce "sornix-estateos-android-bridge-0.5.0-
+          # debug.apk", which reads like the *bridge* app rather than the app a
+          # resident installs. A non-tag ref keeps its own name, sanitised.
+          version="${GITHUB_REF_NAME#bridge-}"
+          name="${version//[^A-Za-z0-9._-]/-}"
           cp apps/android/app/build/outputs/apk/debug/*.apk \
              "dist/sornix-estateos-android-$name-debug.apk"
           # Deliberately app-release.apk only: app-release-unsigned.apk cannot be

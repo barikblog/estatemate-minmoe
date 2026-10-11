@@ -16,7 +16,8 @@ tag.
 
 | Family | File (current) | Was | Built by |
 |---|---|---|---|
-| Android client (residents, staff, admin) | `sornix-estateos-android-<ref>-debug.apk`, and `-release.apk` when the keystore secrets are set | `estatemate-android-<ref>-debug.apk` | `apps/android` (Gradle), collected in the `android-apk` job |
+| Android client (residents, staff, admin) | `sornix-estateos-android-<version>-debug.apk`, and `-release.apk` when the keystore secrets are set | `estatemate-android-<ref>-debug.apk` |
+| Android client identity | application id `com.estatemate.app`, label **Sornix EstateOS** | — | `apps/android` (Gradle), collected in the `android-apk` job |
 | Windows desktop app | `sornix-estateos-desktop-<version>.msi` | `estatemate-client-<version>.msi` | `scripts/package-client-msi.mjs` + `client-apps/windows/estatemate-client.wxs` |
 | Android bridge APK (the on-site phone/tablet agent) | `sornix-estateos-bridge-<version>.apk` | `estatemate-bridge-<version>.apk` | `scripts/build-bridge-apk.py` |
 | Windows bridge executable (portable) | `sornix-estateos-bridge-win-x64.exe` | `estatemate-bridge-win-x64.exe` | `scripts/package-bridge-exe.mjs` |
