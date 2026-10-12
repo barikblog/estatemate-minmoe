@@ -1,5 +1,55 @@
 # AI handoff — EstateMate
 
+## Shipped and published: sign-in work is live; two CI-only failures fixed; smoke test covers the reset route (2026-10-12, same day, second entry)
+
+The sign-in work above is **merged, deployed and released**:
+
+- PR #78 merged into `main` as `620e1f5`. Deploy EstateMate run 38318994415
+  applied migration `0029` and deployed the Worker and the portal.
+- Production smoke run 38319151102 (the automatic `workflow_run` half) passed
+  against the merge commit.
+- Tag `bridge-0.7.0` on `620e1f5` published **Sornix EstateOS Bridge 0.7.0**
+  (21 assets: Android APK, desktop MSI, bridge exe and APK, Windows agent
+  bundle, installer kit). Tag run 38319477460: 7/7 jobs green.
+
+**Two failures only CI could find, both fixed in `f98f502`.** The first pass of
+`bridge.yml` (run 38317044061) went red on two jobs that never run locally:
+
+- *Build Android APK* — six Kotlin errors, all in `Menu.kt`: the `MenuIcon` enum
+  and its `image()` helper had been inserted twice, so the file redeclared both
+  and the two `module.icon.image()` call sites were ambiguous. There is no JDK
+  or Android SDK in the dev sandbox, so `test/sign-in-client-parity.test.ts` now
+  fails if either declaration appears twice — the closest a local run can get to
+  the compiler.
+- *Build the bridge executable* — the dashboard `-SelfTest` failed one check,
+  `the rail shows one section at a time -- Configuration=False, Status=False,
+  Service=False`. The rail was fine: the check was reading the section pages'
+  `Visible` flags, and a child control's `Visible` reports *effective*
+  visibility, folding in every ancestor — including the form, which the
+  self-test never shows. The self-test now shows the window for that one check
+  and hides it again; there is no PowerShell in the dev sandbox either.
+
+Neither failure was visible in the job log from this sandbox: **artifact and log
+downloads redirect to `productionresultssa*.blob.core.windows.net`, which is not
+reachable, so use the check-run annotations** (`gh api
+/repos/…/check-runs/<id>/annotations`). `bridge.yml` writes compiler errors and
+self-test output as `::error title=…::` annotations for exactly this reason.
+
+**Smoke test now covers the route a locked-out person needs.**
+`smoke.yml` gained two steps: `POST /api/auth/forgot-password` with an empty
+payload must answer `400 {code:"validation"}`, and with an address no estate has
+must answer `202` with a `PR-` reference and the estate's delivery rule. That
+route records its throttle attempt before it reads the account, so a 202 also
+proves `0029`'s `auth_attempts` table is in the deployed database. One attempt
+counts against the per-source forgotten-password throttle (3 in 10 minutes).
+
+**The dev sandbox cannot call the Worker directly.** `*.workers.dev` is not in
+its egress allow list, so `curl` from `bash` fails with `SSL_ERROR_SYSCALL` and
+`gh workflow run` fails with 403 (the token has no `actions:write`). `GET`
+requests work through the fetch-page tool, which is how the deployed sign-in
+screen ("Remember me … 30 days", "Forgot password?") was confirmed live; for
+anything that needs `POST`, extend `smoke.yml` and let a deploy run it.
+
 ## Sign-in on every client: real failure messages, remember me, forgotten passwords, icon menus (2026-10-12)
 
 Requested as: *"Let both PC, portal and phone app handle login errors properly
