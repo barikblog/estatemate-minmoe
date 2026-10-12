@@ -35,6 +35,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -47,6 +48,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.estatemate.app.data.EstateRepository
+import com.estatemate.app.data.remote.DeviceOptionDto
 import com.estatemate.app.data.remote.FacilityBookingBody
 import com.estatemate.app.data.remote.FacilityDto
 import com.estatemate.app.data.remote.MaintenanceRequestBody
@@ -202,6 +204,8 @@ data class ModuleListState(
     val facilities: List<FacilityDto> = emptyList(),
     /** The estate's validity window and timezone, read from /api/portal-config. */
     val config: PortalConfigDto? = null,
+    /** Gate devices, for the visitor pass form's "Preferred gate device" picker. */
+    val devices: List<DeviceOptionDto> = emptyList(),
 )
 
 /**
@@ -218,15 +222,10 @@ data class FormFeedback(
     val formSubmitted: Boolean = false,
 )
 
-/** A pass the Worker just issued, with the code the visitor needs. */
-data class IssuedPass(
-    val visitorName: String,
-    val pin: String,
-    val credentialNumber: String?,
-    val validFrom: String?,
-    val validUntil: String?,
-    val visitTimes: Int?,
-)
+// A pass the Worker just issued is kept as a VisitorPassDetails until dismissed:
+// the PIN and the unique number exist nowhere else in the app, and the pass —
+// the same card the portal renders — is what the resident shows, prints or
+// shares with the visitor.
 
 /** The visitor purposes the Worker accepts, with the portal's own labels. */
 val VISITOR_PURPOSE_OPTIONS: List<Pair<String, String>> = listOf(
@@ -238,6 +237,28 @@ val VISITOR_PURPOSE_OPTIONS: List<Pair<String, String>> = listOf(
     "event" to "Event or celebration",
     "other" to "Other — state it below",
 )
+
+/** The person types a terminal files an account under, with the portal's own labels. */
+val VISITOR_PERSON_TYPES: List<Pair<String, String>> = listOf(
+    "visitor" to "Visitor",
+    "normal" to "Normal user",
+)
+
+/** The wording a picker uses, where there is room to explain the choice (the portal's `VISITOR_PERSON_TYPE_CHOICES`). */
+val VISITOR_PERSON_TYPE_CHOICES: List<Pair<String, String>> = listOf(
+    "visitor" to "Visitor (recommended)",
+    "normal" to "Normal user — terminals that refuse the visitor type",
+)
+
+/** What the portal's `visitorPurposeLabel` resolves, so both name the purpose alike. */
+fun visitorPurposeLabel(purpose: String?, purposeOther: String?): String =
+    passPurposeLabel(purpose, purposeOther)
+
+/** What the portal's `visitorPersonTypeLabel` resolves, for the pass list. */
+fun visitorPersonTypeLabel(value: String?): String {
+    val type = value?.trim()?.lowercase().orEmpty()
+    return VISITOR_PERSON_TYPES.firstOrNull { it.first == type }?.second ?: type
+}
 
 /** The maintenance scopes the Worker accepts, with the portal's own labels. */
 val MAINTENANCE_SCOPES: List<Pair<String, String>> = listOf(
@@ -280,8 +301,8 @@ class ModulesViewModel @Inject constructor(private val repository: EstateReposit
     private val _feedback = MutableStateFlow(FormFeedback())
     val feedback: StateFlow<FormFeedback> = _feedback.asStateFlow()
 
-    private val _issuedPass = MutableStateFlow<IssuedPass?>(null)
-    val issuedPass: StateFlow<IssuedPass?> = _issuedPass.asStateFlow()
+    private val _issuedPass = MutableStateFlow<VisitorPassDetails?>(null)
+    val issuedPass: StateFlow<VisitorPassDetails?> = _issuedPass.asStateFlow()
 
     fun load(module: MenuModule) {
         val path = module.path ?: return
@@ -303,6 +324,7 @@ class ModulesViewModel @Inject constructor(private val repository: EstateReposit
                                 properties = support.properties,
                                 facilities = support.facilities,
                                 config = support.config,
+                                devices = support.devices,
                             )
                         }
                     }
@@ -318,6 +340,7 @@ class ModulesViewModel @Inject constructor(private val repository: EstateReposit
                                 properties = support.properties,
                                 facilities = support.facilities,
                                 config = support.config,
+                                devices = support.devices,
                             )
                         }
                     }
@@ -329,12 +352,14 @@ class ModulesViewModel @Inject constructor(private val repository: EstateReposit
         val properties: List<PropertyDto> = emptyList(),
         val facilities: List<FacilityDto> = emptyList(),
         val config: PortalConfigDto? = null,
+        val devices: List<DeviceOptionDto> = emptyList(),
     )
 
     private suspend fun loadSupport(module: MenuModule): Support = when (module.form) {
         MenuForm.VisitorPass -> Support(
             properties = repository.properties(),
             config = repository.portalConfig(),
+            devices = repository.deviceOptions(),
         )
         MenuForm.MaintenanceRequest -> Support(properties = repository.properties())
         MenuForm.FacilityBooking -> Support(
@@ -354,26 +379,28 @@ class ModulesViewModel @Inject constructor(private val repository: EstateReposit
     }
 
     /**
-     * Issues a pass and keeps the code the visitor needs.
+     * Issues a pass and keeps the rendered pass the visitor needs.
      *
-     * The PIN and unique number are generated by the Worker and shown once the
-     * list refreshes: nothing else in the app displays them, and a resident who
-     * cannot read them out cannot get their visitor through the gate.
+     * The PIN and unique number are generated by the Worker and the pass — QR
+     * code, barcode, PIN and all — is shown once it is issued, exactly as the
+     * portal opens its pass modal after a create. The resident's proof files are
+     * uploaded first (the portal uploads them in the same submit) and travel
+     * with the request as `proofKeys`.
      */
-    fun createVisitorPass(request: VisitorPassBody, visitorName: String) = viewModelScope.launch {
+    fun createVisitorPass(
+        request: VisitorPassBody,
+        context: VisitorPassContext,
+        proofs: List<ProofUpload> = emptyList(),
+    ) = viewModelScope.launch {
         _feedback.value = FormFeedback(busy = true)
-        runCatching { repository.createVisitorPass(request) }
+        runCatching {
+            val proofKeys = proofs.map { repository.uploadProofFile(it.uri, it.name, "visitor-proofs") }
+            repository.createVisitorPass(request.copy(proofKeys = proofKeys.ifEmpty { null }))
+        }
             .onSuccess { created ->
-                _issuedPass.value = IssuedPass(
-                    visitorName = visitorName,
-                    pin = created.pin,
-                    credentialNumber = created.credentialNumber,
-                    validFrom = created.validFrom,
-                    validUntil = created.validUntil,
-                    visitTimes = created.visitTimes,
-                )
+                _issuedPass.value = visitorPassDetails(context, created)
                 _feedback.value = FormFeedback(
-                    message = "Pass issued and the visitor account is live on the estate terminals. Share the PIN and unique number with your visitor.",
+                    message = "Pass created and the visitor account is live on the estate terminals. It is deleted from all of them automatically when validity ends; the pass record stays. Share the QR/barcode and unique number with the visitor.",
                     formSubmitted = true,
                 )
                 reload()
@@ -529,13 +556,13 @@ private fun ModuleDetail(
     user: UserDto,
     state: ModuleListState,
     feedback: FormFeedback,
-    issuedPass: IssuedPass?,
+    issuedPass: VisitorPassDetails?,
     formOpen: Boolean,
     onToggleForm: () -> Unit,
     onDismissIssuedPass: () -> Unit,
     onBack: () -> Unit,
     onRefresh: () -> Unit,
-    onCreateVisitorPass: (VisitorPassBody, String) -> Unit,
+    onCreateVisitorPass: (VisitorPassBody, VisitorPassContext, List<ProofUpload>) -> Unit,
     onCreateMaintenance: (MaintenanceRequestBody) -> Unit,
     onCreateBooking: (FacilityBookingBody) -> Unit,
     onCancelBooking: (String) -> Unit,
@@ -543,6 +570,19 @@ private fun ModuleDetail(
     // Which booking is one tap away from being cancelled, so a mis-tap can
     // never cancel somebody's reservation by itself.
     var confirmCancelId by rememberSaveable { mutableStateOf<String?>(null) }
+    // A pass opened from a row of the list — the portal's "View pass" button.
+    var viewedPass by remember { mutableStateOf<VisitorPassDetails?>(null) }
+    val shownPass = viewedPass ?: issuedPass
+    if (shownPass != null) {
+        VisitorPassDialog(
+            details = shownPass,
+            config = state.config,
+            onDismiss = {
+                viewedPass = null
+                onDismissIssuedPass()
+            },
+        )
+    }
     Column(Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) { Icon(Icons.Outlined.ArrowBack, "Back to menu") }
@@ -569,7 +609,7 @@ private fun ModuleDetail(
                     if (formOpen) {
                         FormCard(title = module.createLabel ?: "New record", onClose = onToggleForm) {
                             when (module.form) {
-                                MenuForm.VisitorPass -> VisitorPassForm(user, state.properties, state.config, feedback, onCreateVisitorPass)
+                                MenuForm.VisitorPass -> VisitorPassForm(user, state.properties, state.devices, state.config, feedback, onCreateVisitorPass)
                                 MenuForm.MaintenanceRequest -> MaintenanceForm(user, state.properties, feedback, onCreateMaintenance)
                                 MenuForm.FacilityBooking -> BookingForm(state.facilities, state.config, feedback, onCreateBooking)
                                 null -> Unit
@@ -584,7 +624,6 @@ private fun ModuleDetail(
                     }
                 }
             }
-            issuedPass?.let { pass -> item { IssuedPassCard(pass, onDismissIssuedPass) } }
             feedback.message?.let { text -> item { ResultNotice(text, error = false) } }
             feedback.error?.let { text -> item { ResultNotice(text, error = true) } }
             when {
@@ -598,16 +637,20 @@ private fun ModuleDetail(
                     Text("Nothing to show yet.", color = Color(0xFF6A7790), modifier = Modifier.padding(12.dp))
                 }
                 else -> items(state.items) { row ->
-                    RowCard(module, row) {
-                        BookingRowAction(
-                            module = module,
-                            row = row,
-                            user = user,
-                            busy = feedback.busy,
-                            confirming = confirmCancelId != null && confirmCancelId == row.rawText("id"),
-                            onConfirming = { confirming -> confirmCancelId = if (confirming) row.rawText("id") else null },
-                            onCancel = onCancelBooking,
-                        )
+                    RowCard(module, row, user) {
+                        if (module.id == "visitors") {
+                            TextButton(onClick = { viewedPass = passDetailsFromRow(row) }) { Text("View pass") }
+                        } else {
+                            BookingRowAction(
+                                module = module,
+                                row = row,
+                                user = user,
+                                busy = feedback.busy,
+                                confirming = confirmCancelId != null && confirmCancelId == row.rawText("id"),
+                                onConfirming = { confirming -> confirmCancelId = if (confirming) row.rawText("id") else null },
+                                onCancel = onCancelBooking,
+                            )
+                        }
                     }
                 }
             }
@@ -656,9 +699,9 @@ private fun BookingRowAction(
 }
 
 @Composable
-private fun RowCard(module: MenuModule, row: JsonObject, action: (@Composable () -> Unit)? = null) {
+private fun RowCard(module: MenuModule, row: JsonObject, user: UserDto, action: (@Composable () -> Unit)? = null) {
     val title = module.titleKeys.firstNotNullOfOrNull { row.displayText(it) } ?: "Item"
-    val details = module.detailKeys.mapNotNull { row.displayText(it) }
+    val details = moduleRowDetails(module, row, user)
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = Color.White),
@@ -676,6 +719,50 @@ private fun RowCard(module: MenuModule, row: JsonObject, action: (@Composable ()
             }
         }
     }
+}
+
+/**
+ * One row's printable details. Visitor passes are composed the way the portal's
+ * own table composes them — purpose label, visit count, the staff-only gate,
+ * person type, device and device-account columns, then status and validity —
+ * while every other module shows the columns it declares.
+ */
+private fun moduleRowDetails(module: MenuModule, row: JsonObject, user: UserDto): List<String> =
+    if (module.id == "visitors") visitorRowDetails(row, user.role == "admin" || user.role == "manager" || user.role == "security")
+    else module.detailKeys.mapNotNull { row.displayText(it) }
+
+/** The portal's `Visitor Passes` table columns, in the portal's own order. */
+private fun visitorRowDetails(row: JsonObject, staff: Boolean): List<String> {
+    fun text(vararg keys: String): String? {
+        for (key in keys) {
+            val value = row.rawText(key)?.trim().orEmpty()
+            if (value.isNotEmpty()) return value
+        }
+        return null
+    }
+
+    val details = mutableListOf<String>()
+    listOfNotNull(
+        text("resident_name", "residentName"),
+        text("unit_number"),
+        visitorPurposeLabel(text("purpose_of_visit", "purposeOfVisit"), text("purpose_of_visit_other", "purposeOfVisitOther")).ifEmpty { "—" },
+        "${text("visits_used", "visitsUsed") ?: "0"} of ${text("visit_times", "visitTimes") ?: "1"}",
+        text("credential_number", "credentialNumber"),
+    ).forEach { details += it }
+    if (staff) {
+        val gateScope = text("gate_scope", "gateScope") ?: "both"
+        listOfNotNull(
+            if (gateScope == "gate") "Selected gate only" else "Every gate, entry and exit",
+            visitorPersonTypeLabel(text("person_type", "personType")),
+            text("device_name", "deviceName"),
+            text("device_account_state"),
+        ).forEach { details += it }
+    }
+    listOfNotNull(
+        text("status"),
+        text("valid_until", "validUntil")?.let { passDateText(it) },
+    ).forEach { details += it }
+    return details
 }
 
 /** The raw string of a column, for decisions rather than for display. */

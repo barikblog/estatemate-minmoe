@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Where a rendered visitor pass is written before it is shared or printed:
+  cacheDir/passes/, the same "visitor-pass-<credential>.png|.pdf" names the
+  portal downloads. Cache only — the pass is transient, the record is the
+  Worker's.
+-->
+<paths>
+    <cache-path name="passes" path="passes/" />
+</paths>

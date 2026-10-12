@@ -1,9 +1,12 @@
 package com.estatemate.app.data
 
+import android.content.Context
+import android.net.Uri
 import com.estatemate.app.data.local.AccessEventDao
 import com.estatemate.app.data.local.CachedAccessEvent
 import com.estatemate.app.data.remote.BookingActionBody
 import com.estatemate.app.data.remote.DashboardResponse
+import com.estatemate.app.data.remote.DeviceOptionDto
 import com.estatemate.app.data.remote.EstateMateApi
 import com.estatemate.app.data.remote.FacilityBookingBody
 import com.estatemate.app.data.remote.FacilityBookingCreated
@@ -28,7 +31,12 @@ import com.estatemate.app.data.remote.TenancyRequestBody
 import com.estatemate.app.data.remote.UserDto
 import com.estatemate.app.data.remote.VisitorPassBody
 import com.estatemate.app.data.remote.VisitorPassCreated
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 import retrofit2.HttpException
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -54,6 +62,7 @@ class EstateRepository @Inject constructor(
     private val api: EstateMateApi,
     private val authStore: AuthStore,
     private val eventDao: AccessEventDao,
+    @ApplicationContext private val context: Context,
 ) {
     val recentEvents: Flow<List<CachedAccessEvent>> = eventDao.observeRecent()
 
@@ -114,6 +123,30 @@ class EstateRepository @Inject constructor(
     /** Estate settings the resident forms read: validity window and estate timezone. */
     suspend fun portalConfig(): PortalConfigDto = serverMessage { api.portalConfig() }
 
+    /** Gate devices a pass may be scoped to — the form's "Preferred gate device" picker. */
+    suspend fun deviceOptions(): List<DeviceOptionDto> = serverMessage { api.deviceOptions().items }
+
+    /**
+     * Uploads one supporting proof the way the portal does — the file bytes as
+     * the body, with its name and category in headers — and returns the storage
+     * key the Worker will accept in `proofKeys`.
+     *
+     * The 4 MB ceiling is checked here first so a phone does not push a file the
+     * Worker will refuse, and the refusal uses the Worker's own wording.
+     */
+    suspend fun uploadProofFile(uri: Uri, displayName: String, category: String): String {
+        val bytes = withContext(Dispatchers.IO) {
+            context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        } ?: throw ServerMessageException("Could not read $displayName from this phone.")
+        if (bytes.isEmpty()) throw ServerMessageException("$displayName is empty.")
+        if (bytes.size > MAX_PROOF_FILE_BYTES) throw ServerMessageException("File exceeds the 4 MB upload limit")
+        val contentType = (context.contentResolver.getType(uri) ?: "application/pdf").lowercase()
+        val stored = serverMessage {
+            api.uploadFile(bytes.toRequestBody(contentType.toMediaTypeOrNull()), displayName, category)
+        }
+        return stored.proofKey() ?: throw ServerMessageException("The upload of $displayName did not return a storage key.")
+    }
+
     suspend fun createVisitorPass(request: VisitorPassBody): VisitorPassCreated = serverMessage { api.createVisitorPass(request) }
 
     suspend fun createMaintenanceRequest(request: MaintenanceRequestBody) = serverMessage { api.createMaintenanceRequest(request) }
@@ -163,3 +196,10 @@ class EstateRepository @Inject constructor(
  * uses shows the estate's own words instead of a status line.
  */
 class ServerMessageException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
+/** The Worker's per-file ceiling (`MAX_GITHUB_FILE_SIZE` in `src/github-storage.ts`). */
+private const val MAX_PROOF_FILE_BYTES = 4 * 1024 * 1024
+
+/** The `key` of a `/api/files` upload response, or null when the body is not what the Worker promised. */
+private fun JsonObject.proofKey(): String? =
+    get("key")?.takeIf { it.isJsonPrimitive }?.asString?.takeIf { it.isNotBlank() }

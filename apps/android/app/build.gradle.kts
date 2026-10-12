@@ -126,6 +126,11 @@ dependencies {
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("io.coil-kt:coil-compose:2.7.0")
 
+    // QR and Code 128 for the rendered visitor pass — the two formats the
+    // portal's pass-export draws (qrcode + jsbarcode), drawn here from the
+    // same credential the gate scanner accepts.
+    implementation("com.google.zxing:core:3.5.3")
+
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")

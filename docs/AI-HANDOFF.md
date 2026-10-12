@@ -1,5 +1,61 @@
 # AI handoff — EstateMate
 
+## Client-app visitor passes now match the portal (2026-10-12)
+
+The question this answers: the phone app issued visitor passes as a text card
+(PIN + unique number) while the portal issues a real pass — a rendered card with
+a QR code and a Code 128 barcode of the credential, host/property, validity,
+purpose, remark, visit count and gate scope, shareable as a PNG or one-page PDF
+and re-openable from the pass list. The client app now does what the portal does.
+
+**What changed (all in `apps/android/`, plus a drift test).**
+
+- `VisitorPass.kt` (new) is the Android twin of `apps/web/src/pass-export.ts`:
+  the same 900px layout, palette (`#14213d`/`#68748a`/`#1769e0`/`#dfe6ef`),
+  header (estate mark, `ESTATE VISITOR PASS`, portal name from
+  `/api/portal-config`), QR + Code 128 of the credential (ZXing
+  `com.google.zxing:core`), the `Keypad PIN:` panel, `VALID FROM`/`VALID UNTIL`
+  boxes, purpose/remark/visit lines, the every-gate line, the security policy
+  sentence and the `Powered by sornix.com.ng` footer. The rendered bitmap *is*
+  the pass: the dialog shows it and `📤 Share image` / `📄 Share PDF` / `🖨️ Print`
+  hand on that same bitmap (PNG via FileProvider `cacheDir/passes/`, A4 595×842pt
+  via `PdfDocument` with the portal's 24pt margin, print via `PrintHelper`).
+  The portal's modal and exporter draw purpose/remark/visits only on screen; the
+  Android renderer draws them everywhere, which is what `AGENTS.md` already
+  promises of exports.
+- The pass opens right after issuing (replacing the old PIN card) and from every
+  pass-list row's **View pass**, in the portal's own modal wording (`Visitor pass
+  generated`, `✕ Close pass`, `✕ Done — Close Visitor Pass`, the portal's share
+  status sentences).
+- `VisitorPassForm` gained the portal's remaining create fields: the
+  operator-only **Preferred gate device** (`/api/access/device-options`, same
+  `name — model (QR|PIN/card)` labels) and **Person type on the terminals**
+  (defaulted from `visitor_person_type`), the resident's **proof uploads** (the
+  portal's `ProofFilesField` wording, ≤5 files, 4 MB each, uploaded to
+  `/api/files` with `X-Filename`/`X-File-Category: visitor-proofs` and posted as
+  `proofKeys`), and the gate ID-verification switch now states the portal's exact
+  Optional/Mandatory sentences. `VisitorPassBody` carries `deviceId`, `personType`
+  and `proofKeys`; the create result notice is the portal's own sentence.
+- The pass list composes the portal's `Visitor Passes` columns (resident, unit,
+  purpose label, visits used, unique number, and for staff the gates/person
+  type/device/device-account columns), status and formatted validity last.
+- Plumbing: `EstateRepository.uploadProofFile` (ContentResolver read on IO, the
+  Worker's 4 MB wording when refused), `deviceOptions()`, `PortalConfigDto`
+  gains `portal_name`/`portal_short_name`, FileProvider
+  (`${applicationId}.fileprovider`, `res/xml/file_paths.xml`).
+
+**Drift guard.** `test/client-visitor-pass-parity.test.ts` asserts the two
+renderers share the policy/footer sentences and palette, the form posts every
+field the portal posts, the purpose/person-type label tables are identical, the
+create-form wording matches, and both sides keep the `visitor-pass-<credential>`
+`.png`/`.pdf` share filenames.
+
+**Validation.** `npm run typecheck`, `npm test` (incl. the new parity suite),
+`npm run build:web`, `bash scripts/ci-checks.sh` and the migration chain pass.
+**Kotlin was not compiled locally** (no JDK 17 / Android SDK in the sandbox):
+the `android-apk` job of `.github/workflows/bridge.yml` compiles it on the pull
+request touching `apps/android/**`.
+
 ## Sornix EstateOS naming: product-named downloads, unchanged installed identity (2026-10-11)
 
 The question this answers: the product is **Sornix EstateOS** everywhere a person

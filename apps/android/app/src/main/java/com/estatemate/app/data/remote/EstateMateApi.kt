@@ -2,8 +2,10 @@ package com.estatemate.app.data.remote
 
 import com.google.gson.JsonObject
 import com.google.gson.annotations.SerializedName
+import okhttp3.RequestBody
 import retrofit2.http.Body
 import retrofit2.http.GET
+import retrofit2.http.Header
 import retrofit2.http.PATCH
 import retrofit2.http.POST
 import retrofit2.http.Path
@@ -187,6 +189,9 @@ data class PortalConfigDto(
     @SerializedName("visitor_default_validity_days") val visitorDefaultValidityDays: String? = null,
     @SerializedName("visitor_max_validity_days") val visitorMaxValidityDays: String? = null,
     @SerializedName("visitor_person_type") val visitorPersonType: String? = null,
+    /** The pass header's branding, as the portal's own pass modal prints it. */
+    @SerializedName("portal_name") val portalName: String? = null,
+    @SerializedName("portal_short_name") val portalShortName: String? = null,
 )
 
 /**
@@ -213,13 +218,19 @@ data class VisitorPassBody(
     /** Operators only: the resident the pass is issued for. Residents are the session's own user. */
     val residentId: String? = null,
     val propertyId: String? = null,
+    /** Operators only: scope the pass to one gate device. Blank or absent means every gate. */
+    val deviceId: String? = null,
     val validFrom: String,
     val validUntil: String,
     val purposeOfVisit: String? = null,
     val purposeOfVisitOther: String? = null,
     val visitTimes: Int? = null,
     val remark: String? = null,
+    /** Operators only: the person type filed on the terminals (`visitor` or `normal`). */
+    val personType: String? = null,
     val requireGateIdVerification: Boolean = false,
+    /** Storage keys of the resident's identity/invitation proofs, as the portal posts them. */
+    val proofKeys: List<String>? = null,
 )
 
 /** `POST /api/maintenance` answers with the row it wrote, not a status. */
@@ -281,6 +292,23 @@ data class FacilityDto(
 /** `/api/facilities` answers with `{ items }` only, so it has no paging fields. */
 data class FacilitiesResponse(val items: List<FacilityDto> = emptyList())
 
+/**
+ * One gate device offered by `/api/access/device-options`, for the pass form's
+ * "Preferred gate device" picker — the same rows and the same QR/PIN wording the
+ * portal's create form shows.
+ */
+data class DeviceOptionDto(
+    val id: String,
+    val name: String,
+    val vendor: String? = null,
+    val model: String? = null,
+    @SerializedName("gate_name") val gateName: String? = null,
+    val supportsQr: Boolean? = null,
+)
+
+/** `/api/access/device-options` answers with `{ items }` only. */
+data class DeviceOptionsResponse(val items: List<DeviceOptionDto> = emptyList())
+
 interface EstateMateApi {
     @POST("api/auth/login")
     suspend fun login(@Body request: LoginRequest): LoginResponse
@@ -336,6 +364,22 @@ interface EstateMateApi {
     /** Estate settings for the forms (validity window, estate timezone). */
     @GET("api/portal-config")
     suspend fun portalConfig(): PortalConfigDto
+
+    /** Gate devices a pass may be scoped to — the form's "Preferred gate device" picker. */
+    @GET("api/access/device-options")
+    suspend fun deviceOptions(): DeviceOptionsResponse
+
+    /**
+     * Uploads one supporting proof exactly as the portal does: the raw file
+     * bytes as the body, with the name and category in headers. Answers with
+     * the stored-file record, whose `key` becomes a `proofKeys` entry.
+     */
+    @POST("api/files")
+    suspend fun uploadFile(
+        @Body body: RequestBody,
+        @Header("X-Filename") filename: String,
+        @Header("X-File-Category") category: String,
+    ): JsonObject
 
     @POST("api/visitors")
     suspend fun createVisitorPass(@Body request: VisitorPassBody): VisitorPassCreated

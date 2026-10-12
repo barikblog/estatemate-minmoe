@@ -27,7 +27,7 @@ the app a person signs into.
 | Properties | Owned/rented properties, request an unowned unit, propose a new one, ownership approvals, tenancy nomination/approval/end, dependants and household approvals |
 | Gate activity | Recent access events from the local Room cache, refreshed from `/api/access/events` |
 | Menu | The portal's grouped, role-aware menu (same groups and role rules as `navGroups` in `apps/web/src/App.tsx`). Lists for visitor passes, cards, terminals, staff, bills, maintenance, facility bookings, notices, documents and emergency contacts, each from its Worker list endpoint. Portal-only tools (residents, settings and imports) say so and point to the web portal. |
-| Visitor passes | "New pass" — the portal's create form: visitor name and phone, the property (automatic when a resident has exactly one, picked when they have several, chosen for the resident by an operator), the estate's validity window from `/api/portal-config`, purpose of visit, visit times, remark and the gate ID-verification switch. The Worker's six-digit PIN and unique number are shown once the pass is issued, to pass on to the visitor. |
+| Visitor passes | "New pass" — the portal's create form, field for field: visitor name and phone, the property (automatic when a resident has exactly one, picked when they have several, chosen for the resident by an operator), the estate's validity window from `/api/portal-config`, purpose of visit, visit times, remark, the gate ID-verification switch, the operator-only **preferred gate device** and **person type**, and the resident's **identity/invitation proof** uploads (the same `/api/files` + `proofKeys` flow the portal posts). The issued pass is the portal's own pass — QR code, Code 128 barcode, the Worker's six-digit PIN and unique number, validity window, purpose, remark, visit count and gate scope — rendered by `VisitorPass.kt`, the Android twin of `apps/web/src/pass-export.ts`. It opens right after issuing and again from any row's **View pass**, and can be shared as the portal shares it: 📤 Share image (PNG), 📄 Share PDF (one A4 page), 🖨️ Print. |
 | Maintenance | "Report an issue" — the portal's scopes (personal, street, block, zone, estate) with the target named for street, block and zone, the property, and the description of the fault. |
 | Facility bookings | "Book a facility" — active facilities with their capacity, hours, notice and fee rules; date plus start and end time, purpose, attendees and contact phone. Your own pending or approved booking can be cancelled from its row, and an operator can cancel any, each behind a confirm step. |
 | Account | Name, role, gate, server address, sign out |
@@ -38,6 +38,15 @@ forms and to the Worker's POST/PATCH routes, including the naive
 refuses something — an overlapping booking, a window beyond the estate's
 maximum, a missing property permission — its own `{ error }` wording is shown in
 the form rather than an HTTP status code.
+
+The visitor pass itself is drawn, not composed: `VisitorPass.kt` renders the same
+900px card `apps/web/src/pass-export.ts` renders (palette, layout, wording, QR +
+Code 128 of the unique number), and that bitmap is both what the dialog shows and
+what "Share image"/"Share PDF"/"Print" hand on — PNG through a FileProvider, one
+A4 page through `PdfDocument`, print through `PrintHelper`.
+`test/client-visitor-pass-parity.test.ts` keeps the two renderers' words, palette
+and form fields locked together: change one side without the other and the test
+suite fails.
 
 Offline: the last fetched gate events stay readable (Room). Everything else
 needs the network, and says so.
