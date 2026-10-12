@@ -1,5 +1,10 @@
 package com.estatemate.app
 
+import android.content.Context
+import android.net.Uri
+import android.provider.OpenableColumns
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -34,9 +39,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.estatemate.app.data.remote.DeviceOptionDto
 import com.estatemate.app.data.remote.FacilityBookingBody
 import com.estatemate.app.data.remote.FacilityDto
 import com.estatemate.app.data.remote.MaintenanceRequestBody
@@ -100,42 +107,54 @@ fun ResultNotice(text: String, error: Boolean) {
 }
 
 /**
- * The pass the Worker just issued.
+ * The visitor's identity or invitation proof — the portal's `ProofFilesField`.
  *
- * The PIN and the unique number exist nowhere else in the app — the list only
- * repeats the visitor's name and window — so this panel is what the resident
- * reads to the visitor, and it stays until dismissed.
+ * Up to five files, chosen on the phone and uploaded (with their names) just
+ * before the pass is created, exactly as the portal uploads them in the same
+ * submit. The names are shown so a resident can see what is being sent.
  */
 @Composable
-fun IssuedPassCard(pass: IssuedPass, onDismiss: () -> Unit) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = EstateNavy),
-        shape = RoundedCornerShape(16.dp),
-    ) {
-        Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("VISITOR PASS ISSUED", color = EstateGreen, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold)
-            Text(pass.visitorName, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
-            Spacer(Modifier.height(2.dp))
-            Text("PIN for the terminal keypad", color = Color.White.copy(alpha = 0.7f), fontSize = 11.sp)
-            Text(pass.pin, color = Color.White, fontSize = 32.sp, fontWeight = FontWeight.Black)
-            pass.credentialNumber?.let { Text("Unique number $it", color = Color.White.copy(alpha = 0.85f), fontSize = 13.sp) }
-            val window = listOfNotNull(
-                pass.validFrom?.let(::formatInstant),
-                pass.validUntil?.let(::formatInstant),
-            ).joinToString(" → ")
-            if (window.isNotBlank()) Text("Valid $window", color = Color.White.copy(alpha = 0.85f), fontSize = 12.sp)
-            pass.visitTimes?.let { times ->
-                Text("Usable $times time${if (times == 1) "" else "s"}", color = Color.White.copy(alpha = 0.85f), fontSize = 12.sp)
+private fun ProofFilesField(proofs: List<ProofUpload>, onChoose: (List<ProofUpload>) -> Unit) {
+    val context = LocalContext.current
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        val chosen = uris.take(5).mapNotNull { uri ->
+            displayNameFor(context, uri)?.let { ProofUpload(uri, it) }
+        }
+        if (chosen.isNotEmpty()) onChoose(chosen)
+    }
+    Column {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Button(
+                onClick = {
+                    launcher.launch(arrayOf("image/jpeg", "image/png", "image/webp", "application/pdf"))
+                },
+            ) {
+                Text(if (proofs.isEmpty()) "Choose proof files" else "Change proof files")
             }
-            Text(
-                "Share the PIN or the unique number with your visitor. Security previews the pass at the gate and verifies ID where the estate requires it before entry.",
-                color = Color.White.copy(alpha = 0.75f),
-                fontSize = 11.sp,
-            )
-            TextButton(onClick = onDismiss, modifier = Modifier.align(Alignment.End)) { Text("Done", color = EstateGreen) }
+        }
+        if (proofs.isNotEmpty()) {
+            FieldHint(proofs.joinToString(", ") { it.name })
+        }
+        FieldHint("Up to five JPEG, PNG, WebP or PDF files, maximum 4 MB each. Stored in the configured private GitHub repository.")
+    }
+}
+
+/** The name a document provider shows for a chosen file, so the pass form can name it. */
+private fun displayNameFor(context: Context, uri: Uri): String? {
+    if (uri.scheme == "content") {
+        runCatching {
+            context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (index >= 0) {
+                        val name = cursor.getString(index)
+                        if (!name.isNullOrBlank()) return name
+                    }
+                }
+            }
         }
     }
+    return uri.lastPathSegment?.takeIf { it.isNotBlank() }
 }
 
 /** A line of explanation under a field — the small print the portal also shows. */
@@ -245,15 +264,18 @@ private fun PropertyDto.formLabel(): String = listOfNotNull(
  * The validity window comes from the estate's own settings: the number of days
  * defaults to what an administrator configured and can never exceed the
  * maximum they set, and moving the start (or the number of days) moves the end
- * with it, exactly as the portal's form behaves.
+ * with it, exactly as the portal's form behaves. The operator-only preferred
+ * gate device, person type and the resident's proof uploads round it out to
+ * field-for-field parity with `Visitors` in `apps/web/src/App.tsx`.
  */
 @Composable
 fun VisitorPassForm(
     user: UserDto,
     properties: List<PropertyDto>,
+    devices: List<DeviceOptionDto>,
     config: PortalConfigDto?,
     feedback: FormFeedback,
-    onSubmit: (VisitorPassBody, String) -> Unit,
+    onSubmit: (VisitorPassBody, VisitorPassContext, List<ProofUpload>) -> Unit,
 ) {
     val operator = user.role == "admin" || user.role == "manager"
     val zone = remember(config?.estateTimeZone) { estateZone(config?.estateTimeZone) }
@@ -263,6 +285,7 @@ fun VisitorPassForm(
     var phone by rememberSaveable { mutableStateOf("") }
     var residentId by rememberSaveable { mutableStateOf("") }
     var propertyId by rememberSaveable { mutableStateOf("") }
+    var deviceId by rememberSaveable { mutableStateOf("") }
     var validFrom by rememberSaveable(zone) { mutableStateOf(localDateTimeInput(System.currentTimeMillis(), zone)) }
     // 0 means "whatever the estate's default is", so a settings change that
     // arrives with the config still lands on the right number of days.
@@ -272,7 +295,10 @@ fun VisitorPassForm(
     var purposeOther by rememberSaveable { mutableStateOf("") }
     var times by rememberSaveable { mutableStateOf(VISIT_TIMES_MIN) }
     var remark by rememberSaveable { mutableStateOf("") }
+    // "" means "the estate's default person type", like the portal's uncontrolled select.
+    var personType by rememberSaveable { mutableStateOf("") }
     var idCheck by rememberSaveable { mutableStateOf(false) }
+    var proofs by remember { mutableStateOf(emptyList<ProofUpload>()) }
 
     val days = validityChoice.takeIf { it in VISITOR_VALIDITY_MIN_DAYS..maxDays } ?: defaultDays
     val derivedUntil = remember(validFrom, days) { addDays(validFrom, days) }
@@ -280,11 +306,26 @@ fun VisitorPassForm(
     val chosenProperty = propertyId.ifBlank { properties.singleOrNull()?.id.orEmpty() }
     val visitTimesOptions = (VISIT_TIMES_MIN..VISIT_TIMES_MAX).map { it to it.toString() }
     val validityOptions = (VISITOR_VALIDITY_MIN_DAYS..maxDays).map { it to "$it day${if (it == 1) "" else "s"}" }
+    val defaultPersonType = config?.visitorPersonType?.trim()?.lowercase()?.takeIf { it == "visitor" || it == "normal" } ?: "visitor"
+    val effectivePersonType = personType.ifBlank { defaultPersonType }
+    val deviceOptions = listOf("" to "Every gate, entry and exit") + devices.map { device ->
+        device.id to "${device.name} — ${device.model ?: device.vendor ?: "device"} ${if (device.supportsQr == true) "(QR)" else "(PIN/card)"}"
+    }
 
     OutlinedTextField(name, { name = it }, label = { Text("Visitor name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
     OutlinedTextField(phone, { phone = it }, label = { Text("Phone") }, singleLine = true, modifier = Modifier.fillMaxWidth())
     OperatorResidentField(operator, residentId, { residentId = it })
     PropertyField(operator, properties, propertyId, { propertyId = it })
+    if (operator) {
+        EstateDropdown(
+            label = "Preferred gate device",
+            options = deviceOptions,
+            selected = deviceId,
+            onSelect = { deviceId = it },
+            modifier = Modifier.fillMaxWidth(),
+            hint = "A resident's pass defaults to every gate, entry and exit. Only an operator may pin one to a single gate device.",
+        )
+    }
     OutlinedTextField(
         validFrom,
         { validFrom = it },
@@ -344,35 +385,67 @@ fun VisitorPassForm(
         modifier = Modifier.fillMaxWidth(),
         hint = "How many times this pass may be used at the gate.",
     )
+    if (operator) {
+        EstateDropdown(
+            label = "Person type on the terminals",
+            options = VISITOR_PERSON_TYPE_CHOICES,
+            selected = effectivePersonType,
+            onSelect = { personType = it },
+            modifier = Modifier.fillMaxWidth(),
+            hint = "Visitor is the right type for a temporary account. Choose Normal user only if a terminal rejects the visitor type.",
+        )
+    }
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
-            Text("Gate ID / invitation verification", fontWeight = FontWeight.SemiBold, color = EstateNavy, fontSize = 14.sp)
+            Text("Gate ID / Invitation verification", fontWeight = FontWeight.SemiBold, color = EstateNavy, fontSize = 14.sp)
             Text(
-                "On, security must verify the visitor's physical ID or invitation and upload the gate photo before access. Off, verification stays optional.",
+                if (idCheck) {
+                    "Mandatory — visitor physical ID or invitation must be verified and gate photo uploaded before granting access"
+                } else {
+                    "Optional — security can verify credentials without mandatory gate upload"
+                },
                 fontSize = 11.sp,
                 color = FormSubdued,
             )
         }
         Switch(checked = idCheck, onCheckedChange = { idCheck = it })
     }
-    FieldHint("A six-digit PIN is generated with the pass — the visitor types it on the terminal keypad. It is shown here once the pass is issued.")
+    FieldHint("A six-digit PIN is generated with the pass and printed on it — the visitor types it on the terminal keypad.")
+    ProofFilesField(proofs) { proofs = it }
     Button(
         onClick = {
+            val property = properties.firstOrNull { it.id == chosenProperty }
+            val context = VisitorPassContext(
+                visitorName = name.trim(),
+                host = if (operator) residentId.trim().ifBlank { "Estate resident" } else user.name,
+                property = property?.let { passPropertyText(it.unitNumber, it.id, it.street) } ?: "Selected property",
+                gateText = devices.firstOrNull { deviceId.isNotBlank() && it.id == deviceId }
+                    ?.let { passGateText("gate", it.name) }
+                    ?: PASS_GATE_EVERY,
+                purpose = visitorPurposeLabel(purpose, purposeOther),
+                remark = remark.trim(),
+                visitTimes = times,
+                validFrom = validFrom.trim(),
+                validUntil = validUntil.trim(),
+            )
             onSubmit(
                 VisitorPassBody(
                     visitorName = name.trim(),
                     visitorPhone = phone.trim().takeIf { it.isNotEmpty() },
                     residentId = residentId.trim().takeIf { it.isNotEmpty() },
                     propertyId = chosenProperty.takeIf { it.isNotEmpty() },
+                    deviceId = deviceId.trim().takeIf { operator && it.isNotEmpty() },
                     validFrom = validFrom.trim(),
                     validUntil = validUntil.trim(),
                     purposeOfVisit = purpose.takeIf { it.isNotEmpty() },
                     purposeOfVisitOther = purposeOther.trim().takeIf { purpose == "other" && it.isNotEmpty() },
                     visitTimes = times,
                     remark = remark.trim().takeIf { it.isNotEmpty() },
+                    personType = if (operator) effectivePersonType else null,
                     requireGateIdVerification = idCheck,
                 ),
-                name.trim(),
+                context,
+                proofs,
             )
         },
         enabled = !feedback.busy && name.isNotBlank() && validFrom.isNotBlank() && validUntil.isNotBlank(),
