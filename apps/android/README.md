@@ -26,8 +26,18 @@ the app a person signs into.
 | Overview | Role-aware dashboard cards (bills, visitors, cards, residents, maintenance, gate events, grace window), the latest estate notice with its acknowledgement state |
 | Properties | Owned/rented properties, request an unowned unit, propose a new one, ownership approvals, tenancy nomination/approval/end, dependants and household approvals |
 | Gate activity | Recent access events from the local Room cache, refreshed from `/api/access/events` |
-| Menu | The portal's grouped, role-aware menu (same groups and role rules as `navGroups` in `apps/web/src/App.tsx`). Read-only lists for visitor passes, cards, terminals, staff, bills, maintenance, facility bookings, notices, documents and emergency contacts, each from its Worker list endpoint. Portal-only tools (residents, settings and imports) say so and point to the web portal. Creating or changing records still happens on the web portal. |
+| Menu | The portal's grouped, role-aware menu (same groups and role rules as `navGroups` in `apps/web/src/App.tsx`). Lists for visitor passes, cards, terminals, staff, bills, maintenance, facility bookings, notices, documents and emergency contacts, each from its Worker list endpoint. Portal-only tools (residents, settings and imports) say so and point to the web portal. |
+| Visitor passes | "New pass" — the portal's create form: visitor name and phone, the property (automatic when a resident has exactly one, picked when they have several, chosen for the resident by an operator), the estate's validity window from `/api/portal-config`, purpose of visit, visit times, remark and the gate ID-verification switch. The Worker's six-digit PIN and unique number are shown once the pass is issued, to pass on to the visitor. |
+| Maintenance | "Report an issue" — the portal's scopes (personal, street, block, zone, estate) with the target named for street, block and zone, the property, and the description of the fault. |
+| Facility bookings | "Book a facility" — active facilities with their capacity, hours, notice and fee rules; date plus start and end time, purpose, attendees and contact phone. Your own pending or approved booking can be cancelled from its row, and an operator can cancel any, each behind a confirm step. |
 | Account | Name, role, gate, server address, sign out |
+
+Creating these three records is matched field-for-field to the portal's own
+forms and to the Worker's POST/PATCH routes, including the naive
+`yyyy-MM-ddTHH:mm` datetimes it reads in the estate's timezone. When the Worker
+refuses something — an overlapping booking, a window beyond the estate's
+maximum, a missing property permission — its own `{ error }` wording is shown in
+the form rather than an HTTP status code.
 
 Offline: the last fetched gate events stay readable (Room). Everything else
 needs the network, and says so.

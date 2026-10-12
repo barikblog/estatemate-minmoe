@@ -3652,10 +3652,15 @@ function FacilityBookings({ user }: { user: User }) {
       await api('/api/facilities', {
         method: 'POST',
         body: JSON.stringify({
-          ...values,
+          name: values.name,
+          location: values.location,
           capacity: values.capacity ? Number(values.capacity) : 20,
-          hourlyFee: values.hourlyFee ? Number(values.hourlyFee) : 0,
+          // The route stores money in minor units (`hourly_rate_minor`); the
+          // form's fee is in naira, and posting `hourlyFee` (as this form used
+          // to) saved every facility as free.
+          hourlyRateMinor: Math.round(Number(values.hourlyFee || 0) * 100),
           requiresApproval: values.requiresApproval === '1',
+          rules: values.rules,
         }),
       });
       setShowFacilityForm(false);
@@ -3670,7 +3675,14 @@ function FacilityBookings({ user }: { user: User }) {
       await api('/api/facility-bookings', {
         method: 'POST',
         body: JSON.stringify({
-          ...values,
+          facilityId: values.facilityId,
+          // The Worker reads real datetimes (`parseEstateInstantMs`), so the date
+          // and the two times are combined here. Posting bare `HH:MM` times, as
+          // this form used to, is refused with "startsAt and endsAt must be
+          // readable datetimes".
+          startsAt: `${values.bookingDate}T${values.startsAt}`,
+          endsAt: `${values.bookingDate}T${values.endsAt}`,
+          purpose: values.purpose,
           attendees: values.attendees ? Number(values.attendees) : 1,
         }),
       });
@@ -3679,12 +3691,16 @@ function FacilityBookings({ user }: { user: User }) {
       refresh();
     } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not submit booking'); }
   }
-  async function decideBooking(row: Row, action: 'approve'|'reject'|'cancel'|'complete') {
-    const note = action === 'reject' ? prompt('Reason for rejecting this booking?') : undefined;
-    if (action === 'reject' && note === null) return;
+  async function decideBooking(row: Row, action: 'approve'|'decline'|'cancel') {
+    const note = action === 'decline' ? prompt('Reason for declining this booking?') : undefined;
+    if (action === 'decline' && note === null) return;
     try {
-      await api(`/api/facility-bookings/${row.id}`, { method: 'PATCH', body: JSON.stringify({ action, reviewNote: note || undefined }) });
-      setMessage(`Booking ${action}d.`);
+      // The route accepts approve/decline/cancel/waive_payment and calls the
+      // note `note`; "reject" and "complete" (and `reviewNote`) were answered
+      // with "Invalid booking action". A booking needs no completion step — an
+      // approved one is simply over once its window has passed.
+      await api(`/api/facility-bookings/${row.id}`, { method: 'PATCH', body: JSON.stringify({ action, note: note || undefined }) });
+      setMessage(`Booking ${action === 'approve' ? 'approved' : action === 'decline' ? 'declined' : 'cancelled'}.`);
       refresh();
     } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not update booking'); }
   }
@@ -3703,7 +3719,7 @@ function FacilityBookings({ user }: { user: User }) {
       <div className="row-actions"><button className="primary">Save facility</button><button type="button" className="secondary" onClick={() => setShowFacilityForm(false)}>Cancel</button></div>
     </FormCard>}
     {showBookingForm && <FormCard title="Reserve a facility" onSubmit={submitBooking} message="">
-      <label>Facility<select name="facilityId" required><option value="">Select facility…</option>{(facilities.data?.items ?? []).filter((f) => String(f.status) === 'open').map((f) => <option key={String(f.id)} value={String(f.id)}>{String(f.name)} ({String(f.open_time)}–{String(f.close_time)})</option>)}</select></label>
+      <label>Facility<select name="facilityId" required><option value="">Select facility…</option>{(facilities.data?.items ?? []).filter((f) => String(f.status) === 'active').map((f) => <option key={String(f.id)} value={String(f.id)}>{String(f.name)}{f.capacity ? ` (up to ${String(f.capacity)} guests)` : ''}</option>)}</select></label>
       <label>Date<input name="bookingDate" type="date" required /></label>
       <label>Starts at<input name="startsAt" type="time" defaultValue="10:00" required /></label>
       <label>Ends at<input name="endsAt" type="time" defaultValue="12:00" required /></label>
@@ -3714,22 +3730,23 @@ function FacilityBookings({ user }: { user: User }) {
     <h3>Shared spaces</h3>
     <ListState list={facilities}>
       <DataTable rows={facilities.data?.items ?? []} columns={[
-        ['name', 'Facility'], ['category', 'Category'], ['location', 'Location'],
-        ['capacity', 'Capacity'], ['open_time', 'Opens'], ['close_time', 'Closes'],
-        ['hourly_fee', 'Hourly fee', 'money'], ['upcoming_bookings', 'Upcoming'], ['status', 'Status'],
+        ['name', 'Facility'], ['location', 'Location'], ['capacity', 'Capacity'],
+        ['hourly_rate_minor', 'Hourly fee', 'money'], ['deposit_minor', 'Deposit', 'money'],
+        ['min_notice_hours', 'Notice (h)'], ['max_hours_per_booking', 'Max hours'],
+        ['upcoming_bookings', 'Upcoming'], ['status', 'Status'],
       ]} />
     </ListState>
     <h3>Bookings</h3>
     <ListState list={bookings}>
       <DataTable exportTitle="Facility Bookings" rows={bookings.data?.items ?? []} columns={[
-        ['facility_name', 'Facility'], ['booking_date', 'Date'], ['starts_at', 'From'], ['ends_at', 'To'],
-        ['resident_name', 'Booked by'], ['unit_number', 'Unit'], ['purpose', 'Purpose'],
-        ['attendees', 'Guests'], ['fee_amount', 'Fee', 'money'], ['status', 'Status'],
+        ['facility_name', 'Facility'], ['starts_at', 'From', 'date'], ['ends_at', 'To', 'date'],
+        ['requester_name', 'Booked by'], ['unit_number', 'Unit'], ['purpose', 'Purpose'],
+        ['attendees', 'Guests'], ['estimated_cost_minor', 'Fee', 'money'], ['deposit_minor', 'Deposit', 'money'],
+        ['status', 'Status'],
       ]} action={(row) => (
         <div className="row-actions">
           {canManage && String(row.status) === 'pending' && <button className="text" onClick={() => decideBooking(row, 'approve')}>Approve</button>}
-          {canManage && String(row.status) === 'pending' && <button className="text danger" onClick={() => decideBooking(row, 'reject')}>Reject</button>}
-          {canManage && String(row.status) === 'approved' && <button className="text" onClick={() => decideBooking(row, 'complete')}>Complete</button>}
+          {canManage && String(row.status) === 'pending' && <button className="text danger" onClick={() => decideBooking(row, 'decline')}>Decline</button>}
           {['pending', 'approved'].includes(String(row.status)) && <button className="text danger" onClick={() => decideBooking(row, 'cancel')}>Cancel</button>}
         </div>
       )} />
