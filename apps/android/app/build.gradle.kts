@@ -131,6 +131,10 @@ dependencies {
     // same credential the gate scanner accepts.
     implementation("com.google.zxing:core:3.5.3")
 
+    // PrintHelper (the portal's 🖨️ Print button) lives in AndroidX, not the
+    // framework's android.print package.
+    implementation("androidx.print:print:1.0.0")
+
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
