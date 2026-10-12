@@ -26,6 +26,7 @@ the app a person signs into.
 | Overview | Role-aware dashboard cards (bills, visitors, cards, residents, maintenance, gate events, grace window), the latest estate notice with its acknowledgement state |
 | Properties | Owned/rented properties, request an unowned unit, propose a new one, ownership approvals, tenancy nomination/approval/end, dependants and household approvals |
 | Gate activity | Recent access events from the local Room cache, refreshed from `/api/access/events` |
+| Menu | The portal's grouped, role-aware menu (same groups and role rules as `navGroups` in `apps/web/src/App.tsx`). Read-only lists for visitor passes, cards, terminals, staff, bills, maintenance, facility bookings, notices, documents and emergency contacts, each from its Worker list endpoint. Portal-only tools (residents, settings and imports) say so and point to the web portal. Creating or changing records still happens on the web portal. |
 | Account | Name, role, gate, server address, sign out |
 
 Offline: the last fetched gate events stay readable (Room). Everything else
