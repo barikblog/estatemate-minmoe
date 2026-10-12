@@ -90,10 +90,11 @@ import java.time.format.DateTimeFormatter
 import java.util.Currency
 import javax.inject.Inject
 
-private val EstateBlue = Color(0xFF1769E0)
-private val EstateNavy = Color(0xFF0D1B37)
-private val EstateGreen = Color(0xFF35D07F)
-private val EstateBackground = Color(0xFFF4F7FB)
+// The palette every screen shares, including the Menu's forms (MenuForms.kt).
+internal val EstateBlue = Color(0xFF1769E0)
+internal val EstateNavy = Color(0xFF0D1B37)
+internal val EstateGreen = Color(0xFF35D07F)
+internal val EstateBackground = Color(0xFFF4F7FB)
 
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
@@ -449,7 +450,7 @@ private fun HomeScreen(
             when (tab) {
                 HomeTab.Overview -> Overview(state)
                 HomeTab.Properties -> Properties(state,requestOwnership,reviewOwnership,createTenancy,tenancyAction,createHouseholdMember,householdAction)
-                HomeTab.Menu -> MenuTab(state.user!!.role)
+                HomeTab.Menu -> MenuTab(state.user!!)
                 HomeTab.Activity -> Activity(events)
                 HomeTab.Account -> Account(state.user!!, state.gateName, logout)
             }
@@ -694,4 +695,4 @@ private fun Account(user: UserDto, gateName: String?, logout: () -> Unit) {
 }
 
 private fun formatNaira(minor: Long): String = NumberFormat.getCurrencyInstance().apply { currency = Currency.getInstance("NGN") }.format(minor / 100.0)
-private fun formatInstant(value: String): String = runCatching { DateTimeFormatter.ofPattern("dd MMM, HH:mm").withZone(ZoneId.systemDefault()).format(Instant.parse(value)) }.getOrDefault(value)
+internal fun formatInstant(value: String): String = runCatching { DateTimeFormatter.ofPattern("dd MMM, HH:mm").withZone(ZoneId.systemDefault()).format(Instant.parse(value)) }.getOrDefault(value)
