@@ -19,7 +19,9 @@ and re-openable from the pass list. The client app now does what the portal does
   sentence and the `Powered by sornix.com.ng` footer. The rendered bitmap *is*
   the pass: the dialog shows it and `📤 Share image` / `📄 Share PDF` / `🖨️ Print`
   hand on that same bitmap (PNG via FileProvider `cacheDir/passes/`, A4 595×842pt
-  via `PdfDocument` with the portal's 24pt margin, print via `PrintHelper`).
+  via `PdfDocument` with the portal's 24pt margin, print via AndroidX
+  `PrintHelper` — the class is `androidx.print.PrintHelper`, not in the
+  framework's `android.print` package).
   The portal's modal and exporter draw purpose/remark/visits only on screen; the
   Android renderer draws them everywhere, which is what `AGENTS.md` already
   promises of exports.
