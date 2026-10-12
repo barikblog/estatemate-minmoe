@@ -1,5 +1,6 @@
 package com.estatemate.app.data.remote
 
+import com.google.gson.JsonObject
 import com.google.gson.annotations.SerializedName
 import retrofit2.http.Body
 import retrofit2.http.GET
@@ -7,6 +8,7 @@ import retrofit2.http.PATCH
 import retrofit2.http.POST
 import retrofit2.http.Path
 import retrofit2.http.Query
+import retrofit2.http.Url
 
 data class LoginRequest(val email: String, val password: String)
 
@@ -72,6 +74,9 @@ data class AccessCardDto(
     @SerializedName("deactivated_reason") val deactivatedReason: String?,
 )
 data class ListResponse<T>(val items: List<T>, val page: Int, val limit: Int)
+
+/** A list endpoint whose body is only `{ items }` (no paging fields). Rows stay generic: the Menu renders the columns a module declares. */
+data class ItemsResponse(val items: List<JsonObject> = emptyList())
 data class DashboardResponse(
     val residents: CountDto?,
     val visitors: CountDto?,
@@ -223,4 +228,8 @@ interface EstateMateApi {
 
     @PATCH("api/household-members/{id}")
     suspend fun householdAction(@Path("id") id: String, @Body action: HouseholdActionBody): ActionResponse
+
+    /** Read-only list for a Menu module; [path] is relative to the Worker base URL, e.g. `api/bills`. */
+    @GET
+    suspend fun moduleItems(@Url path: String, @Query("limit") limit: Int = 50): ItemsResponse
 }

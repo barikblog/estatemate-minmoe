@@ -19,6 +19,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Apps
 import androidx.compose.material.icons.outlined.Badge
 import androidx.compose.material.icons.outlined.Dashboard
 import androidx.compose.material.icons.outlined.Logout
@@ -350,7 +351,13 @@ private fun LoginScreen(busy: Boolean, error: String?, onLogin: (String, String)
     }
 }
 
-private enum class HomeTab(val label: String) { Overview("Overview"), Properties("Properties"), Activity("Gate activity"), Account("Account") }
+private fun HomeTab.icon() = when (this) {
+    HomeTab.Activity -> Icons.Outlined.Badge
+    HomeTab.Menu -> Icons.Outlined.Apps
+    else -> Icons.Outlined.Dashboard
+}
+
+private enum class HomeTab(val label: String) { Overview("Overview"), Properties("Properties"), Menu("Menu"), Activity("Gate activity"), Account("Account") }
 
 /**
  * Shown to a Security officer who is posted at more than one gate: the Worker
@@ -431,7 +438,7 @@ private fun HomeScreen(
                     NavigationBarItem(
                         selected = tab == destination,
                         onClick = { tab = destination },
-                        icon = { Icon(if (destination == HomeTab.Activity) Icons.Outlined.Badge else Icons.Outlined.Dashboard, null) },
+                        icon = { Icon(destination.icon(), null) },
                         label = { Text(destination.label) },
                     )
                 }
@@ -442,6 +449,7 @@ private fun HomeScreen(
             when (tab) {
                 HomeTab.Overview -> Overview(state)
                 HomeTab.Properties -> Properties(state,requestOwnership,reviewOwnership,createTenancy,tenancyAction,createHouseholdMember,householdAction)
+                HomeTab.Menu -> MenuTab(state.user!!.role)
                 HomeTab.Activity -> Activity(events)
                 HomeTab.Account -> Account(state.user!!, state.gateName, logout)
             }

@@ -6,6 +6,7 @@ import com.estatemate.app.data.remote.DashboardResponse
 import com.estatemate.app.data.remote.EstateMateApi
 import com.estatemate.app.data.remote.GateDto
 import com.estatemate.app.data.remote.HouseholdActionBody
+import com.google.gson.JsonObject
 import com.estatemate.app.data.remote.HouseholdMemberDto
 import com.estatemate.app.data.remote.HouseholdRequestBody
 import com.estatemate.app.data.remote.LoginRequest
@@ -96,6 +97,9 @@ class EstateRepository @Inject constructor(
     suspend fun householdMembers(): List<HouseholdMemberDto> = api.householdMembers().items
     suspend fun createHouseholdMember(request: HouseholdRequestBody) = api.createHouseholdMember(request)
     suspend fun householdAction(id: String, action: String, visitors: Boolean? = null, bills: Boolean? = null) = api.householdAction(id, HouseholdActionBody(action,visitors,bills))
+
+    /** Rows of a Menu module's list endpoint. Throws on failure so the screen can say what went wrong. */
+    suspend fun moduleItems(path: String): List<JsonObject> = api.moduleItems(path).items
 
     suspend fun refreshEvents() {
         val events = api.accessEvents().items.map {
