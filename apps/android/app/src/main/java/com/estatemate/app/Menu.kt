@@ -1,6 +1,7 @@
 package com.estatemate.app
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -11,15 +12,31 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Apartment
 import androidx.compose.material.icons.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.Badge
+import androidx.compose.material.icons.outlined.Build
+import androidx.compose.material.icons.outlined.Campaign
 import androidx.compose.material.icons.outlined.ChevronRight
+import androidx.compose.material.icons.outlined.Contacts
+import androidx.compose.material.icons.outlined.CreditCard
+import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.Devices
+import androidx.compose.material.icons.outlined.EventAvailable
+import androidx.compose.material.icons.outlined.Payments
+import androidx.compose.material.icons.outlined.People
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.VpnKey
+import androidx.compose.material.icons.outlined.Work
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -41,6 +58,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -51,6 +72,7 @@ import com.estatemate.app.data.EstateRepository
 import com.estatemate.app.data.remote.DeviceOptionDto
 import com.estatemate.app.data.remote.FacilityBookingBody
 import com.estatemate.app.data.remote.FacilityDto
+import com.estatemate.app.data.remote.IssuedPasswordResponse
 import com.estatemate.app.data.remote.MaintenanceRequestBody
 import com.estatemate.app.data.remote.PortalConfigDto
 import com.estatemate.app.data.remote.PropertyDto
@@ -58,12 +80,41 @@ import com.estatemate.app.data.remote.UserDto
 import com.estatemate.app.data.remote.VisitorPassBody
 import com.google.gson.JsonObject
 import dagger.hilt.android.lifecycle.HiltViewModel
+import javax.inject.Inject
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import javax.inject.Inject
+
+/**
+ * The portal's `navIcon()` vocabulary, as Material icons.
+ *
+ * Every module carries the mark a person already knows from the portal's
+ * navigation, so "Bills & payments" is the same tile on the phone as on the PC.
+ * A module with no icon of its own falls back to [Settings].
+ */
+enum class MenuIcon {
+    Visitors, Cards, Devices, Residents, Staff, Properties, Bills,
+    Maintenance, Bookings, Notices, Documents, Emergency, Settings, Resets,
+}
+
+private fun MenuIcon.image(): ImageVector = when (this) {
+    MenuIcon.Visitors -> Icons.Outlined.Badge
+    MenuIcon.Cards -> Icons.Outlined.CreditCard
+    MenuIcon.Devices -> Icons.Outlined.Devices
+    MenuIcon.Residents -> Icons.Outlined.People
+    MenuIcon.Staff -> Icons.Outlined.Work
+    MenuIcon.Properties -> Icons.Outlined.Apartment
+    MenuIcon.Bills -> Icons.Outlined.Payments
+    MenuIcon.Maintenance -> Icons.Outlined.Build
+    MenuIcon.Bookings -> Icons.Outlined.EventAvailable
+    MenuIcon.Notices -> Icons.Outlined.Campaign
+    MenuIcon.Documents -> Icons.Outlined.Description
+    MenuIcon.Emergency -> Icons.Outlined.Contacts
+    MenuIcon.Settings -> Icons.Outlined.Settings
+    MenuIcon.Resets -> Icons.Outlined.VpnKey
+}
 
 /**
  * The portal's menu, as the phone sees it.
@@ -73,10 +124,41 @@ import javax.inject.Inject
  * have their own tabs, so they are not repeated here. A module with a [path] is
  * read in the app; one without is a portal-only tool and says so.
  */
+/**
+ * The portal's `navIcon()` vocabulary, as Material icons.
+ *
+ * Every module carries the mark a person already knows from the portal's
+ * navigation, so "Bills & payments" is the same tile on the phone as on the PC.
+ * A module with no icon of its own falls back to [Settings].
+ */
+enum class MenuIcon {
+    Visitors, Cards, Devices, Residents, Staff, Properties, Bills,
+    Maintenance, Bookings, Notices, Documents, Emergency, Settings, Resets,
+}
+
+private fun MenuIcon.image(): ImageVector = when (this) {
+    MenuIcon.Visitors -> Icons.Outlined.Badge
+    MenuIcon.Cards -> Icons.Outlined.CreditCard
+    MenuIcon.Devices -> Icons.Outlined.Devices
+    MenuIcon.Residents -> Icons.Outlined.People
+    MenuIcon.Staff -> Icons.Outlined.Work
+    MenuIcon.Properties -> Icons.Outlined.Apartment
+    MenuIcon.Bills -> Icons.Outlined.Payments
+    MenuIcon.Maintenance -> Icons.Outlined.Build
+    MenuIcon.Bookings -> Icons.Outlined.EventAvailable
+    MenuIcon.Notices -> Icons.Outlined.Campaign
+    MenuIcon.Documents -> Icons.Outlined.Description
+    MenuIcon.Emergency -> Icons.Outlined.Contacts
+    MenuIcon.Settings -> Icons.Outlined.Settings
+    MenuIcon.Resets -> Icons.Outlined.VpnKey
+}
+
 data class MenuModule(
     val id: String,
     val label: String,
     val group: String,
+    /** The tile this module shows, matching the portal's navigation icon. */
+    val icon: MenuIcon = MenuIcon.Settings,
     /** Roles that see the item; null means every role, as in the portal. */
     val roles: Set<String>? = null,
     /** Worker list endpoint, relative to the base URL. Null for portal-only tools. */
@@ -94,6 +176,12 @@ data class MenuModule(
     val createLabel: String? = null,
     /** Rows of this module can be cancelled by their requester (facility bookings). */
     val cancellableByRequester: Boolean = false,
+    /**
+     * Rows of this module can be answered with a temporary password (the office
+     * queue of forgotten-password requests). Whatever happens on the phone is
+     * written to the same audit trail and the same queue the portal shows.
+     */
+    val issuesTemporaryPassword: Boolean = false,
 ) {
     fun visibleTo(role: String): Boolean = roles == null || role in roles
     fun creatableBy(role: String): Boolean = form != null && (createRoles == null || role in createRoles)
@@ -108,6 +196,7 @@ private val OFFICE_ROLES = setOf("admin", "manager", "cashier", "security", "res
 val MENU_MODULES: List<MenuModule> = listOf(
     MenuModule(
         id = "visitors", label = "Visitor passes", group = "Overview", path = "api/visitors",
+        icon = MenuIcon.Visitors,
         titleKeys = listOf("visitor_name", "visitorName", "name"),
         detailKeys = listOf("status", "purpose_of_visit", "resident_name", "unit_number", "valid_from", "valid_until"),
         // Security and the cashier read the pass list; only the roles the
@@ -118,39 +207,46 @@ val MENU_MODULES: List<MenuModule> = listOf(
     ),
     MenuModule(
         id = "cards", label = "Cards & person sync", group = "Access & gates",
+        icon = MenuIcon.Cards,
         roles = setOf("admin", "manager", "cashier", "resident"), path = "api/access/cards",
         titleKeys = listOf("card_label", "card_uid"),
         detailKeys = listOf("status", "expires_at", "deactivated_reason"),
     ),
     MenuModule(
         id = "devices", label = "Terminals & bridge", group = "Access & gates",
+        icon = MenuIcon.Devices,
         roles = setOf("admin", "manager", "security"), path = "api/access/devices",
         titleKeys = listOf("name", "device_name"),
         detailKeys = listOf("model", "status", "gate_name", "direction", "profile_key"),
     ),
     MenuModule(
         id = "residents", label = "Residents & households", group = "People & estate",
+        icon = MenuIcon.Residents,
         roles = OFFICE_ROLES,
         webNote = "Manage residents and households on the web portal. Your own household is under the Properties tab.",
     ),
     MenuModule(
         id = "staff", label = "Staff & shifts", group = "People & estate", roles = STAFF_ROLES,
+        icon = MenuIcon.Staff,
         path = "api/staff",
         titleKeys = listOf("name", "full_name"),
         detailKeys = listOf("role", "status", "employee_id", "gates", "next_shift"),
     ),
     MenuModule(
         id = "properties", label = "Properties & units", group = "People & estate",
+        icon = MenuIcon.Properties,
         webNote = "Your units and requests are on the Properties tab.",
     ),
     MenuModule(
         id = "bills", label = "Bills & payments", group = "People & estate",
+        icon = MenuIcon.Bills,
         roles = setOf("admin", "cashier", "resident"), path = "api/bills",
         titleKeys = listOf("description", "resident_name"),
         detailKeys = listOf("status", "due_date", "amount_minor", "unit_number"),
     ),
     MenuModule(
         id = "maintenance", label = "Maintenance requests", group = "People & estate", roles = OFFICE_ROLES,
+        icon = MenuIcon.Maintenance,
         path = "api/maintenance",
         titleKeys = listOf("description"),
         detailKeys = listOf("status", "resident_name", "unit_number", "created_at"),
@@ -160,6 +256,7 @@ val MENU_MODULES: List<MenuModule> = listOf(
     ),
     MenuModule(
         id = "bookings", label = "Facility bookings", group = "People & estate", roles = OFFICE_ROLES,
+        icon = MenuIcon.Bookings,
         path = "api/facility-bookings",
         titleKeys = listOf("facility_name", "purpose"),
         detailKeys = listOf("status", "starts_at", "requester_name", "unit_number"),
@@ -172,22 +269,36 @@ val MENU_MODULES: List<MenuModule> = listOf(
     ),
     MenuModule(
         id = "notices", label = "Notices", group = "Community & admin", path = "api/notices",
+        icon = MenuIcon.Notices,
         titleKeys = listOf("title"),
         detailKeys = listOf("severity", "status", "author_name", "published_from"),
     ),
     MenuModule(
         id = "documents", label = "Documents & policies", group = "Community & admin", path = "api/documents",
+        icon = MenuIcon.Documents,
         titleKeys = listOf("title"),
         detailKeys = listOf("category", "status"),
     ),
     MenuModule(
         id = "emergency", label = "Emergency contacts", group = "Community & admin",
+        icon = MenuIcon.Emergency,
         path = "api/emergency-contacts",
         titleKeys = listOf("name"),
         detailKeys = listOf("category", "phone", "status"),
     ),
     MenuModule(
+        id = "resets", label = "Password resets", group = "Community & admin", roles = STAFF_ROLES,
+        icon = MenuIcon.Resets,
+        path = "api/password-resets",
+        titleKeys = listOf("person_name", "name"),
+        detailKeys = listOf("email", "reference", "status", "requested_from", "delivery"),
+        // The queue the portal shows an Administrator or Manager, on the phone:
+        // whoever asked cannot answer themselves, so this is a staff module.
+        issuesTemporaryPassword = true,
+    ),
+    MenuModule(
         id = "settings", label = "Settings & imports", group = "Community & admin", roles = STAFF_ROLES,
+        icon = MenuIcon.Settings,
         webNote = "Settings and CSV imports are administrator tools on the web portal.",
     ),
 )
@@ -304,6 +415,9 @@ class ModulesViewModel @Inject constructor(private val repository: EstateReposit
     private val _issuedPass = MutableStateFlow<VisitorPassDetails?>(null)
     val issuedPass: StateFlow<VisitorPassDetails?> = _issuedPass.asStateFlow()
 
+    private val _issuedPassword = MutableStateFlow<IssuedPasswordResponse?>(null)
+    val issuedPassword: StateFlow<IssuedPasswordResponse?> = _issuedPassword.asStateFlow()
+
     fun load(module: MenuModule) {
         val path = module.path ?: return
         _state.update { ModuleListState(loading = true, loadedFor = module.id) }
@@ -367,6 +481,26 @@ class ModulesViewModel @Inject constructor(private val repository: EstateReposit
             config = repository.portalConfig(),
         )
         null -> Support()
+    }
+
+    /**
+     * Issues a temporary password against a queued reset request, exactly as the
+     * portal's queue does. The password exists once: it is shown here and never
+     * again, and every other session of that account is signed out by the Worker.
+     */
+    fun issueTemporaryPassword(id: String) = viewModelScope.launch {
+        _feedback.value = FormFeedback(busy = true)
+        runCatching { repository.issuePasswordReset(id) }
+            .onSuccess { issued ->
+                _issuedPassword.value = issued
+                _feedback.value = FormFeedback(message = issued.message ?: "Temporary password issued.")
+                reload()
+            }
+            .onFailure { fail(it) }
+    }
+
+    fun dismissIssuedPassword() {
+        _issuedPassword.value = null
     }
 
     /** Clears the last result so an opened form starts blank rather than on an old message. */
@@ -471,6 +605,7 @@ fun MenuTab(user: UserDto, modules: ModulesViewModel = hiltViewModel()) {
     val state by modules.state.collectAsState()
     val feedback by modules.feedback.collectAsState()
     val issuedPass by modules.issuedPass.collectAsState()
+    val issuedPassword by modules.issuedPassword.collectAsState()
     LaunchedEffect(current.id) { modules.load(current) }
     // A create that went through closes its form and leaves the result as a
     // notice beside the list, the way the portal hides the form.
@@ -482,6 +617,7 @@ fun MenuTab(user: UserDto, modules: ModulesViewModel = hiltViewModel()) {
         state = state,
         feedback = feedback,
         issuedPass = issuedPass,
+        issuedPassword = issuedPassword,
         formOpen = formOpen,
         onToggleForm = {
             if (formOpen) {
@@ -492,6 +628,8 @@ fun MenuTab(user: UserDto, modules: ModulesViewModel = hiltViewModel()) {
             }
         },
         onDismissIssuedPass = modules::dismissIssuedPass,
+        onDismissIssuedPassword = modules::dismissIssuedPassword,
+        onIssueTemporaryPassword = modules::issueTemporaryPassword,
         onBack = { if (formOpen) formFor = null else openId = null },
         onRefresh = { modules.load(current) },
         onCreateVisitorPass = modules::createVisitorPass,
@@ -499,6 +637,13 @@ fun MenuTab(user: UserDto, modules: ModulesViewModel = hiltViewModel()) {
         onCreateBooking = modules::createFacilityBooking,
         onCancelBooking = modules::cancelBooking,
     )
+}
+
+/** One colour per module, so a tile is recognised before its label is read. */
+private fun MenuModule.iconTint(): Color = when (group) {
+    "Access & gates" -> Color(0xFF1769E0)
+    "People & estate" -> Color(0xFF137444)
+    else -> Color(0xFF7A4FD3)
 }
 
 @Composable
@@ -537,6 +682,14 @@ private fun ModuleRow(module: MenuModule, onClick: () -> Unit) {
         shape = RoundedCornerShape(16.dp),
     ) {
         Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            val tint = module.iconTint()
+            Box(
+                Modifier.size(42.dp).background(tint.copy(alpha = 0.12f), RoundedCornerShape(12.dp)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(module.icon.image(), null, tint = tint)
+            }
+            Spacer(Modifier.width(14.dp))
             Column(Modifier.weight(1f)) {
                 Text(module.label, fontWeight = FontWeight.Bold, color = Color(0xFF0D1B37))
                 Text(
@@ -557,9 +710,12 @@ private fun ModuleDetail(
     state: ModuleListState,
     feedback: FormFeedback,
     issuedPass: VisitorPassDetails?,
+    issuedPassword: IssuedPasswordResponse?,
     formOpen: Boolean,
     onToggleForm: () -> Unit,
     onDismissIssuedPass: () -> Unit,
+    onDismissIssuedPassword: () -> Unit,
+    onIssueTemporaryPassword: (String) -> Unit,
     onBack: () -> Unit,
     onRefresh: () -> Unit,
     onCreateVisitorPass: (VisitorPassBody, VisitorPassContext, List<ProofUpload>) -> Unit,
@@ -568,11 +724,16 @@ private fun ModuleDetail(
     onCancelBooking: (String) -> Unit,
 ) {
     // Which booking is one tap away from being cancelled, so a mis-tap can
-    // never cancel somebody's reservation by itself.
+    // never cancel somebody's reservation by itself. Issuing a temporary
+    // password is confirmed the same way: it signs the account out everywhere.
     var confirmCancelId by rememberSaveable { mutableStateOf<String?>(null) }
+    var confirmIssueId by rememberSaveable { mutableStateOf<String?>(null) }
     // A pass opened from a row of the list — the portal's "View pass" button.
     var viewedPass by remember { mutableStateOf<VisitorPassDetails?>(null) }
     val shownPass = viewedPass ?: issuedPass
+    issuedPassword?.let { issued ->
+        IssuedPasswordDialog(issued = issued, onDismiss = onDismissIssuedPassword)
+    }
     if (shownPass != null) {
         VisitorPassDialog(
             details = shownPass,
@@ -586,6 +747,14 @@ private fun ModuleDetail(
     Column(Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) { Icon(Icons.Outlined.ArrowBack, "Back to menu") }
+            val tint = module.iconTint()
+            Box(
+                Modifier.size(34.dp).background(tint.copy(alpha = 0.12f), RoundedCornerShape(10.dp)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(module.icon.image(), null, tint = tint, modifier = Modifier.size(19.dp))
+            }
+            Spacer(Modifier.width(10.dp))
             Text(
                 module.label,
                 fontSize = 22.sp,
@@ -638,10 +807,16 @@ private fun ModuleDetail(
                 }
                 else -> items(state.items) { row ->
                     RowCard(module, row, user) {
-                        if (module.id == "visitors") {
-                            TextButton(onClick = { viewedPass = passDetailsFromRow(row) }) { Text("View pass") }
-                        } else {
-                            BookingRowAction(
+                        when {
+                            module.id == "visitors" -> TextButton(onClick = { viewedPass = passDetailsFromRow(row) }) { Text("View pass") }
+                            module.issuesTemporaryPassword -> PasswordResetRowAction(
+                                row = row,
+                                busy = feedback.busy,
+                                confirming = confirmIssueId != null && confirmIssueId == row.rawText("id"),
+                                onConfirming = { confirming -> confirmIssueId = if (confirming) row.rawText("id") else null },
+                                onIssue = onIssueTemporaryPassword,
+                            )
+                            else -> BookingRowAction(
                                 module = module,
                                 row = row,
                                 user = user,
@@ -665,6 +840,77 @@ private fun ModuleDetail(
  * cancel a pending or approved booking, and nobody cancel anything else, so the
  * button appears for exactly those rows and no others.
  */
+/**
+ * "Issue temporary password" for a queued reset request, with the confirmation
+ * the portal's queue asks for: issuing one ends every session that account has,
+ * so it is two taps and the second one says what it does.
+ */
+@Composable
+private fun PasswordResetRowAction(
+    row: JsonObject,
+    busy: Boolean,
+    confirming: Boolean,
+    onConfirming: (Boolean) -> Unit,
+    onIssue: (String) -> Unit,
+) {
+    val id = row.rawText("id") ?: return
+    if (row.rawText("status") != "pending") return
+    if (confirming) {
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text("Issue a temporary password? Their other sessions are signed out.", fontSize = 12.sp, color = Color(0xFF6A7790))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { onConfirming(false); onIssue(id) }, enabled = !busy) { Text("Yes, issue") }
+                TextButton(onClick = { onConfirming(false) }, enabled = !busy) { Text("Not now") }
+            }
+        }
+    } else {
+        TextButton(onClick = { onConfirming(true) }, enabled = !busy) { Text("Issue temporary password") }
+    }
+}
+
+/**
+ * The temporary password, shown once.
+ *
+ * It is not stored anywhere on the phone and the Worker will not repeat it, so
+ * the screen keeps it until somebody has passed it on. The portal's queue does
+ * the same with the same sentence.
+ */
+@Composable
+private fun IssuedPasswordDialog(issued: IssuedPasswordResponse, onDismiss: () -> Unit) {
+    val clipboard = LocalClipboardManager.current
+    var copied by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Temporary password issued", fontWeight = FontWeight.ExtraBold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(issued.personName, fontWeight = FontWeight.Bold, color = Color(0xFF0D1B37))
+                Text(issued.email, fontSize = 12.sp, color = Color(0xFF6A7790))
+                Text("Reference ${issued.reference}", fontSize = 12.sp, color = Color(0xFF6A7790))
+                Text(
+                    issued.temporaryPassword,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFF0D1B37),
+                )
+                Text(
+                    issued.message ?: "Share this password with them securely. They must change it after signing in.",
+                    fontSize = 12.sp,
+                    color = Color(0xFF6A7790),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                clipboard.setText(AnnotatedString(issued.temporaryPassword))
+                copied = true
+            }) { Text(if (copied) "Copied" else "Copy the password") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Done") } },
+    )
+}
+
 @Composable
 private fun BookingRowAction(
     module: MenuModule,

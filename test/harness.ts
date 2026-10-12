@@ -83,6 +83,14 @@ function asD1Database(db: SqliteDatabase): D1Database {
         const results = statements.map((statement) => {
           const bound = registry.get(statement);
           if (!bound) throw new Error('batch() received a statement this harness did not prepare');
+          // D1 hands back the rows a batched statement produced, so a batched
+          // SELECT is usable exactly like an unbatched one. The harness has to
+          // decide read or write *before* running it: running a write twice
+          // would apply it twice.
+          if (/^\s*(select|with|pragma)/i.test(bound.sql)) {
+            const rows = db.prepare(bound.sql).all(...bound.values);
+            return { results: rows, success: true, meta: { changes: 0, rows_read: rows.length, rows_written: 0 } } as unknown as D1Result<never>;
+          }
           return { results: [], success: true, meta: d1Meta(db.prepare(bound.sql).run(...bound.values)) } as D1Result<never>;
         });
         db.exec('COMMIT');
@@ -202,8 +210,8 @@ export function seedEstate(db: TestDatabase): SeededEstate {
   };
 }
 
-export async function tokenFor(env: Env, id: string, role: Role, name = 'Test User'): Promise<string> {
-  return signJwt(env, { id, role, name });
+export async function tokenFor(env: Env, id: string, role: Role, name = 'Test User', issuedAtSeconds?: number): Promise<string> {
+  return signJwt(env, { id, role, name }, 60 * 60 * 12, {}, issuedAtSeconds);
 }
 
 /**
@@ -249,6 +257,8 @@ export interface ApiResponse {
   text: string;
   /** Set-Cookie header, exposed so tests can assert when no session is issued. */
   setCookie: string | null;
+  /** Retry-After header, exposed so a throttle can be asserted on the wire. */
+  retryAfter: string | null;
 }
 
 export async function call(
@@ -277,5 +287,6 @@ export async function call(
     json: (json ?? {}) as Record<string, unknown>,
     text,
     setCookie: response.headers.get('Set-Cookie'),
+    retryAfter: response.headers.get('Retry-After'),
   };
 }

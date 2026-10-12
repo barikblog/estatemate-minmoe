@@ -44,6 +44,13 @@ export interface JwtClaims {
    * session ends as soon as an administrator assigns the officer any post.
    */
   openGate?: boolean;
+  /**
+   * Set when the sign-in asked to be remembered, so the gate-selection step of
+   * a Security officer's sign-in keeps the 30-day lifetime the officer chose
+   * instead of falling back to a working day. Never set on a session token
+   * itself - the lifetime lives in `exp`.
+   */
+  remember?: boolean;
   iat: number;
   exp: number;
 }
@@ -102,5 +109,11 @@ export interface AppVariables {
   user: AuthUser;
   /** Gate (device id) the current Security session is scoped to, else null. */
   sessionGate: string | null;
+  /**
+   * The verified session token's own lifetime. Routes that re-issue a session
+   * (a password change must not sign the person out) keep the remaining
+   * lifetime, so a "remember me" browser stays remembered.
+   */
+  session: { issuedAt: number; expiresAt: number };
   device: DeviceIdentity;
 }

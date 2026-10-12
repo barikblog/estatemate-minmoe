@@ -227,6 +227,80 @@ function New-Button($parent, $text, $x, $y, $width = 120, $height = 28) {
   return $button
 }
 
+# The portal navigates with an icon rail, and this window does the same: each
+# section is named by the glyph `navIcon()` gives it in apps/web/src/App.tsx, so
+# "Status" is the dashboard mark and "Configuration" is the settings mark
+# wherever a person meets them. Keep the two in step:
+# test/sign-in-client-parity.test.ts compares them.
+# The characters are written as code points on purpose: this file is plain
+# ASCII, and Windows PowerShell 5.1 reads a UTF-8 file without a BOM as ANSI,
+# which would turn an embedded glyph into mojibake. 0x25EB is the portal's
+# dashboard mark, 0x2699 its settings mark and 0x21BB its operations mark.
+$script:NavGlyphs = @{
+  Status        = [string][char]0x25EB
+  Configuration = [string][char]0x2699
+  Service       = [string][char]0x21BB
+}
+
+function New-NavButton($parent, [string] $sectionName, [int] $y) {
+  $button = New-Object System.Windows.Forms.Button
+  $button.Text = "$($script:NavGlyphs[$sectionName])  $sectionName"
+  $button.TextAlign = 'MiddleLeft'
+  $button.FlatStyle = 'Flat'
+  $button.FlatAppearance.BorderSize = 0
+  $button.BackColor = [System.Drawing.Color]::FromArgb(13, 27, 55)
+  $button.ForeColor = [System.Drawing.Color]::White
+  $button.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Regular)
+  $button.Location = New-Object System.Drawing.Point(0, $y)
+  $button.Size = New-Object System.Drawing.Size(176, 40)
+  $button.Cursor = 'Hand'
+  $parent.Controls.Add($button)
+  return $button
+}
+
+# Swaps the visible section and marks the chosen rail button, exactly as the
+# portal's sidebar does. Both maps come from New-DashboardForm.
+function Show-DashboardSection([string] $sectionName) {
+  $pages = $script:Controls.SectionPages
+  $buttons = $script:Controls.SectionButtons
+  if (-not $pages -or -not $buttons) { return }
+  foreach ($key in @($pages.Keys)) { $pages[$key].Visible = ($key -eq $sectionName) }
+  foreach ($key in @($buttons.Keys)) {
+    $chosen = ($key -eq $sectionName)
+    $buttons[$key].BackColor = if ($chosen) { [System.Drawing.Color]::FromArgb(23, 105, 224) } else { [System.Drawing.Color]::FromArgb(13, 27, 55) }
+    $style = if ($chosen) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }
+    $buttons[$key].Font = New-Object System.Drawing.Font('Segoe UI', 9, $style)
+  }
+  $script:Section = $sectionName
+}
+
+# The address the desktop app opens the portal at: the client tag tells the
+# Worker the request came from this PC, and a section name opens the portal on
+# that page (the "Forgotten passwords" button opens the reset queue).
+function New-PortalLink([string] $url, [string] $section) {
+  $link = ([string] $url).Trim()
+  if (-not $link) { return '' }
+  if ($link -notmatch '^https?://') { return '' }
+  $query = 'client=desktop'
+  if ($section) { $query = "$query&section=$([System.Uri]::EscapeDataString($section))" }
+  $separator = '?'
+  if ($link.Contains('?')) { $separator = '&' }
+  return "$link$separator$query"
+}
+
+function Open-PortalWindow([string] $section) {
+  $url = ''
+  if ($script:Config -and $script:Config.workerUrl) { $url = [string] $script:Config.workerUrl }
+  if (-not $url -and $script:Controls.ContainsKey('WorkerUrl')) { $url = [string] $script:Controls.WorkerUrl.Text }
+  $link = New-PortalLink $url $section
+  if (-not $link) {
+    Write-Activity 'No portal address yet: save the Worker URL under Configuration first.'
+    return
+  }
+  Start-Process $link | Out-Null
+  Write-Activity "Opened the estate portal: $link"
+}
+
 function New-TextBox($parent, $x, $y, $width, $height = 24) {
   $box = New-Object System.Windows.Forms.TextBox
   $box.Location = New-Object System.Drawing.Point($x, $y)
@@ -258,8 +332,10 @@ function New-DashboardForm {
 
   $form = New-Object System.Windows.Forms.Form
   $form.Text = 'EstateMate Bridge'
-  $form.Size = New-Object System.Drawing.Size(820, 680)
-  $form.MinimumSize = New-Object System.Drawing.Size(720, 580)
+  # Wider than the tabbed window was: the icon rail takes 176 pixels on the
+  # left, and the sections keep the width they were laid out for.
+  $form.Size = New-Object System.Drawing.Size(1000, 700)
+  $form.MinimumSize = New-Object System.Drawing.Size(900, 600)
   $form.StartPosition = 'CenterScreen'
   $script:Controls.Form = $form
 
@@ -299,14 +375,39 @@ function New-DashboardForm {
   $script:Controls.ElevateButton = New-Button $actions 'Restart as administrator' 512 8 190 28
   if (Test-Admin) { $script:Controls.ElevateButton.Visible = $false }
 
-  # ---- tabs ---------------------------------------------------------------
-  $tabs = New-Object System.Windows.Forms.TabControl
-  $tabs.Dock = 'Fill'
-  $root.Controls.Add($tabs, 0, 2)
+  # ---- icon rail + sections -----------------------------------------------
+  # A TabControl cannot be restyled into an icon rail (its header strip stays),
+  # so the rail picks one of three plain panels. The glyphs and the order follow
+  # the portal's sidebar; the rail keeps the portal's navy, the chosen button
+  # its blue.
+  $shell = New-Object System.Windows.Forms.TableLayoutPanel
+  $shell.Dock = 'Fill'
+  $shell.ColumnCount = 2
+  $shell.RowCount = 1
+  $absolute = [System.Windows.Forms.SizeType]::Absolute
+  $percent = [System.Windows.Forms.SizeType]::Percent
+  [void]$shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle($absolute, 176)))
+  [void]$shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle($percent, 100)))
+  $root.Controls.Add($shell, 0, 2)
 
-  $statusTab = New-Object System.Windows.Forms.TabPage
-  $statusTab.Text = 'Status'
-  $tabs.Controls.Add($statusTab)
+  $rail = New-Object System.Windows.Forms.Panel
+  $rail.Dock = 'Fill'
+  $rail.BackColor = [System.Drawing.Color]::FromArgb(13, 27, 55)
+  $shell.Controls.Add($rail, 0, 0)
+
+  $content = New-Object System.Windows.Forms.Panel
+  $content.Dock = 'Fill'
+  $shell.Controls.Add($content, 1, 0)
+
+  $script:Controls.StatusNav = New-NavButton $rail 'Status' 14
+  $script:Controls.ConfigNav = New-NavButton $rail 'Configuration' 56
+  $script:Controls.ServiceNav = New-NavButton $rail 'Service' 98
+  [void](New-Label $rail 'Sign-in, password and terminal settings live in the estate portal.' 12 156 152 70)
+
+  $statusTab = New-Object System.Windows.Forms.Panel
+  $statusTab.Dock = 'Fill'
+  $statusTab.Visible = $false
+  $content.Controls.Add($statusTab)
   $statusLayout = New-Object System.Windows.Forms.TableLayoutPanel
   $statusLayout.Dock = 'Fill'
   $statusLayout.ColumnCount = 1
@@ -323,10 +424,11 @@ function New-DashboardForm {
   $script:Controls.LiveLog = New-ReadOnlyBox
   $statusLayout.Controls.Add($script:Controls.LiveLog, 0, 3)
 
-  $configTab = New-Object System.Windows.Forms.TabPage
-  $configTab.Text = 'Configuration'
+  $configTab = New-Object System.Windows.Forms.Panel
+  $configTab.Dock = 'Fill'
   $configTab.AutoScroll = $true
-  $tabs.Controls.Add($configTab)
+  $configTab.Visible = $false
+  $content.Controls.Add($configTab)
 
   $agentGroup = New-Object System.Windows.Forms.GroupBox
   $agentGroup.Text = 'Agent (portal: Device agent -> Add agent)'
@@ -436,10 +538,11 @@ function New-DashboardForm {
   $script:Controls.SyncClocksButton = New-Button $clockGroup 'Synchronise clocks now' 428 46 180 28
   [void](New-Label $clockGroup 'A terminal hours off rejects live visitor passes early and honours dead ones late. The bridge sets a terminal back only past its drift threshold; this PC''s clock is the reference. The chosen zone is written with the clock set, so a terminal in another zone is re-zoned with it.' 12 78 740 24)
 
-  $serviceTab = New-Object System.Windows.Forms.TabPage
-  $serviceTab.Text = 'Service'
+  $serviceTab = New-Object System.Windows.Forms.Panel
+  $serviceTab.Dock = 'Fill'
   $serviceTab.AutoScroll = $true
-  $tabs.Controls.Add($serviceTab)
+  $serviceTab.Visible = $false
+  $content.Controls.Add($serviceTab)
 
   $serviceGroup = New-Object System.Windows.Forms.GroupBox
   $serviceGroup.Text = 'Start the bridge automatically'
@@ -461,6 +564,25 @@ function New-DashboardForm {
   [void](New-Label $controlGroup 'Configuration and logs live in %ProgramData%\EstateMate; "Open logs" shows them.' 12 48 740 18)
   [void](New-Label $controlGroup 'The bridge only makes outbound connections. It never listens on a port.' 12 72 740 18)
   [void](New-Label $controlGroup 'After changing anything, press "Run check": it authenticates against the Worker and probes every terminal.' 12 96 740 18)
+
+  # Forgotten passwords. The estate has no mail server, so a request is a row an
+  # Administrator or Manager works in the portal - these two buttons are the way
+  # there from the PC that runs the bridge, tagged as the desktop client so the
+  # Worker records where the request came from.
+  $signInGroup = New-Object System.Windows.Forms.GroupBox
+  $signInGroup.Text = 'Sign-in and forgotten passwords'
+  $signInGroup.Location = New-Object System.Drawing.Point(10, 340)
+  $signInGroup.Size = New-Object System.Drawing.Size(775, 146)
+  $serviceTab.Controls.Add($signInGroup)
+  [void](New-Label $signInGroup 'A forgotten password is recorded as a request against the account. The portal shows the queue to Administrators and Managers there; an Administrator can also switch the estate to one-time codes under Settings.' 12 24 740 36)
+  $script:Controls.OpenPortalButton = New-Button $signInGroup 'Open the estate portal' 12 68 170 28
+  $script:Controls.OpenResetsButton = New-Button $signInGroup 'Forgotten passwords' 192 68 170 28
+  $script:Controls.SignInHint = New-Label $signInGroup 'Nothing about a person''s password is stored on this PC - only the reset queue in the portal.' 372 73 390 40
+
+  # The rail owns which section is showing; the maps let its handler swap them.
+  $script:Controls.SectionPages = @{ Status = $statusTab; Configuration = $configTab; Service = $serviceTab }
+  $script:Controls.SectionButtons = @{ Status = $script:Controls.StatusNav; Configuration = $script:Controls.ConfigNav; Service = $script:Controls.ServiceNav }
+  Show-DashboardSection 'Status'
 
   return $form
 }
@@ -886,6 +1008,11 @@ function Initialize-EventHandlers {
   $script:Controls.SaveTerminalsButton.Add_Click({ Save-Settings })
   $script:Controls.InstallServiceButton.Add_Click({ Set-ServiceRegistration $true })
   $script:Controls.RemoveServiceButton.Add_Click({ Set-ServiceRegistration $false })
+  $script:Controls.StatusNav.Add_Click({ Show-DashboardSection 'Status' })
+  $script:Controls.ConfigNav.Add_Click({ Show-DashboardSection 'Configuration' })
+  $script:Controls.ServiceNav.Add_Click({ Show-DashboardSection 'Service' })
+  $script:Controls.OpenPortalButton.Add_Click({ Open-PortalWindow '' })
+  $script:Controls.OpenResetsButton.Add_Click({ Open-PortalWindow 'resets' })
 }
 
 function Start-Dashboard {
@@ -970,10 +1097,42 @@ function Invoke-SelfTest {
                 'BridgeState', 'AgentState', 'DeviceState', 'PortalState', 'ServiceState',
                 'StartButton', 'StopButton', 'CheckButton', 'OpenLogsButton', 'InstallServiceButton',
                 'RemoveServiceButton', 'SaveTerminalsButton', 'AddTerminalButton', 'ApplyPortalButton',
-                'TimeSync', 'TimeZone', 'SyncClocksButton')
+                'TimeSync', 'TimeZone', 'SyncClocksButton',
+                'StatusNav', 'ConfigNav', 'ServiceNav', 'SectionPages', 'SectionButtons',
+                'OpenPortalButton', 'OpenResetsButton')
     $missing = @()
     foreach ($name in $needed) { if (-not $script:Controls.ContainsKey($name)) { $missing += $name } }
     Check 'every control the dashboard uses exists' ($missing.Count -eq 0) ($missing -join ', ')
+
+    # The icon rail: three sections, one visible at a time, and the chosen
+    # button keeps the portal's blue so the rail reads like the sidebar.
+    $script:Controls.SectionPages['Configuration'].Visible = $true
+    Show-DashboardSection 'Configuration'
+    Check 'the rail shows one section at a time' `
+      ($script:Controls.SectionPages['Configuration'].Visible -and -not $script:Controls.SectionPages['Status'].Visible -and -not $script:Controls.SectionPages['Service'].Visible) `
+      ((@($script:Controls.SectionPages.Keys) | ForEach-Object { "$_=$($script:Controls.SectionPages[$_].Visible)" }) -join ', ')
+    Check 'the chosen rail button wears the portal blue' `
+      ($script:Controls.ConfigNav.BackColor -eq [System.Drawing.Color]::FromArgb(23, 105, 224)) `
+      "backColor=$($script:Controls.ConfigNav.BackColor)"
+    Check 'the rail names every section with the portal glyph' `
+      ($script:Controls.StatusNav.Text.StartsWith($script:NavGlyphs['Status']) -and $script:Controls.ConfigNav.Text.StartsWith($script:NavGlyphs['Configuration']) -and $script:Controls.ServiceNav.Text.StartsWith($script:NavGlyphs['Service'])) `
+      "status=$($script:Controls.StatusNav.Text) config=$($script:Controls.ConfigNav.Text) service=$($script:Controls.ServiceNav.Text)"
+    Show-DashboardSection 'Status'
+
+    # The two sign-in controls: they open the portal, on the reset queue when
+    # asked, tagged as the desktop client.
+    Check 'the portal link tags the desktop client' `
+      ((New-PortalLink 'https://estate.example.com' '') -eq 'https://estate.example.com?client=desktop') `
+      (New-PortalLink 'https://estate.example.com' '')
+    Check 'the forgotten-passwords link opens the reset queue' `
+      ((New-PortalLink 'https://estate.example.com' 'resets') -eq 'https://estate.example.com?client=desktop&section=resets') `
+      (New-PortalLink 'https://estate.example.com' 'resets')
+    Check 'an address that already has a query string keeps it' `
+      ((New-PortalLink 'https://estate.example.com/?x=1' 'resets') -eq 'https://estate.example.com/?x=1&client=desktop&section=resets') `
+      (New-PortalLink 'https://estate.example.com/?x=1' 'resets')
+    Check 'a link is empty until the Worker URL is configured' `
+      ((New-PortalLink '' 'resets') -eq '' -and (New-PortalLink 'estate.example.com' '') -eq '') `
+      "blank=$(New-PortalLink '' 'resets') host=$(New-PortalLink 'estate.example.com' '')"
 
     $grid = $script:Controls.Grid
     Check 'the terminal table has its eight columns' ($grid -and $grid.Columns.Count -eq 8) "columns: $($grid.Columns.Count)"

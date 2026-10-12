@@ -5,12 +5,15 @@ import android.net.Uri
 import com.estatemate.app.data.local.AccessEventDao
 import com.estatemate.app.data.local.CachedAccessEvent
 import com.estatemate.app.data.remote.BookingActionBody
+import com.estatemate.app.data.remote.ChangePasswordRequest
 import com.estatemate.app.data.remote.DashboardResponse
 import com.estatemate.app.data.remote.DeviceOptionDto
 import com.estatemate.app.data.remote.EstateMateApi
 import com.estatemate.app.data.remote.FacilityBookingBody
 import com.estatemate.app.data.remote.FacilityBookingCreated
 import com.estatemate.app.data.remote.FacilityDto
+import com.estatemate.app.data.remote.ForgotPasswordRequest
+import com.estatemate.app.data.remote.ForgotPasswordResponse
 import com.estatemate.app.data.remote.GateDto
 import com.estatemate.app.data.remote.HouseholdActionBody
 import com.google.gson.JsonObject
@@ -24,6 +27,9 @@ import com.estatemate.app.data.remote.OwnershipRequestDto
 import com.estatemate.app.data.remote.OwnershipReviewBody
 import com.estatemate.app.data.remote.PortalConfigDto
 import com.estatemate.app.data.remote.PropertyDto
+import com.estatemate.app.data.remote.IssuedPasswordResponse
+import com.estatemate.app.data.remote.ResetPasswordRequest
+import com.estatemate.app.data.remote.ResetPasswordResponse
 import com.estatemate.app.data.remote.SelectGateRequest
 import com.estatemate.app.data.remote.TenancyActionBody
 import com.estatemate.app.data.remote.TenancyDto
@@ -66,16 +72,27 @@ class EstateRepository @Inject constructor(
 ) {
     val recentEvents: Flow<List<CachedAccessEvent>> = eventDao.observeRecent()
 
-    /** Signs in, storing the session token before returning the signed-in user. */
-    suspend fun login(email: String, password: String): LoginOutcome {
-        val response = api.login(LoginRequest(email.trim(), password))
+    /**
+     * Signs in, storing the session token before returning the signed-in user.
+     *
+     * A remembered sign-in gets the Worker's 30-day session and is written to
+     * encrypted storage; one without is held in memory only, so closing the app
+     * signs the person out. The address is kept either way, so the next sign-in
+     * opens with it filled in and never with a password.
+     */
+    suspend fun login(email: String, password: String, rememberMe: Boolean): LoginOutcome {
+        val address = email.trim()
+        val response = api.login(LoginRequest(address, password, rememberMe, client = "android"))
+        val remember = response.rememberMe ?: rememberMe
         response.token?.let {
-            authStore.token = it
+            authStore.storeSession(it, address, remember)
             return LoginOutcome.SignedIn(response.user)
         }
         val selectionToken = response.selectionToken
         val gates = response.gates.orEmpty()
         if (response.requiresGateSelection == true && selectionToken != null && gates.isNotEmpty()) {
+            authStore.rememberMe = remember
+            authStore.rememberedEmail = address
             val onlyGate = gates.singleOrNull()
             if (onlyGate != null) {
                 // One post: nothing to choose, so do not make the officer choose.
@@ -86,12 +103,56 @@ class EstateRepository @Inject constructor(
         throw IllegalStateException("Sign-in did not return a session. Please try again.")
     }
 
-    /** Exchanges a gate choice for a session scoped to that gate. */
+    /**
+     * Exchanges a gate choice for a session scoped to that gate.
+     *
+     * The Worker carries the original sign-in's remember-me choice on the
+     * selection token, so a security officer who chose 30 days keeps them.
+     */
     suspend fun selectGate(selectionToken: String, deviceId: String): UserDto {
         val selected = api.selectGate(SelectGateRequest(selectionToken, deviceId))
-        authStore.token = selected.token
+        authStore.storeSession(selected.token, authStore.rememberedEmail.orEmpty(), authStore.rememberMe)
         return selected.user
     }
+
+    /**
+     * Records a forgotten password and returns what the Worker answered: a
+     * reference for the estate office, or a one-time code where the
+     * Administrator has turned on self-service resets.
+     */
+    suspend fun forgotPassword(email: String): ForgotPasswordResponse =
+        serverMessage { api.forgotPassword(ForgotPasswordRequest(email.trim(), client = "android")) }
+
+    /** Spends a one-time code for a new password. The Worker signs every device out. */
+    suspend fun resetPassword(email: String, code: String, newPassword: String): ResetPasswordResponse =
+        serverMessage { api.resetPassword(ResetPasswordRequest(email.trim(), code.trim(), newPassword)) }
+
+    /** Issues a temporary password for a queued request; the password is shown once. */
+    suspend fun issuePasswordReset(id: String): IssuedPasswordResponse =
+        serverMessage { api.issuePasswordReset(id) }
+
+    /**
+     * Changes the signed-in person's own password.
+     *
+     * Every session that existed before the change is finished off by the
+     * Worker, this one included, so the replacement token in the answer is
+     * stored immediately — otherwise the app would keep using a token the
+     * Worker has already stopped honouring.
+     */
+    suspend fun changePassword(currentPassword: String, newPassword: String): String? =
+        serverMessage { api.changePassword(ChangePasswordRequest(currentPassword, newPassword)) }
+            .also { answer ->
+                if (answer.token != null) {
+                    authStore.storeSession(answer.token, authStore.rememberedEmail.orEmpty(), authStore.rememberMe)
+                }
+            }
+            .let { it.message ?: "Password changed. Your other sessions have been signed out." }
+
+    /** The address the phone offers the next time the sign-in screen opens. */
+    val rememberedEmail: String? get() = authStore.rememberedEmail
+
+    /** Whether the last sign-in on this phone asked to be remembered. */
+    val rememberMe: Boolean get() = authStore.rememberMe
 
     /** The gate this session is scoped to, when it is scoped to one. */
     suspend fun currentGateName(): String? {
@@ -100,7 +161,7 @@ class EstateRepository @Inject constructor(
     }
 
     suspend fun restore(): UserDto? = if (authStore.token == null) null else runCatching { api.me().user }.getOrElse {
-        authStore.token = null
+        authStore.clearSession()
         null
     }
 
@@ -172,9 +233,16 @@ class EstateRepository @Inject constructor(
     private suspend fun <T> serverMessage(block: suspend () -> T): T = try {
         block()
     } catch (error: HttpException) {
-        val text = if (error.code() == 401) null else runCatching { error.response()?.errorBody()?.string() }.getOrNull()
-        val message = text?.let { runCatching { JsonParser.parseString(it).asJsonObject.get("error")?.asString }.getOrNull() }
-        if (message.isNullOrBlank()) throw error else throw ServerMessageException(message, error)
+        val text = runCatching { error.response()?.errorBody()?.string() }.getOrNull()
+        val body = text?.takeIf { it.isNotBlank() }?.let { runCatching { JsonParser.parseString(it).asJsonObject }.getOrNull() }
+        val message = body?.get("error")?.takeIf { it.isJsonPrimitive }?.asString
+        if (message.isNullOrBlank()) throw error else throw ServerMessageException(
+            message = message,
+            status = error.code(),
+            code = body.get("code")?.takeIf { it.isJsonPrimitive }?.asString,
+            retryAfterSeconds = body.get("retryAfterSeconds")?.takeIf { it.isJsonPrimitive }?.asLong,
+            cause = error,
+        )
     }
 
     suspend fun refreshEvents() {
@@ -185,17 +253,27 @@ class EstateRepository @Inject constructor(
     }
 
     suspend fun logout() {
-        authStore.token = null
+        authStore.clearSession()
         eventDao.clear()
     }
 }
 
 /**
- * A refusal the Worker explained (`{ error: "…" }`), carried as an ordinary
- * exception so the same `message(error, fallback)` path every screen already
- * uses shows the estate's own words instead of a status line.
+ * A refusal the Worker explained (`{ error: "…", code: "…" }`), carried as an
+ * ordinary exception so the same `message(error, fallback)` path every screen
+ * already uses shows the estate's own words instead of a status line.
+ *
+ * The status, the machine-readable `code` and any `retryAfterSeconds` travel
+ * with it: without them a throttled sign-in or an ended session would look
+ * exactly like a wrong password by the time a screen sees it.
  */
-class ServerMessageException(message: String, cause: Throwable? = null) : Exception(message, cause)
+class ServerMessageException(
+    message: String,
+    val status: Int? = null,
+    val code: String? = null,
+    val retryAfterSeconds: Long? = null,
+    cause: Throwable? = null,
+) : Exception(message, cause)
 
 /** The Worker's per-file ceiling (`MAX_GITHUB_FILE_SIZE` in `src/github-storage.ts`). */
 private const val MAX_PROOF_FILE_BYTES = 4 * 1024 * 1024

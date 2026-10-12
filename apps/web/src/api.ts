@@ -13,12 +13,43 @@ export interface ListResponse<T = Record<string, unknown>> {
   [key: string]: unknown;
 }
 
+/**
+ * A failed request, with everything a screen needs to explain it.
+ *
+ * `status` is the HTTP status, or 0 when no response arrived at all.
+ * `code` is the Worker's machine-readable reason where it sends one
+ * (`invalid_credentials`, `account_inactive`, `too_many_attempts`, …), so a
+ * screen can use its own wording without parsing the sentence.
+ * `retryAfterSeconds` is how long the Worker asked the client to wait.
+ */
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  code: string | null;
+  retryAfterSeconds: number | null;
+  constructor(message: string, status: number, options: { code?: string | null; retryAfterSeconds?: number | null } = {}) {
     super(message);
     this.status = status;
+    this.code = options.code ?? null;
+    this.retryAfterSeconds = options.retryAfterSeconds ?? null;
   }
+}
+
+/**
+ * Called when a request comes back 401 outside the sign-in routes, i.e. the
+ * session is gone. The app registers one handler and returns to the sign-in
+ * screen with an explanation, instead of leaving every later screen failing
+ * silently with "Request failed (401)".
+ */
+type SessionEndedHandler = (problem: ApiError) => void;
+let sessionEndedHandler: SessionEndedHandler | null = null;
+
+export function onSessionEnded(handler: SessionEndedHandler | null): void {
+  sessionEndedHandler = handler;
+}
+
+/** Paths where a 401 is the expected answer, not a lost session. */
+function isSignInPath(path: string): boolean {
+  return path.startsWith('/api/auth/');
 }
 
 /**
@@ -32,7 +63,13 @@ export class ApiError extends Error {
 const NETWORK_ERROR_MESSAGE = "Can't reach the server. Check your internet connection and try again.";
 
 function asNetworkError(reason: unknown): unknown {
-  return reason instanceof TypeError ? new ApiError(NETWORK_ERROR_MESSAGE, 0) : reason;
+  return reason instanceof TypeError ? new ApiError(NETWORK_ERROR_MESSAGE, 0, { code: 'network_unreachable' }) : reason;
+}
+
+/** True when the browser never reached the Worker at all. */
+export function isOffline(error: unknown): boolean {
+  if (error instanceof ApiError) return error.status === 0;
+  return typeof navigator !== 'undefined' && navigator.onLine === false;
 }
 
 /**
@@ -95,8 +132,22 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
     }
     if (!response.ok) {
       if (response.status === 401) clearApiCache();
-      const message = typeof data === 'object' && data && 'error' in data ? String(data.error) : `Request failed (${response.status})`;
-      throw new ApiError(message, response.status);
+      const body = typeof data === 'object' && data ? (data as Record<string, unknown>) : null;
+      const message = body && 'error' in body ? String(body.error) : `Request failed (${response.status})`;
+      const headerRetry = Number(response.headers.get('Retry-After'));
+      const bodyRetry = Number(body?.retryAfterSeconds);
+      const retryAfterSeconds = Number.isFinite(bodyRetry) && bodyRetry > 0
+        ? bodyRetry
+        : Number.isFinite(headerRetry) && headerRetry > 0 ? headerRetry : null;
+      const error = new ApiError(message, response.status, {
+        code: body && typeof body.code === 'string' ? body.code : null,
+        retryAfterSeconds,
+      });
+      // A 401 from anywhere but the sign-in routes means the session ended:
+      // it expired, the account was deactivated, or the password was changed
+      // somewhere else. The app decides what to show; this only reports it.
+      if (response.status === 401 && !isSignInPath(path)) sessionEndedHandler?.(error);
+      throw error;
     }
     if (isGet) {
       responseCache.set(path, { data, timestamp: Date.now() });

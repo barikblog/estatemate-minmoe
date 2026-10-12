@@ -1,5 +1,114 @@
 # AI handoff — EstateMate
 
+## Sign-in on every client: real failure messages, remember me, forgotten passwords, icon menus (2026-10-12)
+
+Requested as: *"Let both PC, portal and phone app handle login errors properly
+with other errors. Include remember me, view password forgot password feature for
+all platform client app, PC & phone dashboard should have iconic menus like the
+web portal."*
+
+Before this, every sign-in failure read the same thing whichever client you were
+on — the portal said `Request failed (500)` or `TypeError: Failed to fetch`, the
+phone said `Failed to connect to /10.0.2.2:8787`, and a 401 anywhere in the app
+left the screen failing quietly. There was no "remember me", no way to see what
+you had typed, and no way at all to recover a forgotten password.
+
+**The Worker owns the rules (`src/sign-in.ts`, migration `0029`, all of it pure
+except the SQL).**
+
+- One vocabulary for a refusal: `SignInErrorCode` = `validation`,
+  `invalid_credentials`, `account_inactive`, `account_expired`,
+  `too_many_attempts`, `invalid_reset_code`, `reset_expired`, `weak_password`,
+  `service_unavailable`. Every auth route answers `{ error, code }` and, when it
+  is throttling, `{ retryAfterSeconds }` with a `Retry-After` header.
+- `rememberMe` on `POST /api/auth/login` selects `REMEMBER_ME_SECONDS` (30 days)
+  instead of `SESSION_SECONDS` (12 hours) and is carried on the 300-second
+  pending token through the Security officer's gate selection, so the shift keeps
+  the lifetime the officer asked for. The response echoes `rememberMe` and
+  `sessionSeconds`.
+- Forgotten passwords, hybrid by design because the project may not add a paid
+  mail provider: every request is recorded in `password_reset_requests`. The
+  default is `delivery: 'office'` — the requester gets a `PR-XXXXXX` reference
+  and an Administrator or Manager issues a temporary password from the portal or
+  the phone. An Administrator setting `password_reset_self_service` to `true`
+  switches the estate to one-time short codes (`password_reset_code_minutes`,
+  default 30, 5–120), hashed at rest, single use, five wrong guesses allowed.
+  An address the estate does not have gets the same 202 body and a decoy
+  reference, so the endpoint cannot enumerate accounts.
+- `auth_attempts` backs a sliding-window throttle (`LOGIN_THROTTLE` 15 minutes:
+  8 failures per source, 25 per address; `FORGOT_PASSWORD_THROTTLE`: 3 and 10).
+  It protects the free plan's PBKDF2 CPU and gives a client something truthful to
+  say: *"Too many attempts. Try again in N minutes."*
+- `users.password_changed_at` is compared with the token's `iat`; changing a
+  password therefore ends every session issued before it — which is what makes a
+  30-day session safe to hand out.
+- Hidden routes: `POST /api/auth/forgot-password` (202), `POST
+  /api/auth/reset-password` (self-service code), `POST /api/auth/change-password`
+  (issues a replacement token, since the change kills the current one), and the
+  office queue `GET /api/password-resets`, `POST /api/password-resets/:id/issue`,
+  `POST /api/password-resets/:id/dismiss` for Administrators and Managers.
+
+**Portal (`apps/web/src`).** `api.ts` gained `ApiError.code`,
+`ApiError.retryAfterSeconds`, status `0` for "no HTTP response at all" and a
+`onSessionEnded` hook: a 401 outside `/api/auth/*` clears the session and returns
+to sign-in with the reason. New `sign-in-errors.ts` turns any failure into a
+title, a sentence and a hint (`describeSignInProblem`, `signInProblemLine`).
+`AuthShell`, `SignInErrorPanel`, `Login` (remember me, caps-lock hint,
+`PasswordField` show/hide, forgot link) and `ForgotPassword` (reference for the
+office, or the one-time code and the reset form) replace the old sign-in card.
+`PasswordResets` is the office queue with counts, filters and issue/dismiss, with
+a nav entry, a dashboard banner and a badge. Settings gained the **Forgotten
+passwords** card (self-service switch + code lifetime). `initialSection()` honours
+`?section=` for deep links but only for sections the navigation already has, and
+the `resets` case still checks the role, so a link cannot reach past the office
+rule.
+
+**Phone (`apps/android`).** New `SignInErrors.kt` mirrors the portal's
+vocabulary sentence for sentence and carries the same `title`/`message`/`hint`/
+`action` shape. `ServerMessageException` now keeps the status, the Worker's
+`code` and `retryAfterSeconds`, so a refused sign-in is explained instead of
+shown as a status line and a 401 anywhere returns to sign-in with the
+session-ended sentence. The sign-in screen has Remember me (30 days, with the
+portal's own wording), a password you can look at, and a whole Forgot password
+flow: request, `PR-` reference for the office or a one-time code with the reset
+form, then back to sign-in. The Account tab changes the password too. Menu
+modules now carry a tile — `MenuIcon` + `MenuIcon.image()` — with the group's
+tint in the row and in the module header, and staff have the office queue
+(**Password resets**, issue a temporary password with the same confirmation the
+portal asks for, shown once with a copy button).
+
+**PC.** `bridge-apps/windows/dashboard/EstateMateBridge.ps1` (still CRLF,
+ASCII-only, `lint-powershell.py` clean) replaces its `TabControl` with a 176px
+navy icon rail — `New-NavButton` + `Show-DashboardSection`, drawing the portal's
+own `navIcon()` marks as code points (`[char]0x25EB`, `0x2699`, `0x21BB`, because
+Windows PowerShell 5.1 reads a BOM-less UTF-8 file as ANSI) — and the Service
+section gained **Sign-in and forgotten passwords**: *Open the estate portal* and
+*Forgotten passwords*, which deep-links `?section=resets&client=desktop` through
+`New-PortalLink`. The `-SelfTest` grew checks for the rail, the glyphs and the
+link builder. `client-apps/windows/EstateMate.vbs` now opens the portal with
+`?client=desktop`, so a reset request records where it came from.
+
+**Drift guard.** `test/sign-in-client-parity.test.ts` (10 tests) asserts the
+phone repeats the portal's sentences and maps every Worker code, both clients
+offer remember me / view password / forgotten passwords and report which client
+asked, the dashboard draws the portal's glyphs and keeps CRLF/ASCII, every phone
+menu module names a declared and drawn icon, and the desktop deep link and the
+office-only rule stay in step.
+
+**Validation.** `npm run typecheck`, `npx vitest run` (37 files, 395 tests),
+`npm test` (all suites, including the Pi gate, ISAPI bridge, cloudflared kit,
+inbound check, terminal endpoint and Hik-SDK scripts), `npm run build:web`,
+`bash scripts/ci-checks.sh`, `python3 scripts/lint-powershell.py` and the whole
+migration chain (29 migrations) all pass. **Not run here:** the Kotlin compile
+(no JDK/Android SDK in the sandbox — the `android-apk` job of `bridge.yml`
+compiles it on this pull request) and the dashboard `-SelfTest` (needs Windows;
+`bridge.yml` runs it).
+
+**Deliberate boundary.** The phone offers the *requester's* path (ask, and use a
+one-time code) and the office queue for staff; the settings page that switches
+self-service on stays a portal-and-Administrator job, exactly as the setting was
+described in migration 0029.
+
 ## Client-app visitor passes now match the portal (2026-10-12)
 
 The question this answers: the phone app issued visitor passes as a text card

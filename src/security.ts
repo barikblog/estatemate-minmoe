@@ -58,13 +58,21 @@ export async function verifyPassword(password: string, encoded: string): Promise
   if (algorithm !== 'pbkdf2-sha256' || !iterationsText || !saltText || !expectedText) return false;
   const iterations = Number(iterationsText);
   if (!Number.isSafeInteger(iterations) || iterations < 100_000) return false;
-  const key = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', hash: 'SHA-256', salt: fromBase64Url(saltText).buffer as ArrayBuffer, iterations },
-    key,
-    256,
-  );
-  return timingSafeEqual(new Uint8Array(bits), fromBase64Url(expectedText));
+  try {
+    const key = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits(
+      { name: 'PBKDF2', hash: 'SHA-256', salt: fromBase64Url(saltText).buffer as ArrayBuffer, iterations },
+      key,
+      256,
+    );
+    return timingSafeEqual(new Uint8Array(bits), fromBase64Url(expectedText));
+  } catch {
+    // A hash stored in a shape this code cannot read (a truncated row, a value
+    // from another scheme) must read as "does not match" rather than throwing:
+    // a sign-in endpoint that answers 500 on one account is both a worse
+    // experience and a hint that the account exists.
+    return false;
+  }
 }
 
 export function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
@@ -95,6 +103,8 @@ export interface ExtraJwtClaims {
   pendingGate?: boolean;
   /** The gate was picked freely because the officer had no assigned posts. */
   openGate?: boolean;
+  /** Carry a "Remember me" choice across the gate-selection step. */
+  remember?: boolean;
 }
 
 export async function signJwt(
@@ -102,9 +112,15 @@ export async function signJwt(
   user: { id: string; role: Role; name: string },
   ttlSeconds = 60 * 60 * 12,
   extra: ExtraJwtClaims = {},
+  /**
+   * Override for the moment the token is deemed to have been issued at. Tests
+   * use it to model a session that predates a password change; the application
+   * never passes it.
+   */
+  issuedAtSeconds?: number,
 ): Promise<string> {
   if (!env.JWT_SECRET || env.JWT_SECRET.length < 32) throw new Error('JWT_SECRET must be at least 32 characters');
-  const now = Math.floor(Date.now() / 1000);
+  const now = Math.floor(issuedAtSeconds ?? Date.now() / 1000);
   const header = base64Url(encoder.encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })));
   const payload: JwtClaims = {
     sub: user.id,
@@ -113,6 +129,7 @@ export async function signJwt(
     ...(extra.gate ? { gate: extra.gate } : {}),
     ...(extra.pendingGate ? { pendingGate: true } : {}),
     ...(extra.openGate ? { openGate: true } : {}),
+    ...(extra.remember ? { remember: true } : {}),
     iat: now,
     exp: now + ttlSeconds,
   };
