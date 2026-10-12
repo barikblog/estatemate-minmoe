@@ -5,7 +5,10 @@ name: Production smoke test
 # (unlike the deploy job's wrangler environment), so this proves from outside
 # that the deployed portal answers, that D1 answers, and — the check that
 # matters to an operator with a sign-in problem — that POST /api/auth/login
-# responds with JSON instead of a network failure. Dummy credentials only:
+# responds with JSON instead of a network failure. It also asks for a forgotten
+# password for an address the estate does not have: that route writes its
+# throttle row before it answers, so a 202 proves both the route and the tables
+# migration 0029 added are in the deployed database. Dummy credentials only:
 # this never authenticates and must never receive a real secret.
 
 on:
@@ -79,3 +82,43 @@ jobs:
             --data '{}')"
           echo "status=$status body=$(cat /tmp/login-malformed.json)"
           [ "$status" = "400" ] || { echo "expected 400 for a payload without credentials, got $status"; exit 1; }
+
+      - name: Forgotten-password route rejects a payload without an address
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Answered before any attempt is recorded, so a repeated deploy cannot
+          # throttle it: this one only proves the route exists in the deployment
+          # and speaks the shared refusal shape.
+          status="$(curl -sS --max-time 30 -o /tmp/forgot-malformed.json -w '%{http_code}' \
+            -X POST "$BASE_URL/api/auth/forgot-password" \
+            -H 'Content-Type: application/json' \
+            --data '{}')"
+          echo "status=$status body=$(cat /tmp/forgot-malformed.json)"
+          [ "$status" = "400" ] || { echo "expected 400 for a request without an address, got $status"; exit 1; }
+          grep -q '"code":"validation"' /tmp/forgot-malformed.json
+
+      - name: Forgotten-password route answers an unknown address like a known one
+        shell: bash
+        run: |
+          set -euo pipefail
+          # An address no estate has. The answer is the decoy: a reference and
+          # the delivery rule, never a hint that the account is not there.
+          #
+          # The route records its throttle attempt before it reads the account,
+          # so a 202 also proves migration 0029's auth_attempts table is in the
+          # deployed database — a missing table would answer 500 instead. The
+          # estate's own office/self-service setting decides `delivery`, so both
+          # are accepted here; only the reference shape is fixed.
+          #
+          # This counts against the per-source forgotten-password throttle (3 in
+          # 10 minutes), so more than three deploys in ten minutes would see 429.
+          status="$(curl -sS --max-time 30 -o /tmp/forgot-body.json -w '%{http_code}' \
+            -X POST "$BASE_URL/api/auth/forgot-password" \
+            -H 'Content-Type: application/json' \
+            --data '{"email":"smoke-test@example.invalid","client":"portal"}')"
+          echo "status=$status body=$(cat /tmp/forgot-body.json)"
+          [ "$status" = "202" ] || { echo "expected 202 for a forgotten-password request, got $status"; exit 1; }
+          grep -q '"ok":true' /tmp/forgot-body.json
+          grep -q '"reference":"PR-' /tmp/forgot-body.json
+          grep -qE '"delivery":"(office|self_service)"' /tmp/forgot-body.json
