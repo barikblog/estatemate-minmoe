@@ -81,7 +81,7 @@ val MENU_MODULES: List<MenuModule> = listOf(
     MenuModule(
         id = "visitors", label = "Visitor passes", group = "Overview", path = "api/visitors",
         titleKeys = listOf("visitor_name", "visitorName", "name"),
-        detailKeys = listOf("status", "purpose", "resident_name", "unit_number", "valid_from", "valid_until"),
+        detailKeys = listOf("status", "purpose_of_visit", "resident_name", "unit_number", "valid_from", "valid_until"),
     ),
     MenuModule(
         id = "cards", label = "Cards & person sync", group = "Access & gates",
@@ -93,7 +93,7 @@ val MENU_MODULES: List<MenuModule> = listOf(
         id = "devices", label = "Terminals & bridge", group = "Access & gates",
         roles = setOf("admin", "manager", "security"), path = "api/access/devices",
         titleKeys = listOf("name", "device_name"),
-        detailKeys = listOf("model", "status", "ip_address", "profile_key"),
+        detailKeys = listOf("model", "status", "gate_name", "direction", "profile_key"),
     ),
     MenuModule(
         id = "residents", label = "Residents & households", group = "People & estate",
@@ -104,7 +104,7 @@ val MENU_MODULES: List<MenuModule> = listOf(
         id = "staff", label = "Staff & shifts", group = "People & estate", roles = STAFF_ROLES,
         path = "api/staff",
         titleKeys = listOf("name", "full_name"),
-        detailKeys = listOf("role", "status", "employee_id"),
+        detailKeys = listOf("role", "status", "employee_id", "gates", "next_shift"),
     ),
     MenuModule(
         id = "properties", label = "Properties & units", group = "People & estate",
@@ -113,25 +113,25 @@ val MENU_MODULES: List<MenuModule> = listOf(
     MenuModule(
         id = "bills", label = "Bills & payments", group = "People & estate",
         roles = setOf("admin", "cashier", "resident"), path = "api/bills",
-        titleKeys = listOf("description", "title", "resident_name"),
+        titleKeys = listOf("description", "resident_name"),
         detailKeys = listOf("status", "due_date", "amount_minor", "unit_number"),
     ),
     MenuModule(
         id = "maintenance", label = "Maintenance requests", group = "People & estate", roles = OFFICE_ROLES,
         path = "api/maintenance",
-        titleKeys = listOf("title", "category"),
-        detailKeys = listOf("status", "priority", "resident_name", "unit_number", "created_at"),
+        titleKeys = listOf("description"),
+        detailKeys = listOf("status", "resident_name", "unit_number", "created_at"),
     ),
     MenuModule(
         id = "bookings", label = "Facility bookings", group = "People & estate", roles = OFFICE_ROLES,
         path = "api/facility-bookings",
-        titleKeys = listOf("facility_name", "title"),
+        titleKeys = listOf("facility_name", "purpose"),
         detailKeys = listOf("status", "starts_at", "requester_name", "unit_number"),
     ),
     MenuModule(
         id = "notices", label = "Notices", group = "Community & admin", path = "api/notices",
         titleKeys = listOf("title"),
-        detailKeys = listOf("priority", "status", "author_name", "published_from"),
+        detailKeys = listOf("severity", "status", "author_name", "published_from"),
     ),
     MenuModule(
         id = "documents", label = "Documents & policies", group = "Community & admin", path = "api/documents",
