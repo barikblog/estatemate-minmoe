@@ -8,7 +8,7 @@
 ' upgrade keeps working, and this script is what reads it).
 Option Explicit
 
-Dim sh, fso, here, url, profile, candidates, i
+Dim sh, fso, here, url, openUrl, profile, candidates, i
 
 Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
@@ -24,6 +24,19 @@ End If
 ' the sign-in; only the visible product name changed.
 profile = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\EstateMate\Window"
 
+' Tag the window as the desktop client. The portal reads this and tells the
+' Worker where a password-reset request came from, so a screen that offers
+' "forgot password" says the request was made from this PC. An address that
+' already carries a query string keeps it.
+openUrl = url
+If InStr(openUrl, "client=desktop") = 0 Then
+  If InStr(openUrl, "?") > 0 Then
+    openUrl = openUrl & "&client=desktop"
+  Else
+    openUrl = openUrl & "?client=desktop"
+  End If
+End If
+
 candidates = Array( _
   sh.ExpandEnvironmentStrings("%ProgramFiles(x86)%") & "\Microsoft\Edge\Application\msedge.exe", _
   sh.ExpandEnvironmentStrings("%ProgramFiles%") & "\Microsoft\Edge\Application\msedge.exe", _
@@ -33,13 +46,13 @@ candidates = Array( _
 
 For i = 0 To UBound(candidates)
   If fso.FileExists(candidates(i)) Then
-    sh.Run """" & candidates(i) & """ --app=""" & url & """ --user-data-dir=""" & profile & """ --no-first-run", 1, False
+    sh.Run """" & candidates(i) & """ --app=""" & openUrl & """ --user-data-dir=""" & profile & """ --no-first-run", 1, False
     WScript.Quit 0
   End If
 Next
 
 ' No Chromium-based browser found: fall back to the default browser.
-sh.Run url, 1, False
+sh.Run openUrl, 1, False
 
 Function ReadFirstLine(path)
   ReadFirstLine = ""

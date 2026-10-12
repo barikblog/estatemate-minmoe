@@ -1,5 +1,6 @@
 import { CSSProperties, FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ApiError, ListResponse, User, api, clearApiCache, money, peekApiCache, readableDate } from './api';
+import { ApiError, ListResponse, User, api, clearApiCache, money, onSessionEnded, peekApiCache, readableDate } from './api';
+import { describeSignInProblem, signInProblemLine, type SignInProblem } from './sign-in-errors';
 import type { PassShareSource } from './pass-export';
 import { exportRecordsToExcel, exportRecordsToPdf } from './records-export';
 
@@ -16,7 +17,9 @@ type Section =
   // Information & compliance
   | 'information' | 'legal' | 'visitors'
   // Administration
-  | 'imports' | 'settings';
+  | 'imports' | 'settings'
+  // Sign-in
+  | 'resets';
 
 type NavGroup = { id: string; label: string; items: NavItem[] };
 interface NavItem { id: Section; label: string; roles?: User['role'][]; badge?: string }
@@ -68,6 +71,46 @@ function writeCachedSession(user: User | null, gate: Row | null = null): void {
     if (!user) sessionStorage.removeItem(SESSION_USER_STORAGE_KEY);
     else sessionStorage.setItem(SESSION_USER_STORAGE_KEY, JSON.stringify({ user, gate }));
   } catch { /* ignore */ }
+}
+
+const REMEMBERED_SIGN_IN_KEY = 'sornix_remembered_sign_in_v1';
+
+/**
+ * The email a person asked to have remembered on this device — never a
+ * password, and never a token: the session itself is an HttpOnly cookie the
+ * page cannot read. Ticking "Remember me" also asks the Worker for a 30-day
+ * session, so the browser and the server agree about how long "remembered"
+ * means.
+ */
+function readRememberedSignIn(): { email: string; remember: boolean } {
+  try {
+    const raw = localStorage.getItem(REMEMBERED_SIGN_IN_KEY);
+    if (!raw) return { email: '', remember: false };
+    const parsed = JSON.parse(raw) as { email?: unknown; remember?: unknown };
+    return { email: typeof parsed.email === 'string' ? parsed.email : '', remember: Boolean(parsed.remember) };
+  } catch {
+    return { email: '', remember: false };
+  }
+}
+
+function writeRememberedSignIn(email: string, remember: boolean): void {
+  try {
+    if (!remember) localStorage.removeItem(REMEMBERED_SIGN_IN_KEY);
+    else localStorage.setItem(REMEMBERED_SIGN_IN_KEY, JSON.stringify({ email, remember: true }));
+  } catch { /* private mode or a full quota: remembering is a convenience */ }
+}
+
+/**
+ * Which client is asking, so a password-reset request can say where it came
+ * from. The Windows app opens the portal with `?client=desktop`; the Android
+ * client sends `android` itself on its own API calls.
+ */
+function signInClient(): 'portal' | 'desktop' | 'android' {
+  try {
+    const requested = new URLSearchParams(window.location.search).get('client');
+    if (requested === 'desktop' || requested === 'android') return requested;
+  } catch { /* no window: a build-time render */ }
+  return 'portal';
 }
 
 /**
@@ -199,9 +242,28 @@ const navGroups: NavGroup[] = [
   ]},
   { id: 'community', label: 'Community & admin', items: [
     { id: 'notices', label: 'Notices, docs & SOS' },
+    { id: 'resets', label: 'Password resets', roles: ['admin','manager'] },
     { id: 'settings', label: 'Settings & imports', roles: ['admin','manager'] },
   ]},
 ];
+
+/**
+ * The section to open on when the address asked for one.
+ *
+ * The Windows dashboard's "Forgotten passwords" control opens this portal on
+ * the reset queue (`?section=resets&client=desktop`), and any address can be
+ * shared or bookmarked. Only names the navigation already carries are accepted,
+ * and the same role rules that hide a section in the sidebar still apply — a
+ * link cannot reach past them.
+ */
+function initialSection(): Section {
+  try {
+    const requested = new URLSearchParams(window.location.search).get('section');
+    const known = navGroups.flatMap((group) => group.items).some((item) => item.id === requested);
+    if (requested && known) return requested as Section;
+  } catch { /* no window: a build-time render */ }
+  return 'dashboard';
+}
 
 function canonicalNavSection(section: Section): Section {
   switch (section) {
@@ -385,45 +447,9 @@ function GatePicker({ config, gates, officerName, selectionToken, onSelected, on
   </main>;
 }
 
-function Login({ onLogin, config }: { onLogin: (user: User, gate?: Row | null) => void; config:PortalConfig }) {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [gateStep, setGateStep] = useState<{ gates: Row[]; selectionToken: string; officerName: string } | null>(null);
+/** The branded half of the sign-in screen, shared by both steps. */
+function AuthShell({ config, children }: { config: PortalConfig; children: ReactNode }) {
   const image = gateImageUrl(config);
-
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    setLoading(true); setError('');
-    try {
-      const result = await api<{
-        user: User;
-        requiresGateSelection?: boolean;
-        gates?: Row[];
-        selectionToken?: string;
-      }>('/api/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
-      // Every Security officer must choose a gate before a session
-      // cookie is issued, so the API hands back a short-lived selection token.
-      if (result.requiresGateSelection && result.gates?.length && result.selectionToken) {
-        setGateStep({ gates: result.gates, selectionToken: result.selectionToken, officerName: result.user.name });
-        return;
-      }
-      onLogin(result.user, null);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Login failed');
-    } finally { setLoading(false); }
-  }
-
-  if (gateStep) return <GatePicker
-    config={config}
-    gates={gateStep.gates}
-    officerName={gateStep.officerName}
-    selectionToken={gateStep.selectionToken}
-    onSelected={(user, gate) => onLogin(user, gate)}
-    onBack={() => { setGateStep(null); setPassword(''); setError(''); }}
-  />;
-
   return <main className="auth-shell">
     <section className={image ? 'auth-panel brand-panel has-gate-image' : 'auth-panel brand-panel'} style={gateImageStyle(image)}>
       <div className="brand-copy">
@@ -437,19 +463,227 @@ function Login({ onLogin, config }: { onLogin: (user: User, gate?: Row | null) =
     </section>
     <section className="auth-panel form-panel">
       {image && <div className="mobile-gate-banner" style={gateImageStyle(image)}>{config.portal_gate_image_caption || `${config.estate_name} gate`}</div>}
-      <form className="login-card" onSubmit={submit}>
-        <span className="mini-logo">{config.portal_short_name}</span>
-        <h2>Sign in</h2>
-        <p>Use the account issued by your estate administrator.</p>
-        {error && <Notice tone="error">{error}</Notice>}
-        <label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" required /></label>
-        <PasswordField value={password} onChange={setPassword} label="Password" />
-        <button className="primary wide" disabled={loading}>{loading ? 'Signing in…' : 'Continue'}</button>
-        <small>Protected by an encrypted, role-based session.</small>
-      </form>
+      {children}
       <PortalFooter portalName={config.portal_name} />
     </section>
   </main>;
+}
+
+/**
+ * A sign-in failure, as a person can act on it.
+ *
+ * The title says which kind of problem it is, the message is the Worker's own
+ * sentence where it sent one, and the hint says what to do next. Where the fix
+ * is a different form ("Forgot password"), the button is here rather than in a
+ * sentence the person has to interpret.
+ */
+function SignInErrorPanel({ problem, onRetry, onForgot }: { problem: SignInProblem; onRetry?: () => void; onForgot?: () => void }) {
+  return <div className={`notice error sign-in-error ${problem.code ?? 'unknown'}`} role="alert">
+    <strong className="sign-in-error-title">{problem.title}</strong>
+    <span className="sign-in-error-message">{problem.message}</span>
+    {problem.hint && <small className="sign-in-error-hint">{problem.hint}</small>}
+    {(problem.action === 'retry' && onRetry) || (problem.action === 'forgot' && onForgot) ? <span className="sign-in-error-actions">
+      {problem.action === 'retry' && onRetry && <button type="button" className="secondary sm" onClick={onRetry}>Try again</button>}
+      {problem.action === 'forgot' && onForgot && <button type="button" className="secondary sm" onClick={onForgot}>Forgot password?</button>}
+    </span> : null}
+  </div>;
+}
+
+/**
+ * Sign in.
+ *
+ * Three things every client now offers, in the same words: "Remember me"
+ * (a 30-day session instead of a working day), a password you can look at
+ * before you commit to it, and a way out of a forgotten password that does not
+ * require calling somebody who happens to be at the office.
+ */
+function Login({ onLogin, config, initialNotice }: { onLogin: (user: User, gate?: Row | null) => void; config:PortalConfig; initialNotice?: string | null }) {
+  const remembered = useMemo(() => readRememberedSignIn(), []);
+  const [email, setEmail] = useState(remembered.email);
+  const [password, setPassword] = useState('');
+  const [rememberMe, setRememberMe] = useState(remembered.remember);
+  const [problem, setProblem] = useState<SignInProblem | null>(null);
+  const [success, setSuccess] = useState(initialNotice ?? '');
+  const [capsLock, setCapsLock] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [forgot, setForgot] = useState<{ open: boolean; seedEmail: string }>({ open: false, seedEmail: '' });
+  const [gateStep, setGateStep] = useState<{ gates: Row[]; selectionToken: string; officerName: string } | null>(null);
+
+  function watchCapsLock(event: { getModifierState?: (key: string) => boolean }) {
+    try { setCapsLock(Boolean(event.getModifierState?.('CapsLock'))); } catch { /* older browsers */ }
+  }
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setLoading(true); setProblem(null); setSuccess('');
+    try {
+      const result = await api<{
+        user: User;
+        requiresGateSelection?: boolean;
+        gates?: Row[];
+        selectionToken?: string;
+      }>('/api/auth/login', { method: 'POST', body: JSON.stringify({ email: email.trim(), password, rememberMe, client: signInClient() }) });
+      // Remembering the address is a convenience of this device only; the
+      // session's length is decided by the Worker and carried in its cookie.
+      writeRememberedSignIn(email.trim(), rememberMe);
+      // Every Security officer must choose a gate before a session
+      // cookie is issued, so the API hands back a short-lived selection token.
+      if (result.requiresGateSelection && result.gates?.length && result.selectionToken) {
+        setGateStep({ gates: result.gates, selectionToken: result.selectionToken, officerName: result.user.name });
+        return;
+      }
+      onLogin(result.user, null);
+    } catch (reason) {
+      setProblem(describeSignInProblem(reason, 'login'));
+    } finally { setLoading(false); }
+  }
+
+  if (gateStep) return <GatePicker
+    config={config}
+    gates={gateStep.gates}
+    officerName={gateStep.officerName}
+    selectionToken={gateStep.selectionToken}
+    onSelected={(user, gate) => onLogin(user, gate)}
+    onBack={() => { setGateStep(null); setPassword(''); setProblem(null); }}
+  />;
+
+  if (forgot.open) return <ForgotPassword
+    config={config}
+    initialEmail={forgot.seedEmail || email.trim()}
+    onBack={() => setForgot({ open: false, seedEmail: '' })}
+    onSignedIn={() => { setForgot({ open: false, seedEmail: '' }); setPassword(''); setSuccess('Your password has been changed. Sign in with it now.'); }}
+  />;
+
+  return <AuthShell config={config}>
+    <form className="login-card" onSubmit={submit}>
+      <span className="mini-logo">{config.portal_short_name}</span>
+      <h2>Sign in</h2>
+      <p>Use the account issued by your estate administrator.</p>
+      {success && <Notice tone="success">{success}</Notice>}
+      {problem && <SignInErrorPanel problem={problem} onRetry={() => setProblem(null)} onForgot={() => setForgot({ open: true, seedEmail: email })} />}
+      <label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" inputMode="email" required /></label>
+      <PasswordField value={password} onChange={setPassword} label="Password" />
+      {capsLock && <small className="caps-lock-hint" role="status">Caps Lock is on.</small>}
+      <div className="sign-in-row">
+        <label className="check remember-me"><input type="checkbox" checked={rememberMe} onChange={(event) => setRememberMe(event.target.checked)} /> Remember me</label>
+        <button type="button" className="text link" onClick={() => setForgot({ open: true, seedEmail: email })}>Forgot password?</button>
+      </div>
+      <small className="remember-note">{rememberMe
+        ? 'This device stays signed in for 30 days. Do not use it on a shared computer.'
+        : 'Keeps you signed in for 30 days on this device.'}</small>
+      <button className="primary wide" disabled={loading}>{loading ? 'Signing in…' : 'Continue'}</button>
+      <small>Protected by an encrypted, role-based session.</small>
+    </form>
+  </AuthShell>;
+}
+
+/**
+ * Forgot password.
+ *
+ * The estate has no mail server and the project may not depend on a paid one,
+ * so the reset is delivered one of two ways, whichever the Administrator
+ * configured:
+ *
+ *   * the estate office (the default) — the request is queued and an
+ *     Administrator or Manager issues a temporary password; the screen shows
+ *     the reference to quote, and the same reference is on the officer's queue;
+ *   * self-service — a one-time code is created for the request and shown to
+ *     whoever asked, right here, without any mail server at all.
+ *
+ * Either way the estate office sees that somebody is recovering an account.
+ */
+function ForgotPassword({ config, initialEmail, onBack, onSignedIn }: {
+  config: PortalConfig;
+  initialEmail: string;
+  onBack: () => void;
+  onSignedIn: () => void;
+}) {
+  const [email, setEmail] = useState(initialEmail);
+  const [problem, setProblem] = useState<SignInProblem | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [asked, setAsked] = useState<{ reference: string; delivery: string; code?: string; expiresAt?: string; codeMinutes?: number; message: string } | null>(null);
+  const [code, setCode] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [changed, setChanged] = useState(false);
+  const [localProblem, setLocalProblem] = useState('');
+
+  async function request(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true); setProblem(null); setLocalProblem('');
+    try {
+      const result = await api<{ reference: string; delivery: string; code?: string; expiresAt?: string; codeMinutes?: number; message: string }>(
+        '/api/auth/forgot-password',
+        { method: 'POST', body: JSON.stringify({ email: email.trim(), client: signInClient() }) },
+      );
+      setAsked(result);
+      if (result.code) setCode(result.code);
+    } catch (reason) {
+      setProblem(describeSignInProblem(reason, 'forgot'));
+    } finally { setBusy(false); }
+  }
+
+  async function reset(event: FormEvent) {
+    event.preventDefault();
+    setProblem(null); setLocalProblem('');
+    if (newPassword !== confirmPassword) { setLocalProblem('The two new passwords do not match.'); return; }
+    setBusy(true);
+    try {
+      await api('/api/auth/reset-password', { method: 'POST', body: JSON.stringify({ email: email.trim(), code, newPassword }) });
+      setChanged(true);
+    } catch (reason) {
+      setProblem(describeSignInProblem(reason, 'reset'));
+    } finally { setBusy(false); }
+  }
+
+  return <AuthShell config={config}>
+    <div className="login-card">
+      <span className="mini-logo">{config.portal_short_name}</span>
+      <h2>Forgot password</h2>
+
+      {changed ? <>
+        <Notice tone="success">Your password has been changed, and every other session was signed out.</Notice>
+        <button className="primary wide" onClick={onSignedIn}>Back to sign in</button>
+      </> : asked ? <>
+        <p className="forgot-lede">{asked.delivery === 'self_service'
+          ? 'Enter the one-time code below and choose a new password.'
+          : 'The estate office will issue your temporary password. Quote the reference below when you contact them.'}</p>
+        <div className="reset-reference">
+          <p className="eyebrow">REFERENCE</p>
+          <strong>{asked.reference}</strong>
+          <small>{email.trim()}</small>
+        </div>
+        {asked.code && <div className="reset-code">
+          <p className="eyebrow">ONE-TIME CODE</p>
+          <strong>{asked.code}</strong>
+          <small>{asked.codeMinutes ? `Expires in ${asked.codeMinutes} minutes.` : 'Single use.'} The estate office can see that you asked; they can issue a temporary password instead.</small>
+        </div>}
+        {!asked.code && <Notice tone="info">{asked.message}</Notice>}
+        {problem && <SignInErrorPanel problem={problem} />}
+        {localProblem && <Notice tone="error">{localProblem}</Notice>}
+        {asked.delivery === 'self_service' && asked.code && <form className="reset-form" onSubmit={reset}>
+          <PasswordField value={code} onChange={setCode} name="resetCode" label="One-time code" autoComplete="one-time-code" />
+          <PasswordField value={newPassword} onChange={setNewPassword} name="newPassword" label="New password" autoComplete="new-password" minLength={12} />
+          <PasswordField value={confirmPassword} onChange={setConfirmPassword} name="confirmPassword" label="Confirm new password" autoComplete="new-password" minLength={12} />
+          <small className="password-rule">At least 12 characters. A phrase you can remember beats a short password you cannot.</small>
+          <button className="primary wide" disabled={busy || code.trim().length < 8 || newPassword.length < 12}>{busy ? 'Changing your password…' : 'Set my new password'}</button>
+        </form>}
+        <div className="row-actions">
+          <button type="button" className="text" onClick={() => { setAsked(null); setProblem(null); }}>Ask again</button>
+          <button type="button" className="text" onClick={onBack}>← Back to sign in</button>
+        </div>
+      </> : <>
+        <p className="forgot-lede">Tell us the email address your estate account uses. Nothing is sent to it — the estate has no mail server — so the reset is delivered through the estate office instead.</p>
+        {problem && <SignInErrorPanel problem={problem} onRetry={() => setProblem(null)} />}
+        <form onSubmit={request}>
+          <label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" inputMode="email" required /></label>
+          <button className="primary wide" disabled={busy}>{busy ? 'Sending your request…' : 'Send my request'}</button>
+        </form>
+        <small>Already signed in on another device? Change your password there instead, under Settings → Change my password.</small>
+        <button type="button" className="text" onClick={onBack}>← Back to sign in</button>
+      </>}
+    </div>
+  </AuthShell>;
 }
 
 function Notice({ children, tone = 'info' }: { children: ReactNode; tone?: 'info'|'error'|'success'|'warning' }) {
@@ -562,15 +796,36 @@ function App() {
   const [user, setUser] = useState<User | null>(() => cachedSession?.user ?? null);
   const [gate, setGate] = useState<Row | null>(() => cachedSession?.gate ?? null);
   const [switchingGate, setSwitchingGate] = useState(false);
-  const [section, setSection] = useState<Section>('dashboard');
+  const [section, setSection] = useState<Section>(() => initialSection());
   const [checking, setChecking] = useState<boolean>(() => !cachedSession?.user);
   const [menuOpen, setMenuOpen] = useState(false);
   const [popupNotices, setPopupNotices] = useState<Row[]>([]);
+  /** Why the sign-in screen was reached again, when it was not a choice. */
+  const [sessionNotice, setSessionNotice] = useState<string | null>(null);
+  /** Reset requests waiting on the office, for the menu badge. */
+  const [pendingResets, setPendingResets] = useState<number>(0);
   const [portalConfig, setPortalConfig] = useState<PortalConfig>(() => {
     const initial = readCachedPortalConfig();
     applyPortalTheme(initial);
     return initial;
   });
+
+  /**
+   * A 401 outside the sign-in routes means the session is gone — it ran out, the
+   * account was deactivated, or the password was changed elsewhere. The API
+   * layer reports it here, so the app can return to sign-in with an explanation
+   * instead of leaving the person on a screen that fails silently.
+   */
+  useEffect(() => {
+    onSessionEnded((problem) => {
+      setUser(null);
+      setGate(null);
+      writeCachedSession(null);
+      clearApiCache();
+      setSessionNotice(signInProblemLine(describeSignInProblem(problem, 'session')));
+    });
+    return () => onSessionEnded(null);
+  }, []);
 
   const navigateTo = useCallback((nextSection: Section) => {
     setSection(nextSection);
@@ -620,11 +875,14 @@ function App() {
   const isOperator = user?.role === 'admin' || user?.role === 'manager';
   const [openMaintCount, setOpenMaintCount] = useState<number>(0);
   useEffect(() => {
-    if (!user || !isOperator) { setOpenMaintCount(0); return; }
-    api<{ openMaintenance?: { count: number } }>('/api/dashboard')
-      .then((res) => setOpenMaintCount(Number(res.openMaintenance?.count ?? 0)))
+    if (!user || !isOperator) { setOpenMaintCount(0); setPendingResets(0); return; }
+    api<{ openMaintenance?: { count: number }; pendingPasswordResets?: { count: number } }>('/api/dashboard')
+      .then((res) => {
+        setOpenMaintCount(Number(res.openMaintenance?.count ?? 0));
+        setPendingResets(Number(res.pendingPasswordResets?.count ?? 0));
+      })
       .catch(() => {});
-  }, [user?.id, isOperator]);
+  }, [user?.id, isOperator, section]);
 
   async function logout() {
     try {
@@ -649,7 +907,16 @@ function App() {
   }
 
   if (checking) return <div className="splash"><div className="brand-mark">{portalConfig.portal_short_name}</div><span>Loading {portalConfig.portal_name}…</span></div>;
-  if (!user) return <Login config={portalConfig} onLogin={(nextUser, nextGate) => { setUser(nextUser); setGate(nextGate ?? null); writeCachedSession(nextUser, nextGate ?? null); }} />;
+  if (!user) return <Login
+    config={portalConfig}
+    initialNotice={sessionNotice}
+    onLogin={(nextUser, nextGate) => {
+      setSessionNotice(null);
+      setUser(nextUser);
+      setGate(nextGate ?? null);
+      writeCachedSession(nextUser, nextGate ?? null);
+    }}
+  />;
 
   const visibleGroups: NavGroup[] = navGroups
     .map((g) => ({ ...g, items: g.items.filter((item) => !item.roles || item.roles.includes(user.role)) }))
@@ -676,6 +943,7 @@ function App() {
                   <span className="nav-icon">{navIcon(item.id)}</span>
                   <span className="nav-label">{item.label}</span>
                   {item.id === 'maintenance' && isOperator && openMaintCount > 0 && <span className="nav-badge">{openMaintCount}</span>}
+                  {item.id === 'resets' && isOperator && pendingResets > 0 && <span className="nav-badge">{pendingResets}</span>}
                 </button>
               ))}
             </div>
@@ -810,6 +1078,9 @@ function SectionView({ section, user, config, gate, onNavigate }: { section: Sec
           : <EstateNotices user={user} />}
       </>;
     }
+    case 'resets': return ['admin','manager'].includes(user.role)
+      ? <PasswordResets user={user} onNavigate={onNavigate} />
+      : <Dashboard user={user} config={config} gate={gate} onNavigate={onNavigate} />;
     case 'settings':
     case 'imports': {
       const resolved = resolveHubSection(SETTINGS_AND_IMPORTS_TABS, section, user.role);
@@ -861,6 +1132,7 @@ function Dashboard({ user, config, gate, onNavigate }: { user: User; config: Por
   const isOperator = user.role === 'admin' || user.role === 'manager';
   const image = gateImageUrl(config);
   const openMaint = Number(nested(data, 'openMaintenance', 'count') ?? 0);
+  const resetsWaiting = Number(nested(data, 'pendingPasswordResets', 'count') ?? 0);
   const cards: Array<[string, unknown, string]> = user.role === 'resident'
     ? [
       ['Outstanding', nested(data, 'outstandingBills', 'count'), money(nested(data, 'outstandingBills', 'amount'))],
@@ -879,6 +1151,12 @@ function Dashboard({ user, config, gate, onNavigate }: { user: User; config: Por
       <div className="notification-banner">
         <span>🔔 <strong>Maintenance Notice:</strong> You have {openMaint} maintenance request{openMaint === 1 ? '' : 's'} requiring attention or verification.</span>
         {onNavigate && <button type="button" className="secondary sm" onClick={() => onNavigate('maintenance')}>View requests →</button>}
+      </div>
+    )}
+    {isOperator && resetsWaiting > 0 && (
+      <div className="notification-banner sign-in-banner">
+        <span>🔑 <strong>Password resets:</strong> {resetsWaiting} {resetsWaiting === 1 ? 'person is' : 'people are'} waiting to get back into their account.</span>
+        {onNavigate && <button type="button" className="secondary sm" onClick={() => onNavigate('resets')}>Open the queue →</button>}
       </div>
     )}
     {user.role === 'security' && <Notice tone={gate ? 'success' : 'warning'}>{gate
@@ -924,6 +1202,7 @@ function buildQuickActions(role: User['role'], isOperator: boolean): Array<{ tit
     { title: 'Residents & staff', items: [{ id: 'residents', label: 'Residents' }, { id: 'residency', label: 'Tenancy' }, { id: 'dependants', label: 'Dependants' }] },
     { title: 'Estate', items: [{ id: 'properties', label: 'Properties' }, { id: 'bills', label: 'Bills' }, { id: 'maintenance', label: 'Service' }] },
     { title: 'Resources', items: [{ id: 'visitors', label: 'Visitors' }, { id: 'notices', label: 'Notices' }, { id: 'emergency', label: 'Emergency' }, { id: 'information', label: 'Info hub' }] },
+    { title: 'Administration', items: [{ id: 'resets', label: 'Password resets' }, { id: 'settings', label: 'Settings' }] },
   ];
   // Filter items by role visibility (best-effort; mirroring the sidebar rules).
   const can = (id: Section) => {
@@ -936,6 +1215,10 @@ function buildQuickActions(role: User['role'], isOperator: boolean): Array<{ tit
     if (id === 'cards') return ['admin','manager','cashier','resident'].includes(role);
     if (id === 'events') return ['admin','manager','security','resident'].includes(role);
     if (id === 'operations') return isOperator;
+    // The reset queue and Settings are office tools: a Manager answers resets
+    // but a switch that changes sign-in policy stays with an Administrator.
+    if (id === 'resets') return isOperator;
+    if (id === 'settings') return role === 'admin';
     return true;
   };
   return groups
@@ -3032,6 +3315,118 @@ function SecurityGateAssignments() {
   </>;
 }
 
+/**
+ * Password resets — the desk that answers "Forgot password".
+ *
+ * A request only exists because somebody could not sign in, so the screen leads
+ * with who is waiting and how long they have been waiting. Issuing hands over a
+ * temporary password exactly like the People page does (and ends that person's
+ * other sessions); dismissing records why nothing was issued, because "we could
+ * not confirm who this was" is itself a fact the estate should keep.
+ */
+function PasswordResets({ user, onNavigate }: { user: User; onNavigate?: (s: Section) => void }) {
+  const [status, setStatus] = useState('pending');
+  const [search, setSearch] = useState('');
+  const queue = useAsync<{ items: Row[]; counts: Record<string, number>; settings: { selfService: boolean; codeMinutes: number }; pendingDays: number }>(
+    () => api(`/api/password-resets?status=${encodeURIComponent(status)}&search=${encodeURIComponent(search)}`),
+    [status, search],
+  );
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState('');
+  const [issued, setIssued] = useState<{ personName: string; email: string; temporaryPassword: string; reference: string } | null>(null);
+  const [copyNotice, copy] = useCopy();
+
+  function refresh() { queue.reload(); }
+
+  async function issue(row: Row) {
+    const name = String(row.person_name ?? row.email ?? 'this person');
+    if (!confirm(`Issue a temporary password for ${name}? Their other sessions are signed out and they must change it after signing in. Confirm who you are speaking to first.`)) return;
+    setBusy(String(row.id)); setMessage('');
+    try {
+      const result = await api<{ personName: string; email: string; temporaryPassword: string; reference: string }>(
+        `/api/password-resets/${row.id}/issue`, { method: 'POST' },
+      );
+      setIssued(result);
+      setMessage(`Temporary password issued for ${result.personName}.`);
+      refresh();
+    } catch (reason) {
+      setMessage(reason instanceof Error ? reason.message : 'Could not issue a temporary password');
+    } finally { setBusy(''); }
+  }
+
+  async function dismiss(row: Row) {
+    const note = prompt(`Why is this request for ${String(row.person_name ?? row.email)} being closed without a reset?`, 'Could not confirm who this person is.');
+    if (note === null) return;
+    setBusy(String(row.id)); setMessage('');
+    try {
+      await api(`/api/password-resets/${row.id}/dismiss`, { method: 'POST', body: JSON.stringify({ note }) });
+      setMessage('Request closed. The person can ask again at any time.');
+      refresh();
+    } catch (reason) {
+      setMessage(reason instanceof Error ? reason.message : 'Could not close that request');
+    } finally { setBusy(''); }
+  }
+
+  const settings = queue.data?.settings;
+  const counts = queue.data?.counts ?? {};
+  const actions = (row: Row) => <div className="row-actions">
+    <button className="text" disabled={Boolean(busy)} onClick={() => issue(row)}>Issue temporary password</button>
+    <button className="text danger" disabled={Boolean(busy)} onClick={() => dismiss(row)}>Close</button>
+  </div>;
+
+  return <PagePanel title="Password resets" subtitle="People who asked for help signing in, and how each request was answered">
+    {message && <Notice tone={/Could not|not right|denied/i.test(message) ? 'error' : 'success'}>{message}{copyNotice && ` ${copyNotice}`}</Notice>}
+    {copyNotice && !message && <Notice tone="info">{copyNotice}</Notice>}
+    <IssuedPasswordCard issued={issued} onHide={() => setIssued(null)} />
+    {queue.data && <div className="stat-grid">
+      <article className="stat-card"><p>Waiting on the office</p><strong>{Number(counts.pending ?? 0)}</strong><small>Nobody can sign in until these are answered</small></article>
+      <article className="stat-card"><p>Issued</p><strong>{Number(counts.issued ?? 0)}</strong><small>Temporary password handed over</small></article>
+      <article className="stat-card"><p>Reset by the person</p><strong>{Number(counts.completed ?? 0)}</strong><small>Done with a one-time code</small></article>
+      <article className="stat-card"><p>Closed or expired</p><strong>{Number(counts.dismissed ?? 0) + Number(counts.expired ?? 0)}</strong><small>Nothing was issued</small></article>
+    </div>}
+    {settings && <Notice tone={settings.selfService ? 'warning' : 'info'}>
+      {settings.selfService
+        ? <>Self-service reset codes are <strong>on</strong> for this estate: whoever asks receives a one-time code, valid for {settings.codeMinutes} minutes, without the office being involved. Requests still appear here. An Administrator can turn this off under Settings.</>
+        : <>Reset requests come to this queue. The person quotes a reference, you confirm who they are, then issue a temporary password here. An Administrator can switch on self-service codes under Settings.</>}
+      {user.role === 'admin' && onNavigate && <> <button type="button" className="text" onClick={() => onNavigate('settings')}>Open Settings</button></>}
+    </Notice>}
+    <div className="people-filters">
+      <label>Search<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Name, email or reference" /></label>
+      <label>Status<select value={status} onChange={(event) => setStatus(event.target.value)}>
+        <option value="pending">Waiting on the office</option>
+        <option value="issued">Temporary password issued</option>
+        <option value="completed">Reset by the person</option>
+        <option value="dismissed">Closed without a reset</option>
+        <option value="expired">Expired</option>
+        <option value="">Every request</option>
+      </select></label>
+      <button type="button" className="secondary" onClick={refresh}>Refresh</button>
+    </div>
+    {queue.error && <Notice tone="error">{queue.error} <button className="text" onClick={refresh}>Retry</button></Notice>}
+    {queue.loading && <Loading />}
+    {queue.data && <DataTable exportTitle="Password resets" rows={queue.data.items} columns={[
+      ['person_name', 'Person'], ['email', 'Email'], ['role', 'Role'], ['reference', 'Reference', 'id'],
+      ['delivery', 'Delivery'], ['requested_from', 'Asked from'], ['last_requested_at', 'Last asked', 'date'],
+      ['request_count', 'Asks'], ['code_expires_at', 'Code expires', 'date'], ['status', 'Status'],
+      ['handled_by_name', 'Answered by'], ['handled_note', 'Note'],
+    ]} action={(row) => String(row.status) === 'pending' ? actions(row) : <span className="eyebrow">closed</span>} />}
+    {queue.data && <Notice tone="info">A request nobody answers stops being pending after {queue.data.pendingDays} days, and the person can ask again immediately. Issuing here is audited: the estate can always see who handed out a password and when.</Notice>}
+  </PagePanel>;
+}
+
+/** The temporary password, shown once, exactly like the People page does it. */
+function IssuedPasswordCard({ issued, onHide }: { issued: { personName: string; email: string; temporaryPassword: string; reference: string } | null; onHide: () => void }) {
+  if (!issued) return null;
+  return <section className="credential-box">
+    <p className="eyebrow">COPY NOW — SHOWN ONCE</p>
+    <h3>Temporary password for {issued.personName}</h3>
+    <code>{issued.temporaryPassword}</code>
+    <p>For {issued.email}, against reference {issued.reference}. Share it over a channel you trust; every other session of theirs has been signed out and they must change it after signing in.</p>
+    <button className="secondary" onClick={() => navigator.clipboard?.writeText(issued.temporaryPassword)}>Copy password</button>
+    <button className="text" onClick={onHide}>Hide</button>
+  </section>;
+}
+
 function Settings() {
   const list = useList('/api/settings');
   const storage = useAsync<Row>(() => api('/api/storage-settings'), [], '/api/storage-settings');
@@ -3041,6 +3436,7 @@ function Settings() {
   const [portalMessage,setPortalMessage]=useState('');
   const [bankMessage,setBankMessage]=useState('');
   const [passwordMessage, setPasswordMessage] = useState('');
+  const [resetMessage, setResetMessage] = useState('');
   const [storageMessage, setStorageMessage] = useState('');
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = new FormData(event.currentTarget); const value = String(form.get('value') ?? '');
@@ -3080,12 +3476,34 @@ function Settings() {
     setPasswordMessage('');
     const form = event.currentTarget;
     const values = Object.fromEntries(new FormData(form));
-    if (values.newPassword !== values.confirmPassword) { setPasswordMessage('New passwords do not match.'); return; }
+    if (values.newPassword !== values.confirmPassword) { setPasswordMessage('The two new passwords do not match.'); return; }
     try {
       await api('/api/auth/change-password', { method: 'POST', body: JSON.stringify({ currentPassword: values.currentPassword, newPassword: values.newPassword }) });
       form.reset();
-      setPasswordMessage('Password changed successfully.');
-    } catch (reason) { setPasswordMessage(reason instanceof Error ? reason.message : 'Password change failed'); }
+      setPasswordMessage('Password changed successfully. Every other session of yours has been signed out.');
+    } catch (reason) {
+      const problem = describeSignInProblem(reason, 'change-password');
+      setPasswordMessage(problem.hint ? `${problem.title}: ${problem.message} ${problem.hint}` : `${problem.title}: ${problem.message}`);
+    }
+  }
+
+  async function savePasswordResetSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setResetMessage('');
+    const form = event.currentTarget;
+    const values = Object.fromEntries(new FormData(form));
+    const selfService = values.selfService === 'on' ? 'true' : 'false';
+    const minutes = String(values.codeMinutes ?? '30');
+    try {
+      await api('/api/settings/password_reset_self_service', { method: 'PUT', body: JSON.stringify({ value: selfService }) });
+      await api('/api/settings/password_reset_code_minutes', { method: 'PUT', body: JSON.stringify({ value: minutes }) });
+      setResetMessage(selfService === 'true'
+        ? `Self-service reset codes are on. Codes last ${minutes} minutes and every request still appears in the reset queue.`
+        : 'Self-service reset codes are off. Reset requests come to the queue for the office to answer.');
+      list.reload();
+    } catch (reason) {
+      setResetMessage(reason instanceof Error ? reason.message : 'Could not save the reset settings');
+    }
   }
   return <PagePanel title="Settings" subtitle="Estate-wide operational rules and private storage">
     {message && <Notice tone={message.includes('updated') ? 'success' : 'error'}>{message}</Notice>}
@@ -3118,8 +3536,15 @@ function Settings() {
       <label>Fine-grained access token<input name="accessToken" type="password" autoComplete="new-password" placeholder={storage.data.tokenConfigured ? 'Configured — leave blank to keep it' : 'Required to enable storage'} /></label>
       <button className="primary">Verify and save storage</button>
     </FormCard>}
+    {resetMessage && <Notice tone={/on\.|off\./.test(resetMessage) ? 'success' : 'error'}>{resetMessage}</Notice>}
+    <FormCard title="Forgotten passwords" onSubmit={savePasswordResetSettings}>
+      <label className="check span-2"><input name="selfService" type="checkbox" defaultChecked={String(list.data?.items.find((item) => item.key === 'password_reset_self_service')?.value ?? 'false') === 'true'} /> Hand out a one-time reset code straight away</label>
+      <label>Reset code lifetime (minutes)<input name="codeMinutes" type="number" min="5" max="120" defaultValue={String(list.data?.items.find((item) => item.key === 'password_reset_code_minutes')?.value ?? '30')} /></label>
+      <small className="span-2"><strong>Off (recommended):</strong> "Forgot password" records the request and the estate office issues a temporary password from the Password resets menu. <strong>On:</strong> whoever asks receives a one-time code on the spot, so anybody who knows an email address can reset that account without the office confirming who they are. Either way every request appears in the queue, self-service ones included.</small>
+      <button className="primary">Save reset rules</button>
+    </FormCard>
     {passwordMessage && <Notice tone={passwordMessage.includes('successfully') ? 'success' : 'error'}>{passwordMessage}</Notice>}
-    <FormCard title="Change my password" onSubmit={changePassword}><label>Current password<input name="currentPassword" type="password" autoComplete="current-password" required /></label><label>New password<input name="newPassword" type="password" minLength={12} autoComplete="new-password" required /></label><label>Confirm new password<input name="confirmPassword" type="password" minLength={12} autoComplete="new-password" required /></label><button className="primary">Change password</button></FormCard>
+    <FormCard title="Change my password" onSubmit={changePassword}><label>Current password<input name="currentPassword" type="password" autoComplete="current-password" required /></label><label>New password<input name="newPassword" type="password" minLength={12} autoComplete="new-password" required /></label><label>Confirm new password<input name="confirmPassword" type="password" minLength={12} autoComplete="new-password" required /></label><small className="span-2">At least 12 characters. Changing your password signs out every other session of yours, including a "remember me" one on another device.</small><button className="primary">Change password</button></FormCard>
     <ListState list={list}><DataTable rows={list.data?.items ?? []} columns={[['key','Setting'],['value','Value'],['updated_at','Updated','date']]} /></ListState>
   </PagePanel>;
 }
@@ -3300,7 +3725,7 @@ function navIcon(section: Section): string {
     properties: '⌂', bills: '₦', maintenance: '◇', bookings: '▦', notices: '!', emergency: '✚',
     visitors: '↔',
     information: 'ⓘ', legal: '§',
-    imports: '⇩', settings: '⚙',
+    imports: '⇩', settings: '⚙', resets: '⚿',
   })[section] ?? '•';
 }
 

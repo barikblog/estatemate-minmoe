@@ -12,7 +12,62 @@ import retrofit2.http.Path
 import retrofit2.http.Query
 import retrofit2.http.Url
 
-data class LoginRequest(val email: String, val password: String)
+/**
+ * Sign-in body.
+ *
+ * [rememberMe] asks the Worker for a 30-day session instead of a working day,
+ * and [client] tells it which app is asking so a password-reset request can be
+ * recorded with where it came from.
+ */
+data class LoginRequest(
+    val email: String,
+    val password: String,
+    val rememberMe: Boolean = false,
+    val client: String = "android",
+)
+
+/** Body of `POST /api/auth/forgot-password`; the Worker answers 202 either way. */
+data class ForgotPasswordRequest(val email: String, val client: String = "android")
+
+/**
+ * What a reset request answered with.
+ *
+ * `delivery` is `office` (the estate office issues a temporary password) or
+ * `self_service` (a one-time [code] was created and is shown here). A request
+ * for an address the estate does not have answers in exactly the same shape, so
+ * nothing on this screen can reveal which addresses exist.
+ */
+data class ForgotPasswordResponse(
+    val reference: String,
+    val delivery: String,
+    val email: String? = null,
+    val code: String? = null,
+    val codeMinutes: Int? = null,
+    val expiresAt: String? = null,
+    val message: String? = null,
+)
+
+/** Body of `POST /api/auth/reset-password`, which spends a one-time code. */
+data class ResetPasswordRequest(val email: String, val code: String, val newPassword: String)
+data class ResetPasswordResponse(val ok: Boolean, val message: String? = null)
+
+/**
+ * Body of `POST /api/auth/change-password`. The answer carries a replacement
+ * token: changing a password ends every session that existed before it, this
+ * one included, so the new one has to be stored straight away.
+ */
+data class ChangePasswordRequest(val currentPassword: String, val newPassword: String)
+data class ChangePasswordResponse(val ok: Boolean, val token: String? = null, val message: String? = null)
+
+/** What issuing a temporary password answers with; the password exists once. */
+data class IssuedPasswordResponse(
+    val ok: Boolean,
+    val reference: String,
+    val personName: String,
+    val email: String,
+    val temporaryPassword: String,
+    val message: String? = null,
+)
 
 /**
  * A Security officer with assigned gates does not receive a session from login.
@@ -29,6 +84,8 @@ data class LoginResponse(
     @SerializedName("requiresGateSelection") val requiresGateSelection: Boolean?,
     @SerializedName("selectionToken") val selectionToken: String?,
     val gates: List<GateDto>?,
+    /** Echoed by the Worker so the app can store the session the way it was asked for. */
+    val rememberMe: Boolean? = null,
 )
 
 data class GateDto(
@@ -315,6 +372,29 @@ interface EstateMateApi {
 
     @POST("api/auth/select-gate")
     suspend fun selectGate(@Body request: SelectGateRequest): SelectGateResponse
+
+    /**
+     * Records a forgotten password. The estate has no mail server, so the answer
+     * carries either a reference for the estate office or, where the
+     * Administrator enabled it, a one-time code this screen shows.
+     */
+    @POST("api/auth/forgot-password")
+    suspend fun forgotPassword(@Body request: ForgotPasswordRequest): ForgotPasswordResponse
+
+    /** Spends the one-time code for a new password. */
+    @POST("api/auth/reset-password")
+    suspend fun resetPassword(@Body request: ResetPasswordRequest): ResetPasswordResponse
+
+    /** Changes the signed-in person's own password and returns their new session. */
+    @POST("api/auth/change-password")
+    suspend fun changePassword(@Body request: ChangePasswordRequest): ChangePasswordResponse
+
+    /**
+     * Issues a temporary password for a queued reset request (Administrator or
+     * Manager). Their other sessions are ended and the password is shown once.
+     */
+    @POST("api/password-resets/{id}/issue")
+    suspend fun issuePasswordReset(@Path("id") id: String): IssuedPasswordResponse
 
     @GET("api/auth/me")
     suspend fun me(): MeResponse

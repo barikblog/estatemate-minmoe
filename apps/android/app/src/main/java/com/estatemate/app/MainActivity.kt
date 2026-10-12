@@ -16,7 +16,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Apps
@@ -24,7 +27,12 @@ import androidx.compose.material.icons.outlined.Badge
 import androidx.compose.material.icons.outlined.Dashboard
 import androidx.compose.material.icons.outlined.Logout
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Visibility
+import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -53,8 +61,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -65,6 +75,7 @@ import com.estatemate.app.data.EstateRepository
 import com.estatemate.app.data.LoginOutcome
 import com.estatemate.app.data.local.CachedAccessEvent
 import com.estatemate.app.data.remote.DashboardResponse
+import com.estatemate.app.data.remote.ForgotPasswordResponse
 import com.estatemate.app.data.remote.GateDto
 import com.estatemate.app.data.remote.HouseholdMemberDto
 import com.estatemate.app.data.remote.HouseholdRequestBody
@@ -82,7 +93,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import retrofit2.HttpException
 import java.text.NumberFormat
 import java.time.Instant
 import java.time.ZoneId
@@ -113,6 +123,14 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+/**
+ * Which sign-in step is on screen. A forgotten password can be answered without
+ * leaving the app: the request records a reference for the estate office, and
+ * when the Administrator has turned on self-service it hands out a one-time
+ * code that is spent on the next screen.
+ */
+enum class AuthScreen { SignIn, Forgot, Reset }
+
 data class AppState(
     val checkingSession: Boolean = true,
     val user: UserDto? = null,
@@ -131,7 +149,20 @@ data class AppState(
     val gateOptions: List<GateDto> = emptyList(),
     val gateSelectionToken: String? = null,
     val busy: Boolean = false,
+    /** A failure on a signed-in screen, already turned into a sentence. */
     val error: String? = null,
+    /** Which sign-in step is showing. */
+    val authScreen: AuthScreen = AuthScreen.SignIn,
+    /** The sign-in failure, with the reason and the control that fixes it. */
+    val signInProblem: SignInProblem? = null,
+    /** A line worth reading before the form: a reset code, or a changed password. */
+    val notice: String? = null,
+    /** What a reset request answered, kept so the code can be re-read. */
+    val resetRequest: ForgotPasswordResponse? = null,
+    /** The address this phone offers the next time the sign-in screen opens. */
+    val rememberedEmail: String? = null,
+    /** Whether the last sign-in here asked to be remembered for 30 days. */
+    val rememberMe: Boolean = false,
 )
 
 private data class RefreshPayload(
@@ -153,14 +184,31 @@ class MainViewModel @Inject constructor(private val repository: EstateRepository
     init {
         viewModelScope.launch {
             val user = repository.restore()
-            _state.value = AppState(checkingSession = false, user = user)
+            _state.value = signedOut().copy(checkingSession = false, user = user)
             if (user != null) refresh()
         }
     }
 
-    fun login(email: String, password: String) = viewModelScope.launch {
-        _state.value = _state.value.copy(busy = true, error = null)
-        runCatching { repository.login(email, password) }
+    /** The signed-out screen, keeping this phone's remembered address and choice. */
+    private fun signedOut(problem: SignInProblem? = null, notice: String? = null) = AppState(
+        checkingSession = false,
+        rememberedEmail = repository.rememberedEmail,
+        rememberMe = repository.rememberMe,
+        signInProblem = problem,
+        notice = notice,
+    )
+
+    /**
+     * Signs in, handing the Worker this phone's "remember me" choice.
+     *
+     * A refusal is turned into the same title/sentence/hint pair the portal
+     * shows, so a wrong password, a deactivated account, a throttled source and
+     * a phone with no signal are four different sentences rather than one
+     * status line.
+     */
+    fun login(email: String, password: String, rememberMe: Boolean) = viewModelScope.launch {
+        _state.value = _state.value.copy(busy = true, error = null, signInProblem = null, notice = null)
+        runCatching { repository.login(email, password, rememberMe) }
             .onSuccess { outcome ->
                 when (outcome) {
                     is LoginOutcome.SignedIn -> {
@@ -169,6 +217,8 @@ class MainViewModel @Inject constructor(private val repository: EstateRepository
                             gateOptions = emptyList(),
                             gateSelectionToken = null,
                             busy = false,
+                            rememberedEmail = repository.rememberedEmail,
+                            rememberMe = repository.rememberMe,
                         )
                         refresh()
                     }
@@ -177,12 +227,74 @@ class MainViewModel @Inject constructor(private val repository: EstateRepository
                     is LoginOutcome.GateSelectionRequired -> _state.value = _state.value.copy(
                         busy = false,
                         error = null,
+                        signInProblem = null,
                         gateOptions = outcome.gates,
                         gateSelectionToken = outcome.selectionToken,
                     )
                 }
             }
-            .onFailure { error -> _state.value = _state.value.copy(busy = false, error = message(error, "Login failed")) }
+            .onFailure { error ->
+                _state.value = _state.value.copy(
+                    busy = false,
+                    signInProblem = describeSignInProblem(error, SignInContext.Login),
+                )
+            }
+    }
+
+    /** Shows the "forgot password" form. */
+    fun showForgotPassword() {
+        _state.value = _state.value.copy(authScreen = AuthScreen.Forgot, signInProblem = null, notice = null)
+    }
+
+    /** Shows the reset-code form for somebody who already has a code. */
+    fun showResetCode() {
+        _state.value = _state.value.copy(authScreen = AuthScreen.Reset, resetRequest = null, signInProblem = null, notice = null)
+    }
+
+    /** Back to the sign-in form, keeping the remembered address. */
+    fun backToSignIn() {
+        _state.value = _state.value.copy(authScreen = AuthScreen.SignIn, signInProblem = null)
+    }
+
+    /**
+     * Asks the estate for a way back in. The answer is the same for an address
+     * the estate has and one it does not, so nothing here can be used to find
+     * out who lives in the estate.
+     */
+    fun requestPasswordReset(email: String) = viewModelScope.launch {
+        _state.value = _state.value.copy(busy = true, signInProblem = null, notice = null)
+        runCatching { repository.forgotPassword(email) }
+            .onSuccess { answer ->
+                _state.value = _state.value.copy(
+                    busy = false,
+                    authScreen = AuthScreen.Reset,
+                    resetRequest = answer,
+                    notice = answer.message,
+                    rememberedEmail = email.trim().ifBlank { _state.value.rememberedEmail },
+                )
+            }
+            .onFailure { error ->
+                _state.value = _state.value.copy(busy = false, signInProblem = describeSignInProblem(error, SignInContext.Forgot))
+            }
+    }
+
+    /** Spends a one-time code for a new password, then returns to sign-in. */
+    fun resetPassword(email: String, code: String, newPassword: String) = viewModelScope.launch {
+        _state.value = _state.value.copy(busy = true, signInProblem = null, notice = null)
+        runCatching { repository.resetPassword(email, code, newPassword) }
+            .onSuccess { answer ->
+                _state.value = _state.value.copy(
+                    busy = false,
+                    authScreen = AuthScreen.SignIn,
+                    resetRequest = null,
+                    notice = answer.message ?: "Your password has been changed, and every other session was signed out.",
+                    rememberedEmail = email.trim().ifBlank { _state.value.rememberedEmail },
+                    signInProblem = null,
+                )
+            }
+            .onFailure { error ->
+                _state.value = _state.value.copy(busy = false, signInProblem = describeSignInProblem(error, SignInContext.Reset))
+            }
     }
 
     /** Exchanges the chosen gate for a session, then loads that gate's data. */
@@ -199,13 +311,18 @@ class MainViewModel @Inject constructor(private val repository: EstateRepository
                 )
                 refresh()
             }
-            .onFailure { error -> _state.value = _state.value.copy(busy = false, error = message(error, "Gate selection failed")) }
+            .onFailure { error ->
+                _state.value = _state.value.copy(
+                    busy = false,
+                    signInProblem = describeSignInProblem(error, SignInContext.Login),
+                )
+            }
     }
 
     /** Backs out of the gate picker to the sign-in form. */
     fun cancelGateSelection() = viewModelScope.launch {
         repository.logout()
-        _state.value = AppState(checkingSession = false)
+        _state.value = signedOut()
     }
 
     fun refresh() = viewModelScope.launch {
@@ -275,25 +392,48 @@ class MainViewModel @Inject constructor(private val repository: EstateRepository
 
     fun logout() = viewModelScope.launch {
         repository.logout()
-        _state.value = AppState(checkingSession = false)
+        _state.value = signedOut(notice = "You have been signed out.")
+    }
+
+    /** Changes the signed-in person's own password; every other session ends. */
+    fun changePassword(currentPassword: String, newPassword: String) = viewModelScope.launch {
+        _state.value = _state.value.copy(busy = true, error = null)
+        runCatching { repository.changePassword(currentPassword, newPassword) }
+            .onSuccess { message -> _state.value = _state.value.copy(busy = false, error = null, notice = message) }
+            .onFailure { error ->
+                if (error.httpStatus() == 401 && error.apiCode() == "invalid_credentials") {
+                    // A wrong current password is a form problem, not a dead
+                    // session: the Worker answers 401 for both, so the code is
+                    // what tells them apart.
+                    _state.value = _state.value.copy(
+                        busy = false,
+                        error = signInProblemLine(describeSignInProblem(error, SignInContext.ChangePassword)),
+                    )
+                    return@onFailure
+                }
+                fail(error, "Could not change your password")
+            }
+    }
+
+    /** Clears a one-off notice once the screen has shown it. */
+    fun clearNotice() {
+        if (_state.value.notice != null) _state.value = _state.value.copy(notice = null)
     }
 
     /**
-     * A 401 means the session is gone (it expired, or the account was
-     * deactivated): clear it and return to the sign-in screen with an
-     * explanation, instead of leaving every later screen failing silently.
+     * A 401 anywhere outside sign-in means the session is gone — it expired, the
+     * account was deactivated, or the password was changed on another device.
+     * The session is cleared and the sign-in screen explains why, instead of
+     * every later screen failing silently with a status line.
      */
     private fun fail(error: Throwable, fallback: String) {
-        if (error is HttpException && error.code() == 401) {
+        if (error.httpStatus() == 401) {
             viewModelScope.launch { repository.logout() }
-            _state.value = AppState(checkingSession = false, error = "Your session expired. Please sign in again.")
+            _state.value = signedOut(problem = describeSignInProblem(error, SignInContext.Session))
             return
         }
-        _state.value = _state.value.copy(busy = false, error = message(error, fallback))
+        _state.value = _state.value.copy(busy = false, error = describeError(error, fallback))
     }
-
-    private fun message(error: Throwable, fallback: String): String =
-        error.message?.takeIf { it.isNotBlank() } ?: fallback
 }
 
 @Composable
@@ -302,12 +442,43 @@ fun EstateMateApp(viewModel: MainViewModel = hiltViewModel()) {
     val events by viewModel.events.collectAsState()
     when {
         state.checkingSession -> FullScreenLoading()
-        state.user != null -> HomeScreen(state,events,viewModel::refresh,viewModel::requestOwnership,viewModel::reviewOwnership,viewModel::createTenancy,viewModel::tenancyAction,viewModel::createHouseholdMember,viewModel::householdAction,viewModel::logout)
+        state.user != null -> HomeScreen(state,events,viewModel::refresh,viewModel::requestOwnership,viewModel::reviewOwnership,viewModel::createTenancy,viewModel::tenancyAction,viewModel::createHouseholdMember,viewModel::householdAction,viewModel::changePassword,viewModel::clearNotice,viewModel::logout)
         // A Security officer with several posts: the session does not exist until
         // one is chosen, so this is a step of signing in, not an error screen.
         state.gateSelectionToken != null && state.gateOptions.isNotEmpty() ->
-            GatePickerScreen(state.gateOptions,state.busy,state.error,viewModel::chooseGate,viewModel::cancelGateSelection)
-        else -> LoginScreen(state.busy, state.error, viewModel::login)
+            GatePickerScreen(
+                gates = state.gateOptions,
+                busy = state.busy,
+                problem = state.signInProblem,
+                onChoose = viewModel::chooseGate,
+                onCancel = viewModel::cancelGateSelection,
+            )
+        state.authScreen == AuthScreen.Forgot -> ForgotPasswordScreen(
+            busy = state.busy,
+            problem = state.signInProblem,
+            initialEmail = state.rememberedEmail.orEmpty(),
+            onRequest = viewModel::requestPasswordReset,
+            onHaveCode = viewModel::showResetCode,
+            onBack = viewModel::backToSignIn,
+        )
+        state.authScreen == AuthScreen.Reset -> ResetPasswordScreen(
+            busy = state.busy,
+            problem = state.signInProblem,
+            request = state.resetRequest,
+            initialEmail = state.rememberedEmail.orEmpty(),
+            onReset = viewModel::resetPassword,
+            onRequestAnother = viewModel::requestPasswordReset,
+            onBack = viewModel::backToSignIn,
+        )
+        else -> LoginScreen(
+            busy = state.busy,
+            problem = state.signInProblem,
+            notice = state.notice,
+            initialEmail = state.rememberedEmail.orEmpty(),
+            initialRememberMe = state.rememberMe,
+            onLogin = viewModel::login,
+            onForgotPassword = viewModel::showForgotPassword,
+        )
     }
 }
 
@@ -329,28 +500,274 @@ private fun Logo() {
 }
 
 @Composable
-private fun LoginScreen(busy: Boolean, error: String?, onLogin: (String, String) -> Unit) {
-    var email by remember { mutableStateOf("") }
+private fun LoginScreen(
+    busy: Boolean,
+    problem: SignInProblem?,
+    notice: String?,
+    initialEmail: String,
+    initialRememberMe: Boolean,
+    onLogin: (String, String, Boolean) -> Unit,
+    onForgotPassword: () -> Unit,
+) {
+    // The remembered address seeds the field; after that the field is the
+    // person's own, so a later redraw never overwrites what they are typing.
+    var email by remember { mutableStateOf(initialEmail) }
     var password by remember { mutableStateOf("") }
+    var rememberMe by remember { mutableStateOf(initialRememberMe) }
+    var revealed by remember { mutableStateOf(false) }
+    val canSubmit = !busy && email.isNotBlank() && password.isNotBlank()
+    val submit = { if (canSubmit) onLogin(email, password, rememberMe) }
+
     Box(Modifier.fillMaxSize().background(EstateBackground).padding(24.dp), contentAlignment = Alignment.Center) {
         Card(shape = RoundedCornerShape(22.dp), colors = CardDefaults.cardColors(containerColor = Color.White), elevation = CardDefaults.cardElevation(8.dp)) {
-            Column(Modifier.padding(28.dp), verticalArrangement = Arrangement.spacedBy(17.dp)) {
+            Column(Modifier.padding(28.dp), verticalArrangement = Arrangement.spacedBy(15.dp)) {
                 Logo()
                 Column {
                     Text(stringResource(R.string.app_name), color = EstateBlue, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold)
                     Text("Welcome back", fontSize = 30.sp, fontWeight = FontWeight.ExtraBold, color = EstateNavy)
                     Text(stringResource(R.string.sign_in_subtitle), color = Color(0xFF68748A))
                 }
-                if (error != null) Text(error, color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
+                if (notice != null) NoticeCard(notice, tone = EstateGreen)
+                if (problem != null) SignInProblemCard(problem)
                 OutlinedTextField(value = email, onValueChange = { email = it }, label = { Text("Email address") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email, imeAction = ImeAction.Next), modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = password, onValueChange = { password = it }, label = { Text("Password") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done), modifier = Modifier.fillMaxWidth())
-                Button(onClick = { onLogin(email, password) }, enabled = !busy && email.isNotBlank() && password.isNotBlank(), modifier = Modifier.fillMaxWidth().height(52.dp), colors = ButtonDefaults.buttonColors(containerColor = EstateBlue)) {
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = { Text("Password") },
+                    singleLine = true,
+                    visualTransformation = if (revealed) VisualTransformation.None else PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = { submit() }),
+                    trailingIcon = {
+                        // View password: showing what was typed is what stops a
+                        // phone keyboard from locking somebody out of their own
+                        // account over an invisible character.
+                        IconButton(onClick = { revealed = !revealed }) {
+                            Icon(
+                                if (revealed) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
+                                if (revealed) "Hide password" else "Show password",
+                                tint = Color(0xFF6A7790),
+                            )
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = rememberMe, onCheckedChange = { rememberMe = it })
+                    Column(Modifier.weight(1f)) {
+                        Text("Remember me", fontWeight = FontWeight.SemiBold, color = EstateNavy, fontSize = 13.sp)
+                        Text(
+                            if (rememberMe) {
+                                "This device stays signed in for 30 days. Do not use it on a shared computer."
+                            } else {
+                                "Keeps you signed in for 30 days on this device."
+                            },
+                            color = Color(0xFF6A7790),
+                            fontSize = 11.sp,
+                        )
+                    }
+                }
+                Button(onClick = submit, enabled = canSubmit, modifier = Modifier.fillMaxWidth().height(52.dp), colors = ButtonDefaults.buttonColors(containerColor = EstateBlue)) {
                     if (busy) CircularProgressIndicator(Modifier.height(21.dp), strokeWidth = 2.dp, color = Color.White) else Text("Continue", fontWeight = FontWeight.Bold)
                 }
+                TextButton(onClick = onForgotPassword, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Forgot password?") }
             }
         }
     }
 }
+
+/**
+ * The portal's failure panel, on the phone: what kind of failure it was, the
+ * Worker's own sentence, what to do about it, and the control that does it.
+ */
+@Composable
+private fun SignInProblemCard(problem: SignInProblem) {
+    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFDF2F2)), shape = RoundedCornerShape(14.dp)) {
+        Column(Modifier.fillMaxWidth().padding(15.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(problem.title, fontWeight = FontWeight.ExtraBold, color = Color(0xFFA52B36), fontSize = 14.sp)
+            Text(problem.message, color = Color(0xFF7B2B33), fontSize = 12.sp)
+            if (problem.hint != null) Text(problem.hint, color = Color(0xFF7B2B33), fontSize = 11.sp)
+        }
+    }
+}
+
+/** A one-off line worth reading before the form: a code, or a result. */
+@Composable
+private fun NoticeCard(text: String, tone: Color) {
+    Card(colors = CardDefaults.cardColors(containerColor = tone.copy(alpha = 0.12f)), shape = RoundedCornerShape(14.dp)) {
+        Text(text, Modifier.fillMaxWidth().padding(15.dp), color = EstateNavy, fontSize = 12.sp)
+    }
+}
+
+/** The "forgot password" form: an address, and the two ways forward. */
+@Composable
+private fun ForgotPasswordScreen(
+    busy: Boolean,
+    problem: SignInProblem?,
+    initialEmail: String,
+    onRequest: (String) -> Unit,
+    onHaveCode: () -> Unit,
+    onBack: () -> Unit,
+) {
+    var email by remember { mutableStateOf(initialEmail) }
+    Box(Modifier.fillMaxSize().background(EstateBackground).padding(24.dp), contentAlignment = Alignment.Center) {
+        Card(shape = RoundedCornerShape(22.dp), colors = CardDefaults.cardColors(containerColor = Color.White), elevation = CardDefaults.cardElevation(8.dp)) {
+            Column(Modifier.padding(28.dp), verticalArrangement = Arrangement.spacedBy(15.dp)) {
+                Logo()
+                Column {
+                    Text("FORGOT PASSWORD", color = EstateBlue, fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
+                    Text("Get back in", fontSize = 26.sp, fontWeight = FontWeight.ExtraBold, color = EstateNavy)
+                    Text(
+                        "Tell us the email address your estate account uses. Nothing is sent to it — the estate has no mail server — so the reset is delivered through the estate office instead.",
+                        color = Color(0xFF68748A),
+                        fontSize = 13.sp,
+                    )
+                }
+                if (problem != null) SignInProblemCard(problem)
+                OutlinedTextField(value = email, onValueChange = { email = it }, label = { Text("Email address") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email, imeAction = ImeAction.Done), modifier = Modifier.fillMaxWidth())
+                Button(onClick = { onRequest(email) }, enabled = !busy && email.isNotBlank(), modifier = Modifier.fillMaxWidth().height(52.dp), colors = ButtonDefaults.buttonColors(containerColor = EstateBlue)) {
+                    if (busy) CircularProgressIndicator(Modifier.height(21.dp), strokeWidth = 2.dp, color = Color.White) else Text("Send my request", fontWeight = FontWeight.Bold)
+                }
+                OutlinedButton(onClick = onHaveCode, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("I already have a code") }
+                TextButton(onClick = onBack, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Back to sign in") }
+            }
+        }
+    }
+}
+
+/**
+ * The reset form.
+ *
+ * An office request shows its reference — the thing to quote when contacting
+ * the estate office — and a self-service request shows the one-time code to
+ * type below. A code handed out before arriving here works just as well, which
+ * is why the form is reachable on its own.
+ */
+@Composable
+private fun ResetPasswordScreen(
+    busy: Boolean,
+    problem: SignInProblem?,
+    request: ForgotPasswordResponse?,
+    initialEmail: String,
+    onReset: (String, String, String) -> Unit,
+    onRequestAnother: (String) -> Unit,
+    onBack: () -> Unit,
+) {
+    var email by remember { mutableStateOf(initialEmail) }
+    var code by remember { mutableStateOf("") }
+    var newPassword by remember { mutableStateOf("") }
+    var confirmPassword by remember { mutableStateOf("") }
+    var revealed by remember { mutableStateOf(false) }
+    // A stable local so the branches below can smart-cast: the code and the
+    // reference are only read when the Worker actually sent them.
+    val asked = request
+    val canSubmit = !busy && email.isNotBlank() && code.isNotBlank() && newPassword.isNotBlank() && newPassword == confirmPassword
+
+    Box(Modifier.fillMaxSize().background(EstateBackground).padding(24.dp), contentAlignment = Alignment.Center) {
+        Card(shape = RoundedCornerShape(22.dp), colors = CardDefaults.cardColors(containerColor = Color.White), elevation = CardDefaults.cardElevation(8.dp)) {
+            Column(Modifier.padding(28.dp), verticalArrangement = Arrangement.spacedBy(15.dp)) {
+                Logo()
+                Column {
+                    Text("RESET PASSWORD", color = EstateBlue, fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
+                    Text("Choose a new password", fontSize = 26.sp, fontWeight = FontWeight.ExtraBold, color = EstateNavy)
+                }
+                if (problem != null) SignInProblemCard(problem)
+                when {
+                    asked == null -> Text(
+                        "Enter the one-time code below and choose a new password.",
+                        color = Color(0xFF68748A),
+                        fontSize = 13.sp,
+                    )
+                    asked.code != null -> {
+                        NoticeCard("ONE-TIME CODE\n${asked.code}", tone = EstateBlue)
+                        Text(
+                            asked.message ?: "Enter the one-time code below and choose a new password. " +
+                                "It stops working once used, and the estate office can see that you asked.",
+                            color = Color(0xFF68748A),
+                            fontSize = 12.sp,
+                        )
+                    }
+                    else -> {
+                        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFBF2)), shape = RoundedCornerShape(14.dp)) {
+                            Column(Modifier.fillMaxWidth().padding(15.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text("Your reference", fontWeight = FontWeight.ExtraBold, color = EstateNavy, fontSize = 14.sp)
+                                Text(asked.reference, color = EstateBlue, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
+                                Text(
+                                    asked.message ?: "The estate office will issue your temporary password. " +
+                                        "Quote the reference below when you contact them.",
+                                    color = Color(0xFF68748A),
+                                    fontSize = 11.sp,
+                                )
+                            }
+                        }
+                        Text(
+                            "If the office has already sent you a temporary password, sign in with it and change it from your account.",
+                            color = Color(0xFF68748A),
+                            fontSize = 12.sp,
+                        )
+                    }
+                }
+                OutlinedTextField(value = email, onValueChange = { email = it }, label = { Text("Email address") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email, imeAction = ImeAction.Next), modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(
+                    value = code,
+                    onValueChange = { entered -> code = normaliseResetCode(entered) },
+                    label = { Text("One-time code") },
+                    singleLine = true,
+                    // Codes are printed without 0, O, 1, I or L, so the keyboard
+                    // never has to offer characters the estate does not use.
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii, capitalization = KeyboardCapitalization.Characters, imeAction = ImeAction.Next),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = newPassword,
+                    onValueChange = { newPassword = it },
+                    label = { Text("New password") },
+                    singleLine = true,
+                    visualTransformation = if (revealed) VisualTransformation.None else PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                    trailingIcon = {
+                        IconButton(onClick = { revealed = !revealed }) {
+                            Icon(
+                                if (revealed) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
+                                if (revealed) "Hide password" else "Show password",
+                                tint = Color(0xFF6A7790),
+                            )
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text("At least 12 characters. A phrase you can remember beats a short password you cannot.", color = Color(0xFF6A7790), fontSize = 11.sp)
+                OutlinedTextField(
+                    value = confirmPassword,
+                    onValueChange = { confirmPassword = it },
+                    label = { Text("Repeat the new password") },
+                    singleLine = true,
+                    visualTransformation = if (revealed) VisualTransformation.None else PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    isError = confirmPassword.isNotBlank() && confirmPassword != newPassword,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (confirmPassword.isNotBlank() && confirmPassword != newPassword) {
+                    Text("The two new passwords do not match.", color = MaterialTheme.colorScheme.error, fontSize = 11.sp)
+                }
+                Button(
+                    onClick = { onReset(email, code, newPassword) },
+                    enabled = canSubmit,
+                    modifier = Modifier.fillMaxWidth().height(52.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = EstateBlue),
+                ) {
+                    if (busy) CircularProgressIndicator(Modifier.height(21.dp), strokeWidth = 2.dp, color = Color.White) else Text("Set my new password", fontWeight = FontWeight.Bold)
+                }
+                OutlinedButton(onClick = { onRequestAnother(email) }, enabled = !busy && email.isNotBlank(), modifier = Modifier.fillMaxWidth()) { Text("Ask again") }
+                TextButton(onClick = onBack, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Back to sign in") }
+            }
+        }
+    }
+}
+
+/** The Worker's reset-code alphabet, uppercased and without its separators. */
+private fun normaliseResetCode(entered: String): String =
+    entered.uppercase().filter { it.isLetterOrDigit() }.take(8)
 
 private fun HomeTab.icon() = when (this) {
     HomeTab.Activity -> Icons.Outlined.Badge
@@ -369,7 +786,7 @@ private enum class HomeTab(val label: String) { Overview("Overview"), Properties
 private fun GatePickerScreen(
     gates: List<GateDto>,
     busy: Boolean,
-    error: String?,
+    problem: SignInProblem?,
     onChoose: (String) -> Unit,
     onCancel: () -> Unit,
 ) {
@@ -377,7 +794,7 @@ private fun GatePickerScreen(
         Logo()
         Text("Which gate are you working?", fontSize = 26.sp, fontWeight = FontWeight.ExtraBold, color = EstateNavy)
         Text("You are posted at more than one gate. Your shift is recorded against the one you choose.", color = Color(0xFF68748A), fontSize = 13.sp)
-        if (error != null) Text(error, color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
+        if (problem != null) SignInProblemCard(problem)
         LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             items(gates, key = { it.id }) { gate ->
                 val label = gate.gateName ?: gate.name ?: "Gate"
@@ -409,6 +826,8 @@ private fun HomeScreen(
     tenancyAction: (String, String, String?) -> Unit,
     createHouseholdMember: (HouseholdRequestBody) -> Unit,
     householdAction: (String, String, Boolean?, Boolean?) -> Unit,
+    changePassword: (String, String) -> Unit,
+    clearNotice: () -> Unit,
     logout: () -> Unit,
 ) {
     var tab by remember { mutableStateOf(HomeTab.Overview) }
@@ -452,7 +871,7 @@ private fun HomeScreen(
                 HomeTab.Properties -> Properties(state,requestOwnership,reviewOwnership,createTenancy,tenancyAction,createHouseholdMember,householdAction)
                 HomeTab.Menu -> MenuTab(state.user!!)
                 HomeTab.Activity -> Activity(events)
-                HomeTab.Account -> Account(state.user!!, state.gateName, logout)
+                HomeTab.Account -> Account(state.user!!, state.gateName, state.busy, state.error, state.notice, changePassword, clearNotice, logout)
             }
             if (state.busy) CircularProgressIndicator(Modifier.align(Alignment.TopCenter).padding(8.dp))
         }
@@ -678,8 +1097,25 @@ private fun Activity(events: List<CachedAccessEvent>) {
 }
 
 @Composable
-private fun Account(user: UserDto, gateName: String?, logout: () -> Unit) {
-    Column(Modifier.fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+private fun Account(
+    user: UserDto,
+    gateName: String?,
+    busy: Boolean,
+    error: String?,
+    notice: String?,
+    changePassword: (String, String) -> Unit,
+    clearNotice: () -> Unit,
+    logout: () -> Unit,
+) {
+    var currentPassword by remember { mutableStateOf("") }
+    var newPassword by remember { mutableStateOf("") }
+    var confirmPassword by remember { mutableStateOf("") }
+    var revealed by remember { mutableStateOf(false) }
+    val matches = newPassword.isNotBlank() && newPassword == confirmPassword
+    Column(
+        Modifier.fillMaxSize().padding(20.dp).verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
         Logo()
         Text(user.name, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold)
         Text(user.email, color = Color(0xFF68748A))
@@ -689,7 +1125,64 @@ private fun Account(user: UserDto, gateName: String?, logout: () -> Unit) {
         // is what support asks for first, and what proves a build points at the
         // estate's own Worker rather than a placeholder.
         Text("${stringResource(R.string.server_label)}: ${BuildConfig.API_BASE_URL}", color = Color(0xFF98A2B2), fontSize = 11.sp)
-        Spacer(Modifier.weight(1f))
+        if (notice != null) {
+            NoticeCard(notice, tone = EstateGreen)
+            TextButton(onClick = clearNotice) { Text("Dismiss") }
+        }
+        if (error != null) SignInProblemCard(
+            SignInProblem(
+                title = "That did not work",
+                message = error,
+                action = SignInAction.Retry,
+            ),
+        )
+        Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(16.dp)) {
+            Column(Modifier.fillMaxWidth().padding(17.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Change password", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = EstateNavy)
+                Text("Every other device is signed out when you change it, and this phone gets a fresh session.", color = Color(0xFF68748A), fontSize = 11.sp)
+                OutlinedTextField(value = currentPassword, onValueChange = { currentPassword = it }, label = { Text("Current password") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(
+                    value = newPassword,
+                    onValueChange = { newPassword = it },
+                    label = { Text("New password") },
+                    singleLine = true,
+                    visualTransformation = if (revealed) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(onClick = { revealed = !revealed }) {
+                            Icon(
+                                if (revealed) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
+                                if (revealed) "Hide password" else "Show password",
+                                tint = Color(0xFF6A7790),
+                            )
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = confirmPassword,
+                    onValueChange = { confirmPassword = it },
+                    label = { Text("Repeat the new password") },
+                    singleLine = true,
+                    visualTransformation = if (revealed) VisualTransformation.None else PasswordVisualTransformation(),
+                    isError = confirmPassword.isNotBlank() && !matches,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (confirmPassword.isNotBlank() && !matches) {
+                    Text("The two new passwords do not match.", color = MaterialTheme.colorScheme.error, fontSize = 11.sp)
+                }
+                Button(
+                    onClick = {
+                        changePassword(currentPassword, newPassword)
+                        currentPassword = ""
+                        newPassword = ""
+                        confirmPassword = ""
+                    },
+                    enabled = !busy && currentPassword.isNotBlank() && matches,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Change password") }
+            }
+        }
+        Spacer(Modifier.height(6.dp))
         Button(onClick = logout, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = EstateNavy)) { Icon(Icons.Outlined.Logout, null); Spacer(Modifier.padding(4.dp)); Text("Sign out") }
     }
 }

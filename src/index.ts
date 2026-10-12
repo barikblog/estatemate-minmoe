@@ -76,6 +76,49 @@ import {
   verifyJwt,
   verifyPassword,
 } from './security';
+import {
+  CLEARED_SESSION_COOKIE,
+  FORGOT_PASSWORD_THROTTLE,
+  GATE_SELECTION_SECONDS,
+  LOGIN_THROTTLE,
+  REMEMBER_ME_SECONDS,
+  RESET_CODE_LENGTH,
+  RESET_CODE_MAX_ATTEMPTS,
+  RESET_CODE_TTL_MINUTES_DEFAULT,
+  RESET_CODE_TTL_MINUTES_MAX,
+  RESET_CODE_TTL_MINUTES_MIN,
+  RESET_REQUEST_PENDING_DAYS,
+  RESET_REQUEST_REUSE_HOURS,
+  SESSION_COOKIE,
+  SESSION_SECONDS,
+  SIGN_IN_MESSAGES,
+  attemptSourceHash,
+  formatResetCode,
+  generateResetCode,
+  generateResetReference,
+  looksLikeEmail,
+  normalizeEmail,
+  normalizeResetCode,
+  parseSqliteUtc,
+  passwordProblem,
+  readBooleanFlag,
+  readRequestedFrom,
+  readResetCodeMinutes,
+  readSelfServiceEnabled,
+  requestAddress,
+  resetCodeHash,
+  resetCodeMatches,
+  resetExpiry,
+  retryAfterSeconds,
+  retryHint,
+  sessionCookie,
+  sessionIssuedBeforePasswordChange,
+  sessionSecondsFor,
+  signInMessage,
+  signInProblem,
+  type SignInErrorCode,
+  type ThrottleLimits,
+} from './sign-in';
 import type { AccessEventQueuePayload, AppVariables, AuthUser, DeviceIdentity, Env, NormalizedAccessEvent, Role } from './types';
 import { flattenQueuePayload } from './types';
 
@@ -177,10 +220,21 @@ const requireAuth: MiddlewareHandler<{ Bindings: Env; Variables: AppVariables }>
   // one through POST /api/auth/select-gate, so it must never satisfy auth here.
   if (claims.pendingGate) return jsonError(c, 401, 'Select the gate you are working before continuing');
   const user = await c.env.DB.prepare(
-    `SELECT id,name,email,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,property_id FROM users WHERE id=? AND status='active' AND (account_expires_at IS NULL OR datetime(account_expires_at)>datetime('now')) LIMIT 1`,
-  ).bind(claims.sub).first<AuthUser>();
+    `SELECT id,name,email,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,property_id,password_changed_at FROM users WHERE id=? AND status='active' AND (account_expires_at IS NULL OR datetime(account_expires_at)>datetime('now')) LIMIT 1`,
+  ).bind(claims.sub).first<AuthUser & { password_changed_at: string | null }>();
   if (!user) return jsonError(c, 401, 'User is inactive or no longer exists');
-  c.set('user', user);
+  // A password change retires every session issued before it. Exposed as a JSON
+  // code so the clients can say why they are back at the sign-in screen instead
+  // of showing a bare failure on whatever screen the person was using.
+  if (sessionIssuedBeforePasswordChange(user.password_changed_at, claims.iat)) {
+    return c.json({
+      error: 'Your password was changed, so this session ended. Sign in with your new password.',
+      code: 'session_ended',
+    }, 401);
+  }
+  const { password_changed_at: _passwordChangedAt, ...safeUser } = user;
+  c.set('user', safeUser);
+  c.set('session', { issuedAt: claims.iat, expiresAt: claims.exp });
   let sessionGate: string | null = null;
   if (user.role === 'security' && claims.gate) {
     // Re-check the assignment on every request: if an administrator unassigns the
@@ -568,7 +622,12 @@ const BOOLEAN_SETTING_KEYS: readonly string[] = ['portal_gate_image_enabled'];
  * How long a Security officer has to pick their gate after signing in before
  * the gate-selection token expires and they must log in again.
  */
-const GATE_SELECTION_TTL_SECONDS = 5 * 60;
+/**
+ * Gate selection now shares one lifetime with every client (`GATE_SELECTION_SECONDS`
+ * in src/sign-in.ts), so the portal, the PC app and the phone cannot disagree
+ * about how long an officer has to pick a post.
+ */
+const GATE_SELECTION_TTL_SECONDS = GATE_SELECTION_SECONDS;
 
 /**
  * Accepted ways to initiate a payment. Online card collection is deliberately
@@ -640,6 +699,244 @@ app.get('/api/portal-gate-image', async (c) => {
   }
 });
 
+/**
+ * ---------------------------------------------------------------- sign-in ---
+ *
+ * Sign-in helpers shared by every client. The rules themselves live in
+ * src/sign-in.ts; what is here is the database side of them — the attempt
+ * window behind the throttle and the estate's reset queue.
+ */
+
+/**
+ * Reads a JSON object body without throwing on a malformed one. A client that
+ * sends nothing, or sends something that is not JSON, must get a 400 it can
+ * display rather than the Worker's generic 500.
+ */
+async function readJsonObject(c: AppContext): Promise<Record<string, unknown>> {
+  try {
+    const body = await c.req.json<unknown>();
+    return body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * A sign-in refusal, in the shape every client already reads: `{ error }` as
+ * before, plus `code` so the client can use its own wording, and
+ * `retryAfterSeconds` with a `Retry-After` header when the caller must wait.
+ */
+function signInFailure(
+  c: AppContext,
+  status: 400 | 401 | 403 | 409 | 429 | 503,
+  code: SignInErrorCode,
+  message?: string,
+  extra: Record<string, unknown> = {},
+) {
+  const retry = typeof extra.retryAfterSeconds === 'number' ? extra.retryAfterSeconds : null;
+  if (retry !== null) c.header('Retry-After', String(Math.max(1, Math.ceil(retry))));
+  return c.json(signInProblem(code, signInMessage(code, message), extra), status);
+}
+
+type SignInAttemptKind = 'login' | 'forgot_password';
+
+interface ThrottleReading {
+  /** Failed attempts from this address for this account. */
+  source: number;
+  /** Failed attempts for this account from any address. */
+  email: number;
+  /** The oldest attempt still inside the window, for the "try again in" hint. */
+  oldest: string | null;
+}
+
+async function readThrottle(
+  db: D1Database,
+  kind: SignInAttemptKind,
+  email: string,
+  sourceHash: string,
+  windowMinutes: number,
+): Promise<ThrottleReading> {
+  const window = `-${Math.floor(windowMinutes)} minutes`;
+  const row = await db.prepare(
+    `SELECT
+       (SELECT COUNT(*) FROM auth_attempts WHERE kind=? AND email=? AND source_hash=? AND succeeded=0 AND datetime(created_at)>datetime('now',?)) AS source_count,
+       (SELECT COUNT(*) FROM auth_attempts WHERE kind=? AND email=? AND succeeded=0 AND datetime(created_at)>datetime('now',?)) AS email_count,
+       (SELECT MIN(created_at) FROM auth_attempts WHERE kind=? AND email=? AND succeeded=0 AND datetime(created_at)>datetime('now',?)) AS oldest`,
+  ).bind(
+    kind, email, sourceHash, window,
+    kind, email, window,
+    kind, email, window,
+  ).first<{ source_count: number; email_count: number; oldest: string | null }>();
+  return {
+    source: Number(row?.source_count ?? 0),
+    email: Number(row?.email_count ?? 0),
+    oldest: row?.oldest ?? null,
+  };
+}
+
+/**
+ * Records an attempt. A failure is recorded whether or not the address belongs
+ * to an account, so the throttle can never be used to work out which addresses
+ * exist: an unknown address is counted exactly like a real one.
+ */
+async function recordAuthAttempt(
+  db: D1Database,
+  kind: SignInAttemptKind,
+  email: string,
+  sourceHash: string,
+  succeeded = false,
+): Promise<void> {
+  await db.prepare(
+    `INSERT INTO auth_attempts(id,kind,email,source_hash,succeeded) VALUES (?,?,?,?,?)`,
+  ).bind(crypto.randomUUID(), kind, email, sourceHash, succeeded ? 1 : 0).run();
+}
+
+/** A successful sign-in clears the failures that preceded it. */
+async function clearAuthAttempts(db: D1Database, kind: SignInAttemptKind, email: string, sourceHash: string): Promise<void> {
+  await db.prepare(`DELETE FROM auth_attempts WHERE kind=? AND email=? AND source_hash=? AND succeeded=0`).bind(kind, email, sourceHash).run();
+}
+
+/**
+ * Refuses a request that has burned through its window, or null to proceed.
+ * Both limits are checked: one source hammering one account, and many sources
+ * hammering one account, which is what guessing a password from a botnet looks
+ * like.
+ */
+async function throttleExceeded(
+  c: AppContext,
+  kind: SignInAttemptKind,
+  email: string,
+  sourceHash: string,
+  limits: ThrottleLimits,
+): Promise<Response | null> {
+  const reading = await readThrottle(c.env.DB, kind, email, sourceHash, limits.windowMinutes);
+  if (reading.source < limits.perSource && reading.email < limits.perEmail) return null;
+  const seconds = retryAfterSeconds(reading.oldest, limits.windowMinutes);
+  return signInFailure(c, 429, 'too_many_attempts', `${SIGN_IN_MESSAGES.too_many_attempts} ${retryHint(seconds)}`, {
+    retryAfterSeconds: seconds,
+  });
+}
+
+interface ResetSettings {
+  /** Administrator opt-in: hand the requester a one-time code straight away. */
+  selfService: boolean;
+  codeMinutes: number;
+}
+
+async function readResetSettings(db: D1Database): Promise<ResetSettings> {
+  try {
+    const rows = await db.prepare(
+      `SELECT key,value FROM settings WHERE key IN ('password_reset_self_service','password_reset_code_minutes')`,
+    ).all<{ key: string; value: string }>();
+    const values = new Map(rows.results.map((row) => [row.key, row.value]));
+    return {
+      selfService: readSelfServiceEnabled(values.get('password_reset_self_service')),
+      codeMinutes: readResetCodeMinutes(values.get('password_reset_code_minutes')),
+    };
+  } catch {
+    // A deployment whose migration has not run yet still answers, safely: the
+    // office path is the default and codes stay at their default lifetime.
+    return { selfService: false, codeMinutes: RESET_CODE_TTL_MINUTES_DEFAULT };
+  }
+}
+
+/** A reference nobody else holds. Printed on screen and quoted to the office. */
+async function newResetReference(db: D1Database): Promise<string> {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const candidate = generateResetReference();
+    const taken = await db.prepare(`SELECT 1 AS ok FROM password_reset_requests WHERE reference=?`).bind(candidate).first();
+    if (!taken) return candidate;
+  }
+  throw new Error('Could not generate a unique reset reference');
+}
+
+interface RecordedReset {
+  reference: string;
+  delivery: 'office' | 'self_service';
+  /** The one-time code, present only in self-service mode and only once. */
+  code: string | null;
+  expiresAt: string | null;
+  reused: boolean;
+}
+
+/**
+ * Records a reset request for an account that exists.
+ *
+ * Asking again inside the reuse window keeps the reference the person already
+ * has on screen — and the officer already has in the queue — instead of filling
+ * the queue with duplicates. Anything older is superseded, and its code (if it
+ * had one) is thrown away, so only one live request per person can exist.
+ */
+async function recordResetRequest(
+  env: Env,
+  input: { userId: string; email: string; delivery: 'office' | 'self_service'; requestedFrom: string; sourceHash: string; codeMinutes: number },
+): Promise<RecordedReset> {
+  const code = input.delivery === 'self_service' ? generateResetCode() : null;
+  const codeHash = code ? await resetCodeHash(code) : null;
+  const expiresAt = code ? resetExpiry(input.codeMinutes) : null;
+  const open = await env.DB.prepare(
+    `SELECT id,reference,delivery,created_at FROM password_reset_requests
+      WHERE user_id=? AND status='pending' ORDER BY last_requested_at DESC LIMIT 1`,
+  ).bind(input.userId).first<{ id: string; reference: string; delivery: 'office' | 'self_service'; created_at: string }>();
+
+  const reusableSince = Date.now() - RESET_REQUEST_REUSE_HOURS * 3_600_000;
+  if (open && open.delivery === input.delivery && (parseSqliteUtc(open.created_at) ?? 0) >= reusableSince) {
+    await env.DB.prepare(
+      `UPDATE password_reset_requests
+         SET request_count=request_count+1,last_requested_at=datetime('now'),
+             requested_from=?,requested_source_hash=?,
+             code_hash=?,code_expires_at=?,code_attempts=0
+       WHERE id=?`,
+    ).bind(input.requestedFrom, input.sourceHash, codeHash, expiresAt, open.id).run();
+    return { reference: open.reference, delivery: open.delivery, code, expiresAt, reused: true };
+  }
+
+  const id = crypto.randomUUID();
+  const reference = await newResetReference(env.DB);
+  const statements = [
+    env.DB.prepare(
+      `UPDATE password_reset_requests
+         SET status='expired',code_hash=NULL,handled_at=datetime('now'),
+             handled_note='Superseded by a newer request from the same person.'
+       WHERE user_id=? AND status='pending'`,
+    ).bind(input.userId),
+    env.DB.prepare(
+      `INSERT INTO password_reset_requests(id,user_id,email,reference,status,delivery,requested_from,requested_source_hash,code_hash,code_expires_at)
+       VALUES (?,?,?,?,'pending',?,?,?,?,?)`,
+    ).bind(id, input.userId, input.email, reference, input.delivery, input.requestedFrom, input.sourceHash, codeHash, expiresAt),
+  ];
+  await env.DB.batch(statements);
+  return { reference, delivery: input.delivery, code, expiresAt, reused: false };
+}
+
+/** Closes every pending reset for a person, whatever route resolved them. */
+async function closePendingResets(
+  env: Env,
+  userId: string,
+  status: 'issued' | 'completed' | 'dismissed',
+  note: string,
+  handledBy: string | null,
+): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE password_reset_requests
+       SET status=?,code_hash=NULL,handled_by=?,handled_at=datetime('now'),handled_note=?
+     WHERE user_id=? AND status='pending'`,
+  ).bind(status, handledBy, note, userId).run();
+}
+
+/**
+ * Sets a new password and records that it changed.
+ *
+ * `password_changed_at` is what retires every session issued before this
+ * moment, so a reset made because somebody else had the password also ends
+ * their 30-day "remember me" session.
+ */
+async function setPassword(env: Env, userId: string, password: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE users SET password_hash=?,password_changed_at=datetime('now'),updated_at=datetime('now') WHERE id=?`,
+  ).bind(await hashPassword(password), userId).run();
+}
+
 app.post('/api/auth/bootstrap', async (c) => {
   const count = await c.env.DB.prepare('SELECT COUNT(*) AS total FROM users').first<{ total: number }>();
   if ((count?.total ?? 0) > 0) return jsonError(c, 409, 'Bootstrap has already been completed');
@@ -659,31 +956,84 @@ app.post('/api/auth/bootstrap', async (c) => {
   return c.json({ id, email, message: 'Administrator created. Remove or rotate BOOTSTRAP_TOKEN now.' }, 201);
 });
 
+/**
+ * Sign in.
+ *
+ * Every answer says which kind of failure it was (`code`) as well as what to do
+ * about it (`error`), because the three clients used to have to guess from a
+ * status line: a wrong password, a deactivated account, an expired account and
+ * an offline Worker are different problems with different fixes. The password is
+ * verified *before* anything is said about the account's state, so the extra
+ * detail is only ever shown to somebody who already knows the password — the
+ * screen cannot be used to discover which addresses the estate has.
+ *
+ * `rememberMe` chooses the session's lifetime (30 days against a working day),
+ * and the cookie's `Max-Age` always matches the token's own `exp`.
+ */
 app.post('/api/auth/login', async (c) => {
-  const body = await c.req.json<{ email?: string; password?: string }>();
-  if (!body.email || !body.password) return jsonError(c, 400, 'email and password are required');
+  const body = await readJsonObject(c);
+  const email = normalizeEmail(body.email);
+  const password = typeof body.password === 'string' ? body.password : '';
+  if (!email || !password) {
+    return signInFailure(c, 400, 'validation', 'Enter your email address and your password.');
+  }
+
+  const sourceHash = await attemptSourceHash(c.env.JWT_SECRET, requestAddress((name) => c.req.header(name)));
+  const throttled = await throttleExceeded(c, 'login', email, sourceHash, LOGIN_THROTTLE);
+  if (throttled) return throttled;
+
   const user = await c.env.DB.prepare(
-    `SELECT id,name,email,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,property_id,password_hash FROM users WHERE email=? AND status='active' AND (account_expires_at IS NULL OR datetime(account_expires_at)>datetime('now')) LIMIT 1`,
-  ).bind(body.email.trim().toLowerCase()).first<AuthUser & { password_hash: string }>();
-  if (!user || !(await verifyPassword(body.password, user.password_hash))) return jsonError(c, 401, 'Invalid email or password');
-  const { password_hash: _passwordHash, ...safeUser } = user;
+    `SELECT id,name,email,CASE WHEN is_manager=1 THEN 'manager' ELSE role END AS role,property_id,password_hash,status,account_expires_at
+       FROM users WHERE email=? COLLATE NOCASE LIMIT 1`,
+  ).bind(email).first<AuthUser & { password_hash: string; status: string; account_expires_at: string | null }>();
+
+  const passwordOk = Boolean(user) && (await verifyPassword(password, user!.password_hash));
+  if (!user || !passwordOk) {
+    await recordAuthAttempt(c.env.DB, 'login', email, sourceHash);
+    return signInFailure(c, 401, 'invalid_credentials', 'Email or password is not correct. Check it and try again, or use "Forgot password".');
+  }
+  if (user.status !== 'active') {
+    await clearAuthAttempts(c.env.DB, 'login', email, sourceHash);
+    return signInFailure(c, 403, 'account_inactive', 'This account has been deactivated. Ask the estate office to reactivate it.');
+  }
+  const expiresAt = parseSqliteUtc(user.account_expires_at);
+  if (expiresAt !== null && expiresAt <= Date.now()) {
+    await clearAuthAttempts(c.env.DB, 'login', email, sourceHash);
+    return signInFailure(c, 403, 'account_expired', 'This account has expired. Ask the estate office for a new one.');
+  }
+
+  await clearAuthAttempts(c.env.DB, 'login', email, sourceHash);
+  await recordAuthAttempt(c.env.DB, 'login', email, sourceHash, true);
+
+  const rememberMe = readBooleanFlag(body.rememberMe);
+  const sessionSeconds = sessionSecondsFor(rememberMe);
+  const { password_hash: _passwordHash, status: _status, account_expires_at: _expires, ...safeUser } = user;
 
   // A Security officer posted at a specific gate must say which gate they are
   // working for this session. No session cookie is set yet: the short-lived
-  // selection token below can only be exchanged through /api/auth/select-gate.
+  // selection token below can only be exchanged through /api/auth/select-gate,
+  // and it carries the "remember me" choice so the officer's real session keeps
+  // the lifetime they asked for.
   if (user.role === 'security') {
     const gates = await selectableGates(c.env.DB, user.id);
     if (gates.length) {
-      const selectionToken = await signJwt(c.env, user, GATE_SELECTION_TTL_SECONDS, { pendingGate: true });
-      return c.json({ requiresGateSelection: true, gates, selectionToken, user: safeUser });
+      const selectionToken = await signJwt(c.env, user, GATE_SELECTION_TTL_SECONDS, { pendingGate: true, remember: rememberMe });
+      return c.json({ requiresGateSelection: true, gates, selectionToken, user: safeUser, rememberMe });
     }
   }
 
-  const token = await signJwt(c.env, user);
-  c.header('Set-Cookie', `estatemate_session=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=43200`);
+  const token = await signJwt(c.env, user, sessionSeconds);
+  c.header('Set-Cookie', sessionCookie(token, sessionSeconds));
   // Only reached by a Security officer when the estate has no active gate device
   // at all, so there is nothing to choose; they keep estate-wide visibility.
-  return c.json({ token, user: safeUser, ...(user.role === 'security' ? { gateSelectionUnavailable: true } : {}) });
+  return c.json({
+    token,
+    user: safeUser,
+    rememberMe,
+    sessionSeconds,
+    expiresAt: new Date(Date.now() + sessionSeconds * 1000).toISOString(),
+    ...(user.role === 'security' ? { gateSelectionUnavailable: true } : {}),
+  });
 });
 
 /**
@@ -717,8 +1067,12 @@ app.post('/api/auth/select-gate', async (c) => {
   const gate = (await selectableGates(c.env.DB, user.id)).find((device) => device.id === deviceId);
   if (!gate) return jsonError(c, 403, 'You are not allowed to work at that gate');
 
-  const token = await signJwt(c.env, user, 60 * 60 * 12, { gate: deviceId, openGate });
-  c.header('Set-Cookie', `estatemate_session=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=43200`);
+  // The officer's real session keeps whatever lifetime they asked for at
+  // sign-in: a "remember me" choice made before the gate picker would otherwise
+  // be silently downgraded to a working day here.
+  const sessionSeconds = sessionSecondsFor(claims.remember);
+  const token = await signJwt(c.env, user, sessionSeconds, { gate: deviceId, openGate });
+  c.header('Set-Cookie', sessionCookie(token, sessionSeconds));
   await c.env.DB.batch([
     c.env.DB.prepare(`UPDATE security_gate_sessions SET ended_at=datetime('now'),end_reason='replaced' WHERE security_user_id=? AND ended_at IS NULL`).bind(user.id),
     c.env.DB.prepare(`INSERT INTO security_gate_sessions(id,security_user_id,device_id) VALUES (?,?,?)`).bind(crypto.randomUUID(), user.id, deviceId),
@@ -727,8 +1081,164 @@ app.post('/api/auth/select-gate', async (c) => {
 });
 
 app.post('/api/auth/logout', (c) => {
-  c.header('Set-Cookie', 'estatemate_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0');
+  c.header('Set-Cookie', CLEARED_SESSION_COOKIE);
   return c.json({ ok: true });
+});
+
+
+/**
+ * Forgot password — the estate's own reset path.
+ *
+ * The answer never depends on whether the address belongs to an account: the
+ * same 202, the same shape, a fresh reference and the same wording either way.
+ * That is deliberate. A screen that says "no such account" tells a stranger
+ * which addresses this estate has, and a reference that cannot be found in the
+ * queue costs the estate office nothing (the officer searches by the email the
+ * person repeats).
+ *
+ * In the default `office` mode the estate office issues a temporary password
+ * from the reset queue. Where an Administrator has switched self-service on
+ * (`password_reset_self_service`), the same request also mints a short one-time
+ * code, which this response carries and which the person types into the app
+ * they are holding. Either way the request is queued, so the office always sees
+ * that somebody is recovering an account.
+ */
+app.post('/api/auth/forgot-password', async (c) => {
+  const body = await readJsonObject(c);
+  const email = normalizeEmail(body.email);
+  const requestedFrom = readRequestedFrom(body.client);
+  if (!looksLikeEmail(email)) {
+    return signInFailure(c, 400, 'validation', 'Enter the email address your estate account uses.');
+  }
+
+  const sourceHash = await attemptSourceHash(c.env.JWT_SECRET, requestAddress((name) => c.req.header(name)));
+  const throttled = await throttleExceeded(c, 'forgot_password', email, sourceHash, FORGOT_PASSWORD_THROTTLE);
+  if (throttled) return throttled;
+  await recordAuthAttempt(c.env.DB, 'forgot_password', email, sourceHash);
+
+  const { selfService, codeMinutes } = await readResetSettings(c.env.DB);
+  const delivery: 'office' | 'self_service' = selfService ? 'self_service' : 'office';
+  const user = await c.env.DB.prepare(
+    `SELECT id,name,email FROM users WHERE email=? COLLATE NOCASE LIMIT 1`,
+  ).bind(email).first<{ id: string; name: string; email: string }>();
+
+  if (!user) {
+    // A reference-shaped answer with nothing behind it. The estate office finds
+    // nothing when it looks, which is the correct outcome for an address the
+    // estate does not have.
+    return c.json({
+      ok: true,
+      reference: generateResetReference(),
+      delivery,
+      email,
+      codeMinutes,
+      message: selfService
+        ? 'If that address has an account here, a one-time reset code has been created for it. Check the code shown when you asked, or contact the estate office with this reference.'
+        : 'If that address has an account here, the estate office will issue a temporary password. Quote this reference when you contact them.',
+    }, 202);
+  }
+
+  const recorded = await recordResetRequest(c.env, {
+    userId: user.id,
+    email,
+    delivery,
+    requestedFrom,
+    sourceHash,
+    codeMinutes,
+  });
+
+  await audit(c, 'request_password_reset', 'user', user.id, {
+    reference: recorded.reference,
+    delivery: recorded.delivery,
+    requestedFrom,
+    reused: recorded.reused,
+  });
+
+  const message = recorded.code
+    ? `Enter this one-time code to choose a new password: ${formatResetCode(recorded.code)}. It expires in ${codeMinutes} minutes, and the estate office can see that you asked.`
+    : `Your request is with the estate office. Quote reference ${recorded.reference} when you contact them; they will issue a temporary password for you to change after signing in.`;
+
+  return c.json({
+    ok: true,
+    reference: recorded.reference,
+    delivery: recorded.delivery,
+    email,
+    code: recorded.code ? formatResetCode(recorded.code) : undefined,
+    expiresAt: recorded.expiresAt ?? undefined,
+    codeMinutes,
+    message,
+  }, 202);
+});
+
+/**
+ * Completes a self-service reset with the one-time code.
+ *
+ * The code is stored hashed, is single-use and expires; guessing is capped per
+ * request. A wrong code, an expired one, an address with no account and an
+ * account that is no longer active all answer the same way, so the endpoint
+ * cannot be used as a directory either.
+ */
+app.post('/api/auth/reset-password', async (c) => {
+  const body = await readJsonObject(c);
+  const email = normalizeEmail(body.email);
+  const code = normalizeResetCode(body.code);
+  if (!looksLikeEmail(email)) {
+    return signInFailure(c, 400, 'validation', 'Enter the email address your estate account uses.');
+  }
+  if (code.length !== RESET_CODE_LENGTH) {
+    return signInFailure(c, 400, 'validation', `Enter the ${RESET_CODE_LENGTH}-character reset code your estate gave you.`);
+  }
+  const problem = passwordProblem(body.newPassword, email);
+  if (problem) return signInFailure(c, 400, 'weak_password', problem);
+
+  const request = await c.env.DB.prepare(
+    `SELECT r.id,r.user_id,r.code_hash,r.code_attempts,r.code_expires_at
+       FROM password_reset_requests r JOIN users u ON u.id=r.user_id
+      WHERE r.email=? COLLATE NOCASE AND r.delivery='self_service' AND r.status='pending'
+        AND r.code_hash IS NOT NULL AND u.status='active'
+      ORDER BY r.last_requested_at DESC LIMIT 1`,
+  ).bind(email).first<{ id: string; user_id: string; code_hash: string; code_attempts: number; code_expires_at: string | null }>();
+  if (!request) {
+    return signInFailure(c, 401, 'invalid_reset_code', 'That reset code is not right, or it has already been used. Request a new one.');
+  }
+
+  const expiresAt = parseSqliteUtc(request.code_expires_at);
+  if (expiresAt !== null && expiresAt <= Date.now()) {
+    await c.env.DB.prepare(
+      `UPDATE password_reset_requests SET status='expired',code_hash=NULL,handled_at=datetime('now'),handled_note='The one-time code was not used before it expired.' WHERE id=?`,
+    ).bind(request.id).run();
+    return signInFailure(c, 401, 'reset_expired', 'That reset code has expired. Ask for a new one.');
+  }
+
+  if (Number(request.code_attempts) >= RESET_CODE_MAX_ATTEMPTS) {
+    await c.env.DB.prepare(
+      `UPDATE password_reset_requests SET status='expired',code_hash=NULL,handled_at=datetime('now'),handled_note='The one-time code was guessed at too often.' WHERE id=?`,
+    ).bind(request.id).run();
+    return signInFailure(c, 429, 'too_many_attempts', 'Too many wrong codes for this request. Ask for a new one.', { retryAfterSeconds: 60 });
+  }
+
+  if (!(await resetCodeMatches(code, request.code_hash))) {
+    const attempts = Number(request.code_attempts) + 1;
+    const remaining = RESET_CODE_MAX_ATTEMPTS - attempts;
+    // The last wrong guess closes the request on the spot, so the sentence the
+    // person reads matches the row the estate office will look at.
+    await c.env.DB.prepare(
+      remaining > 0
+        ? `UPDATE password_reset_requests SET code_attempts=? WHERE id=?`
+        : `UPDATE password_reset_requests SET code_attempts=?,status='expired',code_hash=NULL,handled_at=datetime('now'),handled_note='The one-time code was guessed at too often.' WHERE id=?`,
+    ).bind(attempts, request.id).run();
+    return signInFailure(c, 401, 'invalid_reset_code', remaining > 0
+      ? `That reset code is not right. ${remaining} attempt${remaining === 1 ? '' : 's'} left before you have to ask for a new one.`
+      : 'That reset code is not right, and the request is now closed. Ask for a new one.');
+  }
+
+  await setPassword(c.env, request.user_id, String(body.newPassword));
+  await closePendingResets(c.env, request.user_id, 'completed', 'Reset with the one-time code.', null);
+  await audit(c, 'complete_password_reset', 'user', request.user_id, { delivery: 'self_service' });
+  return c.json({
+    ok: true,
+    message: 'Your password has been changed and every other session has been signed out. Sign in with your new password.',
+  });
 });
 
 app.use('/api/*', requireAuth);
@@ -747,16 +1257,40 @@ app.get('/api/auth/gates', requireRoles('security'), async (c) => {
   return c.json({ items: await selectableGates(c.env.DB, c.get('user').id), selected: gateScope(c) });
 });
 
+/**
+ * Change my password.
+ *
+ * Changing a password retires every session issued before it, which would
+ * otherwise sign the person out of the device they are using — so this route
+ * hands back a fresh session, with the remaining lifetime kept (a "remember me"
+ * browser stays remembered). The phone app can store the returned token exactly
+ * like the one it gets from sign-in.
+ */
 app.post('/api/auth/change-password', async (c) => {
-  const body = await c.req.json<{ currentPassword?: string; newPassword?: string }>();
-  if (!body.currentPassword || !body.newPassword) return jsonError(c, 400, 'currentPassword and newPassword are required');
-  if (body.newPassword.length < 12) return jsonError(c, 400, 'New password must contain at least 12 characters');
+  const body = await readJsonObject(c);
+  const currentPassword = typeof body.currentPassword === 'string' ? body.currentPassword : '';
+  const newPassword = typeof body.newPassword === 'string' ? body.newPassword : '';
+  if (!currentPassword || !newPassword) {
+    return signInFailure(c, 400, 'validation', 'Enter your current password and your new password.');
+  }
   const user = c.get('user');
+  const problem = passwordProblem(newPassword, user.email);
+  if (problem) return signInFailure(c, 400, 'weak_password', problem);
   const row = await c.env.DB.prepare(`SELECT password_hash FROM users WHERE id=?`).bind(user.id).first<{ password_hash: string }>();
-  if (!row || !(await verifyPassword(body.currentPassword, row.password_hash))) return jsonError(c, 401, 'Current password is incorrect');
-  await c.env.DB.prepare(`UPDATE users SET password_hash=?,updated_at=datetime('now') WHERE id=?`).bind(await hashPassword(body.newPassword), user.id).run();
+  if (!row || !(await verifyPassword(currentPassword, row.password_hash))) {
+    return signInFailure(c, 401, 'invalid_credentials', 'Your current password is not correct.');
+  }
+  if (await verifyPassword(newPassword, row.password_hash)) {
+    return signInFailure(c, 400, 'weak_password', 'Choose a password you have not used here before.');
+  }
+
+  await setPassword(c.env, user.id, newPassword);
+  const remaining = Math.max(60, c.get('session').expiresAt - Math.floor(Date.now() / 1000));
+  const sessionSeconds = remaining > SESSION_SECONDS ? REMEMBER_ME_SECONDS : SESSION_SECONDS;
+  const token = await signJwt(c.env, user, sessionSeconds);
+  c.header('Set-Cookie', sessionCookie(token, sessionSeconds));
   await audit(c, 'change_password', 'user', user.id);
-  return c.json({ ok: true });
+  return c.json({ ok: true, token, message: 'Password changed. Your other sessions have been signed out.' });
 });
 
 app.get('/api/dashboard', async (c) => {
@@ -781,6 +1315,9 @@ app.get('/api/dashboard', async (c) => {
     c.env.DB.prepare(`SELECT COUNT(*) AS count FROM maintenance_requests WHERE status IN ('open','assigned','in_progress','needs_verification')`),
     c.env.DB.prepare(`SELECT COUNT(*) AS count FROM access_events WHERE device_timestamp >= datetime('now','start of day')`),
     c.env.DB.prepare(`SELECT COUNT(DISTINCT b.resident_id) AS count FROM bills b, settings s WHERE s.key='facility_fee_grace_period_days' AND b.bill_type='facility_fee' AND b.status IN ('unpaid','partial') AND date('now') > date(b.due_date) AND date('now') <= date(b.due_date, '+' || CAST(s.value AS INTEGER) || ' days')`),
+    // Somebody using "Forgot password" is waiting on the office; the count is
+    // what puts the badge on the menu in the portal and on the phone.
+    c.env.DB.prepare(`SELECT COUNT(*) AS count FROM password_reset_requests WHERE status='pending'`),
   ]);
   return c.json({
     residents: results[0]?.results[0] ?? { count: 0 },
@@ -788,6 +1325,7 @@ app.get('/api/dashboard', async (c) => {
     openMaintenance: results[2]?.results[0] ?? { count: 0 },
     todayAccessEvents: results[3]?.results[0] ?? { count: 0 },
     residentsInGrace: results[4]?.results[0] ?? { count: 0 },
+    pendingPasswordResets: results[5]?.results[0] ?? { count: 0 },
   });
 });
 
@@ -1639,10 +2177,96 @@ app.post('/api/users/:id/reset-password', requireRoles('admin','manager'), async
   const generated=!body.temporaryPassword;
   const temporaryPassword=body.temporaryPassword || `EM-${randomToken(12)}-aA1!`;
   if (temporaryPassword.length<12) return jsonError(c,400,'Temporary password must contain at least 12 characters');
-  await c.env.DB.prepare(`UPDATE users SET password_hash=?,updated_at=datetime('now') WHERE id=?`).bind(await hashPassword(temporaryPassword),target.id).run();
+  // A reset ends the person's existing sessions as well as their old password:
+  // `password_changed_at` is what the authentication middleware compares a
+  // session token against, so a shared or stolen "remember me" cookie cannot
+  // outlive the reset made to take it out of circulation.
+  await setPassword(c.env,target.id,temporaryPassword);
+  await closePendingResets(c.env,target.id,'issued','A temporary password was issued from People.',c.get('user').id);
   await audit(c,'reset_password','user',target.id,{ generated });
   c.header('Cache-Control','no-store');
   return c.json({ ok:true,temporaryPassword:generated?temporaryPassword:undefined,message:'Share the temporary password securely and require the user to change it after sign-in.' });
+});
+
+/**
+ * The estate's password-reset queue — what "Forgot password" produces.
+ *
+ * Administrators and Managers see who asked, when, from which client and how it
+ * is being delivered, so the person on the office phone can be answered without
+ * anyone guessing. Issuing is held to the same rule as every other account
+ * action: a Manager cannot reset an Administrator's or another Manager's
+ * password.
+ */
+app.get('/api/password-resets', requireRoles('admin','manager'), async (c) => {
+  const status=(c.req.query('status') ?? 'pending').trim();
+  const search=(c.req.query('search') ?? '').trim();
+  const limit=Math.min(100,Math.max(1,Number(c.req.query('limit') ?? 50) || 50));
+  const counts=await c.env.DB.prepare(
+    `SELECT status,COUNT(*) AS count FROM password_reset_requests GROUP BY status`,
+  ).all<{ status:string;count:number }>();
+  const results=await c.env.DB.prepare(
+    `SELECT r.id,r.reference,r.status,r.delivery,r.requested_from,r.request_count,r.created_at,r.last_requested_at,
+            r.code_expires_at,r.handled_at,r.handled_note,
+            u.id AS user_id,u.name AS person_name,u.email,
+            CASE WHEN u.is_manager=1 THEN 'manager' ELSE u.role END AS role,
+            u.status AS account_status,
+            handler.name AS handled_by_name
+       FROM password_reset_requests r
+       JOIN users u ON u.id=r.user_id
+       LEFT JOIN users handler ON handler.id=r.handled_by
+      WHERE (?='' OR r.status=?)
+        AND (?='' OR u.name LIKE ? OR u.email LIKE ? OR r.reference LIKE ?)
+      ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END, r.last_requested_at DESC
+      LIMIT ?`,
+  ).bind(status,status,search,`%${search}%`,`%${search}%`,`%${search}%`,limit).all();
+  const settings=await readResetSettings(c.env.DB);
+  const tally=Object.fromEntries(counts.results.map((row)=>[row.status,Number(row.count)]));
+  return c.json({
+    items:results.results,
+    counts:{ pending:0,issued:0,dismissed:0,completed:0,expired:0,...tally },
+    settings:{ selfService:settings.selfService,codeMinutes:settings.codeMinutes },
+    // How long an unanswered request stays pending, so the screen can say it.
+    pendingDays:RESET_REQUEST_PENDING_DAYS,
+  });
+});
+
+app.post('/api/password-resets/:id/issue', requireRoles('admin','manager'), async (c) => {
+  const request=await c.env.DB.prepare(
+    `SELECT r.id,r.reference,r.status,r.delivery,u.id AS user_id,u.name,u.email,
+            CASE WHEN u.is_manager=1 THEN 'manager' ELSE u.role END AS role
+       FROM password_reset_requests r JOIN users u ON u.id=r.user_id WHERE r.id=?`,
+  ).bind(c.req.param('id')).first<{ id:string;reference:string;status:string;delivery:string;user_id:string;name:string;email:string;role:Role }>();
+  if (!request) return jsonError(c,404,'That reset request no longer exists');
+  if (request.status!=='pending') return jsonError(c,409,'That request has already been handled');
+  if (!canManageAccount(c.get('user').role,request.role)) return jsonError(c,403,'Managers cannot reset administrator or manager passwords');
+  const temporaryPassword=`EM-${randomToken(12)}-aA1!`;
+  await setPassword(c.env,request.user_id,temporaryPassword);
+  await closePendingResets(c.env,request.user_id,'issued',`Temporary password issued against ${request.reference}.`,c.get('user').id);
+  await audit(c,'issue_password_reset','user',request.user_id,{ reference:request.reference,delivery:request.delivery });
+  c.header('Cache-Control','no-store');
+  return c.json({
+    ok:true,
+    reference:request.reference,
+    personName:request.name,
+    email:request.email,
+    temporaryPassword,
+    message:`Share this temporary password with ${request.name} securely. Their other sessions have been signed out and they must change it after signing in.`,
+  });
+});
+
+app.post('/api/password-resets/:id/dismiss', requireRoles('admin','manager'), async (c) => {
+  const body=await readJsonObject(c);
+  const note=typeof body.note==='string' ? body.note.trim().slice(0,300) : '';
+  const request=await c.env.DB.prepare(
+    `SELECT id,reference,status,user_id FROM password_reset_requests WHERE id=?`,
+  ).bind(c.req.param('id')).first<{ id:string;reference:string;status:string;user_id:string }>();
+  if (!request) return jsonError(c,404,'That reset request no longer exists');
+  if (request.status!=='pending') return jsonError(c,409,'That request has already been handled');
+  await c.env.DB.prepare(
+    `UPDATE password_reset_requests SET status='dismissed',code_hash=NULL,handled_by=?,handled_at=datetime('now'),handled_note=? WHERE id=? AND status='pending'`,
+  ).bind(c.get('user').id,note||"Closed without a reset. Confirm the person's identity before issuing one.",request.id).run();
+  await audit(c,'dismiss_password_reset','user',request.user_id,{ reference:request.reference,note });
+  return c.json({ ok:true });
 });
 
 app.delete('/api/users/:id', requireRoles('admin','manager'), async (c) => {
@@ -6037,6 +6661,13 @@ app.put('/api/settings/:key', requireRoles('admin'), async (c) => {
   const body = await c.req.json<{ value?: string }>();
   if (body.value == null) return jsonError(c, 400, 'value is required');
   if (key === 'facility_fee_grace_period_days' && (!/^\d{1,3}$/.test(body.value) || Number(body.value) > 365)) return jsonError(c, 400, 'Grace period must be 0–365 days');
+  // The password-reset switch is an estate security decision, so it is validated
+  // here rather than trusted: a value that is neither true nor false would
+  // otherwise sit in the settings table looking like it meant something.
+  if (key === 'password_reset_self_service' && !['true','false'].includes(body.value)) return jsonError(c, 400, 'password_reset_self_service must be true or false');
+  if (key === 'password_reset_code_minutes' && (!/^\d{1,3}$/.test(body.value) || Number(body.value) < RESET_CODE_TTL_MINUTES_MIN || Number(body.value) > RESET_CODE_TTL_MINUTES_MAX)) {
+    return jsonError(c, 400, `A reset code must last between ${RESET_CODE_TTL_MINUTES_MIN} and ${RESET_CODE_TTL_MINUTES_MAX} minutes`);
+  }
   await c.env.DB.prepare(
     `INSERT INTO settings(key,value,updated_by,updated_at) VALUES (?,?,?,datetime('now')) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_by=excluded.updated_by,updated_at=excluded.updated_at`,
   ).bind(key, body.value, c.get('user').id).run();
@@ -7615,6 +8246,22 @@ async function pruneAccessEvents(env: Env): Promise<void> {
   ).bind(Math.floor(days)).run();
 }
 
+/**
+ * Retention for the sign-in tables, on the hourly trigger with every other
+ * prune: attempt rows are only ever read through a 15-minute window, and a
+ * request nobody acted on stops being "pending" so the office queue means
+ * something. Neither job touches a pending request that is still fresh.
+ */
+async function pruneSignInRecords(env: Env): Promise<void> {
+  await env.DB.prepare(`DELETE FROM auth_attempts WHERE created_at < datetime('now','-1 day')`).run();
+  await env.DB.prepare(
+    `UPDATE password_reset_requests
+       SET status='expired',code_hash=NULL,handled_at=datetime('now'),
+           handled_note='No action was taken within ${RESET_REQUEST_PENDING_DAYS} days.'
+     WHERE status='pending' AND datetime(last_requested_at) <= datetime('now','-${RESET_REQUEST_PENDING_DAYS} days')`,
+  ).run();
+}
+
 async function processPropertyLifecycle(env: Env): Promise<void> {
   const expired = await env.DB.prepare(
     `SELECT id,property_id,tenant_id FROM property_tenancies WHERE status='active' AND end_date IS NOT NULL AND date(end_date)<date('now')`,
@@ -7776,6 +8423,7 @@ export default {
       enforceFacilityFees(env),
       expireStalePresence(env),
       pruneAccessEvents(env),
+      pruneSignInRecords(env),
       expireFingerprintTemplates(env),
       syncActiveVisitorPasses(env.DB),
       // Also swept hourly, so a missed or delayed minute trigger still catches up.
