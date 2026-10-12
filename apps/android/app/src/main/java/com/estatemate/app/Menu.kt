@@ -124,35 +124,6 @@ private fun MenuIcon.image(): ImageVector = when (this) {
  * have their own tabs, so they are not repeated here. A module with a [path] is
  * read in the app; one without is a portal-only tool and says so.
  */
-/**
- * The portal's `navIcon()` vocabulary, as Material icons.
- *
- * Every module carries the mark a person already knows from the portal's
- * navigation, so "Bills & payments" is the same tile on the phone as on the PC.
- * A module with no icon of its own falls back to [Settings].
- */
-enum class MenuIcon {
-    Visitors, Cards, Devices, Residents, Staff, Properties, Bills,
-    Maintenance, Bookings, Notices, Documents, Emergency, Settings, Resets,
-}
-
-private fun MenuIcon.image(): ImageVector = when (this) {
-    MenuIcon.Visitors -> Icons.Outlined.Badge
-    MenuIcon.Cards -> Icons.Outlined.CreditCard
-    MenuIcon.Devices -> Icons.Outlined.Devices
-    MenuIcon.Residents -> Icons.Outlined.People
-    MenuIcon.Staff -> Icons.Outlined.Work
-    MenuIcon.Properties -> Icons.Outlined.Apartment
-    MenuIcon.Bills -> Icons.Outlined.Payments
-    MenuIcon.Maintenance -> Icons.Outlined.Build
-    MenuIcon.Bookings -> Icons.Outlined.EventAvailable
-    MenuIcon.Notices -> Icons.Outlined.Campaign
-    MenuIcon.Documents -> Icons.Outlined.Description
-    MenuIcon.Emergency -> Icons.Outlined.Contacts
-    MenuIcon.Settings -> Icons.Outlined.Settings
-    MenuIcon.Resets -> Icons.Outlined.VpnKey
-}
-
 data class MenuModule(
     val id: String,
     val label: String,

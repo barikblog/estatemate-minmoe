@@ -213,6 +213,14 @@ describe('every client handles sign-in the same way', () => {
     expect(dashboard).toContain("Show-DashboardSection 'Status'");
     expect(dashboard).toContain('SectionPages');
     expect(dashboard).toContain('SectionButtons');
+
+    // The self-test reads those pages' Visible flags back, and a child control
+    // reports *effective* visibility: on the window as it is built — never
+    // shown — all three read False, so the check shows it for the length of
+    // that one assertion and hides it again. Drop the Show and the self-test
+    // fails on the build server, which is the only place it ever runs.
+    expect(dashboard).toContain('$dashboardForm.Show()');
+    expect(dashboard).toContain('$dashboardForm.Hide()');
   });
 
   it('names every module on the phone with an icon, as the portal does', async () => {
@@ -240,6 +248,12 @@ describe('every client handles sign-in the same way', () => {
     expect([...menu.matchAll(/module\.icon\.image\(\)/g)].length).toBeGreaterThanOrEqual(2);
     expect(menu).toContain('module.iconTint()');
     expect(menu).toContain('ImageVector');
+
+    // Declared once. A second copy of the enum or the helper is a Kotlin
+    // redeclaration error, and Kotlin is only ever compiled by CI's Gradle
+    // build: this is the only test that can catch it on the way in.
+    expect([...menu.matchAll(/enum class MenuIcon\b/g)].length).toBe(1);
+    expect([...menu.matchAll(/private fun MenuIcon\.image\(\)/g)].length).toBe(1);
   });
 
   it('opens the portal on the reset queue from the desktop dashboard', async () => {

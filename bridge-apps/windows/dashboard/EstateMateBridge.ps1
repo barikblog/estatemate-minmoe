@@ -264,6 +264,10 @@ function Show-DashboardSection([string] $sectionName) {
   $pages = $script:Controls.SectionPages
   $buttons = $script:Controls.SectionButtons
   if (-not $pages -or -not $buttons) { return }
+  # A name no rail button sends would otherwise hide every section and leave a
+  # blank window. Only the three handlers below call this, so the guard is a
+  # seat belt around the rail rather than a path anyone walks.
+  if (-not $pages.ContainsKey($sectionName)) { return }
   foreach ($key in @($pages.Keys)) { $pages[$key].Visible = ($key -eq $sectionName) }
   foreach ($key in @($buttons.Keys)) {
     $chosen = ($key -eq $sectionName)
@@ -1106,7 +1110,18 @@ function Invoke-SelfTest {
 
     # The icon rail: three sections, one visible at a time, and the chosen
     # button keeps the portal's blue so the rail reads like the sidebar.
-    $script:Controls.SectionPages['Configuration'].Visible = $true
+    #
+    # A child's Visible getter reports *effective* visibility - its own flag
+    # combined with every ancestor's - so a window that was never shown reads
+    # False for all three pages and the check could not tell them apart. Show it
+    # for the length of this check and hide it again: the dashboard only ever
+    # runs this window shown, and no other check here cares whether it is on
+    # screen. Showing it runs no dashboard code of its own - the form has no
+    # Load or Shown handler - so this stays a paint, not a side effect.
+    $dashboardForm = $script:Controls.Form
+    $showError = ''
+    try { $dashboardForm.Show() } catch { $showError = $_.Exception.Message }
+    Check 'the window opens for the rail check' (-not $showError) $showError
     Show-DashboardSection 'Configuration'
     Check 'the rail shows one section at a time' `
       ($script:Controls.SectionPages['Configuration'].Visible -and -not $script:Controls.SectionPages['Status'].Visible -and -not $script:Controls.SectionPages['Service'].Visible) `
@@ -1117,7 +1132,14 @@ function Invoke-SelfTest {
     Check 'the rail names every section with the portal glyph' `
       ($script:Controls.StatusNav.Text.StartsWith($script:NavGlyphs['Status']) -and $script:Controls.ConfigNav.Text.StartsWith($script:NavGlyphs['Configuration']) -and $script:Controls.ServiceNav.Text.StartsWith($script:NavGlyphs['Service'])) `
       "status=$($script:Controls.StatusNav.Text) config=$($script:Controls.ConfigNav.Text) service=$($script:Controls.ServiceNav.Text)"
+    # A rail button can only send one of the three names above, but a name that
+    # matched nothing must never hide every section and leave a blank window.
+    Show-DashboardSection 'No such section'
+    Check 'an unknown section leaves the rail where it was' `
+      ($script:Controls.SectionPages['Configuration'].Visible -and -not $script:Controls.SectionPages['Status'].Visible -and $script:Section -eq 'Configuration') `
+      "section=$($script:Section); config=$($script:Controls.SectionPages['Configuration'].Visible)"
     Show-DashboardSection 'Status'
+    $dashboardForm.Hide()
 
     # The two sign-in controls: they open the portal, on the reset queue when
     # asked, tagged as the desktop client.
